@@ -1,0 +1,12 @@
+# docker/.dockerignore
+.git
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+*.egg
+*.ipynb_checkpoints
+raw_data/
+data/
+output/

@@ -1,0 +1,89 @@
+project:
+  results_path: /global/homes/b/bkieft/metatlas_junkdrawer/data_integration/results
+  project_tag: 3
+  dataset_list:
+    - tx
+    - mx
+  variable_list:
+    - group
+    - salinity
+    - light
+    - condition
+  PI_name: Cvetkovska
+  proposal_ID: 508469
+  keyword: Chlamydomonas
+
+datasets:
+  data_processing_tag: 0
+  tx:
+    dataset_dir: transcriptomics
+    index: 1
+    datatype: counts
+    normalization_parameters:
+      filtering:
+        method: minimum
+        value: 100
+      devariancing:
+        method: percent
+        value: 25
+      scaling:
+        method: modified_zscore
+        log2: true
+      replicate_handling:
+        group: group
+        value: 0.5
+    annotation:
+      method: magi2
+      id_colname:
+      name_colname:
+      custom_file:
+  mx:
+    dataset_dir: metabolomics
+    mode: untargeted
+    chromatography: HILIC
+    polarity: multipolarity
+    datatype: peak-height
+    normalization_parameters:
+      filtering:
+        method: minimum
+        value: 100000
+      devariancing:
+        method: percent
+        value: 25
+      scaling:
+        method: modified_zscore
+        log2: true
+      replicate_handling:
+        group: group
+        value: 0.5
+    annotation:
+      method: magi2
+      id_colname:
+      name_colname:
+      custom_file:
+
+analyses:
+  data_analysis_tag: 0
+  analysis_parameters:
+    feature_selection:
+      feature_selection_method: glm
+      metadata_category: salinity
+      metadata_category_reference: LowS
+      significance_level: 0.05
+      log_fold_level: 0.5
+      max_features: 10000
+      feature_list_file:
+    networking:
+      network_mode: bipartite
+      submodule_mode: community
+      corr_method: pearson
+      corr_cutoff: 0.8
+      keep_negative: false
+    magi:
+      magi_source_dir:
+      magi_sequence_input:
+      magi_compound_input:
+    mofa:
+      num_mofa_factors: 5
+      num_mofa_iterations: 1000
+      seed_for_training: 555
