@@ -8,19 +8,8 @@ import shutil
 from typing import Dict, Any, List, Optional
 from IPython.display import display
 
-config_file = "project_config_508469.yaml"
-config_path = "/global/homes/b/bkieft/jgi_integration/configs/"
-config_fname = f'{config_path}/{config_file}'
-
-with open(config_fname, 'r') as file:
-    config = yaml.safe_load(file)
-
-# Set path to executables
-sys.path.insert(0, "/global/homes/b/bkieft/jgi_integration/tools")
-import helpers as hlp
-
-pd.options.display.max_colwidth = 200
-overwrite_existing_files = True
+#sys.path.insert(0, "/home/jgi_user/tools")
+import tools.helpers as hlp
 
 class Project:
     """Project configuration and directory management."""
@@ -36,12 +25,12 @@ class Project:
         self.study_variables = self.project_config['variable_list']
         self.project_name = f"{self.PI_name}_{self.proposal_ID}_{self.keyword}"
         self.output_dir = self.project_config['results_path']
-        self.raw_data_dir = "/global/homes/b/bkieft/jgi_integration/raw_data"
+        self.raw_data_dir = self.project_config['raw_data_path']
         self.main_dir = f"{self.output_dir}/{self.project_name}"
         self.project_dir = f"{self.main_dir}/{self.project_name}_{self.project_config['project_tag']}"
         self.script_dir = f"{self.project_dir}/raw_data_retrieval"
         #self.tools_path = os.path.expandvars(self.project_config.get('tools_path', ''))
-        self.tools_path = "/global/homes/b/bkieft/jgi_integration/tools"
+        #self.tools_path = "/home/jgi_user/tools"
         os.makedirs(self.main_dir, exist_ok=True)
         os.makedirs(self.project_dir, exist_ok=True)
         os.makedirs(self.script_dir, exist_ok=True)
@@ -467,8 +456,7 @@ class Analysis(BaseDataHandler):
         self.project = project
         self.datasets_config = self.project.config['datasets']
         self.analyses_config = self.project.config['analyses']
-        #self.metadata_link_script = self.project.config['metadata_link_script']
-        self.metadata_link_script = "/global/homes/b/bkieft/jgi_integration/scripts/metadata_link_script_508469.py"
+        self.metadata_link_script = self.project.config['metadata_link_script']
 
         # Check if analysis directory exists
         analysis_outdir = self.set_up_analysis_outdir(self.project, self.datasets_config, 

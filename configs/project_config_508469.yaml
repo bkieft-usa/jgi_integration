@@ -1,5 +1,7 @@
 project:
-  results_path: /global/homes/b/bkieft/metatlas_junkdrawer/data_integration/results
+  results_path: /home/jgi_user/work/results
+  raw_data_path: /home/jgi_user/work/raw_data
+  metadata_link_script: /home/jgi_user/work/scripts/metadata_link_script_508469.py
   project_tag: 3
   dataset_list:
     - tx
