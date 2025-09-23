@@ -168,7 +168,7 @@ def run_kruskalwallis_test(
     return significant_features
 
 
-def subset_features_before_network_analysis(
+def perform_feature_selection(
     data: pd.DataFrame,
     metadata: pd.DataFrame,
     output_filename: str = "feature_selection_table.csv",
@@ -386,6 +386,7 @@ def plot_correlation_network(
             G.nodes[node]['datatype_color'] = "gray"
             G.nodes[node]['datatype_shape'] = "Rectangle" 
 
+    # Annotate nodes and edges with functional information if available
     if annotation_df is not None and not annotation_df.empty:
         print("Annotating nodes and edges with functional information...")
         annotation_df['node_id'] = annotation_df.index
@@ -404,6 +405,11 @@ def plot_correlation_network(
                 G.edges[edge]['source_annotation'] = str(node_annotations[edge[0]])
             if edge[1] in node_annotations:
                 G.edges[edge]['target_annotation'] = str(node_annotations[edge[1]])
+
+    # Remove isolated groups of exactly 2 nodes
+    small_components = [c for c in nx.connected_components(G) if len(c) < 3]
+    for comp in small_components:
+        G.remove_nodes_from(comp)    
 
     print(f"Exporting node/edge tables and correlation network...")
     nx.write_graphml(G, output_filenames['graph'])
@@ -1943,99 +1949,157 @@ def remove_low_replicable_features(
     return replicable_data
 
 def plot_pca(
-    data: pd.DataFrame,
+    data: dict[str, pd.DataFrame],
     metadata: pd.DataFrame,
     metadata_variables: List[str],
     alpha: float = 0.75,
     output_dir: str = None,
+    output_filename: str = None,
     dataset_name: str = None,
-    overwrite: bool = False
 ) -> None:
     """
     Plot a PCA of the data colored by a metadata variable.
 
     Args:
-        data (pd.DataFrame): Feature matrix (features x samples).
+        data (dict): A dictionary containing two DataFrames: {"linked": linked_data, "normalized": normalized_data}.
         metadata (pd.DataFrame): Metadata DataFrame.
         metadata_variables (List[str]): List of metadata variables to plot.
         alpha (float): Transparency for points.
         output_dir (str, optional): Output directory for plots.
+        output_filename (str, optional): Name for output file.
         dataset_name (str, optional): Name for output file.
-        overwrite (bool): Overwrite existing plots.
 
     Returns:
         None
     """
 
-    # Check if plots already exist
-    plots = []
-    for metadata_variable in metadata_variables:
-        filename = f"PCA_of_{metadata_variable}_for_{dataset_name}.pdf"
-        output_subdir = f"{output_dir}/plots"
-        os.makedirs(output_subdir, exist_ok=True)
-        output_plot = f"{output_subdir}/{filename}"
-        if os.path.exists(output_plot):
-            plots.append(output_plot)
-    if plots and not overwrite:
-        print(f"Plots already exist. Not overwriting.")
-        return
+    clear_directory(output_dir)
+    plot_paths = {}
+    for df_type, df in data.items():
+        plot_paths[df_type] = []
+        df_samples = df.columns.tolist()
+        metadata_samples = metadata['unique_group'].tolist()
+        if not set(df_samples).intersection(set(metadata_samples)):
+            print(f"Warning: No matching samples between {df_type} data and metadata. Skipping PCA plot for {df_type}.")
+            continue
+        common_samples = list(set(df_samples).intersection(set(metadata_samples)))
+        metadata_input = metadata[metadata['unique_group'].isin(common_samples)]
+        data_input = df.T
+        data_input = data_input.loc[common_samples]
+        data_input = data_input.fillna(0)
+
+        # Perform PCA
+        pca = PCA(n_components=2)
+        pca_result = pca.fit_transform(data_input)
         
-    # Set up data and metadata for PCA
-    common_samples = data.columns.intersection(metadata.index)
-    metadata_input = metadata.loc[common_samples]
-    data_input = data.T
-    data_input = data_input.loc[common_samples]
-    data_input = data_input.fillna(0)
-    output_subdir = f"{output_dir}/plots"
-    os.makedirs(output_subdir, exist_ok=True)
-    
-    # Perform PCA
-    pca = PCA(n_components=2)
-    pca_result = pca.fit_transform(data_input)
-    pca_df = pd.DataFrame(data=pca_result, columns=['PCA1', 'PCA2'], index=data_input.index)
-    
-    # Merge PCA results with metadata
-    pca_df = pca_df.join(metadata_input)
-    
-    # Plot PCA using seaborn
-    for metadata_variable in metadata_variables:
-        plt.figure(figsize=(8, 6))
-        sns.kdeplot(
-            data=pca_df, 
-            x='PCA1', 
-            y='PCA2', 
-            hue=metadata_variable, 
-            fill=True, 
-            alpha=alpha, 
-            palette='viridis',
-            bw_adjust=2
-        )
-        sns.scatterplot(
-            x='PCA1', y='PCA2', 
-            hue=metadata_variable, 
-            palette='viridis', 
-            data=pca_df, 
-            alpha=alpha,
-            s=100,
-            edgecolor='w',
-            linewidth=0.5
-        )
-        plt.xlabel('PCA1')
-        plt.ylabel('PCA2')
-        plt.title(f"{dataset_name} PCA by {metadata_variable}")
-        plt.legend(title=metadata_variable)
+        # Merge PCA results with metadata
+        pca_df = pd.DataFrame(data=pca_result, columns=['PCA1', 'PCA2'], index=data_input.index)
+        pca_df = pca_df.reset_index().rename(columns={'index': 'unique_group'})
+        pca_df = pca_df.merge(metadata_input, on='unique_group', how='left')
         
-        # Save the plot if output_dir is specified
-        if output_dir:
-            filename = f"PCA_of_{metadata_variable}_for_{dataset_name}.pdf"
-            output_subdir = f"{output_dir}/plots"
-            os.makedirs(output_subdir, exist_ok=True)
-            output_plot = f"{output_subdir}/{filename}"
-            print(f"Saving plot to {output_plot}")
-            plt.savefig(output_plot)
-            plt.close()
-        else:
-            print("Not saving plot to disk.")
+        # Plot PCA using seaborn
+        for metadata_variable in metadata_variables:
+            plt.figure(figsize=(8, 6))
+            sns.kdeplot(
+                data=pca_df, 
+                x='PCA1', 
+                y='PCA2', 
+                hue=metadata_variable, 
+                fill=True, 
+                alpha=alpha, 
+                palette='viridis',
+                bw_adjust=2
+            )
+            sns.scatterplot(
+                x='PCA1', y='PCA2', 
+                hue=metadata_variable, 
+                palette='viridis', 
+                data=pca_df, 
+                alpha=alpha,
+                s=100,
+                edgecolor='w',
+                linewidth=0.5
+            )
+            plt.xlabel('PCA1')
+            plt.ylabel('PCA2')
+            plt.title(f"{dataset_name} {df_type} data PCA by {metadata_variable}")
+            plt.legend(title=metadata_variable)
+            
+            # Save the plot if output_dir is specified
+            if output_dir:
+                filename = f"PCA_of_{df_type}_data_by_{metadata_variable}_for_{dataset_name}.pdf"
+                output_plot = f"{output_dir}/{filename}"
+                print(f"Saving plot to {output_plot}")
+                plt.savefig(output_plot)
+                plot_paths[df_type].append(output_plot)
+                plt.close()
+            else:
+                print("Not saving plot to disk.")
+
+    plot_pdf_grids(plot_paths, output_dir, metadata_variables, output_filename)
+
+    return
+
+def plot_pdf_grids(plot_paths: dict[str, list[str]], output_dir: str, variables: List[str], output_filename: str) -> None:
+    """
+    Combine PDF plots into a grid PDF (rows: data types, columns: metadata variables).
+
+    Args:
+        plot_paths (dict): {"linked": [...], "normalized": [...]}, each a list of PDF paths.
+        variables (List[str]): Metadata variable names (columns).
+        output_dir (str): Output directory for combined PDF.
+        output_filename (str): Name for output PDF.
+
+    Returns:
+        None
+    """
+    # Build grid: each row is a data type, each column is a variable
+    grid = []
+    for data_type, paths in plot_paths.items():
+        grid_row = []
+        for var in variables:
+            match = next((f for f in paths if f and f"_by_{var}_" in f), None)
+            grid_row.append(match)
+        grid.append(grid_row)
+
+    # Set page size based on grid
+    n_rows = len(grid)
+    n_cols = len(variables)
+    page_height = 250 * n_rows
+    page_width = 250 * n_cols
+
+    doc = fitz.open()
+    page = doc.new_page(width=page_width, height=page_height)
+
+    img_w = page_width / n_cols
+    img_h = page_height / n_rows
+
+    for i, grid_row in enumerate(grid):
+        for j, pdf in enumerate(grid_row):
+            if pdf and os.path.exists(pdf):
+                try:
+                    src = fitz.open(pdf)
+                    src_page = src[0]
+                    scale_x = img_w / src_page.rect.width
+                    scale_y = img_h / src_page.rect.height
+                    scale = min(scale_x, scale_y)
+                    mat = fitz.Matrix(scale, scale)
+                    rect = fitz.Rect(
+                        j * img_w,
+                        i * img_h,
+                        (j + 1) * img_w,
+                        (i + 1) * img_h
+                    )
+                    page.show_pdf_page(rect, src, 0, mat)
+                    src.close()
+                except Exception as e:
+                    print(f"Error processing {pdf}: {e}")
+
+    output_pdf = os.path.join(output_dir, output_filename)
+    doc.save(output_pdf)
+    doc.close()
+    print(f"Combined PDF saved as {output_pdf}")
+    return
 
 def plot_data_variance_indv_histogram(
     data: pd.DataFrame,
@@ -2142,6 +2206,7 @@ def run_full_mofa2_analysis(
     mofa2_views: list[str],
     metadata: pd.DataFrame,
     output_dir: str,
+    output_filename: str,
     num_factors: int = 5,
     num_features: int = 10,
     num_iterations: int = 100,
@@ -2157,6 +2222,7 @@ def run_full_mofa2_analysis(
         mofa2_views (list of str): Names for each omics view (e.g., ['tx', 'mx']).
         metadata (pd.DataFrame): Metadata DataFrame (samples x variables).
         output_dir (str): Output directory for results.
+        output_filename (str): Name for model h5 file.
         num_factors (int): Number of MOFA factors to compute.
         num_features (int): Number of top features to plot per factor.
         num_iterations (int): Number of training iterations.
@@ -2167,17 +2233,7 @@ def run_full_mofa2_analysis(
         None
     """
 
-    output_subdir = f"{output_dir}/mofa2_analyses"
-
-    if os.path.exists(output_subdir) and overwrite is True:
-        print(f"Output directory {output_subdir} already exists. Overwriting existing files.")
-        shutil.rmtree(output_subdir)
-    elif os.path.exists(output_subdir) and overwrite is False:
-        print(f"Output directory {output_subdir} already exists. Not overwriting existing files.")
-        return
-    elif not os.path.exists(output_subdir):
-        print(f"Creating output directory {output_subdir}...")
-        os.makedirs(output_subdir, exist_ok=True)
+    clear_directory(output_dir)
 
     melted_dfs = []
     for datatype in mofa2_views:
@@ -2197,7 +2253,7 @@ def run_full_mofa2_analysis(
     print("Converted omics data to mofa2 format:\n")
 
     # Run the model and load to memory
-    model_file = run_mofa2_model(data=mofa_data, output_dir=output_subdir,
+    model_file = run_mofa2_model(data=mofa_data, output_dir=output_dir, output_filename=output_filename,
                                 num_factors=num_factors, num_iterations=num_iterations, 
                                 training_seed=training_seed)
     
@@ -2213,23 +2269,23 @@ def run_full_mofa2_analysis(
         Groups: {', '.join(model.groups)}
         Datasets: {', '.join(model.views)}
     """
-    info_file_path = os.path.join(output_subdir, f"mofa2_model_summary.txt")
+    info_file_path = os.path.join(output_dir, f"mofa2_model_summary.txt")
     with open(info_file_path, 'w') as f:
         f.write(info_text)
     print(info_text)
 
     # Calculate and save model stats
-    calculate_mofa2_feature_weights_and_r2(model=model, output_dir=output_subdir, num_factors=num_factors)        
+    calculate_mofa2_feature_weights_and_r2(model=model, output_dir=output_dir, num_factors=num_factors)        
 
     # Plot and save generic output graphs
     #plot_mofa2_factor_r2(model=model, output_dir=output_subdir, num_factors=num_factors)
-    plot_mofa2_feature_weights_linear(model=model, num_features=num_features, output_dir=output_subdir)
+    plot_mofa2_feature_weights_linear(model=model, num_features=num_features, output_dir=output_dir)
     for dataset in mofa2_views:
         plot_mofa2_feature_weights_scatter(model=model, data_type=dataset, factorX="Factor0", factorY="Factor1",
-                                           num_features=num_features, output_dir=output_subdir)
+                                           num_features=num_features, output_dir=output_dir)
     # for dataset in mofa2_views:
     #     plot_mofa2_feature_importance_per_factor(model=model, num_features=num_features,
-    #                                              data_type=dataset, output_dir=output_subdir)
+    #                                              data_type=dataset, output_dir=output_dir)
     return
 
 
@@ -2288,6 +2344,7 @@ def plot_feature_abundance_by_metadata(
 def run_mofa2_model(
     data: pd.DataFrame,
     output_dir: str = None,
+    output_filename: str = "mofa2_model.hdf5",
     num_factors: int = 1,
     num_iterations: int = 100,
     training_seed: int = 555
@@ -2306,7 +2363,7 @@ def run_mofa2_model(
         str: Path to the saved MOFA2 model file.
     """
 
-    outfile = f"{output_dir}/mofa2_model.hdf5"
+    outfile = os.path.join(output_dir, output_filename)
         
     ent = entry_point()
     ent.set_data_options(
@@ -3207,95 +3264,68 @@ def plot_heatmap_with_dendrogram(
     plt.show()
     plt.close()
 
-def plot_pdf_grids(plots_path: str, 
-                   variables: List[str],
-                   overwrite: bool = False
-) -> None:
-    """
-    Combine PCA and heatmap PDF plots into grid PDFs for both plot types.
+# def calculate_correlated_features(
+#     data: pd.DataFrame,
+#     output_filename: str,
+#     output_dir: str,
+#     corr_method: str = "pearson",
+#     corr_cutoff: float = 0.5,
+#     overwrite: bool = False,
+#     keep_negative: bool = False,
+#     only_bipartite: bool = False,
+#     save_corr_matrix: bool = False
+# ) -> pd.DataFrame:
+#     """
+#     Calculate and filter feature-feature correlation matrix.
 
-    Args:
-        plots_path (str): Path to the directory containing the 'plots' subdirectory with PDF files.
-        variables (List[str]): List of variable names to use as columns in the grid.
-        overwrite (bool): If True, overwrite existing grid PDFs.
+#     Args:
+#         data (pd.DataFrame): Feature matrix (features x samples).
+#         output_dir (str): Output directory for results.
+#         corr_method (str): Correlation method.
+#         corr_cutoff (float): Correlation threshold.
+#         overwrite (bool): Overwrite existing results.
+#         keep_negative (bool): Keep negative correlations if True.
+#         only_bipartite (bool): Only keep bipartite correlations.
+#         save_corr_matrix (bool): Save correlation matrix to disk.
 
-    This function searches for PCA and heatmap PDF files, arranges them in a grid
-    (rows: nonnormalized/normalized, columns: variables), and saves combined grid PDFs
-    for both PCA and heatmap plots.
-    """
+#     Returns:
+#         pd.DataFrame: Filtered correlation matrix.
+#     """
 
-    plot_types = {
-        "pca": {
-            "pattern": "PCA_of_*for*.pdf",
-            "output": "PCA_grid.pdf",
-            "height": 100,
-            "width": 250
-        },
-        # "heatmap": {
-        #     "pattern": "heatmap_of_grouped_metadata*.pdf",
-        #     "output": "heatmap_grid.pdf",
-        #     "height": 400,
-        #     "width": 450
-        # }
-    }
+#     output_subdir = output_dir
+#     #output_subdir = f"{output_dir}/feature_correlation"
+#     os.makedirs(output_subdir, exist_ok=True)
 
-    rows = ["_nonnormalized", "_normalized"]
-    cols = variables
+#     existing_output = f"{output_subdir}/{output_filename}"
+#     if os.path.exists(existing_output) and overwrite is False:
+#         print(f"Correlation table already exists at {existing_output}. \nSkipping calculation and returning existing matrix.")
+#         return pd.read_csv(existing_output, sep=',')
 
-    for plot_type, info in plot_types.items():
-        pdf_files = glob.glob(os.path.join(plots_path, "plots", info["pattern"]))
-        output_pdf = os.path.join(plots_path, "plots", info["output"])
-        if os.path.exists(output_pdf) and overwrite is False:
-            print("Plots already exist. Not overwriting.")
-            continue
+#     data_input = data.T
 
-        # Build grid of file paths
-        grid = []
-        for row in rows:
-            grid_row = []
-            for col in cols:
-                match = [f for f in pdf_files if row in f and col in f]
-                grid_row.append(match[0] if match else None)
-            grid.append(grid_row)
+#     print(f"Calculating feature correlation matrix...")
+#     correlation_matrix = data_input.corr(method=corr_method)
+#     melted_corr = correlation_matrix.reset_index().melt(id_vars='features', var_name='features_2', value_name='correlation')
+#     melted_corr.rename(columns={'features': 'feature_1', 'features_2': 'feature_2'}, inplace=True)
+#     print(f"\tCorrelation matrix calculated with {melted_corr.shape[0]} pairs.")
 
-        # Create new PDF
-        doc = fitz.open()
-        page_height, page_width = info['height'], info['width']
+#     print(f"Filtering correlation matrix by cutoff value {corr_cutoff}...")
+#     if keep_negative is True:
+#         melted_corr = melted_corr[(abs(melted_corr['correlation']) >= corr_cutoff) & (melted_corr['correlation'] != 1) & (melted_corr['correlation'] != -1)]
+#     else:
+#         melted_corr = melted_corr[(melted_corr['correlation'] >= corr_cutoff) & (melted_corr['correlation'] != 1)]
+#     print(f"\tCorrelation matrix filtered to {melted_corr.shape[0]} pairs.")
 
-        # Add a blank page
-        page = doc.new_page(width=page_width, height=page_height)
+#     if only_bipartite is True:
+#         print("Filtering for only bipartite correlations...")
+#         melted_corr = melted_corr[melted_corr['feature_1'].str[:3] != melted_corr['feature_2'].str[:3]]
+#         print(f"\tCorrelation matrix filtered to {melted_corr.shape[0]} pairs.")
 
-        img_w = page_width / len(cols)
-        img_h = page_height / len(rows)
+#     if save_corr_matrix is True:
+#         print(f"Saving and returning feature correlation table to disk...")
+#         write_integration_file(melted_corr, output_subdir, output_filename, indexing=False)
 
-        for i, grid_row in enumerate(grid):
-            for j, pdf in enumerate(grid_row):
-                if pdf and os.path.exists(pdf):
-                    try:
-                        src = fitz.open(pdf)
-                        src_page = src[0]
-                        # Scale the source page to fit the target rectangle
-                        scale_x = img_w / src_page.rect.width
-                        scale_y = img_h / src_page.rect.height
-                        scale = min(scale_x, scale_y)
-                        mat = fitz.Matrix(scale, scale)
-                        # Define the target rectangle
-                        rect = fitz.Rect(
-                            j * img_w,
-                            page_height - (i + 1) * img_h,
-                            (j + 1) * img_w,
-                            page_height - i * img_h
-                        )
-                        # Insert the source page into the target rectangle
-                        page.show_pdf_page(rect, src, 0, mat)
-                        src.close()
-                    except Exception as e:
-                        print(f"Error processing {pdf}: {e}")
-
-        doc.save(output_pdf)
-        doc.close()
-        print(f"Combined PDF saved as {output_pdf}")
-        return
+#     return melted_corr
 
 def calculate_correlated_features(
     data: pd.DataFrame,
@@ -3309,7 +3339,8 @@ def calculate_correlated_features(
     save_corr_matrix: bool = False
 ) -> pd.DataFrame:
     """
-    Calculate and filter feature-feature correlation matrix.
+    Memory-efficient calculation and filtering of feature-feature correlation matrix.
+    Only stores pairs above cutoff in memory.
 
     Args:
         data (pd.DataFrame): Feature matrix (features x samples).
@@ -3326,41 +3357,61 @@ def calculate_correlated_features(
     """
 
     output_subdir = output_dir
-    #output_subdir = f"{output_dir}/feature_correlation"
     os.makedirs(output_subdir, exist_ok=True)
-
     existing_output = f"{output_subdir}/{output_filename}"
-    if os.path.exists(existing_output) and overwrite is False:
-        print(f"Correlation table already exists at {existing_output}. \nSkipping calculation and returning existing matrix.")
+    if os.path.exists(existing_output) and not overwrite:
+        print(f"Correlation table already exists at {existing_output}. Returning existing matrix.")
         return pd.read_csv(existing_output, sep=',')
 
     data_input = data.T
+    features = data_input.columns.tolist()
+    n = len(features)
+    print(f"Calculating feature correlations for {n} features...")
 
-    print(f"Calculating feature correlation matrix...")
-    correlation_matrix = data_input.corr(method=corr_method)
-    melted_corr = correlation_matrix.reset_index().melt(id_vars='features', var_name='features_2', value_name='correlation')
-    melted_corr.rename(columns={'features': 'feature_1', 'features_2': 'feature_2'}, inplace=True)
-    print(f"\tCorrelation matrix calculated with {melted_corr.shape[0]} pairs.")
+    # Use numpy for speed and memory
+    arr = data_input.values
+    means = np.mean(arr, axis=0)
+    stds = np.std(arr, axis=0)
+    arr_centered = arr - means
 
-    print(f"Filtering correlation matrix by cutoff value {corr_cutoff}...")
-    if keep_negative is True:
-        melted_corr = melted_corr[(abs(melted_corr['correlation']) >= corr_cutoff) & (melted_corr['correlation'] != 1) & (melted_corr['correlation'] != -1)]
-    else:
-        melted_corr = melted_corr[(melted_corr['correlation'] >= corr_cutoff) & (melted_corr['correlation'] != 1)]
-    print(f"\tCorrelation matrix filtered to {melted_corr.shape[0]} pairs.")
+    # Only store pairs above cutoff
+    results = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Pearson correlation calculation
+            if corr_method == "pearson":
+                denom = stds[i] * stds[j]
+                if denom == 0:
+                    corr = 0
+                else:
+                    corr = np.dot(arr_centered[:, i], arr_centered[:, j]) / (arr.shape[0] * denom)
+            else:
+                # fallback to pandas for other methods (less efficient)
+                corr = pd.Series(arr[:, i]).corr(pd.Series(arr[:, j]), method=corr_method)
+            # Filtering
+            if keep_negative:
+                if abs(corr) >= corr_cutoff and abs(corr) != 1:
+                    results.append((features[i], features[j], corr))
+            else:
+                if corr >= corr_cutoff and corr != 1:
+                    results.append((features[i], features[j], corr))
 
-    if only_bipartite is True:
+    print(f"\tFiltered to {len(results)} pairs above cutoff.")
+
+    # Only bipartite
+    if only_bipartite:
         print("Filtering for only bipartite correlations...")
-        melted_corr = melted_corr[melted_corr['feature_1'].str[:3] != melted_corr['feature_2'].str[:3]]
-        print(f"\tCorrelation matrix filtered to {melted_corr.shape[0]} pairs.")
+        results = [r for r in results if r[0][:3] != r[1][:3]]
+        print(f"\tCorrelation matrix filtered to {len(results)} pairs.")
 
-    if save_corr_matrix is True:
-        print(f"Saving and returning feature correlation table to disk...")
+    # Build DataFrame
+    melted_corr = pd.DataFrame(results, columns=['feature_1', 'feature_2', 'correlation'])
+
+    if save_corr_matrix:
+        print(f"Saving feature correlation table to disk...")
         write_integration_file(melted_corr, output_subdir, output_filename, indexing=False)
 
     return melted_corr
-
-
 
 def plot_correlated_features(
     data: pd.DataFrame,
@@ -4066,3 +4117,17 @@ def upload_to_google_drive(
     except Exception as e:
         print(f"Warning! Google Drive upload failed on upload check with exception: {e}\nCommand: {check_upload_command}")
         return
+
+def clear_directory(dir_path: str) -> None:
+    # Wipe out all contents of dir_path if generating new outputs
+    if os.path.exists(dir_path):
+        #print(f"Clearing existing contents of directory: {dir_path}")
+        for filename in os.listdir(dir_path):
+            file_path = os.path.join(dir_path, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+            except Exception as e:
+                print(f'Failed to delete {file_path}. Reason: {e}')        

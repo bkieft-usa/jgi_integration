@@ -7,8 +7,6 @@ import numpy as np
 import shutil
 from typing import Dict, Any, List, Optional
 from IPython.display import display
-
-#sys.path.insert(0, "/home/jgi_user/tools")
 import tools.helpers as hlp
 
 class Project:
@@ -29,11 +27,9 @@ class Project:
         self.main_dir = f"{self.output_dir}/{self.project_name}"
         self.project_dir = f"{self.main_dir}/{self.project_name}_{self.project_config['project_tag']}"
         self.script_dir = f"{self.project_dir}/raw_data_retrieval"
-        #self.tools_path = os.path.expandvars(self.project_config.get('tools_path', ''))
-        #self.tools_path = "/home/jgi_user/tools"
         os.makedirs(self.main_dir, exist_ok=True)
         os.makedirs(self.project_dir, exist_ok=True)
-        os.makedirs(self.script_dir, exist_ok=True)
+        #os.makedirs(self.script_dir, exist_ok=True)
         print(f"Project directory: {self.project_dir}")
 
     def __repr__(self):
@@ -109,7 +105,7 @@ class BaseDataHandler:
 class Dataset(BaseDataHandler):
     """Simplified Dataset class using hybrid approach."""
 
-    def __init__(self, dataset_name: str, project: Project, clear_dataset_dir: bool = False):
+    def __init__(self, dataset_name: str, project: Project, overwrite: bool = False):
         print("\n=== Initializing Datasets ===")
         self.project = project
         self.dataset_name = dataset_name
@@ -119,7 +115,7 @@ class Dataset(BaseDataHandler):
         # Set up output directories
         dataset_outdir = self.set_up_dataset_outdir(self.project, self.datasets_config,
                                                     self.dataset_config, self.dataset_name,
-                                                    overwrite=clear_dataset_dir)
+                                                    overwrite=overwrite)
         self.output_dir = dataset_outdir
         self.dataset_raw_dir = os.path.join(self.project.raw_data_dir, self.dataset_config['dataset_dir'])
         os.makedirs(self.output_dir, exist_ok=True)
@@ -145,11 +141,11 @@ class Dataset(BaseDataHandler):
         if os.path.exists(processing_dir):
             if overwrite:
                 print(f"Overwriting existing dataset processing directory for {dataset_name} at {processing_dir}.")
-                shutil.rmtree(processing_dir)
+                #shutil.rmtree(processing_dir)
                 return processing_dir
             else:
                 print(f"ERROR: Dataset processing directory already exists for {dataset_name} at {processing_dir}")
-                print("\nPlease choose a different tag, delete the existing directory, or use the clear_dataset_dir=True flag before proceeding.")
+                print("\nPlease choose a different tag, delete the existing directory, or use the overwrite=True flag before proceeding.")
                 sys.exit(1)
         else:
             print(f"Set up {dataset_name} dataset output directory: {processing_dir}")
@@ -168,7 +164,8 @@ class Dataset(BaseDataHandler):
             'filtered_data': 'filtered_data.csv',
             'devarianced_data': 'devarianced_data.csv',
             'scaled_data': 'scaled_data.csv',
-            'normalized_data': 'normalized_data.csv'
+            'normalized_data': 'normalized_data.csv',
+            'pca_grid': 'pca_grid.pdf'
         }
         for attr, filename in manual_file_storage.items():
             setattr(self, f"_{attr}_filename", filename)
@@ -278,27 +275,25 @@ class Dataset(BaseDataHandler):
     
     def plot_pca(self, overwrite: bool = False, **kwargs) -> None:
         """Hybrid: Class setup + external hlp.plot_pca function."""
-        datasets = {
-            f"{self.dataset_name}_nonnormalized": self.linked_data,
-            f"{self.dataset_name}_normalized": self.normalized_data
-        }
-        
-        valid_datasets = {name: data for name, data in datasets.items() 
-                         if data is not None and not data.empty}
+        print("\n=== Plotting individual PCAs and grid ===")
+        plot_subdir = "plots"
+        plot_dir = os.path.join(self.output_dir, plot_subdir)
+        os.makedirs(plot_dir, exist_ok=True)
+        if os.path.exists(os.path.join(plot_dir, self._pca_grid_filename)) and not overwrite:
+            print(f"PCA grid plot already exists at {plot_dir}. Skipping.")
+            return
         
         call_params = {
+            'data': {"linked": self.linked_data, "normalized": self.normalized_data},
             'metadata': self.linked_metadata,
             'metadata_variables': self.project.study_variables,
             'alpha': 0.75,
-            'output_dir': self.output_dir,
-            'overwrite': overwrite
+            'output_dir': plot_dir,
+            'output_filename': self._pca_grid_filename,
+            'dataset_name': self.dataset_name
         }
         call_params.update(kwargs)
-        
-        for dataset_name, data in valid_datasets.items():
-            call_params['data'] = data
-            call_params['dataset_name'] = dataset_name
-            hlp.plot_pca(**call_params)
+        hlp.plot_pca(**call_params)
 
 # Set up properties for Dataset class
 manual_file_storage = {
@@ -309,7 +304,8 @@ manual_file_storage = {
     'filtered_data': 'filtered_data.csv',
     'devarianced_data': 'devarianced_data.csv',
     'scaled_data': 'scaled_data.csv',
-    'normalized_data': 'normalized_data.csv'
+    'normalized_data': 'normalized_data.csv',
+    'pca_grid': 'pca_grid.pdf'
 }
 #for attr in config['datasets']['file_storage']:
 for attr, filename in manual_file_storage.items():
@@ -317,8 +313,8 @@ for attr, filename in manual_file_storage.items():
 
 class MX(Dataset):
     """Metabolomics dataset with specific configuration."""
-    def __init__(self, project: Project, clear_dataset_dir: bool = False):
-        super().__init__("mx", project, clear_dataset_dir)
+    def __init__(self, project: Project, overwrite: bool = False):
+        super().__init__("mx", project, overwrite)
         self.chromatography = self.dataset_config['chromatography']
         self.polarity = self.dataset_config['polarity']
         self.mode = self.dataset_config['mode']
@@ -385,8 +381,8 @@ class MX(Dataset):
 
 class TX(Dataset):
     """Transcriptomics dataset with specific configuration."""
-    def __init__(self, project: Project, clear_dataset_dir: bool = False):
-        super().__init__("tx", project, clear_dataset_dir)
+    def __init__(self, project: Project, overwrite: bool = False):
+        super().__init__("tx", project, overwrite)
         self.index = self.dataset_config['index']
         self.apid = None
 
@@ -451,16 +447,16 @@ class TX(Dataset):
 class Analysis(BaseDataHandler):
     """Simplified Analysis class using consistent hybrid approach."""
 
-    def __init__(self, project: Project, datasets: list = None, clear_analysis_dir: bool = False):
+    def __init__(self, project: Project, datasets: list = None, overwrite: bool = False):
         print("\n=== Initializing Analysis ===")
         self.project = project
         self.datasets_config = self.project.config['datasets']
         self.analyses_config = self.project.config['analyses']
-        self.metadata_link_script = self.project.config['metadata_link_script']
+        self.metadata_link_script = self.project.project_config['metadata_link']
 
         # Check if analysis directory exists
         analysis_outdir = self.set_up_analysis_outdir(self.project, self.datasets_config, 
-                                                      self.analyses_config, overwrite=clear_analysis_dir)
+                                                      self.analyses_config, overwrite=overwrite)
         self.output_dir = analysis_outdir
         os.makedirs(self.output_dir, exist_ok=True)
         super().__init__(self.output_dir)
@@ -486,11 +482,11 @@ class Analysis(BaseDataHandler):
         if os.path.exists(analysis_dir):
             if overwrite:
                 print(f"Overwriting existing analysis directory {analysis_dir}.")
-                shutil.rmtree(analysis_dir)
+                #shutil.rmtree(analysis_dir)
                 return analysis_dir
             else:
                 print(f"ERROR: Analysis directory already exists for {dataset_name} at {analysis_dir}")
-                print("\nPlease choose a different tag, delete the existing directory, or use the clear_analysis_dir=True flag before proceeding.")
+                print("\nPlease choose a different tag, delete the existing directory, or use the overwrite=True flag before proceeding.")
                 sys.exit(1)
         else:
             print(f"Set up analysis output directory: {analysis_dir}")
@@ -505,11 +501,12 @@ class Analysis(BaseDataHandler):
             'integrated_metadata': 'integrated_metadata.csv',
             'integrated_data': 'integrated_data.csv',
             'feature_annotation_table': 'feature_annotation_table.csv',
-            'feature_selection_table': 'feature_selection_table.csv',
+            'integrated_data_selected': 'integrated_data_selected.csv',
             'feature_correlation_table': 'feature_correlation_table.csv',
             'feature_network_graph': 'feature_network_graph.graphml',
             'feature_network_edge_table': 'feature_network_edge_table.csv',
-            'feature_network_node_table': 'feature_network_node_table.csv'
+            'feature_network_node_table': 'feature_network_node_table.csv',
+            'mofa_model': 'mofa_model.hdf5',
         }
         for attr, filename in manual_file_storage.items():
             setattr(self, f"_{attr}_filename", filename)
@@ -538,21 +535,7 @@ class Analysis(BaseDataHandler):
         """Set DataFrame to cache and disk."""
         if filename:
             self.save_data(df, self.output_dir, filename, indexing=True)
-        self._cache[key] = df
-
-    def _clear_directory(self, dir_path: str) -> None:
-        # Wipe out all contents of dir_path if generating new outputs
-        if os.path.exists(dir_path):
-            print(f"Clearing existing contents of directory: {dir_path}")
-            for filename in os.listdir(dir_path):
-                file_path = os.path.join(dir_path, filename)
-                try:
-                    if os.path.isfile(file_path) or os.path.islink(file_path):
-                        os.unlink(file_path)
-                    elif os.path.isdir(file_path):
-                        shutil.rmtree(file_path)
-                except Exception as e:
-                    print(f'Failed to delete {file_path}. Reason: {e}')            
+        self._cache[key] = df    
 
     def filter_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply filtering to all datasets in the analysis."""
@@ -635,7 +618,7 @@ class Analysis(BaseDataHandler):
 
     def integrate_metadata(self, overwrite: bool = False) -> None:
         """Hybrid: Class validation + external hlp.integrate_metadata function."""
-        print("=== Integrating metadata across data types ===")
+        print("\n=== Integrating metadata across data types ===")
         if self.check_and_load_attribute('integrated_metadata', self._integrated_metadata_filename, overwrite):
             return
         
@@ -651,7 +634,7 @@ class Analysis(BaseDataHandler):
     
     def integrate_data(self, overlap_only: bool = True, overwrite: bool = False) -> None:
         """Hybrid: Class validation + external hlp.integrate_data function."""
-        print("=== Integrating data matrices across data types ===")
+        print("\n=== Integrating data matrices across data types ===")
         if self.check_and_load_attribute('integrated_data', self._integrated_data_filename, overwrite):
             return
         
@@ -664,33 +647,62 @@ class Analysis(BaseDataHandler):
         self.integrated_data = result
         print(f"Created a single integrated data table with {self.integrated_data.shape[0]} samples and {self.integrated_data.shape[1]} features.\n")
 
-    def subset_features_before_network_analysis(self, overwrite: bool = False, **kwargs) -> None:
-        """Hybrid: Class parameter setup + external hlp.subset_features_before_network_analysis function."""
+    def perform_feature_selection(self, overwrite: bool = False, **kwargs) -> None:
+        """Hybrid: Class parameter setup + external hlp.perform_feature_selection function."""
         print("=== Subsetting Features before Network Analysis ===")
-        if self.check_and_load_attribute('feature_selection_table', self._feature_selection_table_filename, overwrite):
+        if self.check_and_load_attribute('integrated_data_selected', self._integrated_data_selected_filename, overwrite):
             return
         
         feature_selection_params = self.analysis_parameters.get('feature_selection', {})
-        
+        selected_method = feature_selection_params.get('selected_method', 'variance')
+        method_params = feature_selection_params.get(selected_method, {})
+
         call_params = {
             'data': self.integrated_data,
             'metadata': self.integrated_metadata,
-            'output_filename': self._feature_selection_table_filename,
-            'subset_method': feature_selection_params.get('feature_selection_method', 'variance'),
-            'significance_level': feature_selection_params.get('significance_level', 0.05),
-            'lfc_level': feature_selection_params.get('log_fold_level', 0.5),
-            'category_column': feature_selection_params.get('metadata_category', None),
-            'reference_group': feature_selection_params.get('metadata_category_reference', None),
+            'output_filename': self._integrated_data_selected_filename,
+            'subset_method': selected_method,
             'output_dir': self.output_dir,
-            'feature_cutoff': feature_selection_params.get('max_features', None),
-            'feature_list_file': feature_selection_params.get('feature_list_file', None),
+            'overwrite': overwrite,
+            'feature_cutoff': method_params.get('max_features', 5000),
+            'category_column': method_params.get('metadata_category', None),
+            'reference_group': method_params.get('metadata_category_reference', None),
+            'significance_level': method_params.get('significance_level', 0.05),
+            'lfc_level': method_params.get('log_fold_level', 0.5),
+            'feature_list_file': method_params.get('feature_list_file', None)
+        }
+
+        call_params.update(kwargs)
+
+        result = hlp.perform_feature_selection(**call_params)
+        self.integrated_data_selected = result
+        print(f"Created a subset of the integrated data with {self.integrated_data_selected.shape[0]} samples and {self.integrated_data_selected.shape[1]} features for network analysis.\n")
+
+    def calculate_correlated_features(self, overwrite: bool = False, **kwargs) -> None:
+        """Hybrid: Class validation + external hlp.calculate_correlated_features function."""
+        print("=== Calculating Correlated Features ===")
+        if self.check_and_load_attribute('feature_correlation_table', self._feature_correlation_table_filename, overwrite):
+            return
+        
+        # Get parameters from config with defaults
+        networking_params = self.analysis_parameters.get('networking', {})
+        
+        call_params = {
+            'data': self.integrated_data_selected,
+            'output_filename': self._feature_correlation_table_filename,
+            'output_dir': self.output_dir,
+            'corr_method': networking_params.get('corr_method', 'pearson'),
+            'corr_cutoff': networking_params.get('corr_cutoff', 0.5),
+            'keep_negative': networking_params.get('keep_negative', False),
+            'only_bipartite': networking_params.get('network_mode', 'bipartite') == 'bipartite',
+            'save_corr_matrix': True,  # Should save since we're storing the result
             'overwrite': overwrite
         }
         call_params.update(kwargs)
         
-        result = hlp.subset_features_before_network_analysis(**call_params)
-        self._feature_subset_data = result
-        print(f"Created a subset of the integrated data with {self._feature_subset_data.shape[0]} samples and {self._feature_subset_data.shape[1]} features for network analysis.\n")
+        result = hlp.calculate_correlated_features(**call_params)
+        self.feature_correlation_table = result
+        print(f"Created a feature correlation table with {self.feature_correlation_table.shape[0]} feature pairs.\n")
 
     def plot_correlation_network(self, overwrite: bool = False, **kwargs) -> None:
         print("=== Plotting Correlation Network ===")
@@ -705,10 +717,9 @@ class Analysis(BaseDataHandler):
                 self.check_and_load_attribute('feature_network_edge_table', os.path.join(network_subdir, self._feature_network_edge_table_filename), overwrite):
             return
         else: # necessary to clear carryover from previous analyses
-            self._clear_directory(network_dir)
-            self._clear_directory(submodule_dir)
+            hlp.clear_directory(network_dir)
+            hlp.clear_directory(submodule_dir)
 
-        network_data = getattr(self, '_feature_subset_data', self.integrated_data)
         networking_params = self.analysis_parameters.get('networking', {})
         output_filenames = {
             'graph': os.path.join(network_dir, self._feature_network_graph_filename),
@@ -720,14 +731,14 @@ class Analysis(BaseDataHandler):
         call_params = {
             'correlation_matrix': self.feature_correlation_table,
             'feature_prefixes': [ds.dataset_name for ds in self.datasets],
-            'integrated_data': network_data,
+            'integrated_data': self.integrated_data_selected,
             'integrated_metadata': self.integrated_metadata,
             'output_filenames': output_filenames,
             'annotation_df': getattr(self, 'feature_annotation_table', None),
             'network_mode': networking_params.get('network_mode', 'bipartite'),
             'submodule_mode': networking_params.get('submodule_mode', 'community'),
             'extract_submodules': True,
-            'show_plot_in_notebook': False,
+            'show_plot_in_notebook': True,
             'corr_cutoff': networking_params.get('corr_cutoff', 0.5)
         }
         call_params.update(kwargs)
@@ -735,39 +746,23 @@ class Analysis(BaseDataHandler):
         hlp.plot_correlation_network(**call_params)
         print("Created correlation network graph and associated node/edge tables.\n")
 
-    def calculate_correlated_features(self, overwrite: bool = False, **kwargs) -> None:
-        """Hybrid: Class validation + external hlp.calculate_correlated_features function."""
-        print("=== Calculating Correlated Features ===")
-        if self.check_and_load_attribute('feature_correlation_table', self._feature_correlation_table_filename, overwrite):
-            return
-        
-        # Get parameters from config with defaults
-        networking_params = self.analysis_parameters.get('networking', {})
-        
-        call_params = {
-            'data': self.integrated_data,
-            'output_filename': self._feature_correlation_table_filename,
-            'output_dir': self.output_dir,
-            'corr_method': networking_params.get('corr_method', 'pearson'),
-            'corr_cutoff': networking_params.get('corr_cutoff', 0.5),
-            'keep_negative': networking_params.get('keep_negative', False),
-            'only_bipartite': networking_params.get('network_mode', 'bipartite') == 'bipartite',
-            'save_corr_matrix': True,  # Should save since we're storing the result
-            'overwrite': overwrite
-        }
-        call_params.update(kwargs)
-        
-        result = hlp.calculate_correlated_features(**call_params)
-        self.feature_correlation_table = result
-
     def run_mofa2_analysis(self, overwrite: bool = False, **kwargs) -> None:
         """Hybrid: Class parameter setup + external hlp.run_full_mofa2_analysis function."""
+        mofa_subdir = "mofa"
+        mofa_dir = os.path.join(self.output_dir, mofa_subdir)
+        os.makedirs(mofa_dir, exist_ok=True)
+        print("=== Running MOFA2 Analysis ===")
+        if os.path.exists(os.path.join(mofa_subdir, self._mofa_model_filename)) and not overwrite:
+            print(f"MOFA2 model already exists in {mofa_dir}. Skipping.")
+            return
+
         mofa2_params = self.analysis_parameters.get('mofa', {})
         call_params = {
-            'integrated_data': self.integrated_data,
+            'integrated_data': self.integrated_data_selected,
             'mofa2_views': [ds.dataset_name for ds in self.datasets],
             'metadata': self.integrated_metadata,
-            'output_dir': self.output_dir,
+            'output_dir': mofa_dir,
+            'output_filename': self._mofa_model_filename,
             'num_factors': mofa2_params.get('num_mofa_factors', 5),
             'num_features': 10,
             'num_iterations': mofa2_params.get('num_mofa_iterations', 100),
@@ -783,11 +778,12 @@ manual_file_storage = {
     'integrated_metadata': 'integrated_metadata.csv',
     'integrated_data': 'integrated_data.csv',
     'feature_annotation_table': 'feature_annotation_table.csv',
-    'feature_selection_table': 'feature_selection_table.csv',
+    'integrated_data_selected': 'integrated_data_selected.csv',
     'feature_correlation_table': 'feature_correlation_table.csv',
     'feature_network_graph': 'feature_network_graph.graphml',
     'feature_network_edge_table': 'feature_network_edge_table.csv',
-    'feature_network_node_table': 'feature_network_node_table.csv'
+    'feature_network_node_table': 'feature_network_node_table.csv',
+    'mofa_model': 'mofa_model.hdf5'
 }
 #for attr in config['analyses']['file_storage']:
 for attr, filename in manual_file_storage.items():
