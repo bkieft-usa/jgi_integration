@@ -16,27 +16,17 @@ class Project:
         print("\n=== Initializing Project ===")
         self.config = config
         self.project_config = config['project']
+        self.user_settings = config['user_settings']
         self.PI_name = self.project_config['PI_name']
         self.proposal_ID = self.project_config['proposal_ID']
-        self.keyword = self.project_config['keyword']
         self.data_types = self.project_config['dataset_list']
-        self.study_variables = self.project_config['variable_list']
-        self.project_name = f"{self.PI_name}_{self.proposal_ID}_{self.keyword}"
+        self.study_variables = self.user_settings['variable_list']
+        self.project_name = self.user_settings['project_name']
         self.output_dir = self.project_config['results_path']
         self.raw_data_dir = self.project_config['raw_data_path']
-        self.main_dir = f"{self.output_dir}/{self.project_name}"
-        self.project_dir = f"{self.main_dir}/{self.project_name}_{self.project_config['project_tag']}"
-        self.script_dir = f"{self.project_dir}/raw_data_retrieval"
-        os.makedirs(self.main_dir, exist_ok=True)
+        self.project_dir = f"{self.output_dir}/{self.project_name}"
         os.makedirs(self.project_dir, exist_ok=True)
-        #os.makedirs(self.script_dir, exist_ok=True)
         print(f"Project directory: {self.project_dir}")
-
-    def __repr__(self):
-        project = (f"Project(PI_name={self.PI_name}, proposal_ID={self.proposal_ID}, "
-                f"keyword={self.keyword})")
-        print(f"\tCreated project: {project}")
-        return project
 
 class BaseDataHandler:
     """Base class with common data handling functionality."""
@@ -265,6 +255,7 @@ class Dataset(BaseDataHandler):
             'dataset_name': self.dataset_name,
             'output_filename': self._normalized_data_filename,
             'output_dir': self.output_dir,
+            'method': params.get('method', 'variance'),
             'group_col': params.get('group', 'group'),
             'threshold': params.get('value', 0.6)
         }
@@ -685,15 +676,15 @@ class Analysis(BaseDataHandler):
             return
         
         # Get parameters from config with defaults
-        networking_params = self.analysis_parameters.get('networking', {})
-        
+        correlation_params = self.analysis_parameters.get('correlation', {})
+        networking_params = self.analysis_parameters.get('networking', {})        
         call_params = {
             'data': self.integrated_data_selected,
             'output_filename': self._feature_correlation_table_filename,
             'output_dir': self.output_dir,
-            'corr_method': networking_params.get('corr_method', 'pearson'),
-            'corr_cutoff': networking_params.get('corr_cutoff', 0.5),
-            'keep_negative': networking_params.get('keep_negative', False),
+            'corr_method': correlation_params.get('corr_method', 'pearson'),
+            'corr_cutoff': correlation_params.get('corr_cutoff', 0.5),
+            'keep_negative': correlation_params.get('keep_negative', False),
             'only_bipartite': networking_params.get('network_mode', 'bipartite') == 'bipartite',
             'save_corr_matrix': True,  # Should save since we're storing the result
             'overwrite': overwrite
