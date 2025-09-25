@@ -12,6 +12,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 import yaml
+from tqdm import tqdm
 
 # --- Display and plotting ---
 from IPython.display import display
@@ -59,13 +60,9 @@ from community import community_louvain
 # --- Cheminformatics ---
 from rdkit import Chem
 
-# --- Plotly for interactive plots ---
 import plotly.graph_objects as go
 import plotly.io as pio
 pio.kaleido.scope.mathjax = None
-
-# --- Progress bars ---
-from tqdm import tqdm
 
 # ====================================
 # Helper functions for various tasks

@@ -1,12 +1,18 @@
 FROM jupyter/base-notebook
 
-WORKDIR /home/jgi_user/work
+USER root
 
-COPY . .
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir -r docker/requirements.txt
+WORKDIR /home/jovyan/work
 
-RUN pip install ipykernel && \
+USER jovyan
+
+RUN git clone https://github.com/bkieft-usa/jgi_integration.git /home/jovyan/work/workflow_tools
+
+RUN pip install --no-cache-dir -r /home/jovyan/work/workflow_tools/docker/requirements.txt ipykernel && \
     python -m ipykernel install --user --name=jgi-integration --display-name "JGI Integration"
 
-ENV PYTHONPATH="/home/jgi_user/work"
+RUN cp /home/jovyan/work/workflow_tools/notebooks/integration_workflow.ipynb /home/jovyan/work/
+
+ENV PYTHONPATH="/home/jovyan/work/workflow_tools"
