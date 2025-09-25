@@ -376,7 +376,8 @@ class TX(Dataset):
     """Transcriptomics dataset with specific configuration."""
     def __init__(self, project: Project, overwrite: bool = False):
         super().__init__("tx", project, overwrite)
-        self.index = self.dataset_config['index']
+        #self.index = self.dataset_config['index']
+        self.index = 1 # Currently only index 1 supported, not configurable
         self.apid = None
         #self.datatype = self.dataset_config['datatype']
         self.datatype = "counts" # Currently only counts supported, not configurable
