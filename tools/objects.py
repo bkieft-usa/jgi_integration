@@ -7,7 +7,7 @@ import numpy as np
 import shutil
 from typing import Dict, Any, List, Optional
 from IPython.display import display
-import workflow_tools.tools.helpers as hlp
+import tools.helpers as hlp
 
 class Project:
     """Project configuration and directory management."""
