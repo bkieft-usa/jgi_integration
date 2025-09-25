@@ -8,11 +8,11 @@ WORKDIR /home/jovyan/work
 
 USER jovyan
 
-RUN git clone https://github.com/bkieft-usa/jgi_integration.git /home/jovyan/work/workflow_tools
+RUN git clone https://github.com/bkieft-usa/jgi_integration.git
 
-RUN pip install --no-cache-dir -r /home/jovyan/work/workflow_tools/docker/requirements.txt ipykernel && \
+RUN pip install --no-cache-dir -r /home/jovyan/work/jgi_integration/docker/requirements.txt ipykernel && \
     python -m ipykernel install --user --name=jgi-integration --display-name "JGI Integration"
 
-RUN cp /home/jovyan/work/workflow_tools/notebooks/integration_workflow.ipynb /home/jovyan/work/
+RUN cp /home/jovyan/work/jgi_integration/notebooks/integration_workflow.ipynb /home/jovyan/work/
 
-ENV PYTHONPATH="/home/jovyan/work/workflow_tools"
+ENV PYTHONPATH="/home/jovyan/work/jgi_integration"
