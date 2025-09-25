@@ -2028,7 +2028,7 @@ def remove_low_replicable_features(
     if method == "none":
         print(f"\tNot removing any features based on replicability in {dataset_name}. Retaining all {data.shape[0]} features.")
         replicable_data = data
-    elif method != "variance":
+    elif method == "variance":
         variability_func = lambda x: x.std(axis=1, skipna=True)
 
         if group_col not in metadata.columns:

@@ -1,3 +1,5 @@
 tools/__pycache__
 .ipynb_checkpoints
 .DS_Store
+docs/setup.docx
+docs/run.docx

@@ -1,6 +1,15 @@
 # Analysis Parameters Explained
 
-This document describes the practical effect of each option in the configuration file for the main analysis steps in omics data integration: feature selection, network analysis, and MOFA2 modeling. Each section lists available methods, their options, and default values. Note that the max_features option during feature selection, which shows up in almost all modes, restricts the number of features that go into downstream correlation analysis and networking - this is designed to reduce the size and scale of calculations and should be set to a value lower than 10,000 when possible.
+This document describes the practical effect of each option in the configuration file for the main analysis steps in omics data integration, including the analysis tag, feature selection, network analysis, and MOFA2 modeling. Each section lists available methods, their options, and default values, and at the end there is an example of a full analysis workflow.
+
+---
+
+# Setup Parameters
+
+## 1. Tagging
+- **data_analysis_tag**
+  *Allows user to create a new analysis folder (Analysis--**TAG**) underneath the data processing folder to store analysis results. This is useful if analysis settings are changed (see below) and a new set of outputs should be produced that is separate from previous runs*
+  *Note: if an analysis folder already exists with the supplied tag and overwriting is disabled, the workflow will return an error message indicating that you should change the tag* 
 
 ---
 
@@ -46,6 +55,9 @@ This document describes the practical effect of each option in the configuration
 
 - **none**  
   *No feature selection is performed; all features are retained.*
+
+- **Note**
+  *The max_features option during feature selection, which shows up in almost all modes, restricts the number of features that go into downstream correlation analysis and networking - this is designed to reduce the size and scale of calculations and should be set to a value lower than 10,000 when possible.*
 
 ---
 
@@ -104,7 +116,8 @@ This document describes the practical effect of each option in the configuration
 
 Suppose you run an analysis with the following configuration:
 
-analyses:
+```yaml
+analysis:
   data_analysis_tag: 0
   analysis_parameters:
     feature_selection:
@@ -125,6 +138,7 @@ analyses:
       num_mofa_factors: 5
       num_mofa_iterations: 1000
       seed_for_training: 555
+```
 
 **Result:**
 - Only features with normalized abundance significantly associated with the "temperature" category (e.g., samples with low vs. medium vs. high) by a Kruskal-Wallis test are kept.

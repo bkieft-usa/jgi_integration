@@ -116,7 +116,6 @@ class Dataset(BaseDataHandler):
         self._setup_dataset_filenames()
 
         # Configuration
-        self.datatype = self.dataset_config['datatype']
         self.normalization_params = self.dataset_config.get('normalization_parameters', {})
         self.annotation = self.dataset_config.get('annotation', {})
 
@@ -308,7 +307,10 @@ class MX(Dataset):
         super().__init__("mx", project, overwrite)
         self.chromatography = self.dataset_config['chromatography']
         self.polarity = self.dataset_config['polarity']
-        self.mode = self.dataset_config['mode']
+        #self.mode = self.dataset_config['mode']
+        self.mode = "untargeted" # Currently only untargeted supported, not configurable
+        #self.datatype = self.dataset_config['datatype']
+        self.datatype = "peak-height" # Currently only peak-height supported, not configurable
 
     def get_raw_data(self, overwrite: bool = False) -> None:
         print("\n=== Getting Raw Data (MX) ===")
@@ -376,6 +378,8 @@ class TX(Dataset):
         super().__init__("tx", project, overwrite)
         self.index = self.dataset_config['index']
         self.apid = None
+        #self.datatype = self.dataset_config['datatype']
+        self.datatype = "counts" # Currently only counts supported, not configurable
 
     def get_raw_data(self, overwrite: bool = False) -> None:
         print("\n=== Getting Raw Data (TX) ===")
@@ -442,20 +446,20 @@ class Analysis(BaseDataHandler):
         print("\n=== Initializing Analysis ===")
         self.project = project
         self.datasets_config = self.project.config['datasets']
-        self.analyses_config = self.project.config['analyses']
+        self.analysis_config = self.project.config['analysis']
         self.metadata_link_script = self.project.project_config['metadata_link']
 
         # Check if analysis directory exists
         analysis_outdir = self.set_up_analysis_outdir(self.project, self.datasets_config, 
-                                                      self.analyses_config, overwrite=overwrite)
+                                                      self.analysis_config, overwrite=overwrite)
         self.output_dir = analysis_outdir
         os.makedirs(self.output_dir, exist_ok=True)
         super().__init__(self.output_dir)
 
-        #self._setup_analysis_filenames(self.analyses_config['file_storage'])
+        #self._setup_analysis_filenames(self.analysis_config['file_storage'])
         self._setup_analysis_filenames()
 
-        self.analysis_parameters = self.analyses_config.get('analysis_parameters', {})
+        self.analysis_parameters = self.analysis_config.get('analysis_parameters', {})
         self.datasets = datasets or []
     
         print(f"Created analysis with {len(self.datasets)} datasets.")
@@ -463,12 +467,12 @@ class Analysis(BaseDataHandler):
             print(f"\t- {ds.dataset_name} with output directory: {ds.output_dir}")
 
     @staticmethod
-    def set_up_analysis_outdir(project: Project, datasets_config: dict, analyses_config: dict, overwrite: bool = False) -> str:
+    def set_up_analysis_outdir(project: Project, datasets_config: dict, analysis_config: dict, overwrite: bool = False) -> str:
         """Check if the Analysis output directory already exists."""
         analysis_dir = os.path.join(
             project.project_dir,
             f"Dataset_Processing--{datasets_config['data_processing_tag']}",
-            f"Analysis--{analyses_config['data_analysis_tag']}"
+            f"Analysis--{analysis_config['data_analysis_tag']}"
         )
         if os.path.exists(analysis_dir):
             if overwrite:
@@ -776,6 +780,6 @@ manual_file_storage = {
     'feature_network_node_table': 'feature_network_node_table.csv',
     'mofa_model': 'mofa_model.hdf5'
 }
-#for attr in config['analyses']['file_storage']:
+#for attr in config['analysis']['file_storage']:
 for attr, filename in manual_file_storage.items():
     setattr(Analysis, attr, Analysis._create_property(None, attr, f'_{attr}_filename'))

@@ -1,8 +1,22 @@
-# Normalization Parameters Explained
+# Datasets Settings Explained
 
-This document describes the practical effect of each option in the configuration file for the four normalization steps used in omics data processing (filtering, devariancing, scaling, and replicability). Each section lists available methods, their options, and default values, and at the end there is an example of a full data processing workflow.
+This document describes the practical effect of each option in the **datasets** section of the integration workflow configuration file (project_config.yml), including the data processing tag and the four normalization steps used in omics data processing (filtering, devariancing, scaling, and replicability). Each section lists available methods, their options, and default values, and at the end there is an example of a full data processing workflow.
 
 ---
+
+# Setup Parameters
+
+## 1. Tagging
+- **data_processing_tag**
+  *Allows user to create a new data processing folder (Data_Processing--**TAG**) to store results. This is useful if data processing and normalization settings are changed (see below) and a new set of outputs should be produced that is separate from previous runs*
+  *Note: if a data processing folder already exists with the supplied tag and overwriting is disabled, the workflow will return an error message indicating that you should change the tag* 
+
+- **dataset_dir**
+  *This is currently fixed based on the workflow structure, so do not change it*
+
+---
+
+# Normalization Parameters
 
 ## 1. Filtering (`filter_data`)
 
@@ -20,7 +34,6 @@ This document describes the practical effect of each option in the configuration
 - **none**  
   *No filtering is performed; all features are retained regardless of abundance or prevalence.*
 
----
 
 ## 2. Devariancing (`devariance_data`)
 
@@ -33,7 +46,6 @@ This document describes the practical effect of each option in the configuration
 - **none**  
   *No variance-based filtering is performed; all features are retained regardless of their variance.*
 
----
 
 ## 3. Scaling (`scale_data`)
 
@@ -50,7 +62,6 @@ This document describes the practical effect of each option in the configuration
 - **none**  
   *No scaling is performed; features retain their original values.*
 
----
 
 ## 4. Replicate Handling (`remove_low_replicable_features`)
 
@@ -90,24 +101,26 @@ Samples are grouped into two categories:
 
 And the following dataset configuration:
 
-  tx:
-    dataset_dir: transcriptomics
-    index: 1
-    datatype: counts
-    normalization_parameters:
-      filtering:
-        method: minimum
-        value: 10
-      devariancing:
-        method: percent
-        value: 20
-      scaling:
-        log2: true
-        method: modified_zscore
-      replicate_handling:
-        method: variance
-        group: group
-        value: 0.5
+```yaml
+tx:
+  dataset_dir: transcriptomics
+  index: 1
+  datatype: counts
+  normalization_parameters:
+    filtering:
+      method: minimum
+      value: 10
+    devariancing:
+      method: percent
+      value: 20
+    scaling:
+      log2: true
+      method: modified_zscore
+    replicate_handling:
+      method: variance
+      group: group
+      value: 0.5
+```
 
 ---
 
