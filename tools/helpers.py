@@ -1811,26 +1811,123 @@ def link_data_across_datasets(
 
     return unified_data
 
-def integrate_datasets(
-    datasets: dict,
-    output_dir: str
+
+def integrate_metadata(
+    datasets: list,
+    metadata_vars: list[str] = [],
+    unifying_col: str = 'unique_group',
+    output_filename: str = "integrated_metadata",
+    output_dir: str = None
 ) -> pd.DataFrame:
     """
-    Integrate multiple normalized datasets into a single DataFrame.
+    Integrate multiple metadata tables into a single DataFrame using a unifying column.
 
     Args:
-        datasets (dict): Dictionary of DataFrames to integrate.
-        output_dir (str): Output directory.
+        datasets (list): List of dataset objects with linked_metadata attributes.
+        metadata_vars (list of str): Metadata columns to include.
+        unifying_col (str): Column name to join on.
+        output_dir (str, optional): Output directory to save integrated metadata.
 
     Returns:
-        pd.DataFrame: Integrated dataset.
+        pd.DataFrame: Integrated metadata DataFrame.
     """
 
-    integrated_data = pd.concat(datasets.values(), join='inner', ignore_index=False)
+    print("Creating a single integrated (shared) metadata table across datasets...")
+
+    metadata_tables = [ds.linked_metadata for ds in datasets if hasattr(ds, "linked_metadata")]
+
+    subset_cols = metadata_vars + [unifying_col]
+    integrated_metadata = metadata_tables[0][subset_cols].copy()
+
+    # Merge all subsequent tables
+    for i, table in enumerate(metadata_tables[1:], start=2):
+        integrated_metadata = integrated_metadata.merge(
+            table[subset_cols],
+            on=unifying_col,
+            suffixes=(None, f'_{i}'),
+            how='outer'
+        )
+        # Collapse columns if they match
+        for column in metadata_vars:
+            col1 = column
+            col2 = f"{column}_{i}"
+            if col2 in integrated_metadata.columns:
+                integrated_metadata[column] = integrated_metadata[col1].combine_first(integrated_metadata[col2])
+                integrated_metadata.drop(columns=[col2], inplace=True)
+
+    integrated_metadata.rename(columns={unifying_col: 'sample'}, inplace=True)
+    integrated_metadata.sort_values('sample', inplace=True)
+    integrated_metadata.drop_duplicates(inplace=True)
+    integrated_metadata.set_index('sample', inplace=True)
+
+    print("Writing integrated metadata table...")
+    write_integration_file(data=integrated_metadata, output_dir=output_dir, filename=output_filename)
+    
+    return integrated_metadata
+
+def integrate_data(
+    datasets: list,
+    overlap_only: bool = True,
+    output_filename: str = "integrated_data",
+    output_dir: str = None
+) -> pd.DataFrame:
+    """
+    Integrate multiple normalized datasets into a single feature matrix by concatenating features.
+
+    Args:
+        datasets (list): List of dataset objects with normalized_data attributes.
+        overlap_only (bool): If True, restrict to overlapping samples across datasets.
+        output_dir (str, optional): Output directory to save integrated data.
+
+    Returns:
+        pd.DataFrame: Integrated feature matrix with all datasets combined.
+    """
+    
+    print("Creating a single integrated feature matrix across datasets...")
+    
+    # Collect normalized data from all datasets
+    dataset_data = {}
+    sample_sets = {}
+    
+    for ds in datasets:
+        if hasattr(ds, 'normalized_data') and not ds.normalized_data.empty:
+            # Add dataset prefix to feature names to avoid conflicts
+            data_copy = ds.normalized_data.copy()
+            if not data_copy.index.str.startswith(f"{ds.dataset_name}_").any():
+                data_copy.index = [f"{ds.dataset_name}_{idx}" for idx in data_copy.index]
+            
+            dataset_data[ds.dataset_name] = data_copy
+            sample_sets[ds.dataset_name] = set(data_copy.columns)
+            print(f"\tAdding {data_copy.shape[0]} features from {ds.dataset_name}")
+        else:
+            raise ValueError(f"Dataset {ds.dataset_name} missing normalized_data. Run processing pipeline first.")
+    
+    # Handle overlapping samples if requested
+    if overlap_only and len(dataset_data) > 1:
+        print("\tRestricting to overlapping samples across all datasets...")
+        overlapping_samples = set.intersection(*sample_sets.values())
+        
+        if not overlapping_samples:
+            raise ValueError("No overlapping samples found across datasets.")
+        
+        # Filter each dataset to only include overlapping samples
+        for ds_name, data in dataset_data.items():
+            overlapping_cols = [col for col in overlapping_samples if col in data.columns]
+            dataset_data[ds_name] = data[overlapping_cols]
+            print(f"\t{ds_name}: {len(overlapping_cols)} overlapping samples")
+    
+    # Combine all datasets vertically (concatenate features)
+    integrated_data = pd.concat(dataset_data.values(), axis=0)
     integrated_data.index.name = 'features'
     integrated_data = integrated_data.fillna(0)
-    print("Saving integrated dataset to disk...")
-    write_integration_file(integrated_data, output_dir, "integrated_data", indexing=True)
+    
+    print(f"Final integrated dataset: {integrated_data.shape[0]} features x {integrated_data.shape[1]} samples")
+    
+    # Save result if output directory provided
+    if output_dir:
+        print("Writing integrated data table...")
+        write_integration_file(integrated_data, output_dir, output_filename, indexing=True)
+    
     return integrated_data
 
 # ====================================
@@ -1980,19 +2077,25 @@ def scale_data(
     if norm_method == "none":
         print("Not scaling data.")
         scaled_df = df
-    if log2 is True:
-        print(f"Transforming {dataset_name} data by log2 before z-scoring...")
-        unscaled_df = df.copy()
-        df = unscaled_df.apply(pd.to_numeric, errors='coerce')
-        df = np.log2(df + 1)
-    if norm_method == "zscore":
-        print(f"Scaling {dataset_name} data to z-scores...")
-        scaled_df = df.apply(lambda x: (x - x.mean()) / x.std(), axis=1)
-    elif norm_method == "modified_zscore":
-        print(f"Scaling {dataset_name} data to modified z-scores...")
-        scaled_df = df.apply(lambda x: ((x - x.median()) * 0.6745) / (x - x.median()).abs().median(), axis=1)
     else:
-        raise ValueError("Please select a valid norm_method: 'zscore' or 'modified_zscore'.")
+        if log2 is True:
+            print(f"Transforming {dataset_name} data by log2 before z-scoring...")
+            unscaled_df = df.copy()
+            df = unscaled_df.apply(pd.to_numeric, errors='coerce')
+            df = np.log2(df + 1)
+        if norm_method == "zscore":
+            print(f"Scaling {dataset_name} data to z-scores...")
+            scaled_df = df.apply(lambda x: (x - x.mean()) / x.std(), axis=1)
+        elif norm_method == "modified_zscore":
+            print(f"Scaling {dataset_name} data to modified z-scores...")
+            scaled_df = df.apply(lambda x: ((x - x.median()) * 0.6745) / (x - x.median()).abs().median(), axis=1)
+        else:
+            raise ValueError("Please select a valid norm_method: 'zscore' or 'modified_zscore'.")
+
+    # Ensure output is float, and replace NA/inf/-inf with 0
+    scaled_df = scaled_df.astype(float)
+    scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan)
+    scaled_df = scaled_df.fillna(0)
 
     print(f"Saving scaled data for {dataset_name}...")
     write_integration_file(scaled_df, output_dir, output_filename, indexing=True)
@@ -2109,6 +2212,7 @@ def plot_pca(
         data_input = df.T
         data_input = data_input.loc[common_samples]
         data_input = data_input.fillna(0)
+        data_input = data_input.replace([np.inf, -np.inf], 0)
 
         # Perform PCA
         pca = PCA(n_components=2)
@@ -3798,123 +3902,26 @@ def upload_to_google_drive(
     
 #     return percentages
 
-
-# def integrate_metadata(
-#     datasets: list,
-#     metadata_vars: list[str] = [],
-#     unifying_col: str = 'unique_group',
-#     output_filename: str = "integrated_metadata",
-#     output_dir: str = None
+# def integrate_datasets(
+#     datasets: dict,
+#     output_dir: str
 # ) -> pd.DataFrame:
 #     """
-#     Integrate multiple metadata tables into a single DataFrame using a unifying column.
+#     Integrate multiple normalized datasets into a single DataFrame.
 
 #     Args:
-#         datasets (list): List of dataset objects with linked_metadata attributes.
-#         metadata_vars (list of str): Metadata columns to include.
-#         unifying_col (str): Column name to join on.
-#         output_dir (str, optional): Output directory to save integrated metadata.
+#         datasets (dict): Dictionary of DataFrames to integrate.
+#         output_dir (str): Output directory.
 
 #     Returns:
-#         pd.DataFrame: Integrated metadata DataFrame.
+#         pd.DataFrame: Integrated dataset.
 #     """
 
-#     print("Creating a single integrated (shared) metadata table across datasets...")
-
-#     metadata_tables = [ds.linked_metadata for ds in datasets if hasattr(ds, "linked_metadata")]
-
-#     subset_cols = metadata_vars + [unifying_col]
-#     integrated_metadata = metadata_tables[0][subset_cols].copy()
-
-#     # Merge all subsequent tables
-#     for i, table in enumerate(metadata_tables[1:], start=2):
-#         integrated_metadata = integrated_metadata.merge(
-#             table[subset_cols],
-#             on=unifying_col,
-#             suffixes=(None, f'_{i}'),
-#             how='outer'
-#         )
-#         # Collapse columns if they match
-#         for column in metadata_vars:
-#             col1 = column
-#             col2 = f"{column}_{i}"
-#             if col2 in integrated_metadata.columns:
-#                 integrated_metadata[column] = integrated_metadata[col1].combine_first(integrated_metadata[col2])
-#                 integrated_metadata.drop(columns=[col2], inplace=True)
-
-#     integrated_metadata.rename(columns={unifying_col: 'sample'}, inplace=True)
-#     integrated_metadata.sort_values('sample', inplace=True)
-#     integrated_metadata.drop_duplicates(inplace=True)
-#     integrated_metadata.set_index('sample', inplace=True)
-
-#     print("Writing integrated metadata table...")
-#     write_integration_file(data=integrated_metadata, output_dir=output_dir, filename=output_filename)
-    
-#     return integrated_metadata
-
-# def integrate_data(
-#     datasets: list,
-#     overlap_only: bool = True,
-#     output_filename: str = "integrated_data",
-#     output_dir: str = None
-# ) -> pd.DataFrame:
-#     """
-#     Integrate multiple normalized datasets into a single feature matrix by concatenating features.
-
-#     Args:
-#         datasets (list): List of dataset objects with normalized_data attributes.
-#         overlap_only (bool): If True, restrict to overlapping samples across datasets.
-#         output_dir (str, optional): Output directory to save integrated data.
-
-#     Returns:
-#         pd.DataFrame: Integrated feature matrix with all datasets combined.
-#     """
-    
-#     print("Creating a single integrated feature matrix across datasets...")
-    
-#     # Collect normalized data from all datasets
-#     dataset_data = {}
-#     sample_sets = {}
-    
-#     for ds in datasets:
-#         if hasattr(ds, 'normalized_data') and not ds.normalized_data.empty:
-#             # Add dataset prefix to feature names to avoid conflicts
-#             data_copy = ds.normalized_data.copy()
-#             if not data_copy.index.str.startswith(f"{ds.dataset_name}_").any():
-#                 data_copy.index = [f"{ds.dataset_name}_{idx}" for idx in data_copy.index]
-            
-#             dataset_data[ds.dataset_name] = data_copy
-#             sample_sets[ds.dataset_name] = set(data_copy.columns)
-#             print(f"\tAdding {data_copy.shape[0]} features from {ds.dataset_name}")
-#         else:
-#             raise ValueError(f"Dataset {ds.dataset_name} missing normalized_data. Run processing pipeline first.")
-    
-#     # Handle overlapping samples if requested
-#     if overlap_only and len(dataset_data) > 1:
-#         print("\tRestricting to overlapping samples across all datasets...")
-#         overlapping_samples = set.intersection(*sample_sets.values())
-        
-#         if not overlapping_samples:
-#             raise ValueError("No overlapping samples found across datasets.")
-        
-#         # Filter each dataset to only include overlapping samples
-#         for ds_name, data in dataset_data.items():
-#             overlapping_cols = [col for col in overlapping_samples if col in data.columns]
-#             dataset_data[ds_name] = data[overlapping_cols]
-#             print(f"\t{ds_name}: {len(overlapping_cols)} overlapping samples")
-    
-#     # Combine all datasets vertically (concatenate features)
-#     integrated_data = pd.concat(dataset_data.values(), axis=0)
+#     integrated_data = pd.concat(datasets.values(), join='inner', ignore_index=False)
 #     integrated_data.index.name = 'features'
 #     integrated_data = integrated_data.fillna(0)
-    
-#     print(f"Final integrated dataset: {integrated_data.shape[0]} features x {integrated_data.shape[1]} samples")
-    
-#     # Save result if output directory provided
-#     if output_dir:
-#         print("Writing integrated data table...")
-#         write_integration_file(integrated_data, output_dir, output_filename, indexing=True)
-    
+#     print("Saving integrated dataset to disk...")
+#     write_integration_file(integrated_data, output_dir, "integrated_data", indexing=True)
 #     return integrated_data
 
 # def write_integrated_metadata(
