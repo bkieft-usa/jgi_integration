@@ -2085,10 +2085,10 @@ def scale_data(
             df = np.log2(df + 1)
         if norm_method == "zscore":
             print(f"Scaling {dataset_name} data to z-scores...")
-            scaled_df = df.apply(lambda x: (x - x.mean()) / x.std(), axis=1)
+            scaled_df = df.apply(lambda x: (x - x.mean()) / x.std(), axis=0)
         elif norm_method == "modified_zscore":
             print(f"Scaling {dataset_name} data to modified z-scores...")
-            scaled_df = df.apply(lambda x: ((x - x.median()) * 0.6745) / (x - x.median()).abs().median(), axis=1)
+            scaled_df = df.apply(lambda x: ((x - x.median()) * 0.6745) / (x - x.median()).abs().median(), axis=0)
         else:
             raise ValueError("Please select a valid norm_method: 'zscore' or 'modified_zscore'.")
 
@@ -2372,11 +2372,12 @@ def plot_data_variance_indv_histogram(
 
 def plot_data_variance_histogram(
     dataframes: dict[str, pd.DataFrame],
+    datatype: str,
     bins: int = 50,
     transparency: float = 0.8,
     xlog: bool = False,
-    dataset_name: str = None,
-    output_dir: str = None
+    output_dir: str = None,
+    show_plot: bool = True
 ) -> None:
     """
     Plot histograms of values for multiple datasets on the same plot.
@@ -2386,7 +2387,6 @@ def plot_data_variance_histogram(
         bins (int): Number of histogram bins.
         transparency (float): Alpha for bars.
         xlog (bool): Use log scale for x-axis.
-        dataset_name (str, optional): Name for output file.
         output_dir (str, optional): Output directory for plots.
 
     Returns:
@@ -2418,13 +2418,14 @@ def plot_data_variance_histogram(
     plt.legend()
 
     # Save the plot if output_dir is specified
-    output_subdir = f"{output_dir}/data_distributions"
+    output_subdir = f"{output_dir}/dataset_distributions"
     os.makedirs(output_subdir, exist_ok=True)
-    filename = f"distribution_of_{dataset_name}.pdf"
+    filename = f"distribution_of_{datatype}_datasets.pdf"
     print(f"Saving plot to {output_subdir}/{filename}...")
     plt.savefig(f"{output_subdir}/{filename}")
-
-    plt.show()
+    if show_plot is True:
+        plt.show()
+    plt.close()
 
 def plot_feature_abundance_by_metadata(
     data: pd.DataFrame,

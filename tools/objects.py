@@ -328,7 +328,7 @@ class MX(Dataset):
             filtered_mx=False,
         )
         self.raw_data = result
-        print(f"\tCreated raw data for MX with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.\n")
+        print(f"\tCreated raw data for MX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.\n")
 
     def get_raw_metadata(self, overwrite: bool = False) -> None:
         print("\n=== Getting Raw Metadata (MX) ===")
@@ -396,7 +396,7 @@ class TX(Dataset):
             overwrite=overwrite
         )
         self.raw_data = result
-        print(f"\tCreated raw data for TX with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.\n")
+        print(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.\n")
 
     def get_raw_metadata(self, overwrite: bool = False) -> None:
         print("\n=== Getting Raw Metadata (TX) ===")
@@ -608,9 +608,28 @@ class Analysis(BaseDataHandler):
         # Set results back to datasets
         for ds in self.datasets:
             ds.linked_data = linked_data[ds.dataset_name]
-            print(f"Created linked_data for {ds.dataset_name} with {ds.linked_data.shape[0]} samples and {ds.linked_data.shape[1]} features.\n")
+            print(f"Created linked_data for {ds.dataset_name} with {ds.linked_data.shape[1]} samples and {ds.linked_data.shape[0]} features.\n")
         
         return
+
+    def plot_dataset_distributions(self, datatype: str = "normalized", bins: int = 50, transparency: float = 0.8, xlog: bool = False) -> None:
+        """
+        Plot histograms of feature values for each dataset in the analysis.
+        """
+        print("\n=== Plotting feature value distributions for all datasets ===")
+        if datatype == "normalized":
+            dataframes = {ds.dataset_name: ds.normalized_data for ds in self.datasets if hasattr(ds, "normalized_data")}
+        elif datatype == "nonnormalized":
+            dataframes = {ds.dataset_name: ds.linked_data for ds in self.datasets if hasattr(ds, "linked_data")}
+        hlp.plot_data_variance_histogram(
+            dataframes=dataframes,
+            datatype=datatype,
+            bins=bins,
+            transparency=transparency,
+            xlog=xlog,
+            output_dir=self.output_dir,
+            show_plot=True
+        )    
 
     def integrate_metadata(self, overwrite: bool = False) -> None:
         """Hybrid: Class validation + external hlp.integrate_metadata function."""
