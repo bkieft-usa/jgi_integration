@@ -561,6 +561,13 @@ class Analysis(BaseDataHandler):
             print(f"Removing low replicable features from {ds.dataset_name} dataset...")
             ds.remove_low_replicable_features(overwrite=overwrite, **kwargs)
 
+    def plot_pca_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
+        """Plot PCA for all datasets in the analysis."""
+        print("\n=== Plotting Individual PCAs and Grid ===")
+        for ds in self.datasets:
+            print(f"Plotting PCA for {ds.dataset_name} dataset...")
+            ds.plot_pca(overwrite=overwrite, **kwargs)
+
     def link_metadata(self, overwrite: bool = False) -> None:
         """Hybrid: Class orchestration + external hlp.link_metadata_with_custom_script function."""
 
