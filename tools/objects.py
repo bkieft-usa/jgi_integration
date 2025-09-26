@@ -762,7 +762,7 @@ class Analysis(BaseDataHandler):
             'network_mode': networking_params.get('network_mode', 'bipartite'),
             'submodule_mode': networking_params.get('submodule_mode', 'community'),
             'extract_submodules': True,
-            'show_plot_in_notebook': True,
+            'show_plot_in_notebook': False,
             'corr_cutoff': correlation_params.get('corr_cutoff', 0.5)
         }
         call_params.update(kwargs)
