@@ -628,6 +628,7 @@ class Analysis(BaseDataHandler):
             dataframes = {ds.dataset_name: ds.normalized_data for ds in self.datasets if hasattr(ds, "normalized_data")}
         elif datatype == "nonnormalized":
             dataframes = {ds.dataset_name: ds.linked_data for ds in self.datasets if hasattr(ds, "linked_data")}
+
         hlp.plot_data_variance_histogram(
             dataframes=dataframes,
             datatype=datatype,

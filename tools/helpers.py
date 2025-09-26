@@ -2425,6 +2425,7 @@ def plot_data_variance_histogram(
     print(f"Saving plot to {output_subdir}/{filename}...")
     plt.savefig(f"{output_subdir}/{filename}")
     if show_plot is True:
+        print("\nDatasets should follow similar distributions, while quantitative values can be slightly shifted:")
         plt.show()
     plt.close()
 
