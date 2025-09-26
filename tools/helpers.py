@@ -512,7 +512,6 @@ def plot_correlation_network(
     annotation_df: str = None,
     network_mode: str = "bipartite",
     submodule_mode: str = "community",
-    extract_submodules: bool = True,
     show_plot_in_notebook: bool = False,
     corr_cutoff: float = 0.5
 ) -> None:
@@ -527,8 +526,7 @@ def plot_correlation_network(
         output_filenames (dict): Dictionary with keys 'graph', 'node_table', 'edge_table' for output filenames.
         annotation_df (pd.DataFrame): DataFrame with feature annotations.
         network_mode (str): 'bipartite' or 'full'.
-        submodule_mode (str): 'community' or 'subgraphs'.
-        extract_submodules (bool): Whether to extract submodules.
+        submodule_mode (str): 'community' or 'subgraphs' or 'none'
         show_plot_in_notebook (bool): Whether to display the plot.
         corr_cutoff (float): Correlation threshold for edges.
 
@@ -627,7 +625,7 @@ def plot_correlation_network(
         nx.draw(G, pos, with_labels=True, node_size=200, node_color=node_colors, font_size=1)
         plt.show()
 
-    if extract_submodules is True and network_mode == "bipartite":
+    if submodule_mode is not "none" and network_mode == "bipartite":
         print("Extracting submodules from the bipartite network...")
         G = extract_submodules_from_bipartite_network(graph=G, integrated_data=integrated_data, metadata=integrated_metadata,
                                                       output_filenames=output_filenames, submodule_mode=submodule_mode)
@@ -639,6 +637,8 @@ def plot_correlation_network(
         node_table.index.name = 'node_id'
         node_table.to_csv(output_filenames['node_table'], index=True, index_label='node_index')
         edge_table.to_csv(output_filenames['edge_table'], index=True, index_label='edge_index')
+    elif submodule_mode is not "none" and network_mode == "full":
+        raise ValueError(f"Submodule creation is currently only supported for the 'bipartite' network mode".)
 
 def extract_submodules_from_bipartite_network(
     graph: 'nx.Graph',
