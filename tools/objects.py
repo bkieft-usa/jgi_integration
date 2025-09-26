@@ -744,6 +744,7 @@ class Analysis(BaseDataHandler):
             hlp.clear_directory(submodule_dir)
 
         networking_params = self.analysis_parameters.get('networking', {})
+        correlation_params = self.analysis_parameters.get('correlation', {})
         output_filenames = {
             'graph': os.path.join(network_dir, self._feature_network_graph_filename),
             'node_table': os.path.join(network_dir, self._feature_network_node_table_filename),
@@ -762,7 +763,7 @@ class Analysis(BaseDataHandler):
             'submodule_mode': networking_params.get('submodule_mode', 'community'),
             'extract_submodules': True,
             'show_plot_in_notebook': True,
-            'corr_cutoff': networking_params.get('corr_cutoff', 0.5)
+            'corr_cutoff': correlation_params.get('corr_cutoff', 0.5)
         }
         call_params.update(kwargs)
         

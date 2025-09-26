@@ -486,7 +486,7 @@ def calculate_correlated_features(
                 if corr >= corr_cutoff and corr != 1:
                     results.append((features[i], features[j], corr))
 
-    print(f"\tFiltered to {len(results)} pairs above cutoff.")
+    print(f"\tFiltered to {len(results)} pairs above cutoff of {corr_cutoff}.")
 
     # Only bipartite
     if only_bipartite:
