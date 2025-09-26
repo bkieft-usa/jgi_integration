@@ -621,7 +621,8 @@ def plot_correlation_network(
     print("Drawing graph...")
     if show_plot_in_notebook is True:
         plt.figure(figsize=(12, 8))
-        pos = nx.spring_layout(G)
+        #pos = nx.spring_layout(G)
+        pos = nx.forceatlas2_layout(G)
         node_colors = [G.nodes[node]['datatype_color'] for node in G.nodes()]
         nx.draw(G, pos, with_labels=True, node_size=200, node_color=node_colors, font_size=1)
         plt.show()
