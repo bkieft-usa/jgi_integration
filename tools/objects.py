@@ -612,7 +612,7 @@ class Analysis(BaseDataHandler):
         
         return
 
-    def plot_dataset_distributions(self, datatype: str = "normalized", bins: int = 50, transparency: float = 0.8, xlog: bool = False) -> None:
+    def plot_dataset_distributions(self, datatype: str = "normalized", bins: int = 50, transparency: float = 0.8, xlog: bool = False, show_plot: bool = True) -> None:
         """
         Plot histograms of feature values for each dataset in the analysis.
         """
@@ -628,7 +628,7 @@ class Analysis(BaseDataHandler):
             transparency=transparency,
             xlog=xlog,
             output_dir=self.output_dir,
-            show_plot=True
+            show_plot=show_plot
         )    
 
     def integrate_metadata(self, overwrite: bool = False) -> None:
