@@ -4,7 +4,7 @@ USER root
 
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /home/jovyan/work/.cache/matplotlib && chown -R jovyan:users /home/jovyan/work/.cache
+RUN mkdir -p /home/jovyan/.cache/matplotlib && chown -R jovyan:users /home/jovyan/.cache
 
 WORKDIR /home/jovyan/work
 
@@ -18,4 +18,4 @@ RUN pip install --no-cache-dir -r /home/jovyan/work/jgi_integration/docker/requi
 RUN cp /home/jovyan/work/jgi_integration/notebooks/integration_workflow.ipynb /home/jovyan/work/
 
 ENV PYTHONPATH="/home/jovyan/work/jgi_integration"
-ENV MPLCONFIGDIR="/home/jovyan/work/.cache/matplotlib"
+ENV MPLCONFIGDIR="/home/jovyan/.cache/matplotlib"
