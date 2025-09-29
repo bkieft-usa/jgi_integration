@@ -638,7 +638,7 @@ def plot_correlation_network(
         node_table.to_csv(output_filenames['node_table'], index=True, index_label='node_index')
         edge_table.to_csv(output_filenames['edge_table'], index=True, index_label='edge_index')
     elif submodule_mode is not "none" and network_mode == "full":
-        raise ValueError(f"Submodule creation is currently only supported for the 'bipartite' network mode".)
+        raise ValueError("Submodule creation is currently only supported for the 'bipartite' network mode.")
 
 def extract_submodules_from_bipartite_network(
     graph: 'nx.Graph',
