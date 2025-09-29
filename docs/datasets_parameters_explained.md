@@ -18,56 +18,97 @@ This document describes the practical effect of each option in the **datasets** 
 
 # Normalization Parameters
 
-## 1. Filtering
+## 2. Filtering
 
-  **method**  
-  * _minimum_ **\[default\]**  
+### Options:
+
+  **method**
+
+  #### Parameters:
+
+  * _minimum_ \[default\]
+
     Removes features whose average observed value across samples is below the specified threshold. Useful for excluding low-abundance or low-count features that may be noise or low confidence observations.
-  * _proportion_  
+
+  * _proportion_
+
     Removes features that are observed at higher abundance than the detection limit in fewer than a specified percentage of samples. Helps filter out features that are rarely detected.
-  * _none_  
+
+  * _none_
+
     No filtering is performed; all features are retained regardless of abundance or prevalence.
 
-  **value**  
+  **value**
+
   Value determines the minimum or proportion value for filtering. It represents either observed quantitative values from the raw data (_minimum_; real numbers > 0) or percentage of samples (_proportion_; real numbers 0-100).
 
 ## 2. Devariancing
 
-  **method**  
-  * _percent_ **\[default\]**  
+### Options:
+
+  **method**
+
+  #### Parameters:
+
+  * _percent_ \[default\]
+
     Removes a specified percentage of features with the lowest variance across samples. This keeps only the most variable features, which are more likely to be informative.
-  * _none_  
+
+  * _none_
+
     No variance-based filtering is performed; all features are retained regardless of their variance.
 
-  **value**  
+  **value**
+
   Value determines percent value for removing low variance features (real numbers 0-100). It represents percent of total features.
 
 ## 3. Scaling
 
-  **log2** **\[default\]**  
+### Options:
+
+  **log2** \[default\]
+
   If enabled, applies a log2(x+1) transformation to all values before scaling. This reduces skewness and compresses large values.
 
-  **method**  
-  * _modified_zscore_ **\[default\]**  
+  **method**
+
+  #### Parameters:
+
+  * _modified_zscore_ \[default\]
+
     Standardizes each feature using the median and median absolute deviation, making it more robust to outliers than standard z-score and makes features comparable regardless of their original scale.
-  * _zscore_  
+
+  * _zscore_
+
     Standardizes each feature to have mean zero and unit variance across samples. This makes features comparable regardless of their original scale.
-  * _none_  
+
+  * _none_
+
     No scaling is performed; features retain their original values. Not recommended because datasets will not fall along the same distribution and integration will be difficult to interpret.
 
 ## 4. Replicate Handling
 
-  **method**  
-  * _variance_ **\[default\]**  
+### Options:
+
+  **method**
+
+  #### Parameters:
+
+  * _variance_ \[default\]
+
     Removes features with high variability among replicates within each group (or specified metadata category - see below). Only features with consistent observed values within a replicate group are retained.
-  * _none_  
+
+  * _none_
+
     No replicate handling is performed; all features are retained.
 
-  **group**  
-  If method is _variance_, **group** is any column from the dataset metadata (i.e., a variable in the `user_settings->variable_list` in the configuration file) for grouping samples as replicates - defaults to the meta-variable 'group', which is the combination of all listed metadata categories.
+  **group**
 
-  **value**  
-  If method is _variance_, this sets the threshold for maximum allowable within-group variability. Features with variability above this threshold are removed (default: 0.5). _Note_: this step typically is performed after data scaling, so mean and variance will be standardized.
+  If method is not _none_, **group** is any column from the dataset metadata (i.e., a variable in the `user_settings->variable_list` in the configuration file) for grouping samples as replicates - defaults to the meta-variable 'group', which is the combination of all listed metadata categories.
+
+  **value**
+
+  If method is not _none_, this sets the threshold for maximum allowable within-group variability. Features with variability above this threshold are removed (default: 0.5). _Note_: this step typically is performed after data scaling, so mean and variance will be standardized.
 
 # Example
 
@@ -191,5 +232,6 @@ And the following transcriptomics dataset (features as rows, samples as columns)
 | FeatureH | -0.134 | 0.224 | 0.134 | 0.044 | 0.313 | -0.224 | -0.313 | -0.134 | 0.044 | -0.224 |
 | FeatureI | 0.044 | 0.186 | 0.089 | 0.228 | 0.120 | -0.022 | 0.044 | -0.067 | 0.044 | -0.015 |
 
-**Final Output:**  
+**Final Output:**
+
 After all normalization steps, the dataset contains 7 features and all 10 samples, with all values log2-transformed and modified z-score standardized. This dataset now has a quality-controlled and standardized quantitative distribution and can be integrated with other datasets that have undergone the same treatment.

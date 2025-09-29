@@ -12,13 +12,15 @@ This document describes the practical effect of each option in the **analysis** 
 
   _Note_: if an analysis folder already exists with the supplied tag and overwriting is disabled, the workflow will return an error message indicating that you should change the tag
 
-## 1. Feature Selection
+## 2. Feature Selection
 
 ### Options:
 
   **variance** \[default\]
 
   Selects the features with the highest variance across samples. Useful for keeping only the most variable and potentially informative features.
+
+  #### Parameters:
 
   * _max_features_
 
@@ -27,6 +29,8 @@ This document describes the practical effect of each option in the **analysis** 
   **glm**
 
   Generates a Generalized Linear Model (GLM) to identify features significantly associated with a metadata category. Filters by FDR-corrected p-value and minimum log2 fold change to keep only significant features.
+
+  #### Parameters:
 
   * _metadata_category_
 
@@ -52,6 +56,8 @@ This document describes the practical effect of each option in the **analysis** 
 
   Use the Kruskal-Wallis test to identify features significantly associated with a metadata category. Filters by FDR-corrected p-value and minimum log2 fold change.
 
+  #### Parameters:
+
   * _metadata_category_
 
     Metadata column to use for group comparison (must match a variable in the user_settings->variable_list in the configuration file).
@@ -72,6 +78,8 @@ This document describes the practical effect of each option in the **analysis** 
 
   Selects features from a user-provided list (one feature ID per line in a file, must match the feature IDs in the analysis.integrated_data table).
 
+  #### Parameters:
+
   * _feature_list_file_
 
     Filename containing the list of features to keep. This file must be saved into the correct analysis output directory (e.g., /output_data/project_name/Data_Processing--TAG/Analysis--TAG/). You can drop this file directly into the folder via the JupyterLab interface.
@@ -84,17 +92,24 @@ This document describes the practical effect of each option in the **analysis** 
 
   No feature selection is performed; all features are retained.
 
+  #### Parameters:
+
   * _max_features_
 
     Maximum number of features to retain (integer > 0; default: 5,000). _Warning_: currently, a limit still needs to be imposed even when no feature selection is performed due to memory constraints when calculating large correlation matrices/networks. The top features are selected in the order they appear in the data table.
 
     _Note_: the max_features option during feature selection, which shows up in almost all modes, restricts the number of features that go into downstream correlation analysis and networking - this is designed to reduce the size and scale of calculations and should be set to a value lower than 10,000 when possible.
 
-## 2. Feature Correlation
+## 3. Feature Correlation
 
 ### Options:
 
   **corr_method**
+
+  Determines the way that pairwise feature relationships are calculated.
+
+  #### Parameters:
+
   * _pearson_ \[default\]
 
     Calculates Pearson correlation between features.
@@ -113,13 +128,18 @@ This document describes the practical effect of each option in the **analysis** 
 
   **keep_negative**
 
-  If true, includes both positive and negative correlations above the absolute threshold. If false, only positive correlations are included.
+  If true, includes both positive and negative correlations above the absolute threshold. If false (default), only positive correlations are included.
 
-## 3. Network Analysis
+## 4. Network Analysis
 
 ### Options:
 
   **network_mode**
+
+  Determines the architecture of the network by categorizing edges and selecting only subsets based on dataset type.
+
+  #### Parameters:
+
   * _bipartite_ \[default\]
 
     Constructs a network only between features from different datasets (e.g., transcript and metabolite node edges)
@@ -131,6 +151,11 @@ This document describes the practical effect of each option in the **analysis** 
     _Note_: Functionally, this **network_mode** option is also passed to the feature correlation step above to keep the cached correlation matrix as small as possible.
 
   **submodule_mode**
+
+  Determines if submodules will be extracted from the network and if so by which method.
+
+  #### Parameters:
+
   *  _community_ \[default\]
 
     Extracts submodules using community detection algorithms (Louvain method).
@@ -143,7 +168,7 @@ This document describes the practical effect of each option in the **analysis** 
 
     No submodules are extracted from the main graph.
 
-## 4. MOFA Analysis
+## 5. MOFA Analysis
 
 ### Options:
 
@@ -196,4 +221,6 @@ analysis:
 *   The network includes only bipartite edges (i.e., edges between nodes of different data types)
 *   Multi-omics factor analysis is run with 3 factors, 1000 iterations, and a fixed random seed of 555 for reproducibility.
 
-**Final Output:** After these analysis steps, your results will include a subset of the integrated, QC-ed, and normalized features from the data processing step, a correlation network focused on strong cross-omics relationships, and a MOFA model summarizing features that are a major sources of variation across samples and datasets.
+**Final Output:** 
+
+After these analysis steps, your results will include a subset of the integrated, QC-ed, and normalized features from the data processing step, a correlation network focused on strong cross-omics relationships, and a MOFA model summarizing features that are a major sources of variation across samples and datasets.
