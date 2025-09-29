@@ -1,103 +1,99 @@
-# Datasets Settings Explained
+# Datasets Parameters Explained
 
-This document describes the practical effect of each option in the **datasets** section of the integration workflow configuration file (/input\_data/config/project\_config.yml), including the data processing tag and the four normalization steps used in omics data processing (filtering, devariancing, scaling, and replicability). Each section lists available methods, their options, and default values, and at the end there is an example of a full data processing workflow.
+This document describes the practical effect of each option in the **datasets** section of the integration workflow configuration file (`/input_data/config/project_config.yml`), including the data processing tag and the four normalization steps used in omics data processing (filtering, devariancing, scaling, and replicate handling). Each section lists available methods, their options, and default values, and at the end there is an example of a full data processing workflow.
 
 # Setup Parameters
 
-## 1\. Tagging
+## 1. Tagging
 
-*   **data\_processing\_tag**
+  **data_processing_tag**
 
-Allows user to create a new data processing folder (Data\_Processing--**TAG**) to store results. This is useful if data processing and normalization settings are changed (see below) and a new set of outputs should be produced that is separate from previous runs. Default: “0”.
+  Allows user to create a new data processing folder (`Data_Processing--TAG`) to store results. This is useful if data processing and normalization settings are changed (see below) and a new set of outputs should be produced that is separate from previous runs. Default: “0”.
 
-_Note_: If a data processing folder already exists with the supplied tag and overwriting is disabled, the workflow will return an error message indicating that you should change the tag
+  _Note_: If a data processing folder already exists with the supplied tag and overwriting is disabled, the workflow will return an error message indicating that you should change the tag.
 
-*   **dataset\_dir**
+  **dataset_dir**
 
-This is currently fixed based on the workflow structure, so do not change it.
+  This is currently fixed based on the workflow structure, so do not change it.
 
 # Normalization Parameters
 
-## 1\. Filtering
+## 1. Filtering
 
-### Options:
+  **method**  
+  * _minimum_ **\[default\]**  
+    Removes features whose average observed value across samples is below the specified threshold. Useful for excluding low-abundance or low-count features that may be noise or low confidence observations.
+  * _proportion_  
+    Removes features that are observed at higher abundance than the detection limit in fewer than a specified percentage of samples. Helps filter out features that are rarely detected.
+  * _none_  
+    No filtering is performed; all features are retained regardless of abundance or prevalence.
 
-*   **method**
-    *   _minimum_ \[default\]
+  **value**  
+  Value determines the minimum or proportion value for filtering. It represents either observed quantitative values from the raw data (_minimum_; real numbers > 0) or percentage of samples (_proportion_; real numbers 0-100).
 
-Removes features whose average observed value across samples is below the specified threshold. Useful for excluding low-abundance or low-count features that may be noise or low confidence observations.
+## 2. Devariancing
 
-*   _proportion_
+  **method**  
+  * _percent_ **\[default\]**  
+    Removes a specified percentage of features with the lowest variance across samples. This keeps only the most variable features, which are more likely to be informative.
+  * _none_  
+    No variance-based filtering is performed; all features are retained regardless of their variance.
 
-Removes features that are observed at higher abundance than the detection limit in fewer than a specified percentage of samples. Helps filter out features that are rarely detected.
+  **value**  
+  Value determines percent value for removing low variance features (real numbers 0-100). It represents percent of total features.
 
-*   _none_
+## 3. Scaling
 
-No filtering is performed; all features are retained regardless of abundance or prevalence.
+  **log2** **\[default\]**  
+  If enabled, applies a log2(x+1) transformation to all values before scaling. This reduces skewness and compresses large values.
 
-*   **value**
-    *   Value determines the minimum or proportion value for filtering. It represents either observed quantitative values from the raw data (_minimum_; real numbers greater than 0) or percentage of samples (_proportion_; real numbers 0-100).
+  **method**  
+  * _modified_zscore_ **\[default\]**  
+    Standardizes each feature using the median and median absolute deviation, making it more robust to outliers than standard z-score and makes features comparable regardless of their original scale.
+  * _zscore_  
+    Standardizes each feature to have mean zero and unit variance across samples. This makes features comparable regardless of their original scale.
+  * _none_  
+    No scaling is performed; features retain their original values. Not recommended because datasets will not fall along the same distribution and integration will be difficult to interpret.
 
-## 2\. Devariancing
+## 4. Replicate Handling
 
-### Options:
+  **method**  
+  * _variance_ **\[default\]**  
+    Removes features with high variability among replicates within each group (or specified metadata category - see below). Only features with consistent observed values within a replicate group are retained.
+  * _none_  
+    No replicate handling is performed; all features are retained.
 
-*   **method**
-    *   _percent_ \[default\]
+  **group**  
+  If method is _variance_, **group** is any column from the dataset metadata (i.e., a variable in the `user_settings->variable_list` in the configuration file) for grouping samples as replicates - defaults to the meta-variable 'group', which is the combination of all listed metadata categories.
 
-Removes a specified percentage of features with the lowest variance across samples. This keeps only the most variable features, which are more likely to be informative.
+  **value**  
+  If method is _variance_, this sets the threshold for maximum allowable within-group variability. Features with variability above this threshold are removed (default: 0.5). _Note_: this step typically is performed after data scaling, so mean and variance will be standardized.
 
-*   *   _none_
+# Example
 
-No variance-based filtering is performed; all features are retained regardless of their variance.
+Suppose you start with the following configuration:
 
-*   **value**
-    *   Value determines percent value for removing low variance features (real numbers 0-100). It represents percent of total features.
+```yaml
+datasets:
+    tx:
+        dataset_dir: transcriptomics
+        normalization_parameters:
+            filtering:
+                method: minimum
+                value: 10
+            devariancing:
+                method: percent
+                value: 20
+            scaling:
+                log2: true
+                method: modified_zscore
+            replicate_handling:
+                method: variance
+                group: group
+                value: 0.5
+```
 
-## 3\. Scaling
-
-### Options:
-
-*   **log2** \[default\]
-
-If enabled, applies a log2(x+1) transformation to all values before scaling. This reduces skewness and compresses large values.
-
-*   **modified\_zscore** \[default\]
-
-Standardizes each feature using the median and median absolute deviation, making it more robust to outliers than standard z-score and makes features comparable regardless of their original scale.
-
-*   **zscore**
-
-Standardizes each feature to have mean zero and unit variance across samples. This makes features comparable regardless of their original scale.
-
-*   **none**
-
-No scaling is performed; features retain their original values. Not recommended because datasets will not fall along the same distribution and integration will be difficult to interpret.
-
-## 4\. Replicate Handling
-
-### Options:
-
-*   **method**
-    *   _variance_ \[default\]
-
-Removes features with high variability among replicates within each group (or specified metadata category - see below). Only features with consistent observed values within a replicate group are retained.
-
-*   *   _none_
-
-No replicate handling is performed; all features are retained.
-
-*   **group**
-
-If method is _variance_, **group** is any column from the dataset metadata (i.e., a variable in the user\_settings->variable\_list in the configuration file) for grouping samples as replicates - defaults to the meta-variable 'group', which is the combination of all listed metadata categories.
-
-*   **value**
-
-If method is _variance,_ this sets the threshold for maximum allowable within-group variability. Features with variability above this threshold are removed (default: 0.5). _Note_: this step typically is performed after data scaling, so mean and variance will be standardized.
-
-## Example
-
-Suppose you start with the following transcriptomics dataset (features as rows, samples as columns), with two sample groupings (high or low).
+And the following transcriptomics dataset (features as rows, samples as columns), with two sample groupings (high or low):
 
 | Feature | High_1 | High_2 | High_3 | High_4 | High_5 | Low_1 | Low_2 | Low_3 | Low_4 | Low_5 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -112,44 +108,11 @@ Suppose you start with the following transcriptomics dataset (features as rows, 
 | FeatureI | 300 | 320 | 310 | 330 | 315 | 290 | 295 | 285 | 300 | 292 |
 | FeatureJ | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 1 |
 
-And the following dataset configuration:
+### Step 1: Filtering
 
-tx:
-
-dataset\_dir: transcriptomics
-
-normalization\_parameters:
-
-filtering:
-
-method: minimum
-
-value: 10
-
-devariancing:
-
-method: percent
-
-value: 20
-
-scaling:
-
-log2: true
-
-method: modified\_zscore
-
-replicate\_handling:
-
-method: variance
-
-group: group
-
-value: 0.5
-
-### Step 1: Filtering (filter\_data)
-
-*   Options: minimum, value = 10
-*   Result: Remove FeatureB (average observed = 5.7, below threshold)
+  * **method:** minimum, **value:** 10  
+    Remove features whose average observed value is below 10.  
+    _Result_: Remove FeatureB (average observed = 5.7, below threshold)
 
 | Feature | High_1 | High_2 | High_3 | High_4 | High_5 | Low_1 | Low_2 | Low_3 | Low_4 | Low_5 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -163,10 +126,11 @@ value: 0.5
 | FeatureI | 300 | 320 | 310 | 330 | 315 | 290 | 295 | 285 | 300 | 292 |
 | FeatureJ | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 1 |
 
-### Step 2: Devariancing (devariance\_data)
+### Step 2: Devariancing
 
-*   Options: percent, value = 20 (removes 20% of 9 feature rounded down, i.e., 1 feature with lowest variance)
-*   Result: Remove FeatureE (variance = 0)
+  * **method:** percent, **value:** 20  
+    Remove 20% of features with the lowest variance (rounded down, i.e., 1 feature).  
+    _Result_: Remove FeatureE (variance = 0)
 
 | Feature | High_1 | High_2 | High_3 | High_4 | High_5 | Low_1 | Low_2 | Low_3 | Low_4 | Low_5 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -181,8 +145,9 @@ value: 0.5
 
 ### Step 3: Scaling
 
-*   Option: log2 + modified\_zscore
-*   Result: scaled dataset
+  * **log2:** true, **method:** modified_zscore  
+    First, apply log2(x+1) transformation to all values.  
+    Then, apply modified z-score standardization.
 
 **First, apply log2(x+1) transformation:**
 
@@ -212,8 +177,9 @@ value: 0.5
 
 ### Step 4: Replicate Handling
 
-*   Option: variance, value = 0.5, group = group (high vs low)
-*   Result: Remove FeatureJ (Low\_5 sample value is an outlier, causing high within-group variance in "low" group)
+  * **method:** variance, **group:** group, **value:** 0.5  
+    Remove features with high within-group variance (threshold = 0.5).  
+    _Result_: Remove FeatureJ (Low_5 sample value is an outlier, causing high within-group variance in "low" group)
 
 | Feature | High_1 | High_2 | High_3 | High_4 | High_5 | Low_1 | Low_2 | Low_3 | Low_4 | Low_5 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -225,4 +191,5 @@ value: 0.5
 | FeatureH | -0.134 | 0.224 | 0.134 | 0.044 | 0.313 | -0.224 | -0.313 | -0.134 | 0.044 | -0.224 |
 | FeatureI | 0.044 | 0.186 | 0.089 | 0.228 | 0.120 | -0.022 | 0.044 | -0.067 | 0.044 | -0.015 |
 
-**Final Output:** After all normalization steps, the dataset contains 7 features and all 10 samples, with all values log2-transformed and modified z-score standardized. This dataset now has a quality-controlled and standardized quantitative distribution and can be integrated with other datasets that have undergone the same treatment.
+**Final Output:**  
+After all normalization steps, the dataset contains 7 features and all 10 samples, with all values log2-transformed and modified z-score standardized. This dataset now has a quality-controlled and standardized quantitative distribution and can be integrated with other datasets that have undergone the same treatment.
