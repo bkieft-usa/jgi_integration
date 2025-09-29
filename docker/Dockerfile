@@ -4,6 +4,9 @@ USER root
 
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
+# Ensure matplotlib config dir exists and is owned by jovyan
+RUN mkdir -p /home/jovyan/.cache/matplotlib && chown -R jovyan:users /home/jovyan/.cache
+
 WORKDIR /home/jovyan/work
 
 USER jovyan
@@ -16,3 +19,4 @@ RUN pip install --no-cache-dir -r /home/jovyan/work/jgi_integration/docker/requi
 RUN cp /home/jovyan/work/jgi_integration/notebooks/integration_workflow.ipynb /home/jovyan/work/
 
 ENV PYTHONPATH="/home/jovyan/work/jgi_integration"
+ENV MPLCONFIGDIR="/home/jovyan/.cache/matplotlib"
