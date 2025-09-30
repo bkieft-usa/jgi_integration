@@ -88,9 +88,51 @@ This document describes the practical effect of each option in the **analysis** 
 
     Maximum number of features to retain (integer > 0; default: 5,000)
 
+  **lasso**
+
+  Uses Lasso regression to select features most predictive of a continuous metadata variable. Features are ranked by absolute coefficient magnitude.
+
+  #### Parameters:
+
+  * _metadata_category_
+
+    Metadata column to use as the target variable (must be continuous).
+
+  * _max_features_
+
+    Maximum number of features to retain (integer > 0; default: 5,000)
+
+  **random_forest**
+
+  Uses a random forest model to select features most predictive of a metadata variable (regression for continuous, classification for categorical). Features are ranked by importance.
+
+  #### Parameters:
+
+  * _metadata_category_
+
+    Metadata column to use as the target variable.
+
+  * _max_features_
+
+    Maximum number of features to retain (integer > 0; default: 5,000)
+
+  **mutual_info**
+
+  Selects features with highest mutual information with a metadata variable (continuous or categorical). Captures non-linear associations.
+
+  #### Parameters:
+
+  * _metadata_category_
+
+    Metadata column to use as the target variable.
+
+  * _max_features_
+
+    Maximum number of features to retain (integer > 0; default: 5,000)
+
   **none**
 
-  No feature selection is performed; all features are retained.
+  No feature selection is performed; all features are retained, up to the max_features limit.
 
   #### Parameters:
 
@@ -118,9 +160,17 @@ This document describes the practical effect of each option in the **analysis** 
 
     Calculates Spearman rank correlation.
 
-  * _kendall_
+  * _cosine_
 
-    Calculates Kendall rank correlation.
+    Calculates cosine similarity between features.
+
+  * _centered_cosine_
+
+    Calculates centered cosine similarity (cosine similarity after mean-centering).
+
+  * _bicor_
+
+    Calculates biweight midcorrelation (robust correlation using median and MAD).
 
   **corr_cutoff**
 
@@ -129,6 +179,18 @@ This document describes the practical effect of each option in the **analysis** 
   **keep_negative**
 
   If true, includes both positive and negative correlations above the absolute threshold. If false (default), only positive correlations are included.
+
+  **block_size**
+
+  Number of features processed per block during correlation calculation (integer > 0; default: 500). Larger blocks may use more memory but can be faster.
+
+  **n_jobs**
+
+  Number of parallel jobs for block-wise correlation calculation (integer; default: 1). Use -1 to utilize all available cores.
+
+  **only_bipartite**
+
+  If true (default), only calculates correlations between features of different types (e.g., transcript vs. metabolite). If false, calculates all pairwise correlations (including within type).
 
 ## 4. Network Analysis
 
@@ -142,31 +204,41 @@ This document describes the practical effect of each option in the **analysis** 
 
   * _bipartite_ \[default\]
 
-    Constructs a network only between features from different datasets (e.g., transcript and metabolite node edges)
+    Constructs a network only between features from different datasets (e.g., transcript and metabolite node edges).
 
   * _full_
 
-    Constructs a network including all feature-feature correlations, regardless of dataset. Not currently recommended.
-
-    _Note_: Functionally, this **network_mode** option is also passed to the feature correlation step above to keep the cached correlation matrix as small as possible.
+    Constructs a network including all feature-feature correlations, regardless of dataset.
 
   **submodule_mode**
 
   Determines if submodules will be extracted from the network and if so by which method.
 
+  **interactive**
+
+  Determines if the network is printed to the notebook interface in interactive mode.
+
   #### Parameters:
 
-  *  _community_ \[default\]
+  * _none_
 
-    Extracts submodules using community detection algorithms (Louvain method).
+    No submodules are extracted from the main graph.
 
   * _subgraphs_
 
     Extracts submodules as connected components.
 
-  * _none_
+  * _louvain_ \[default\]
 
-    No submodules are extracted from the main graph.
+    Extracts submodules using the Louvain community detection algorithm.
+
+  * _leiden_
+
+    Extracts submodules using the Leiden community detection algorithm (requires igraph and leidenalg).
+
+  * _wgcna_
+
+    Extracts submodules using WGCNA-style hierarchical clustering on the topological overlap matrix (TOM). Parameters include beta (soft-threshold power), min_module_size (minimum module size), and distance_cutoff (clustering cutoff).
 
 ## 5. MOFA Analysis
 
@@ -208,6 +280,7 @@ analysis:
         networking:
             network_mode: bipartite
             submodule_mode: community
+            interactive: false
         mofa:
             num_mofa_factors: 3
             num_mofa_iterations: 1000
