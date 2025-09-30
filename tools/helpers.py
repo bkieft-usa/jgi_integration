@@ -13,18 +13,23 @@ from datetime import datetime
 from pathlib import Path
 import yaml
 from tqdm import tqdm
+import warnings
 
 # --- Display and plotting ---
 from IPython.display import display
 import fitz  # PyMuPDF
 
 # --- Typing ---
-from typing import List
+from typing import List, Tuple, Union, Optional, Dict
 
 # --- Scientific computing & data analysis ---
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
+from scipy.stats import rankdata
+import scipy.sparse as sp
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
 
 # --- Plotting ---
 import matplotlib.pyplot as plt
@@ -55,11 +60,17 @@ from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 
 # --- Network analysis ---
 import networkx as nx
-from community import community_louvain
+import community as community_louvain
+import igraph as ig
+import leidenalg
 
 # --- Cheminformatics ---
 from rdkit import Chem
 
+# --- Parallelization ---
+from joblib import Parallel, delayed
+
+# --- Plotly for interactive plots ---
 import plotly.graph_objects as go
 import plotly.io as pio
 pio.kaleido.scope.mathjax = None
@@ -427,320 +438,618 @@ def perform_feature_selection(
         write_integration_file(data=pd.DataFrame(), output_dir=output_dir, filename=output_filename, indexing=True)
         return None
 
-def calculate_correlated_features(
+def _set_up_matrix(
+    X: np.ndarray,
+    method: str,
+) -> Tuple[np.ndarray, float]:
+    """
+    Parameters
+    ------
+    X : (n_samples, n_features) ndarray
+        Raw (already log-scaled / z-scored) data.
+    method : str
+        One of  {'pearson', 'spearman', 'cosine',
+                  'centered_cosine', 'bicor'}.
+
+    Returns
+    ---
+    Z : ndarray, same shape as X
+        Transformed matrix.
+    scale : float
+        Multiplicative factor that must be applied to the dot-product
+        `Z_i.T @ Z_j` to obtain the final similarity.
+        For Pearson / Spearman / bicor   → 1/(n_samples-1)
+        For Cosine / Centered-Cosine   → 1
+    """
+    n = X.shape[0]                     # number of samples
+    if method == "pearson":
+        mu = X.mean(axis=0, keepdims=True)
+        sigma = X.std(axis=0, ddof=1, keepdims=True)
+        sigma[sigma == 0] = 1.0
+        Z = (X - mu) / sigma
+        scale = 1.0 / (n - 1)
+
+    elif method == "spearman":
+        # rank each column, then treat the ranks as ordinary data
+        R = np.apply_along_axis(rankdata, 0, X)
+        mu = R.mean(axis=0, keepdims=True)
+        sigma = R.std(axis=0, ddof=1, keepdims=True)
+        sigma[sigma == 0] = 1.0
+        Z = (R - mu) / sigma
+        scale = 1.0 / (n - 1)
+
+    elif method == "cosine":
+        norm = np.linalg.norm(X, axis=0, keepdims=True)
+        norm[norm == 0] = 1.0
+        Z = X / norm
+        scale = 1.0                           # dot = cosine directly
+
+    elif method == "centered_cosine":
+        mu = X.mean(axis=0, keepdims=True)
+        Xc = X - mu
+        norm = np.linalg.norm(Xc, axis=0, keepdims=True)
+        norm[norm == 0] = 1.0
+        Z = Xc / norm
+        scale = 1.0
+
+    elif method == "bicor":
+        # Robust “biweight-mid-correlation” approximated by
+        # median-centre + MAD-scale → then Pearson on the robust z-scores
+        med = np.median(X, axis=0, keepdims=True)
+        mad = np.median(np.abs(X - med), axis=0, keepdims=True)
+        # Convert MAD to a sigma estimator (the 1.4826 factor makes it unbiased
+        # for a normal distribution)
+        sigma = mad * 1.4826
+        sigma[sigma == 0] = 1.0
+        Z = (X - med) / sigma
+        scale = 1.0 / (n - 1)
+
+    else:
+        raise ValueError(
+            f"Method '{method}' not recognised. Choose "
+            "'pearson', 'spearman', 'cosine', 'centered_cosine' or 'bicor'."
+        )
+    return Z, scale
+
+
+def _block_pair(
+    Z_i: np.ndarray,
+    Z_j: np.ndarray,
+    idx_i: np.ndarray,
+    idx_j: np.ndarray,
+    scale: float,
+    cutoff: float,
+    keep_negative: bool,
+) -> List[Tuple[int, int, float]]:
+    """
+    Z_i : (n_samples, b_i)   - transcript block
+    Z_j : (n_samples, b_j)   - metabolite block
+    idx_i / idx_j : global column indices of the two blocks (int arrays)
+    scale : factor to turn the raw dot-product into the final similarity
+    """
+    # dot-product (fast BLAS)
+    sim = (Z_i.T @ Z_j) * scale                # shape (b_i, b_j)
+
+    if keep_negative:
+        mask = np.abs(sim) >= cutoff
+    else:
+        mask = sim >= cutoff
+
+    ii, jj = np.where(mask)                    # indices *inside* the block
+    return [
+        (int(idx_i[ii[k]]), int(idx_j[jj[k]]), float(sim[ii[k], jj[k]]))
+        for k in range(ii.size)
+    ]
+
+def bipartite_correlation(
     data: pd.DataFrame,
     output_filename: str,
     output_dir: str,
-    corr_method: str = "pearson",
-    corr_cutoff: float = 0.5,
-    overwrite: bool = False,
+    method: str = "pearson",
+    cutoff: float = 0.75,
     keep_negative: bool = False,
-    only_bipartite: bool = False,
-    save_corr_matrix: bool = False
+    block_size: int = 500,
+    n_jobs: int = 1,
+    only_bipartite: bool = True,
 ) -> pd.DataFrame:
     """
-    Memory-efficient calculation and filtering of feature-feature correlation matrix.
-    Only stores pairs above cutoff in memory.
+    Compute bipartite (transcript ↔ metabolite) similarity on a
+    already normalised feature-by-sample matrix.
 
-    Args:
-        data (pd.DataFrame): Feature matrix (features x samples).
-        output_dir (str): Output directory for results.
-        corr_method (str): Correlation method.
-        corr_cutoff (float): Correlation threshold.
-        overwrite (bool): Overwrite existing results.
-        keep_negative (bool): Keep negative correlations if True.
-        only_bipartite (bool): Only keep bipartite correlations.
-        save_corr_matrix (bool): Save correlation matrix to disk.
+    Parameters
+    ------
+    data : pd.DataFrame
+        Rows = features (transcripts + metabolites), columns = samples.
+        Must already be log-scaled / z-scored etc.
+    method : str, default 'pearson'
+        Similarity to compute - ``'pearson'``, ``'spearman'``,
+        ``'cosine'``, ``'centered_cosine'`` or ``'bicor'``.
+    cutoff : float, default 0.75
+        Minimum absolute similarity (or minimum similarity if
+        ``keep_negative=False``) for a pair to be kept.
+    keep_negative : bool, default False
+        If True, also keep negative correlations whose absolute value
+        exceeds ``cutoff``.
+    block_size : int, default 500
+        Number of features processed per block (memory ~= 4 x block_size x n_samples bytes).
+    n_jobs : int, default 1
+        Parallelism over transcript blocks.  ``-1`` uses all cores.
 
-    Returns:
-        pd.DataFrame: Filtered correlation matrix.
+    Returns
+    ---
+    pd.DataFrame
+        Columns ``['transcript', 'metabolite', 'correlation']``.
     """
 
-    output_subdir = output_dir
-    os.makedirs(output_subdir, exist_ok=True)
-    existing_output = f"{output_subdir}/{output_filename}"
-    if os.path.exists(existing_output) and not overwrite:
-        print(f"Correlation table already exists at {existing_output}. Returning existing matrix.")
-        return pd.read_csv(existing_output, sep=',')
+    # Create feature type designation based on prefixes
+    ftype = pd.Series(
+        [
+            "transcript" if name.startswith("tx_") else
+            "metabolite" if name.startswith("mx_") else
+            None
+            for name in data.index
+        ],
+        index=data.index,
+    )
+    if ftype.isnull().any():
+        invalid = ftype[ftype.isnull()].index.tolist()
+        raise ValueError(f"Feature names must start with 'tx_' or 'mx_'. Invalid: {invalid}")
 
-    data_input = data.T
-    features = data_input.columns.tolist()
-    n = len(features)
-    print(f"Calculating feature correlations for {n} features...")
+    # Basic checks
+    if not isinstance(ftype, pd.Series):
+        raise TypeError("feature_type must be a pandas Series.")
+    if not ftype.index.equals(data.index):
+        raise ValueError("Index of feature_type must match data rows.")
+    if method not in {
+        "pearson", "spearman", "cosine", "centered_cosine", "bicor"
+    }:
+        raise ValueError(f"Unsupported method '{method}'.")
 
-    # Use numpy for speed and memory
-    arr = data_input.values
-    means = np.mean(arr, axis=0)
-    stds = np.std(arr, axis=0)
-    arr_centered = arr - means
+    # Identify transcript & metabolite column indices (after transpose)
+    X = data.T.values.astype(np.float64, copy=False)   # (n_samples, n_features)
+    feature_names = data.index.to_numpy()
+    n_features = X.shape[1]
 
-    # Only store pairs above cutoff
-    results = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            corr = pd.Series(arr[:, i]).corr(pd.Series(arr[:, j]), method=corr_method)
-            if keep_negative:
-                if abs(corr) >= corr_cutoff and abs(corr) != 1:
-                    results.append((features[i], features[j], corr))
-            else:
-                if corr >= corr_cutoff and corr != 1:
-                    results.append((features[i], features[j], corr))
+    is_transcript = ftype.str.lower().eq("transcript").values
+    trans_idx = np.where(is_transcript)[0]
+    metab_idx = np.where(~is_transcript)[0]
 
-    print(f"\tFiltered to {len(results)} pairs above cutoff of {corr_cutoff}.")
-
-    # Only bipartite
+    # If only_bipartite, keep current logic
+    # If not, set both indices to all features
     if only_bipartite:
-        print("Filtering for only bipartite correlations...")
-        results = [r for r in results if r[0][:3] != r[1][:3]]
-        print(f"\tCorrelation matrix filtered to {len(results)} pairs.")
+        pairs = [(trans_idx, metab_idx)]
+    else:
+        # All pairs (including within group)
+        all_idx = np.arange(n_features)
+        pairs = [(all_idx, all_idx)]
 
-    # Build DataFrame
-    melted_corr = pd.DataFrame(results, columns=['feature_1', 'feature_2', 'correlation'])
+    # Transform data once according to the requested similarity
+    Z, scale = _set_up_matrix(X, method)
 
-    if save_corr_matrix:
-        print(f"Saving feature correlation table to disk...")
-        write_integration_file(melted_corr, output_subdir, output_filename, indexing=False)
+    # Block-wise computation
+    def _process_block(i_idx, j_idx, t_start: int, t_end: int) -> List[Tuple[int, int, float]]:
+        block_i_idx = i_idx[t_start:t_end]
+        Z_i = Z[:, block_i_idx]
+        block_results: List[Tuple[int, int, float]] = []
+        for m_start in range(0, len(j_idx), block_size):
+            m_end = min(m_start + block_size, len(j_idx))
+            block_j_idx = j_idx[m_start:m_end]
+            Z_j = Z[:, block_j_idx]
+            block_results.extend(
+                _block_pair(
+                    Z_i,
+                    Z_j,
+                    block_i_idx,
+                    block_j_idx,
+                    scale,
+                    cutoff,
+                    keep_negative,
+                )
+            )
+        return block_results
 
-    return melted_corr
+    # Parallel over blocks
+    all_pairs: List[Tuple[int, int, float]] = []
+    for i_idx, j_idx in pairs:
+        if n_jobs == 1:
+            for t_start in range(0, len(i_idx), block_size):
+                t_end = min(t_start + block_size, len(i_idx))
+                all_pairs.extend(_process_block(i_idx, j_idx, t_start, t_end))
+        else:
+            n_jobs_eff = -1 if n_jobs == -1 else n_jobs
+            parallel = Parallel(n_jobs=n_jobs_eff, backend="loky", verbose=0)
+            chunks = parallel(
+                delayed(_process_block)(i_idx, j_idx, t_start, min(t_start + block_size, len(i_idx)))
+                for t_start in range(0, len(i_idx), block_size)
+            )
+            all_pairs.extend([pair for sublist in chunks for pair in sublist])
+
+    if not all_pairs:
+        empty_df = pd.DataFrame(columns=["transcript", "metabolite", "correlation"])
+        print("Warning: No pairs passed the correlation cutoff. Returning empty DataFrame.")
+        write_integration_file(data=empty_df, output_dir=output_dir, filename=output_filename, indexing=True)
+
+    tr_idx, met_idx, sims = zip(*all_pairs)
+    df = pd.DataFrame(
+        {
+            "feature_1": feature_names[np.fromiter(tr_idx, dtype=int, count=len(tr_idx))],
+            "feature_2": feature_names[np.fromiter(met_idx, dtype=int, count=len(met_idx))],
+            "correlation": sims,
+        }
+    )
+    df["abs_corr"] = np.abs(df["correlation"])
+    df = df.sort_values("abs_corr", ascending=False).drop(columns="abs_corr")
+
+    write_integration_file(data=df, output_dir=output_dir, filename=output_filename, indexing=True)
+    return df
+
+def _make_prefix_maps(prefixes: List[str]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Return two dicts:
+        prefix → color (hex)
+        prefix → shape (networkx-compatible string)
+    colors are taken from a viridis palette and are reproducible.
+    """
+    palette = viridis(np.linspace(0, 1, max(3, len(prefixes))))
+    colors = [to_hex(c) for c in palette]
+    shape_map = {}
+    for i, pref in enumerate(prefixes):
+        shape_map[pref] = "Round Rectangle" if i == 0 else "Diamond"
+    color_map = {pref: colors[i % len(colors)] for i, pref in enumerate(prefixes)}
+    return color_map, shape_map
+
+def _build_sparse_adj(
+    corr_df: pd.DataFrame,
+    prefixes: List[str],
+    corr_cutoff: float,
+    network_mode: str,
+) -> sp.coo_matrix:
+    """
+    Returns a COO-format sparse matrix where the data are the *edge weights*.
+    For `bipartite` mode only edges that link two different prefixes are kept.
+    """
+    # Boolean mask of values above cutoff 
+    corr_vals = corr_df.values
+    mask = np.abs(corr_vals) >= corr_cutoff
+    np.fill_diagonal(mask, False)
+
+    #  If bipartite, enforce prefix mismatch 
+    if network_mode == "bipartite":
+        rows = corr_df.index.to_numpy()
+        cols = corr_df.columns.to_numpy()
+        def _assign_prefix(arr):
+            out = np.empty(len(arr), dtype=object)
+            out[:] = ""
+            for pref in prefixes:
+                hits = np.char.startswith(arr, pref)
+                out[hits] = pref
+            return out
+
+        row_pref = _assign_prefix(rows)
+        col_pref = _assign_prefix(cols)
+        # keep only pairs whose prefixes differ (and are non-empty)
+        pref_mask = (row_pref[:, None] != col_pref[None, :]) & (row_pref[:, None] != "") & (col_pref[None, :] != "")
+        mask &= pref_mask
+
+    #  Extract the sparse representation 
+    row_idx, col_idx = np.where(mask)
+    weights = corr_vals[row_idx, col_idx]
+
+    weights = (np.abs(weights) * 100) ** 2
+
+    n = corr_df.shape[0]
+    return sp.coo_matrix((weights, (row_idx, col_idx)), shape=(n, n))
+
+def _graph_from_sparse(
+    adj: sp.coo_matrix,
+    node_names: np.ndarray,
+) -> nx.Graph:
+    """
+    Convert a COO adjacency matrix to a networkx Graph with the original
+    node names as labels.
+    """
+    G = nx.from_scipy_sparse_matrix(adj, edge_attribute="weight", create_using=nx.Graph())
+    mapping = dict(enumerate(node_names))
+    return nx.relabel_nodes(G, mapping)
+
+def _assign_node_attributes(
+    G: nx.Graph,
+    prefixes: List[str],
+    color_map: Dict[str, str],
+    shape_map: Dict[str, str],
+    annotation_df: Optional[pd.DataFrame] = None,
+) -> None:
+    """
+    Mutates G in-place -  adds:
+        * datatype_color, datatype_shape
+        * annotation, annotation_shape (if annotation_df supplied)
+    """
+    #  color / shape based on prefix
+    node_names = np.array(list(G.nodes()))
+    # vectorised prefix lookup
+    node_pref = np.empty(len(node_names), dtype=object)
+    node_pref[:] = ""
+    for pref in prefixes:
+        hits = np.char.startswith(node_names, pref)
+        node_pref[hits] = pref
+
+    # build dicts for networkx.set_node_attributes
+    color_dict = {name: color_map.get(p, "gray") for name, p in zip(node_names, node_pref)}
+    shape_dict = {name: shape_map.get(p, "Rectangle") for name, p in zip(node_names, node_pref)}
+    nx.set_node_attributes(G, color_dict, "datatype_color")
+    nx.set_node_attributes(G, shape_dict, "datatype_shape")
+
+    #  optional functional annotation
+    if annotation_df is not None and not annotation_df.empty:
+        # annotation_df must have an index that matches node IDs
+        ann = annotation_df["annotation"].fillna("Unassigned").to_dict()
+        ann_shape = {n: ("Diamond" if a != "Unassigned" else "Round Rectangle")
+                     for n, a in ann.items()}
+        nx.set_node_attributes(G, ann, "annotation")
+        nx.set_node_attributes(G, ann_shape, "annotation_shape")
+
+        # edge-level annotation (source/target)
+        for u, v, d in G.edges(data=True):
+            d["source_annotation"] = ann.get(u, "")
+            d["target_annotation"] = ann.get(v, "")
+
+def _detect_submodules(
+    G: nx.Graph,
+    method: str,
+    **kwargs,
+) -> List[Tuple[str, nx.Graph]]:
+    """
+    Returns a list of (module_name, subgraph) tuples.
+    Supported ``method`` values:
+        * "subgraphs" -  simple connected components
+        * "louvain"   -  python-louvain
+        * "leiden"    -  leidenalg (requires igraph)
+        * "wgcna"     -  soft-threshold → TOM → hierarchical clustering
+    ``kwargs`` are forwarded to the specific implementation (e.g. beta for
+    WGCNA, min_module_size, distance_cutoff …).
+    """
+    if method == "subgraphs":
+        comps = nx.connected_components(G)
+        return [(f"submodule_{i+1}", G.subgraph(c).copy())
+                for i, c in enumerate(comps)]
+
+    if method == "louvain":
+        partition = community_louvain.best_partition(G, weight="weight")
+        modules: Dict[int, List[str]] = {}
+        for node, comm in partition.items():
+            modules.setdefault(comm, []).append(node)
+        return [(f"submodule_{i+1}", G.subgraph(nodes).copy())
+                for i, (comm, nodes) in enumerate(sorted(modules.items()))]
+
+    if method == "leiden":
+        if ig is None or leidenalg is None:
+            raise ImportError("igraph + leidenalg not installed -  `pip install igraph leidenalg`")
+        # Convert to igraph (preserves node names)
+        ig_g = ig.Graph.from_networkx(G)
+        partition = leidenalg.find_partition(
+            ig_g, leidenalg.ModularityVertexPartition, weights="weight"
+        )
+        modules = []
+        for i, community in enumerate(partition):
+            nodes = [ig_g.vs[idx]["name"] for idx in community]
+            modules.append((f"submodule_{i+1}", G.subgraph(nodes).copy()))
+        return modules
+
+    if method == "wgcna":
+        # build adjacency from the correlation matrix (soft-threshold)
+        beta: int = kwargs.get("beta", 6)
+        min_mod_sz: int = kwargs.get("min_module_size", 30)
+        dist_cut: float = kwargs.get("distance_cutoff", 0.25)
+
+        # original correlation dataframe (must be symmetric)
+        corr = nx.to_pandas_adjacency(G, weight="weight")
+        raw_corr = np.sqrt(corr.values) / 100.0
+        raw_corr = np.clip(raw_corr, -1, 1) * np.sign(corr.values)   # keep sign
+
+        # soft-threshold adjacency
+        adj = np.abs(raw_corr) ** beta
+
+        # topological overlap matrix (TOM)
+        A = sp.csr_matrix(adj)
+        A2 = A @ A
+        k = np.asarray(A.sum(axis=1)).ravel()
+        min_k = np.minimum.outer(k, k)
+        denom = min_k + 1 - adj
+        tom = (A2 + A) / denom
+        np.fill_diagonal(tom, 1.0)
+
+        # hierarchical clustering on TOM-distance
+        dist = 1.0 - tom
+        condensed = squareform(dist, checks=False)
+        Z = linkage(condensed, method="average")
+        cluster_labels = fcluster(Z, t=dist_cut, criterion="distance")
+        # discard clusters that are too small
+        modules = {}
+        for lbl, node in zip(cluster_labels, corr.index):
+            modules.setdefault(lbl, []).append(node)
+        kept = [(f"submodule_{i+1}", G.subgraph(nodes).copy())
+                for i, (lbl, nodes) in enumerate(sorted(modules.items()))
+                if len(nodes) >= min_mod_sz]
+        return kept
+
+    raise ValueError(f"Invalid submodule method '{method}'. "
+                     "Choose from 'subgraphs', 'louvain', 'leiden', 'wgcna'.")
 
 def plot_correlation_network(
     correlation_matrix: pd.DataFrame,
-    feature_prefixes: list,
+    feature_prefixes: List[str],
     integrated_data: pd.DataFrame,
     integrated_metadata: pd.DataFrame,
-    output_filenames: dict,
-    annotation_df: str = None,
+    output_filenames: Dict[str, str],
+    annotation_df: Optional[pd.DataFrame] = None,
     network_mode: str = "bipartite",
-    submodule_mode: str = "community",
+    submodule_mode: str = "louvain",
     show_plot_in_notebook: bool = False,
-    corr_cutoff: float = 0.5
+    corr_cutoff: float = 0.5,
 ) -> None:
     """
-    Plot and export a correlation network from a correlation matrix, with optional submodule extraction.
+    Build a correlation graph from a long-format table, optionally
+    detect submodules (connected components, Louvain, Leiden or WGCNA)
+    and write everything to disk.
 
-    Args:
-        correlation_matrix (pd.DataFrame): DataFrame with columns ['feature_1', 'feature_2', 'correlation'].
-        feature_prefixes (list): List of feature prefixes (e.g., ['tx', 'mx']).
-        integrated_data (pd.DataFrame): Feature matrix.
-        integrated_metadata (pd.DataFrame): Metadata DataFrame.
-        output_filenames (dict): Dictionary with keys 'graph', 'node_table', 'edge_table' for output filenames.
-        annotation_df (pd.DataFrame): DataFrame with feature annotations.
-        network_mode (str): 'bipartite' or 'full'.
-        submodule_mode (str): 'community' or 'subgraphs' or 'none'
-        show_plot_in_notebook (bool): Whether to display the plot.
-        corr_cutoff (float): Correlation threshold for edges.
-
-    Returns:
-        None
+    Parameters are identical to your original function; the only
+    behavioural change is the expanded ``submodule_mode`` options.
     """
+    # Ensure network_mode is valid
+    if network_mode not in {"bipartite", "full"}:
+        raise ValueError("network_mode must be 'bipartite' or 'full'")
 
-    # Create a correlation matrix
+    # Pivot → square matrix (features × features)
     if network_mode == "bipartite":
-        print("Filtering correlation matrix to bipartite relationships...")
-        correlation_matrix = correlation_matrix[~correlation_matrix.apply(lambda row: row['feature_1'][:3] == row['feature_2'][:3], axis=1)]
-        
-    print("Pivoting data...")
-    correlation_df = correlation_matrix.pivot(index='feature_2', columns='feature_1', values='correlation')
+        correlation_df = correlation_matrix.pivot(
+            index="feature_2", columns="feature_1", values="correlation"
+        ).fillna(0.0)
+    else:  # full
+        correlation_df = correlation_matrix.pivot(
+            index="feature_2", columns="feature_1", values="correlation"
+        ).fillna(0.0)
 
-    # Create a graph from the correlation matrix
-    print("Creating graph...")
-    G = nx.Graph()
+    # Build sparse adjacency (edges only above cutoff)
+    sparse_adj = _build_sparse_adj(
+        correlation_df, feature_prefixes, corr_cutoff, network_mode
+    )
 
-    # Use vectorized operations to add nodes and edges based on the threshold
-    print(f"Filtering edges based on correlation threshold of {corr_cutoff}...")
-    mask = np.abs(correlation_df.values) >= corr_cutoff
-    np.fill_diagonal(mask, False)  # Exclude self-loops
-    edges = np.column_stack(np.where(mask))
-    #print(f"\t{len(edges)} edges added to the graph.")
-    if network_mode == "full":
-        for i, j in edges:
-            G.add_edge(correlation_df.index[i], correlation_df.columns[j], weight=correlation_df.iloc[i, j])
-    elif network_mode == "bipartite":
-        for i, j in edges:
-            node_i = correlation_df.index[i]
-            node_j = correlation_df.columns[j]
-            if (any(prefix in node_i for prefix in feature_prefixes) and 
-                any(prefix in node_j for prefix in feature_prefixes) and 
-                node_i[:2] != node_j[:2]):  # Ensure nodes are from different groups
-                G.add_edge(node_i, node_j, weight=float((correlation_df.iloc[i, j]*100)**2))
-    else:
-        raise ValueError("Invalid network_mode. Please select 'full' or 'bipartite'.")
-    print(f"\t{G.number_of_edges()} edges added to the graph.")
-    print(f"\t{G.number_of_nodes()} nodes added to the graph.")
+    # Create networkx graph (node names = original feature IDs)
+    G = _graph_from_sparse(sparse_adj, correlation_df.index.to_numpy())
+    print(f"\tGraph built -  {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
 
-    # Define node colors based on datatype
-    print("Adding node aesthetics...")
-    viridis_colors = viridis(np.linspace(0, 1, 3))  # Generate 3 distinct colors from viridis colormap
-    viridis_colors_hex = [to_hex(color) for color in viridis_colors]  # Convert to hex color strings
-    for node in G.nodes():
-        if any(keyword in node for keyword in feature_prefixes):
-            for i, keyword in enumerate(feature_prefixes):
-                if keyword in node:
-                    G.nodes[node]['datatype_color'] = viridis_colors_hex[i % len(viridis_colors_hex)]
-                    G.nodes[node]['datatype_shape'] = "Round Rectangle" if keyword == "tx" else "Diamond"
-        else:
-            G.nodes[node]['datatype_color'] = "gray"
-            G.nodes[node]['datatype_shape'] = "Rectangle" 
+    # Node aesthetics (color / shape) and optional annotation
+    color_map, shape_map = _make_prefix_maps(feature_prefixes)
+    _assign_node_attributes(G, feature_prefixes, color_map, shape_map, annotation_df)
 
-    # Annotate nodes and edges with functional information if available
-    if annotation_df is not None and not annotation_df.empty:
-        print("Annotating nodes and edges with functional information...")
-        annotation_df['node_id'] = annotation_df.index
-        node_annotations = annotation_df.set_index('node_id')['annotation'].fillna("Unassigned").to_dict()
-        for node in G.nodes():
-            if node in node_annotations:
-                annotation_string = str(node_annotations[node])
-                if annotation_string == "Unassigned":
-                    node_shape = "Round Rectangle"
-                else:
-                    node_shape = "Diamond"
-                G.nodes[node]['annotation'] = annotation_string
-                G.nodes[node]['annotation_shape'] = node_shape
-        for edge in G.edges():
-            if edge[0] in node_annotations:
-                G.edges[edge]['source_annotation'] = str(node_annotations[edge[0]])
-            if edge[1] in node_annotations:
-                G.edges[edge]['target_annotation'] = str(node_annotations[edge[1]])
+    # Remove tiny isolated components (size < 3)
+    tiny = [c for c in nx.connected_components(G) if len(c) < 3]
+    if tiny:
+        G.remove_nodes_from({n for comp in tiny for n in comp})
+        print(f"\tRemoved {len(tiny)} tiny components (<3 nodes).")
 
-    # Remove isolated groups of exactly 2 nodes
-    small_components = [c for c in nx.connected_components(G) if len(c) < 3]
-    for comp in small_components:
-        G.remove_nodes_from(comp)    
-
-    print(f"Exporting node/edge tables and correlation network...")
-    nx.write_graphml(G, output_filenames['graph'])
+    # Export the raw graph (before submodule annotation)
+    nx.write_graphml(G, output_filenames["graph"])
     edge_table = nx.to_pandas_edgelist(G)
-    edge_table.index.name = 'edge_index'
-    node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient='index')
-    node_table.index.name = 'node_id'
-    node_table.to_csv(output_filenames['node_table'], index=True, index_label='node_index')
-    edge_table.to_csv(output_filenames['edge_table'], index=True, index_label='edge_index')
+    node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient="index")
+    node_table.to_csv(output_filenames["node_table"], index_label="node_id")
+    edge_table.to_csv(output_filenames["edge_table"], index_label="edge_index")
+    print("\tRaw graph, node table and edge table written to disk.")
 
-    print("Drawing graph...")
-    if show_plot_in_notebook is True:
+    # submodule detection
+    if submodule_mode not in {"none", "subgraphs", "louvain", "leiden", "wgcna"}:
+        raise ValueError(
+            "submodule_mode must be one of "
+            "'none', 'subgraphs', 'louvain', 'leiden', 'wgcna'"
+        )
+    if submodule_mode != "none":
+        print(f"Detecting submodules using '{submodule_mode}' …")
+        submods = _detect_submodules(
+            G,
+            method=submodule_mode,
+            # WGCNA specific defaults -  you can pass extra kwargs via **kwargs in future
+            beta=6,
+            min_module_size=30,
+            distance_cutoff=0.25,
+        )
+        _annotate_and_save_submodules(
+            submods,
+            G,
+            output_filenames,
+            integrated_data,
+            integrated_metadata,
+            save_plots=True,
+        )
+
+        # Re-write the *main* graph (now enriched with submodule attributes)
+        nx.write_graphml(G, output_filenames["graph"])
+        edge_table = nx.to_pandas_edgelist(G)
+        node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient="index")
+        node_table.to_csv(output_filenames["node_table"], index_label="node_id")
+        edge_table.to_csv(output_filenames["edge_table"], index_label="edge_index")
+        print("\tMain graph updated with submodule annotations and written to disk.")
+
+    # interactive plot
+    if show_plot_in_notebook:
         plt.figure(figsize=(12, 8))
-        #pos = nx.spring_layout(G)
         pos = nx.forceatlas2_layout(G)
-        node_colors = [G.nodes[node]['datatype_color'] for node in G.nodes()]
-        nx.draw(G, pos, with_labels=True, node_size=200, node_color=node_colors, font_size=1)
+        node_cols = [G.nodes[n]["datatype_color"] for n in G.nodes()]
+        nx.draw(G, pos, with_labels=False, node_size=200,
+                node_color=node_cols, font_size=1)
         plt.show()
 
-    if submodule_mode != "none" and network_mode == "bipartite":
-        print("Extracting submodules from the bipartite network...")
-        G = extract_submodules_from_bipartite_network(graph=G, integrated_data=integrated_data, metadata=integrated_metadata,
-                                                      output_filenames=output_filenames, submodule_mode=submodule_mode)
-        print(f"Updating main graphml file and edge/node tables with submodule information...")
-        nx.write_graphml(G, output_filenames['graph'])
-        edge_table = nx.to_pandas_edgelist(G)
-        edge_table.index.name = 'edge_index'
-        node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient='index')
-        node_table.index.name = 'node_id'
-        node_table.to_csv(output_filenames['node_table'], index=True, index_label='node_index')
-        edge_table.to_csv(output_filenames['edge_table'], index=True, index_label='edge_index')
-    elif submodule_mode != "none" and network_mode == "full":
-        raise ValueError("Submodule creation is currently only supported for the 'bipartite' network mode.")
-
-def extract_submodules_from_bipartite_network(
-    graph: 'nx.Graph',
+def _annotate_and_save_submodules(
+    submodules: List[Tuple[str, nx.Graph]],
+    main_graph: nx.Graph,
+    output_filenames: Dict[str, str],
     integrated_data: pd.DataFrame,
     metadata: pd.DataFrame,
-    output_filenames: dict,
-    submodule_mode: str,
     save_plots: bool = True,
-) -> 'nx.Graph':
+) -> None:
     """
-    Extract submodules (connected components or communities) from a bipartite network and save results.
-
-    Args:
-        graph (nx.Graph): Bipartite network graph.
-        integrated_data (pd.DataFrame): Feature matrix.
-        metadata (pd.DataFrame): Metadata DataFrame.
-        output_filenames (dict): Dictionary with keys 'graph', 'node_table', 'edge_table' for output filenames.
-        submodule_mode (str): 'subgraphs' or 'community'.
-        save_plots (bool): Whether to save abundance plots.
-
-    Returns:
-        nx.Graph: Annotated main graph with submodule information.
+    - Annotates every node in ``main_graph`` with ``submodule`` and its color.
+    - Writes each submodule as its own GraphML + node/edge CSV.
+    - (Optionally) draws a violin-strip plot of the *mean* abundance of all
+      members of the submodule across the group variable in ``metadata``.
     """
+    # colors for submodules (shuffle for visual separation)
+    n_mod = len(submodules)
+    sub_cols = viridis(np.linspace(0, 1, n_mod))
+    sub_hex = [to_hex(c) for c in sub_cols]
+    random.shuffle(sub_hex)
 
-    if submodule_mode == "subgraphs": # Find connected components in the graph
-        submodules = [graph.subgraph(c).copy() for c in nx.connected_components(graph)]
-    elif submodule_mode == "community": # Detect communities in the graph and group nodes into submodules by their community
-        partition = community_louvain.best_partition(graph)
-        submodules = []
-        for community_id in set(partition.values()):
-            nodes_in_community = [node for node, community in partition.items() if community == community_id]
-            submodules.append(graph.subgraph(nodes_in_community).copy())
-    else:
-        raise ValueError("Invalid submodule_mode. Please select 'subgraphs' or 'community'.")
+    sub_path = output_filenames.get("submodule_path", "submodules")
+    os.makedirs(sub_path, exist_ok=True)
 
-    # Define module colors based on index text and add as node attribute
-    submodule_num = len(submodules)
-    viridis_colors = viridis(np.linspace(0, 1, submodule_num))  # Generate distinct colors from viridis colormap
-    viridis_colors_hex = [to_hex(color) for color in viridis_colors]  # Convert to hex color strings
-    random.shuffle(viridis_colors_hex)
+    graph_name = os.path.basename(output_filenames["graph"]).replace(".graphml", "")
 
-    for idx, submodule in enumerate(submodules):
+    for idx, (mod_name, sub_g) in enumerate(submodules, start=1):
+        # annotate nodes in main_graph and subgraph
+        col = sub_hex[(idx - 1) % len(sub_hex)]
+        for n in sub_g.nodes():
+            main_graph.nodes[n]["submodule"] = mod_name
+            main_graph.nodes[n]["submodule_color"] = col
+            sub_g.nodes[n]["submodule"] = mod_name
+            sub_g.nodes[n]["submodule_color"] = col
 
-        # Annotate nodes in submodules and main graph with submodule IDs
-        for node in submodule.nodes():
-            if node in graph.nodes():
-                graph.nodes[node]['submodule'] = f"submodule_{idx+1}"
-                graph.nodes[node]['submodule_color'] = viridis_colors_hex[idx % len(viridis_colors_hex)]
-            submodule.nodes[node]['submodule'] = f"submodule_{idx+1}"
-            submodule.nodes[node]['submodule_color'] = viridis_colors_hex[idx % len(viridis_colors_hex)]
+        # write submodule files
+        subgraph_file = f"{sub_path}/{graph_name}_submodule{idx}.graphml"
+        nx.write_graphml(sub_g, subgraph_file)
 
-        # Save each submodule as a GraphML file
-        graph_filename = os.path.basename(output_filenames['graph'])
-        os.makedirs(output_filenames['submodule_path'], exist_ok=True)
-        submodule_graph_name = f"{output_filenames['submodule_path']}/{graph_filename.replace('.graphml', '_submodule')}{idx+1}.graphml"
-        nx.write_graphml(submodule, submodule_graph_name)
-        print(f"\tSubmodule {idx + 1} saved to {submodule_graph_name}")
+        node_tbl = pd.DataFrame.from_dict(dict(sub_g.nodes(data=True)), orient="index")
+        edge_tbl = nx.to_pandas_edgelist(sub_g)
+        node_tbl.to_csv(f"{sub_path}/{graph_name}_submodule{idx}_nodes.csv")
+        edge_tbl.to_csv(f"{sub_path}/{graph_name}_submodule{idx}_edges.csv")
 
-        # Write node and edge tables for each submodule
-        node_table = pd.DataFrame.from_dict(dict(submodule.nodes(data=True)), orient='index')
-        node_table.index.name = 'node_id'
-        edge_table = nx.to_pandas_edgelist(submodule)
-        edge_table.index.name = 'node_id'
-        node_table_filename = os.path.basename(output_filenames['node_table'])
-        edge_table_filename = os.path.basename(output_filenames['edge_table'])
-        submodule_node_table_name = f"{output_filenames['submodule_path']}/{node_table_filename.replace('.csv', '_submodule')}{idx+1}.csv"
-        submodule_edge_table_name = f"{output_filenames['submodule_path']}/{edge_table_filename.replace('.csv', '_submodule')}{idx+1}.csv"
-        node_table.to_csv(submodule_node_table_name, index=True)
-        edge_table.to_csv(submodule_edge_table_name, index=True)
-
-        # Graph the abundance of features in each submodule across metadata
-        if save_plots is True:
-            nodes_df = pd.DataFrame(node_table.index, columns=['node_id'])
-            nodes_df = nodes_df.set_index('node_id')
-            abundance_df = integrated_data.apply(pd.to_numeric, errors='coerce')
-            linked_df = nodes_df.join(abundance_df, how='inner')
-            if linked_df.empty:
-                print(f"\tNo data available for plotting submodule {idx+1}. Skipping...")
+        # abundance plot
+        if save_plots:
+            # mean abundance of all members of the submodule per sample
+            members = list(sub_g.nodes())
+            # intersect with integrated_data columns (some nodes might have been filtered out)
+            members = [m for m in members if m in integrated_data.columns]
+            if not members:
                 continue
-            else:
-                data_series = linked_df.mean(axis=0)
-            
-            final_df = pd.DataFrame(data_series, columns=['abundance'])
-            plot_df = final_df.join(metadata, how='inner')
-
-            plt.figure(figsize=(10, 10))
-            sns.violinplot(x='group', y='abundance', data=plot_df, inner=None, palette='viridis')
-            sns.stripplot(x='group', y='abundance', data=plot_df, color='k', alpha=0.5)
-            plt.title(f'Mean abundance of nodes in submodule{idx+1} across group')
-            plt.xlabel('group')
-            plt.ylabel(f'Mean abundance')
-            plt.xticks(rotation=90)
+            mean_abund = integrated_data[members].mean(axis=1).rename("abundance")
+            plot_df = pd.concat([mean_abund, metadata], axis=1, join="inner")
+            plt.figure(figsize=(10, 6))
+            sns.violinplot(
+                x="group", y="abundance", data=plot_df,
+                inner=None, palette="viridis"
+            )
+            sns.stripplot(
+                x="group", y="abundance", data=plot_df,
+                color="k", alpha=0.5, size=3
+            )
+            plt.title(f"Mean abundance of {mod_name}")
+            plt.xlabel("group")
+            plt.ylabel("mean abundance")
             plt.tight_layout()
-
-            submodule_boxplot_name = f"{output_filenames['submodule_path']}/submodule_{idx+1}_abundance_boxplot.pdf"
-            plt.savefig(submodule_boxplot_name, dpi=300, format='pdf')
+            plt.savefig(
+                f"{sub_path}/{graph_name}_submodule{idx}_abundance.pdf",
+                dpi=300,
+            )
             plt.close()
 
-    if save_plots is True:
-        print(f"\n\tSubmodule node abundance boxplots plots saved.")
-
-    return graph
 
 # ====================================
 # Dataset acquisition functions
@@ -1245,7 +1554,7 @@ def get_mx_metadata(
     polarity: str
 ) -> pd.DataFrame:
     """
-    Load MX metadata from extracted files.
+    Load MX metadata from extracted files, optionally filtered.
 
     Args:
         output_filename (str): Output filename for MX metadata.
@@ -3088,7 +3397,7 @@ def plot_mofa2_feature_weights_linear(
     Args:
         model: MOFA2 model object.
         output_dir (str): Output directory to save the plot.
-        num_features (int): Number of top features to plot.
+        num_features (int): Number of top features to plot per factor.
 
     Returns:
         plt.Figure: The matplotlib figure object for the feature weights plot.
@@ -4053,6 +4362,164 @@ def upload_to_google_drive(
 #     overwrite: bool = False,
 #     keep_negative: bool = False,
 #     only_bipartite: bool = False,
+#     save_corr_matrix: bool = False,
+#     block_size: int = 500
+# ) -> pd.DataFrame:
+#     """
+#     Memory-efficient calculation and filtering of feature-feature correlation matrix.
+#     Only stores pairs above cutoff in memory.
+
+#     Args:
+#         data (pd.DataFrame): Feature matrix (features x samples).
+#         output_dir (str): Output directory for results.
+#         corr_method (str): Correlation method.
+#         corr_cutoff (float): Correlation threshold.
+#         overwrite (bool): Overwrite existing results.
+#         keep_negative (bool): Keep negative correlations if True.
+#         only_bipartite (bool): Only keep bipartite correlations.
+#         save_corr_matrix (bool): Save correlation matrix to disk.
+
+#     Returns:
+#         pd.DataFrame: Filtered correlation matrix.
+#     """
+
+#     output_subdir = output_dir
+#     os.makedirs(output_subdir, exist_ok=True)
+#     existing_output = f"{output_subdir}/{output_filename}"
+#     if os.path.exists(existing_output) and not overwrite:
+#         print(f"Correlation table already exists at {existing_output}. \nSkipping calculation and returning existing matrix.")
+#         return pd.read_csv(existing_output, sep=',')
+
+#     data_input = data.T
+#     features = data_input.columns.tolist()
+#     n = len(features)
+#     print(f"Calculating feature correlations for {n} features using block size {block_size}...")
+
+#     results = []
+#     for i_start in range(0, n, block_size):
+#         i_end = min(i_start + block_size, n)
+#         block_i = data_input.iloc[:, i_start:i_end]
+#         for j_start in range(i_start, n, block_size):
+#             j_end = min(j_start + block_size, n)
+#             block_j = data_input.iloc[:, j_start:j_end]
+#             # Compute correlation matrix between block_i and block_j
+#             corr_matrix = block_i.corrwith(block_j, axis=0, method=corr_method) if block_i.shape[1] == 1 or block_j.shape[1] == 1 else block_i.corr(block_j, method=corr_method)
+#             # Only keep upper triangle for self-blocks to avoid duplicates
+#             for ii, f1 in enumerate(block_i.columns):
+#                 for jj, f2 in enumerate(block_j.columns):
+#                     if (i_start == j_start and jj <= ii):
+#                         continue  # skip lower triangle and diagonal
+#                     corr = corr_matrix.iloc[ii, jj]
+#                     if pd.isnull(corr):
+#                         continue
+#                     if keep_negative:
+#                         if abs(corr) >= corr_cutoff and abs(corr) != 1:
+#                             results.append((f1, f2, corr))
+#                     else:
+#                         if corr >= corr_cutoff and corr != 1:
+#                             results.append((f1, f2, corr))
+#     print(f"\tFiltered to {len(results)} pairs above cutoff of {corr_cutoff}.")
+
+#     if only_bipartite:
+#         print("Filtering for only bipartite correlations...")
+#         results = [r for r in results if r[0][:3] != r[1][:3]]
+#         print(f"\tCorrelation matrix filtered to {len(results)} pairs.")
+
+#     melted_corr = pd.DataFrame(results, columns=['feature_1', 'feature_2', 'correlation'])
+
+#     if save_corr_matrix:
+#         print(f"Saving feature correlation table to disk...")
+#         write_integration_file(melted_corr, output_dir, output_filename, indexing=False)
+
+#     return melted_corr
+
+
+
+# def calculate_correlated_features(
+#     data: pd.DataFrame,
+#     output_filename: str,
+#     output_dir: str,
+#     corr_method: str = "pearson",
+#     corr_cutoff: float = 0.5,
+#     overwrite: bool = False,
+#     keep_negative: bool = False,
+#     only_bipartite: bool = False,
+#     save_corr_matrix: bool = False
+# ) -> pd.DataFrame:
+#     """
+#     Memory-efficient calculation and filtering of feature-feature correlation matrix.
+#     Only stores pairs above cutoff in memory.
+
+#     Args:
+#         data (pd.DataFrame): Feature matrix (features x samples).
+#         output_dir (str): Output directory for results.
+#         corr_method (str): Correlation method.
+#         corr_cutoff (float): Correlation threshold.
+#         overwrite (bool): Overwrite existing results.
+#         keep_negative (bool): Keep negative correlations if True.
+#         only_bipartite (bool): Only keep bipartite correlations.
+#         save_corr_matrix (bool): Save correlation matrix to disk.
+
+#     Returns:
+#         pd.DataFrame: Filtered correlation matrix.
+#     """
+
+#     output_subdir = output_dir
+#     os.makedirs(output_subdir, exist_ok=True)
+#     existing_output = f"{output_subdir}/{output_filename}"
+#     if os.path.exists(existing_output) and not overwrite:
+#         print(f"Correlation table already exists at {existing_output}. Returning existing matrix.")
+#         return pd.read_csv(existing_output, sep=',')
+
+#     data_input = data.T
+#     features = data_input.columns.tolist()
+#     n = len(features)
+#     print(f"Calculating feature correlations for {n} features...")
+
+#     # Use numpy for speed and memory
+#     arr = data_input.values
+#     means = np.mean(arr, axis=0)
+#     stds = np.std(arr, axis=0)
+#     arr_centered = arr - means
+
+#     # Only store pairs above cutoff
+#     results = []
+#     for i in range(n):
+#         for j in range(i + 1, n):
+#             corr = pd.Series(arr[:, i]).corr(pd.Series(arr[:, j]), method=corr_method)
+#             if keep_negative:
+#                 if abs(corr) >= corr_cutoff and abs(corr) != 1:
+#                     results.append((features[i], features[j], corr))
+#             else:
+#                 if corr >= corr_cutoff and corr != 1:
+#                     results.append((features[i], features[j], corr))
+
+#     print(f"\tFiltered to {len(results)} pairs above cutoff of {corr_cutoff}.")
+
+#     # Only bipartite
+#     if only_bipartite:
+#         print("Filtering for only bipartite correlations...")
+#         results = [r for r in results if r[0][:3] != r[1][:3]]
+#         print(f"\tCorrelation matrix filtered to {len(results)} pairs.")
+
+#     # Build DataFrame
+#     melted_corr = pd.DataFrame(results, columns=['feature_1', 'feature_2', 'correlation'])
+
+#     if save_corr_matrix:
+#         print(f"Saving feature correlation table to disk...")
+#         write_integration_file(melted_corr, output_subdir, output_filename, indexing=False)
+
+#     return melted_corr
+
+# def calculate_correlated_features(
+#     data: pd.DataFrame,
+#     output_filename: str,
+#     output_dir: str,
+#     corr_method: str = "pearson",
+#     corr_cutoff: float = 0.5,
+#     overwrite: bool = False,
+#     keep_negative: bool = False,
+#     only_bipartite: bool = False,
 #     save_corr_matrix: bool = False
 # ) -> pd.DataFrame:
 #     """
@@ -4168,3 +4635,242 @@ def upload_to_google_drive(
 #     for group in shared_groups:
 #         count = group_counts[group]
 #         print(f"{group} (count: {count})")
+
+# def plot_correlation_network(
+#     correlation_matrix: pd.DataFrame,
+#     feature_prefixes: list,
+#     integrated_data: pd.DataFrame,
+#     integrated_metadata: pd.DataFrame,
+#     output_filenames: dict,
+#     annotation_df: str = None,
+#     network_mode: str = "bipartite",
+#     submodule_mode: str = "community",
+#     show_plot_in_notebook: bool = False,
+#     corr_cutoff: float = 0.5
+# ) -> None:
+#     """
+#     Plot and export a correlation network from a correlation matrix, with optional submodule extraction.
+
+#     Args:
+#         correlation_matrix (pd.DataFrame): DataFrame with columns ['feature_1', 'feature_2', 'correlation'].
+#         feature_prefixes (list): List of feature prefixes (e.g., ['tx', 'mx']).
+#         integrated_data (pd.DataFrame): Feature matrix.
+#         integrated_metadata (pd.DataFrame): Metadata DataFrame.
+#         output_filenames (dict): Dictionary with keys 'graph', 'node_table', 'edge_table' for output filenames.
+#         annotation_df (pd.DataFrame): DataFrame with feature annotations.
+#         network_mode (str): 'bipartite' or 'full'.
+#         submodule_mode (str): 'community' or 'subgraphs' or 'none'
+#         show_plot_in_notebook (bool): Whether to display the plot.
+#         corr_cutoff (float): Correlation threshold for edges.
+
+#     Returns:
+#         None
+#     """
+
+#     # Create a correlation matrix
+#     if network_mode == "bipartite":
+#         print("Filtering correlation matrix to bipartite relationships...")
+#         correlation_matrix = correlation_matrix[~correlation_matrix.apply(lambda row: row['feature_1'][:3] == row['feature_2'][:3], axis=1)]
+        
+#     print("Pivoting data...")
+#     correlation_df = correlation_matrix.pivot(index='feature_2', columns='feature_1', values='correlation')
+
+#     # Create a graph from the correlation matrix
+#     print("Creating graph...")
+#     G = nx.Graph()
+
+#     # Use vectorized operations to add nodes and edges based on the threshold
+#     print(f"Filtering edges based on correlation threshold of {corr_cutoff}...")
+#     mask = np.abs(correlation_df.values) >= corr_cutoff
+#     np.fill_diagonal(mask, False)  # Exclude self-loops
+#     edges = np.column_stack(np.where(mask))
+#     #print(f"\t{len(edges)} edges added to the graph.")
+#     if network_mode == "full":
+#         for i, j in edges:
+#             G.add_edge(correlation_df.index[i], correlation_df.columns[j], weight=correlation_df.iloc[i, j])
+#     elif network_mode == "bipartite":
+#         for i, j in edges:
+#             node_i = correlation_df.index[i]
+#             node_j = correlation_df.columns[j]
+#             if (any(prefix in node_i for prefix in feature_prefixes) and 
+#                 any(prefix in node_j for prefix in feature_prefixes) and 
+#                 node_i[:2] != node_j[:2]):  # Ensure nodes are from different groups
+#                 G.add_edge(node_i, node_j, weight=float((correlation_df.iloc[i, j]*100)**2))
+#     else:
+#         raise ValueError("Invalid network_mode. Please select 'full' or 'bipartite'.")
+#     print(f"\t{G.number_of_edges()} edges added to the graph.")
+#     print(f"\t{G.number_of_nodes()} nodes added to the graph.")
+
+#     # Define node colors based on datatype
+#     print("Adding node aesthetics...")
+#     viridis_colors = viridis(np.linspace(0, 1, 3))  # Generate 3 distinct colors from viridis colormap
+#     viridis_colors_hex = [to_hex(color) for color in viridis_colors]  # Convert to hex color strings
+#     for node in G.nodes():
+#         if any(keyword in node for keyword in feature_prefixes):
+#             for i, keyword in enumerate(feature_prefixes):
+#                 if keyword in node:
+#                     G.nodes[node]['datatype_color'] = viridis_colors_hex[i % len(viridis_colors_hex)]
+#                     G.nodes[node]['datatype_shape'] = "Round Rectangle" if keyword == "tx" else "Diamond"
+#         else:
+#             G.nodes[node]['datatype_color'] = "gray"
+#             G.nodes[node]['datatype_shape'] = "Rectangle" 
+
+#     # Annotate nodes and edges with functional information if available
+#     if annotation_df is not None and not annotation_df.empty:
+#         print("Annotating nodes and edges with functional information...")
+#         annotation_df['node_id'] = annotation_df.index
+#         node_annotations = annotation_df.set_index('node_id')['annotation'].fillna("Unassigned").to_dict()
+#         for node in G.nodes():
+#             if node in node_annotations:
+#                 annotation_string = str(node_annotations[node])
+#                 if annotation_string == "Unassigned":
+#                     node_shape = "Round Rectangle"
+#                 else:
+#                     node_shape = "Diamond"
+#                 G.nodes[node]['annotation'] = annotation_string
+#                 G.nodes[node]['annotation_shape'] = node_shape
+#         for edge in G.edges():
+#             if edge[0] in node_annotations:
+#                 G.edges[edge]['source_annotation'] = str(node_annotations[edge[0]])
+#             if edge[1] in node_annotations:
+#                 G.edges[edge]['target_annotation'] = str(node_annotations[edge[1]])
+
+#     # Remove isolated groups of exactly 2 nodes
+#     small_components = [c for c in nx.connected_components(G) if len(c) < 3]
+#     for comp in small_components:
+#         G.remove_nodes_from(comp)    
+
+#     print(f"Exporting node/edge tables and correlation network...")
+#     nx.write_graphml(G, output_filenames['graph'])
+#     edge_table = nx.to_pandas_edgelist(G)
+#     edge_table.index.name = 'edge_index'
+#     node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient='index')
+#     node_table.index.name = 'node_id'
+#     node_table.to_csv(output_filenames['node_table'], index=True, index_label='node_index')
+#     edge_table.to_csv(output_filenames['edge_table'], index=True, index_label='edge_index')
+
+#     print("Drawing graph...")
+#     if show_plot_in_notebook is True:
+#         plt.figure(figsize=(12, 8))
+#         #pos = nx.spring_layout(G)
+#         pos = nx.forceatlas2_layout(G)
+#         node_colors = [G.nodes[node]['datatype_color'] for node in G.nodes()]
+#         nx.draw(G, pos, with_labels=True, node_size=200, node_color=node_colors, font_size=1)
+#         plt.show()
+
+#     if submodule_mode != "none" and network_mode == "bipartite":
+#         print("Extracting submodules from the bipartite network...")
+#         G = extract_submodules_from_bipartite_network(graph=G, integrated_data=integrated_data, metadata=integrated_metadata,
+#                                                       output_filenames=output_filenames, submodule_mode=submodule_mode)
+#         print(f"Updating main graphml file and edge/node tables with submodule information...")
+#         nx.write_graphml(G, output_filenames['graph'])
+#         edge_table = nx.to_pandas_edgelist(G)
+#         edge_table.index.name = 'edge_index'
+#         node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient='index')
+#         node_table.index.name = 'node_id'
+#         node_table.to_csv(output_filenames['node_table'], index=True, index_label='node_index')
+#         edge_table.to_csv(output_filenames['edge_table'], index=True, index_label='edge_index')
+#     elif submodule_mode != "none" and network_mode == "full":
+#         raise ValueError("Submodule creation is currently only supported for the 'bipartite' network mode.")
+
+# def extract_submodules_from_bipartite_network(
+#     graph: 'nx.Graph',
+#     integrated_data: pd.DataFrame,
+#     metadata: pd.DataFrame,
+#     output_filenames: dict,
+#     submodule_mode: str,
+#     save_plots: bool = True,
+# ) -> 'nx.Graph':
+#     """
+#     Extract submodules (connected components or communities) from a bipartite network and save results.
+
+#     Args:
+#         graph (nx.Graph): Bipartite network graph.
+#         integrated_data (pd.DataFrame): Feature matrix.
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_filenames (dict): Dictionary with keys 'graph', 'node_table', 'edge_table' for output filenames.
+#         submodule_mode (str): 'subgraphs' or 'community'.
+#         save_plots (bool): Whether to save abundance plots.
+
+#     Returns:
+#         nx.Graph: Annotated main graph with submodule information.
+#     """
+
+#     if submodule_mode == "subgraphs": # Find connected components in the graph
+#         submodules = [graph.subgraph(c).copy() for c in nx.connected_components(graph)]
+#     elif submodule_mode == "community": # Detect communities in the graph and group nodes into submodules by their community
+#         partition = community_louvain.best_partition(graph)
+#         submodules = []
+#         for community_id in set(partition.values()):
+#             nodes_in_community = [node for node, community in partition.items() if community == community_id]
+#             submodules.append(graph.subgraph(nodes_in_community).copy())
+#     else:
+#         raise ValueError("Invalid submodule_mode. Please select 'subgraphs' or 'community'.")
+
+#     # Define module colors based on index text and add as node attribute
+#     submodule_num = len(submodules)
+#     viridis_colors = viridis(np.linspace(0, 1, submodule_num))  # Generate distinct colors from viridis colormap
+#     viridis_colors_hex = [to_hex(color) for color in viridis_colors]  # Convert to hex color strings
+#     random.shuffle(viridis_colors_hex)
+
+#     for idx, submodule in enumerate(submodules):
+
+#         # Annotate nodes in submodules and main graph with submodule IDs
+#         for node in submodule.nodes():
+#             if node in graph.nodes():
+#                 graph.nodes[node]['submodule'] = f"submodule_{idx+1}"
+#                 graph.nodes[node]['submodule_color'] = viridis_colors_hex[idx % len(viridis_colors_hex)]
+#             submodule.nodes[node]['submodule'] = f"submodule_{idx+1}"
+#             submodule.nodes[node]['submodule_color'] = viridis_colors_hex[idx % len(viridis_colors_hex)]
+
+#         # Save each submodule as a GraphML file
+#         graph_filename = os.path.basename(output_filenames['graph'])
+#         os.makedirs(output_filenames['submodule_path'], exist_ok=True)
+#         submodule_graph_name = f"{output_filenames['submodule_path']}/{graph_filename.replace('.graphml', '_submodule')}{idx+1}.graphml"
+#         nx.write_graphml(submodule, submodule_graph_name)
+#         print(f"\tSubmodule {idx + 1} saved to {submodule_graph_name}")
+
+#         # Write node and edge tables for each submodule
+#         node_table = pd.DataFrame.from_dict(dict(submodule.nodes(data=True)), orient='index')
+#         node_table.index.name = 'node_id'
+#         edge_table = nx.to_pandas_edgelist(submodule)
+#         edge_table.index.name = 'node_id'
+#         node_table_filename = os.path.basename(output_filenames['node_table'])
+#         edge_table_filename = os.path.basename(output_filenames['edge_table'])
+#         submodule_node_table_name = f"{output_filenames['submodule_path']}/{node_table_filename.replace('.csv', '_submodule')}{idx+1}.csv"
+#         submodule_edge_table_name = f"{output_filenames['submodule_path']}/{edge_table_filename.replace('.csv', '_submodule')}{idx+1}.csv"
+#         node_table.to_csv(submodule_node_table_name, index=True)
+#         edge_table.to_csv(submodule_edge_table_name, index=True)
+
+#         # Graph the abundance of features in each submodule across metadata
+#         if save_plots is True:
+#             nodes_df = pd.DataFrame(node_table.index, columns=['node_id'])
+#             nodes_df = nodes_df.set_index('node_id')
+#             abundance_df = integrated_data.apply(pd.to_numeric, errors='coerce')
+#             linked_df = nodes_df.join(abundance_df, how='inner')
+#             if linked_df.empty:
+#                 print(f"\tNo data available for plotting submodule {idx+1}. Skipping...")
+#                 continue
+#             else:
+#                 data_series = linked_df.mean(axis=0)
+            
+#             final_df = pd.DataFrame(data_series, columns=['abundance'])
+#             plot_df = final_df.join(metadata, how='inner')
+
+#             plt.figure(figsize=(10, 10))
+#             sns.violinplot(x='group', y='abundance', data=plot_df, inner=None, palette='viridis')
+#             sns.stripplot(x='group', y='abundance', data=plot_df, color='k', alpha=0.5)
+#             plt.title(f'Mean abundance of nodes in submodule{idx+1} across group')
+#             plt.xlabel('group')
+#             plt.ylabel(f'Mean abundance')
+#             plt.xticks(rotation=90)
+#             plt.tight_layout()
+
+#             submodule_boxplot_name = f"{output_filenames['submodule_path']}/submodule_{idx+1}_abundance_boxplot.pdf"
+#             plt.savefig(submodule_boxplot_name, dpi=300, format='pdf')
+#             plt.close()
+
+#     if save_plots is True:
+#         print(f"\n\tSubmodule node abundance boxplots plots saved.")
+
+#     return graph

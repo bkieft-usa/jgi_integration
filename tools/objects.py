@@ -714,16 +714,16 @@ class Analysis(BaseDataHandler):
             'data': self.integrated_data_selected,
             'output_filename': self._feature_correlation_table_filename,
             'output_dir': self.output_dir,
-            'corr_method': correlation_params.get('corr_method', 'pearson'),
-            'corr_cutoff': correlation_params.get('corr_cutoff', 0.5),
+            'method': correlation_params.get('corr_method', 'pearson'),
+            'cutoff': correlation_params.get('corr_cutoff', 0.5),
             'keep_negative': correlation_params.get('keep_negative', False),
-            'only_bipartite': networking_params.get('network_mode', 'bipartite') == 'bipartite',
-            'save_corr_matrix': True,  # Should save since we're storing the result
-            'overwrite': overwrite
+            'block_size': correlation_params.get('block_size', 500),
+            'n_jobs': correlation_params.get('cores', -1),
+            'only_bipartite': networking_params.get('network_mode', 'bipartite') == 'bipartite'
         }
         call_params.update(kwargs)
         
-        result = hlp.calculate_correlated_features(**call_params)
+        result = hlp.bipartite_correlation(**call_params)
         self.feature_correlation_table = result
         print(f"Created a feature correlation table with {self.feature_correlation_table.shape[0]} feature pairs.\n")
 
