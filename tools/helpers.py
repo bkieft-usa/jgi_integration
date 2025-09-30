@@ -14,13 +14,14 @@ from pathlib import Path
 import yaml
 from tqdm import tqdm
 import warnings
+import logging
 
 # --- Display and plotting ---
 from IPython.display import display
 import fitz  # PyMuPDF
 
 # --- Typing ---
-from typing import List, Tuple, Union, Optional, Dict
+from typing import List, Tuple, Union, Optional, Dict, Any, Callable
 
 # --- Scientific computing & data analysis ---
 import numpy as np
@@ -40,6 +41,8 @@ from matplotlib.colors import to_hex
 # --- Machine learning & statistics ---
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LassoCV
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import multipletests
@@ -73,16 +76,24 @@ from joblib import Parallel, delayed
 # --- Plotly for interactive plots ---
 import plotly.graph_objects as go
 import plotly.io as pio
-pio.kaleido.scope.mathjax = None
+#pio.kaleido.scope.mathjax = None
 
 # ====================================
 # Helper functions for various tasks
 # ====================================
 
+log = logging.getLogger(__name__)
+if not log.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    fmt = "\033[47m%(levelname)s – %(message)s\033[0m"
+    handler.setFormatter(logging.Formatter(fmt))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+
 def clear_directory(dir_path: str) -> None:
     # Wipe out all contents of dir_path if generating new outputs
     if os.path.exists(dir_path):
-        #print(f"Clearing existing contents of directory: {dir_path}")
+        #log.info(f"Clearing existing contents of directory: {dir_path}")
         for filename in os.listdir(dir_path):
             file_path = os.path.join(dir_path, filename)
             try:
@@ -91,7 +102,7 @@ def clear_directory(dir_path: str) -> None:
                 elif os.path.isdir(file_path):
                     shutil.rmtree(file_path)
             except Exception as e:
-                print(f'Failed to delete {file_path}. Reason: {e}')  
+                log.info(f'Failed to delete {file_path}. Reason: {e}')  
 
 def write_integration_file(
     data: pd.DataFrame,
@@ -121,322 +132,338 @@ def write_integration_file(
         if index_label is not None:
             data.index.name = index_label
         data.to_csv(fname, index=indexing)
-        print(f"\tData saved to {fname}\n")
+        log.info(f"\tData saved to {fname}\n")
     else:
-        print("Not saving data to disk.")
+        log.info("Not saving data to disk.")
 
 # ====================================
 # Analysis step functions
 # ====================================
 
-def glm_for_differential_abundance(
-    count_df: pd.DataFrame,
-    metadata_df: pd.DataFrame,
-    category_column: str,
-    reference_group: str,
-    output_dir: str,
-    threshold: float = 0.05
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Perform differential abundance analysis using Generalized Linear Models (GLM) with a Gaussian family.
+def _fdr_correct(pvals: np.ndarray, alpha: float = 0.05) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (adjusted p-values, mask of significant)."""
+    adj = multipletests(pvals, method="fdr_bh", alpha=alpha)[1]
+    log.info("FDR correction applied.")
+    return adj, adj <= alpha
 
-    Args:
-        count_df (pd.DataFrame): Features x samples count matrix.
-        metadata_df (pd.DataFrame): Samples x metadata DataFrame.
-        category_column (str): Metadata column for group comparison.
-        reference_group (str): Reference group for GLM.
-        output_dir (str): Output directory for results.
-        threshold (float): Adjusted p-value threshold.
+def _subset_by_rank(
+    scores: pd.DataFrame,
+    score_col: str,
+    max_features: int,
+    ascending: bool = False,
+) -> List[str]:
+    """Return a list of top-`max_features` feature names sorted by `score_col`."""
+    if scores.empty:
+        return []
+    ordered = scores[score_col].sort_values(ascending=ascending).index
+    log.info(f"Selecting top {max_features} features by {score_col}.")
+    return list(ordered[:max_features])
 
-    Returns:
-        tuple: (coefficients_df, corrected_p_values_df) DataFrames.
-    """
-
-    # Check if outputs already exist and skip if they do
-    coefficient_file = os.path.join(output_dir, f"glm_coefficients_{reference_group}_against_{category_column}")
-    pvalue_file = os.path.join(output_dir, f"glm_corrected_pvalues_{reference_group}_against_{category_column}")
-    if os.path.exists(f"{coefficient_file}.csv") and os.path.exists(f"{pvalue_file}.csv"):
-        print(f"GLM results for {category_column} already exist. Skipping analysis and returning existing data.\n")
-        return pd.read_csv(f"{coefficient_file}.csv", index_col=0), pd.read_csv(f"{pvalue_file}.csv", index_col=0)
-
-    # Transpose the count DataFrame to have samples as rows and features as columns
-    count_df_transposed = count_df.T
-
-    # Merge count DataFrame and metadata on sample identifiers
-    linked_data = count_df_transposed.join(metadata_df)
-
-    # Check for NaNs and infinite values in the linked data
-    if linked_data.isnull().values.any():
-        raise ValueError("NaN values detected in the linked data. Please clean the data.")
-
-    # Ensure the reference group exists in the category column
-    unique_categories = metadata_df[category_column].unique()
-    if reference_group not in unique_categories:
-        raise ValueError(f"Reference group '{reference_group}' not found in the '{category_column}' column.")
-
-    # Set the reference group for the categorical variable
-    linked_data[category_column] = pd.Categorical(
-        linked_data[category_column],
-        categories=[reference_group] + [cat for cat in unique_categories if cat != reference_group],
-        ordered=True
-    )
-
-    print(f"Running GLM on all features against {category_column} with reference group '{reference_group}'...")
-    results = {}
-    coefficients = {}
-
-    # Loop through each feature
-    for feature in count_df.index:
-        # Create a formula for the GLM
-        formula = f'Q("{feature}") ~ C({category_column})'
-        # Fit the GLM with a Gaussian family
-        try:
-            model = smf.glm(formula=formula, data=linked_data, family=sm.families.Gaussian())
-            result = model.fit()
-            results[feature] = result
-            coefficients[feature] = result.params.to_dict()
-        except ValueError as e:
-            # Handle cases where the model fitting fails
-            print(f"Model fitting failed for feature {feature}: {e}")
-            results[feature] = None
-            coefficients[feature] = None
-
-    # Extract and correct p-values
-    print(f"\tExtracting and correcting p-values for {category_column} model")
-    all_p_values_dict = {}
-    for feature, result in results.items():
-        if result is not None:
-            all_p_values_dict[feature] = result.pvalues.to_dict()
-
-    all_p_values_list = []
-    feature_keys = []
-    term_keys = []
-    for feature, terms in all_p_values_dict.items():
-        for term, p_value in terms.items():
-            all_p_values_list.append(p_value)
-            feature_keys.append(feature)
-            term_keys.append(term)
-    corrected_p_values = multipletests(all_p_values_list, alpha=threshold, method='fdr_bh')[1]
-
-    corrected_p_values_dict = {}
-    for feature, term, corrected_p_value in zip(feature_keys, term_keys, corrected_p_values):
-        if feature not in corrected_p_values_dict:
-            corrected_p_values_dict[feature] = {}
-        corrected_p_values_dict[feature][term] = float(corrected_p_value)
-
-    # Create DataFrames for coefficients and corrected p-values
-    coefficients_df = pd.DataFrame.from_dict(coefficients, orient='index')
-    coefficients_df['reference'] = reference_group
-    corrected_p_values_df = pd.DataFrame.from_dict(corrected_p_values_dict, orient='index')
-    corrected_p_values_df['reference'] = reference_group
-    
-    # Save results to output directory
-    print(f"\tExporting results for {category_column} model")
-    write_integration_file(coefficients_df, output_dir, os.path.basename(coefficient_file))
-    write_integration_file(corrected_p_values_df, output_dir, os.path.basename(pvalue_file))
-
-    return coefficients_df, corrected_p_values_df
-
-def run_kruskalwallis_test(
+def variance_selection(
     data: pd.DataFrame,
-    integrated_metadata: pd.DataFrame,
-    attribute: str = None,
+    top_n: int = None,
+    max_features: int = 5000,
+) -> pd.DataFrame:
+    """Select the `max_features` most variable features."""
+    var_series = data.var(axis=1).rename("variance")
+    top = _subset_by_rank(var_series.to_frame(), "variance", max_features, ascending=False)
+    log.info(f"Variance selection: keeping top {max_features} most variable features.")
+    return data.loc[top]
+
+def glm_selection(
+    data: pd.DataFrame,
+    metadata: pd.DataFrame,
+    category: str,
+    reference: str,
     significance_level: float = 0.05,
-    lfc_level: float = 0.5,
-    test_type: str = 'kruskalwallis',
-    output_dir: str = None,
-    stats_results_filename: str = None
+    log2fc_cutoff: float = 0.25,
+    max_features: int = 10000,
 ) -> pd.DataFrame:
     """
-    Subset features based on statistical significance and log fold change using a specified test.
-
-    Args:
-        data (pd.DataFrame): Feature matrix (features x samples).
-        integrated_metadata (pd.DataFrame): Metadata DataFrame with sample information.
-        attribute (str): Metadata column to test for group differences.
-        significance_level (float): FDR-corrected p-value cutoff.
-        lfc_level (float): Minimum absolute log2 fold change to consider significant.
-        test_type (str): Statistical test to use ('kruskalwallis').
-        output_dir (str): Directory to write results.
-        stats_results_filename (str): Filename for summary statistics.
-
-    Returns:
-        pd.DataFrame: Subset of features passing significance and LFC thresholds.
+    Fit a Gaussian GLM for each feature vs. a categorical metadata column.
+    Returns a subset of features that satisfy BOTH a p-value threshold
+    (FDR-adjusted) and an absolute log2-fold-change threshold.
     """
-    if attribute not in integrated_metadata.columns:
-        raise ValueError(f"Attribute '{attribute}' not found in metadata")
-    
-    # Calculate test statistic and p-value for each feature
-    data = data.fillna(0)
-    integrated_metadata_subset = integrated_metadata[integrated_metadata.index.isin(data.columns)]
-    groups = integrated_metadata_subset[attribute].unique()
-    p_values = []
-    log_fold_changes = pd.DataFrame(index=data.index)
-    for feature in data.index:
-        samples = [data.loc[feature, integrated_metadata_subset[integrated_metadata_subset[attribute] == group].index].values for group in groups]
-        if test_type == 'kruskalwallis':
-            if all(np.all(sample == sample[0]) for sample in samples):
-                p_val = 1.0  # Assign a non-significant p-value if all samples are identical
-            else:
-                _, p_val = stats.kruskal(*samples)
+    # Merge once
+    df = data.T.join(metadata)
+    if category not in df.columns:
+        raise ValueError(f"Metadata column '{category}' not found.")
+    # Force ordered categorical with reference first
+    uniq = df[category].dropna().unique()
+    if reference not in uniq:
+        raise ValueError(f"Reference group '{reference}' not present in '{category}'.")
+    ordered_cats = [reference] + [c for c in uniq if c != reference]
+    df[category] = pd.Categorical(df[category], categories=ordered_cats, ordered=True)
+
+    log.info(f"GLM: fitting {data.shape[0]} features against '{category}' (ref={reference})")
+    coeffs = {}
+    pvals = {}
+    for feat in data.index:
+        formula = f'Q("{feat}") ~ C({category})'
+        try:
+            res = smf.glm(formula=formula, data=df, family=sm.families.Gaussian()).fit()
+            # The first non-intercept term corresponds to the reference contrast
+            term = [t for t in res.params.index if t != "Intercept"][0]
+            coeffs[feat] = res.params[term]
+            pvals[feat] = res.pvalues[term]
+        except Exception as exc:  # pragma: no cover
+            log.debug(f"GLM failed for {feat}: {exc}")
+            coeffs[feat] = np.nan
+            pvals[feat] = np.nan
+
+    coeffs_s = pd.Series(coeffs, name="coef")
+    pvals_s = pd.Series(pvals, name="pvalue")
+    # Multiple-testing correction
+    adj, sig_mask = _fdr_correct(pvals_s.values, alpha=significance_level)
+    adj_s = pd.Series(adj, index=pvals_s.index, name="adj_pvalue")
+
+    # Build a DataFrame of filters
+    passes = (sig_mask) & (coeffs_s.abs() >= log2fc_cutoff)
+    selected = passes[passes].index.tolist()
+    if len(selected) > max_features:
+        # rank by absolute coefficient (largest effect first)
+        selected = coeffs_s.loc[selected].abs().sort_values(ascending=False).index[:max_features].tolist()
+    log.info(f"GLM selected {len(selected)} features (max_features={max_features})")
+    return data.loc[selected]
+
+def kruskal_selection(
+    data: pd.DataFrame,
+    metadata: pd.DataFrame,
+    category: str,
+    significance_level: float = 0.05,
+    lfc_cutoff: float = 0.5,
+    max_features: int = 10000,
+) -> pd.DataFrame:
+    """
+    Kruskal-Wallis test per feature against a categorical metadata column.
+    Returns features that satisfy both an FDR-adjusted p-value < `significance_level`
+    and an absolute median-difference (as a proxy for effect size) >= `lfc_cutoff`.
+    """
+    if category not in metadata.columns:
+        raise ValueError(f"Metadata column '{category}' missing.")
+    groups = metadata[category].dropna().unique()
+    if len(groups) < 2:
+        raise ValueError(f"Need at least two groups in '{category}' for Kruskal-Wallis.")
+    # Build dict of sample indices per group
+    idx_by_grp = {g: metadata[metadata[category] == g].index for g in groups}
+    pvals = {}
+    effects = {}
+    log.info(f"Kruskal-Wallis test: evaluating {data.shape[0]} features for '{category}'")
+    for feat in data.index:
+        samples = [data.loc[feat, idx_by_grp[g]].values for g in groups]
+        # Constant vectors yield p=1
+        if all(np.allclose(s, s[0]) for s in samples):
+            p = 1.0
+            eff = 0.0
         else:
-            raise ValueError("Invalid test_type")
-        p_values.append(p_val)
-        # Calculate log fold change between each pair of groups for each feature
-        for i in range(len(groups)):
-            for j in range(i + 1, len(groups)):
-                mean_i = np.mean(samples[i])
-                mean_j = np.mean(samples[j])
-                log_fold_change = np.log2(mean_i / mean_j)
-                column_name = f"LFC_{groups[i]}_vs_{groups[j]}"
-                log_fold_changes.loc[feature, column_name] = log_fold_change
+            _, p = stats.kruskal(*samples)
+            medians = [np.median(s) for s in samples]
+            eff = max(abs(m1 - m2) for i, m1 in enumerate(medians)
+                                          for m2 in medians[i + 1 :])
+        pvals[feat] = p
+        effects[feat] = eff
 
-    corrected_p_values = multipletests(p_values, alpha=significance_level, method='fdr_bh')[1]
-    
-    # Create the final dataframe with feature name, p value, corrected p value, and log-fold-change columns
-    results_df = pd.DataFrame(index=data.index)
-    results_df['p_value'] = p_values
-    results_df['corrected_p_value'] = corrected_p_values
-    results_df = results_df.join(log_fold_changes)
+    pvals_s = pd.Series(pvals, name="pvalue")
+    eff_s = pd.Series(effects, name="effect")
+    adj, sig_mask = _fdr_correct(pvals_s.values, alpha=significance_level)
+    adj_s = pd.Series(adj, index=pvals_s.index, name="adj_pvalue")
+    # Apply both thresholds
+    passes = (sig_mask) & (eff_s.abs() >= lfc_cutoff)
+    selected = passes[passes].index.tolist()
+    if len(selected) > max_features:
+        selected = eff_s.loc[selected].abs().sort_values(ascending=False).index[:max_features].tolist()
+    log.info(f"Kruskal-Wallis selected {len(selected)} features")
+    return data.loc[selected]
 
-    # Subset the dataframe by significant features and log-fold-change
-    significant_features = data[(results_df['corrected_p_value'] <= significance_level) & (results_df.iloc[:, 2:].abs() >= lfc_level).any(axis=1)]
-    significant_features['padj'] = results_df.loc[significant_features.index, 'corrected_p_value']
-    print(f"Found {significant_features.shape[0]} significant features (out of {data.shape[0]}) based on '{attribute}' attribute using {test_type} test. Keeping only these features.\n")
+def feature_list_selection(
+    data: pd.DataFrame,
+    feature_list_file: Union[str, Path],
+    max_features: int = 10000,
+) -> pd.DataFrame:
+    """
+    Subset features by a user-provided list (one feature name per line).
+    """
+    path = Path(feature_list_file)
+    if not path.is_file():
+        raise ValueError(f"Feature list file not found: {path}")
+    feature_list = pd.read_csv(path, header=None, sep="\s+", engine="python")[0].astype(str).tolist()
+    intersect = list(set(data.index).intersection(feature_list))
+    if not intersect:
+        log.warning("No features from the list were present in the data matrix.")
+        return pd.DataFrame()
+    # Respect max_features – keep order as in the original list (if possible)
+    ordered = [f for f in feature_list if f in intersect][:max_features]
+    log.info(f"Feature list selection: using file {feature_list_file}, max {max_features} features.")
+    return data.loc[ordered]
 
-    print("Writing summary stats table...")
-    write_integration_file(data=results_df, output_dir=output_dir, filename=stats_results_filename, indexing=True)
+def lasso_selection(
+    data: pd.DataFrame,
+    metadata: pd.DataFrame,
+    category: str,
+    max_features: int = 5000,
+) -> pd.DataFrame:
+    """
+    Fit LassoCV to predict a continuous category variable from all features.
+    Returns the top-`max_features` features by absolute coefficient magnitude.
+    """
+    if category not in metadata.columns:
+        raise ValueError(f"Target column '{category}' missing.")
 
-    return significant_features
+    # Check if category can be coerced to float
+    try:
+        y = metadata[category].astype(float).values
+    except Exception:
+        raise ValueError(f"Target column '{category}' is probably not continuous and cannot be coerced to float. Choose a different category or selection method.")
+
+    X = data.T.values  # samples × features
+    lasso = LassoCV(cv=5, n_jobs=-1, random_state=0).fit(X, y)
+    coef = pd.Series(np.abs(lasso.coef_), index=data.index, name="lasso_importance")
+    top = _subset_by_rank(coef.to_frame(), "lasso_importance", max_features, ascending=False)
+    log.info(f"Lasso selection: fitting model for {category}, selecting top {max_features} features.")
+    return data.loc[top]
+
+def random_forest_selection(
+    data: pd.DataFrame,
+    metadata: pd.DataFrame,
+    category: str,
+    max_features: int = 5000,
+) -> pd.DataFrame:
+    """
+    Train a random-forest model (regressor if target numeric, classifier otherwise)
+    and return the top-`max_features` features by Gini importance.
+    """
+    if category not in metadata.columns:
+        raise ValueError(f"Target column '{category}' missing.")
+
+    y_raw = metadata[category]
+    is_numeric = pd.api.types.is_numeric_dtype(y_raw)
+    y = y_raw.astype(float).values if is_numeric else y_raw.astype(str).values
+    X = data.T.values
+
+    if is_numeric:
+        model = RandomForestRegressor(
+            n_estimators=500, max_features="sqrt", n_jobs=-1, random_state=0
+        )
+    else:
+        model = RandomForestClassifier(
+            n_estimators=500, max_features="sqrt", n_jobs=-1, random_state=0
+        )
+    model.fit(X, y)
+    imp = pd.Series(model.feature_importances_, index=data.index, name="rf_importance")
+    top = _subset_by_rank(imp.to_frame(), "rf_importance", max_features, ascending=False)
+    log.info(f"Random forest selection: fitting model for {category}, selecting top {max_features} features.")
+    return data.loc[top]
+
+def mutual_info_selection(
+    data: pd.DataFrame,
+    metadata: pd.DataFrame,
+    category: str,
+    max_features: int = 5000,
+) -> pd.DataFrame:
+    """
+    Estimate (non-linear) mutual information between each feature and the target.
+    Uses `mutual_info_regression` for continuous targets, otherwise
+    `mutual_info_classif`. Returns the top-`max_features` features.
+    """
+    if category not in metadata.columns:
+        raise ValueError(f"Target column '{category}' missing.")
+    try:
+        from sklearn.feature_selection import mutual_info_regression, mutual_info_classif
+    except Exception as exc:
+        raise ValueError("scikit-learn is required for mutual information.") from exc
+
+    y_raw = metadata[category]
+    is_numeric = pd.api.types.is_numeric_dtype(y_raw)
+    y = y_raw.astype(float).values if is_numeric else y_raw.astype(str).values
+    X = data.T.values
+    if is_numeric:
+        mi = mutual_info_regression(X, y, random_state=0)
+    else:
+        mi = mutual_info_classif(X, y, random_state=0)
+    mi_series = pd.Series(mi, index=data.index, name="mutual_info")
+    top = _subset_by_rank(mi_series.to_frame(), "mutual_info", max_features, ascending=False)
+    log.info(f"Mutual information selection: evaluating {data.shape[0]} features for {category}, selecting top {max_features}.")
+    return data.loc[top]
 
 def perform_feature_selection(
     data: pd.DataFrame,
     metadata: pd.DataFrame,
-    output_filename: str = "feature_selection_table.csv",
-    subset_method: str = "variance",
-    significance_level: float = 0.05,
-    lfc_level: float = 0.5,
-    category_column: str = None,
-    reference_group: str = None,
+    config: Dict[str, Any],
+    max_features: int = 5000,
     output_dir: str = None,
-    feature_cutoff: int = 5000,
-    overwrite: bool = False,
-    feature_list_file: str = None
+    output_filename: str = None
 ) -> pd.DataFrame:
     """
-    Subset features prior to network analysis using various methods.
+    High-level driver that looks at config["analysis"]["analysis_parameters"]
+    ["feature_selection"] and calls the appropriate selection function.
 
-    Args:
-        data (pd.DataFrame): Feature matrix (features x samples).
-        metadata (pd.DataFrame): Metadata DataFrame.
-        output_filename (str): Filename for the feature selection table.
-        subset_method (str): Method for subsetting ('variance', 'glm', 'kruskalwallis', 'feature_list', 'none').
-        significance_level (float): FDR-corrected p-value cutoff.
-        lfc_level (float): Minimum absolute log2 fold change.
-        category_column (str): Metadata column for group comparison.
-        reference_group (str): Reference group for GLM.
-        output_dir (str): Directory to write results.
-        feature_cutoff (int): Maximum number of features to retain.
-        overwrite (bool): Whether to overwrite existing results.
-        feature_list_file (str): Path to file with list of features to keep.
+    It validates that all required keys for the chosen method exist,
+    writes the resulting subset to output_dir using the filename
+    feature_selection_table.csv (or the name you set in the config),
+    and returns the subsetted matrix.
 
-    Returns:
-        pd.DataFrame: Subsetted feature matrix.
     """
 
-    # Always use this filename for the output table
-    selection_table_path = f"{output_dir}/{output_filename}"
+    method = config.get("selected_method")
+    if not method:
+        raise ValueError("'selected_method' not defined in config.")
+    method = method.lower().strip()
 
-    if os.path.exists(selection_table_path) and not overwrite:
-        print(f"Feature selection table already exists: {selection_table_path}. \nReturning and skipping calculation...")
-        return pd.read_csv(selection_table_path, index_col=0)
+    # Check that data and metadata have the same samples and subset accordingly
+    common_samples = data.columns.intersection(metadata.index)
+    if len(common_samples) < 3:
+        raise ValueError("Data and metadata have fewer than 3 samples in common.")
+    if len(common_samples) < data.shape[1]:
+        log.info(f"Data and metadata have {len(common_samples)} samples in common, "
+                    f"but data has {data.shape[1]} samples. Subsetting data.")
+        data = data[common_samples]
+    if len(common_samples) < metadata.shape[0]:
+        log.info(f"Data and metadata have {len(common_samples)} samples in common, "
+                  f"but metadata has {metadata.shape[0]} samples. Subsetting metadata.")
+        metadata = metadata.loc[common_samples]
 
-    if subset_method == "none":
-        print(f"\nNot subsetting dataset by any statistical methods and printing/returning data...\n")
-        write_integration_file(data=data, output_dir=output_dir, filename=output_filename, indexing=True)
-        return data
+    # Map method name → function and its required keys
+    method_map: Dict[str, Tuple[Callable, List[str]]] = {
+        "variance": (variance_selection, ["variance"]),
+        "glm": (glm_selection, ["glm"]),
+        "kruskalwallis": (kruskal_selection, ["kruskalwallis"]),
+        "feature_list": (feature_list_selection, ["feature_list"]),
+        "lasso": (lasso_selection, ["lasso"]),
+        "random_forest": (random_forest_selection, ["random_forest"]),
+        "mutual_info": (mutual_info_selection, ["mutual_info"]),
+    }
 
-    elif subset_method == "glm":
-        print(f"\nRunning GLM model on {data.shape[0]} features in integrated dataset to find significant features across samples...\n")
-        lfc_table, pval_table = glm_for_differential_abundance(data, metadata, category_column, reference_group, output_dir, threshold=significance_level)
-        summary_stats_table = pd.concat([lfc_table, pval_table], axis=1)
-        summary_stats_table.index.name = "features"
-        pval_table['psum'] = pval_table.iloc[:, 1:-1].sum(axis=1)
-        pval_table.sort_values('psum', inplace=True)
-        pval_table.drop(columns=['psum'], inplace=True)
-        sig_indexes_pval = (pval_table.iloc[:, 1:-1] <= significance_level).any(axis=1)
-        sig_indexes_lfc = (lfc_table.iloc[:, 1:-1] >= lfc_level).any(axis=1)
-        sig_indexes = sig_indexes_pval & sig_indexes_lfc
-        combined_df_subset = data[sig_indexes]
-        combined_df_subset = combined_df_subset.reindex(pval_table.index).dropna()
-        if combined_df_subset.shape[0] == 0:
-            print(f"No features were found after running GLM model.")
-            write_integration_file(data=combined_df_subset, output_dir=output_dir, filename=output_filename, indexing=True)
-            return None
-        else:
-            print(f"{combined_df_subset.shape[0]} features with GLM model p-value<{significance_level} and LFC>{lfc_level} were selected for network analysis.\n")
-            if combined_df_subset.shape[0] > feature_cutoff:
-                print(f"\tNote! More than {feature_cutoff} features were output from GLM model. Need to subset to top {feature_cutoff} for network analysis.\n")
-                combined_df_subset = combined_df_subset.iloc[:feature_cutoff]
-            print("Writing significant features table...")
-            write_integration_file(data=combined_df_subset, output_dir=output_dir, filename=output_filename, indexing=True)
-        return combined_df_subset
+    if method not in method_map:
+        raise ValueError(f"Unsupported feature-selection method '{method}'. "
+                                   f"Supported: {list(method_map)}")
 
-    elif subset_method == "kruskalwallis":
-        print(f"\nRunning {subset_method} test on {data.shape[0]} features in integrated dataset to subset by those significantly associated with '{category_column}' variable...\n")
-        combined_df_subset = run_kruskalwallis_test(data=data, integrated_metadata=metadata, attribute=category_column, lfc_level=lfc_level, \
-                                                    test_type=subset_method, significance_level=significance_level, output_dir=output_dir,
-                                                    stats_results_filename=f"{subset_method}_summary_stats_on_{category_column}")
-        if combined_df_subset is not None and 'padj' in combined_df_subset.columns:
-            combined_df_subset = combined_df_subset.sort_values(by='padj').drop(columns=['padj'])
-        if combined_df_subset is None or combined_df_subset.shape[0] == 0:
-            print(f"No features were found to be significantly associated with '{category_column}' group using a {subset_method} test at alpha={significance_level} and lfc={lfc_level}.\n")
-            write_integration_file(data=pd.DataFrame(), output_dir=output_dir, filename=output_filename, indexing=True)
-            return None
-        else:
-            print(f"""{combined_df_subset.shape[0]} features are significantly (alpha={significance_level}) associated with '{category_column}' variable.""")
-            if combined_df_subset.shape[0] > feature_cutoff:
-                print(f"\tNote! More features than allowed by feature cutoff were identified. Need to subset to top {feature_cutoff} for network analysis.\n")
-                combined_df_subset = combined_df_subset.iloc[:feature_cutoff]
-            print("Writing significant features table...")
-            write_integration_file(data=combined_df_subset, output_dir=output_dir, filename=output_filename, indexing=True)
-        return combined_df_subset
+    selection_function, selection_parameters = method_map[method]
 
-    elif subset_method == "variance":
-        print(f"\nRunning variance test on {data.shape[0]} features in integrated dataset to subset by those with highest variance across samples...\n")
-        combined_df_subset = data.loc[data.var(axis=1).sort_values(ascending=False).head(feature_cutoff).index]
-        if combined_df_subset.shape[0] == 0:
-            print(f"""No features were found after {subset_method} sorting.""")
-            write_integration_file(data=combined_df_subset, output_dir=output_dir, filename=output_filename, indexing=True)
-            return None
-        else:
-            print(f"""{combined_df_subset.shape[0]} features with the highest variance were selected for network analysis.""")
-            print("\nWriting significant features table...")
-            write_integration_file(data=combined_df_subset, output_dir=output_dir, filename=output_filename, indexing=True)
-        return combined_df_subset
+    kwargs: Dict[str, Any] = {}
+    for block in selection_parameters:
+        block_cfg = config.get(block, {})
+        if not isinstance(block_cfg, dict):
+            raise ValueError(f"Configuration for '{block}' must be a mapping.")
+        kwargs.update(block_cfg)
+    
+    kwargs["max_features"] = max_features
+    kwargs["data"] = data
+    if selection_function is not feature_list_selection and \
+       selection_function is not variance_selection:
+        kwargs["metadata"] = metadata
 
-    elif subset_method == "feature_list":
-        if os.path.exists(os.path.join(output_dir, feature_list_file)) is False:
-            print(f"Feature list file does not exist: {feature_list_file}. Please provide a valid file path.")
-            write_integration_file(data=pd.DataFrame(), output_dir=output_dir, filename=output_filename, indexing=True)
-            return None
-        print(f"\nSubsetting {data.shape[0]} features in integrated dataset by a specific feature list...\n")
-        feature_list = pd.read_csv(os.path.join(output_dir, feature_list_file), header=None).iloc[:, 0].tolist()
-        combined_df_subset = data.loc[data.index.isin(feature_list)]
-        if combined_df_subset.shape[0] == 0:
-            print(f"No features from feature list were found in data")
-            write_integration_file(data=combined_df_subset, output_dir=output_dir, filename=output_filename, indexing=True)
-            return None
-        else:
-            print(f"{combined_df_subset.shape[0]} features from the input list were selected for network analysis.")
-            print("Writing selected features table...")
-            write_integration_file(data=combined_df_subset, output_dir=output_dir, filename=output_filename, indexing=True)
-        return combined_df_subset
+    log.info(f"Performing feature selection using method '{method}'.")
+    try:
+        subset = selection_function(**kwargs)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Error while executing method '{method}': {exc}") from exc
 
-    else:
-        print("Please select a valid subsetting method: 'none', 'glm', 'kruskalwallis', 'variance', or 'feature_list'")
-        write_integration_file(data=pd.DataFrame(), output_dir=output_dir, filename=output_filename, indexing=True)
-        return None
+    log.info(f"Feature selection complete.")
+    log.info(f"Selected {subset.shape[0]} features out of {data.shape[0]} total.")
+    write_integration_file(subset, output_dir, output_filename, indexing=True)
+    return subset
 
 def _set_up_matrix(
     X: np.ndarray,
@@ -581,6 +608,7 @@ def bipartite_correlation(
         Columns ``['transcript', 'metabolite', 'correlation']``.
     """
 
+    log.info("Starting bipartite correlation computation...")
     # Create feature type designation based on prefixes
     ftype = pd.Series(
         [
@@ -593,6 +621,7 @@ def bipartite_correlation(
     )
     if ftype.isnull().any():
         invalid = ftype[ftype.isnull()].index.tolist()
+        log.info(f"Invalid feature names detected: {invalid}")
         raise ValueError(f"Feature names must start with 'tx_' or 'mx_'. Invalid: {invalid}")
 
     # Basic checks
@@ -605,6 +634,8 @@ def bipartite_correlation(
     }:
         raise ValueError(f"Unsupported method '{method}'.")
 
+    log.info(f"Using method: {method}, cutoff: {cutoff}, keep_negative: {keep_negative}, block_size: {block_size}, n_jobs: {n_jobs}, only_bipartite: {only_bipartite}")
+
     # Identify transcript & metabolite column indices (after transpose)
     X = data.T.values.astype(np.float64, copy=False)   # (n_samples, n_features)
     feature_names = data.index.to_numpy()
@@ -614,17 +645,23 @@ def bipartite_correlation(
     trans_idx = np.where(is_transcript)[0]
     metab_idx = np.where(~is_transcript)[0]
 
+    log.info(f"Found {len(trans_idx)} transcripts and {len(metab_idx)} metabolites.")
+
     # If only_bipartite, keep current logic
     # If not, set both indices to all features
     if only_bipartite:
         pairs = [(trans_idx, metab_idx)]
+        log.info("Computing only bipartite correlations (transcript ↔ metabolite).")
     else:
         # All pairs (including within group)
         all_idx = np.arange(n_features)
         pairs = [(all_idx, all_idx)]
+        log.info("Computing all pairwise correlations (including within group).")
 
     # Transform data once according to the requested similarity
+    log.info("Transforming data matrix for correlation computation...")
     Z, scale = _set_up_matrix(X, method)
+    log.info("Data transformation complete.")
 
     # Block-wise computation
     def _process_block(i_idx, j_idx, t_start: int, t_end: int) -> List[Tuple[int, int, float]]:
@@ -646,29 +683,36 @@ def bipartite_correlation(
                     keep_negative,
                 )
             )
+        log.info(f"Processed block {t_start}:{t_end} of transcripts against metabolites.")
         return block_results
 
     # Parallel over blocks
     all_pairs: List[Tuple[int, int, float]] = []
     for i_idx, j_idx in pairs:
+        log.info(f"Processing {len(i_idx)} transcript features in blocks of {block_size}...")
         if n_jobs == 1:
             for t_start in range(0, len(i_idx), block_size):
                 t_end = min(t_start + block_size, len(i_idx))
+                log.info(f"Processing transcript block {t_start}:{t_end}...")
                 all_pairs.extend(_process_block(i_idx, j_idx, t_start, t_end))
         else:
             n_jobs_eff = -1 if n_jobs == -1 else n_jobs
+            log.info(f"Processing in parallel with {n_jobs_eff} jobs...")
             parallel = Parallel(n_jobs=n_jobs_eff, backend="loky", verbose=0)
             chunks = parallel(
                 delayed(_process_block)(i_idx, j_idx, t_start, min(t_start + block_size, len(i_idx)))
                 for t_start in range(0, len(i_idx), block_size)
             )
+            log.info("Parallel block processing complete.")
             all_pairs.extend([pair for sublist in chunks for pair in sublist])
 
     if not all_pairs:
         empty_df = pd.DataFrame(columns=["transcript", "metabolite", "correlation"])
-        print("Warning: No pairs passed the correlation cutoff. Returning empty DataFrame.")
+        log.info("Warning: No pairs passed the correlation cutoff. Returning empty DataFrame.")
         write_integration_file(data=empty_df, output_dir=output_dir, filename=output_filename, indexing=True)
+        return empty_df
 
+    log.info(f"Total pairs passing cutoff: {len(all_pairs)}")
     tr_idx, met_idx, sims = zip(*all_pairs)
     df = pd.DataFrame(
         {
@@ -680,7 +724,9 @@ def bipartite_correlation(
     df["abs_corr"] = np.abs(df["correlation"])
     df = df.sort_values("abs_corr", ascending=False).drop(columns="abs_corr")
 
+    log.info(f"Writing correlation results to {output_dir}/{output_filename}.csv")
     write_integration_file(data=df, output_dir=output_dir, filename=output_filename, indexing=True)
+    log.info("Bipartite correlation computation complete.")
     return df
 
 def _make_prefix_maps(prefixes: List[str]) -> Tuple[Dict[str, str], Dict[str, str]]:
@@ -720,11 +766,11 @@ def _build_sparse_adj(
         def _assign_prefix(arr):
             out = np.empty(len(arr), dtype=object)
             out[:] = ""
+            arr_str = arr.astype(str)
             for pref in prefixes:
-                hits = np.char.startswith(arr, pref)
+                hits = np.char.startswith(arr_str, pref)
                 out[hits] = pref
             return out
-
         row_pref = _assign_prefix(rows)
         col_pref = _assign_prefix(cols)
         # keep only pairs whose prefixes differ (and are non-empty)
@@ -748,7 +794,7 @@ def _graph_from_sparse(
     Convert a COO adjacency matrix to a networkx Graph with the original
     node names as labels.
     """
-    G = nx.from_scipy_sparse_matrix(adj, edge_attribute="weight", create_using=nx.Graph())
+    G = nx.from_scipy_sparse_array(adj, edge_attribute="weight", create_using=nx.Graph())
     mapping = dict(enumerate(node_names))
     return nx.relabel_nodes(G, mapping)
 
@@ -876,7 +922,7 @@ def _detect_submodules(
                      "Choose from 'subgraphs', 'louvain', 'leiden', 'wgcna'.")
 
 def plot_correlation_network(
-    correlation_matrix: pd.DataFrame,
+    corr_table: pd.DataFrame,
     feature_prefixes: List[str],
     integrated_data: pd.DataFrame,
     integrated_metadata: pd.DataFrame,
@@ -899,15 +945,11 @@ def plot_correlation_network(
     if network_mode not in {"bipartite", "full"}:
         raise ValueError("network_mode must be 'bipartite' or 'full'")
 
-    # Pivot → square matrix (features × features)
-    if network_mode == "bipartite":
-        correlation_df = correlation_matrix.pivot(
-            index="feature_2", columns="feature_1", values="correlation"
-        ).fillna(0.0)
-    else:  # full
-        correlation_df = correlation_matrix.pivot(
-            index="feature_2", columns="feature_1", values="correlation"
-        ).fillna(0.0)
+    # Get all unique features
+    all_features = pd.Index(sorted(set(corr_table["feature_1"]).union(set(corr_table["feature_2"]))))
+
+    # Pivot and reindex to ensure square matrix
+    correlation_df = corr_table.pivot(index="feature_2", columns="feature_1", values="correlation").reindex(index=all_features, columns=all_features, fill_value=0.0)
 
     # Build sparse adjacency (edges only above cutoff)
     sparse_adj = _build_sparse_adj(
@@ -916,7 +958,7 @@ def plot_correlation_network(
 
     # Create networkx graph (node names = original feature IDs)
     G = _graph_from_sparse(sparse_adj, correlation_df.index.to_numpy())
-    print(f"\tGraph built -  {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
+    log.info(f"\tGraph built -  {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
 
     # Node aesthetics (color / shape) and optional annotation
     color_map, shape_map = _make_prefix_maps(feature_prefixes)
@@ -926,7 +968,7 @@ def plot_correlation_network(
     tiny = [c for c in nx.connected_components(G) if len(c) < 3]
     if tiny:
         G.remove_nodes_from({n for comp in tiny for n in comp})
-        print(f"\tRemoved {len(tiny)} tiny components (<3 nodes).")
+        log.info(f"\tRemoved {len(tiny)} tiny components (<3 nodes).")
 
     # Export the raw graph (before submodule annotation)
     nx.write_graphml(G, output_filenames["graph"])
@@ -934,7 +976,7 @@ def plot_correlation_network(
     node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient="index")
     node_table.to_csv(output_filenames["node_table"], index_label="node_id")
     edge_table.to_csv(output_filenames["edge_table"], index_label="edge_index")
-    print("\tRaw graph, node table and edge table written to disk.")
+    log.info("\tRaw graph, node table and edge table written to disk.")
 
     # submodule detection
     if submodule_mode not in {"none", "subgraphs", "louvain", "leiden", "wgcna"}:
@@ -943,7 +985,7 @@ def plot_correlation_network(
             "'none', 'subgraphs', 'louvain', 'leiden', 'wgcna'"
         )
     if submodule_mode != "none":
-        print(f"Detecting submodules using '{submodule_mode}' …")
+        log.info(f"Detecting submodules using '{submodule_mode}' …")
         submods = _detect_submodules(
             G,
             method=submodule_mode,
@@ -967,16 +1009,77 @@ def plot_correlation_network(
         node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient="index")
         node_table.to_csv(output_filenames["node_table"], index_label="node_id")
         edge_table.to_csv(output_filenames["edge_table"], index_label="edge_index")
-        print("\tMain graph updated with submodule annotations and written to disk.")
+        log.info("\tMain graph updated with submodule annotations and written to disk.")
 
     # interactive plot
     if show_plot_in_notebook:
-        plt.figure(figsize=(12, 8))
-        pos = nx.forceatlas2_layout(G)
-        node_cols = [G.nodes[n]["datatype_color"] for n in G.nodes()]
-        nx.draw(G, pos, with_labels=False, node_size=200,
-                node_color=node_cols, font_size=1)
-        plt.show()
+        try:
+            import plotly.graph_objects as go
+            pos = nx.spring_layout(G, seed=42)  # or use nx.forceatlas2_layout(G) if available
+            edge_x = []
+            edge_y = []
+            for edge in G.edges():
+                x0, y0 = pos[edge[0]]
+                x1, y1 = pos[edge[1]]
+                edge_x += [x0, x1, None]
+                edge_y += [y0, y1, None]
+            edge_trace = go.Scatter(
+                x=edge_x, y=edge_y,
+                line=dict(width=0.5, color='#888'),
+                hoverinfo='none',
+                mode='lines'
+            )
+            node_x = []
+            node_y = []
+            node_color = []
+            for node in G.nodes():
+                x, y = pos[node]
+                node_x.append(x)
+                node_y.append(y)
+                if submodule_mode != "none":
+                    node_color.append(G.nodes[node].get("submodule_color", "#888"))
+                else:
+                    node_color.append(G.nodes[node].get("datatype_color", "#888"))
+            node_trace = go.Scatter(
+                x=node_x, y=node_y,
+                mode='markers',
+                hoverinfo='text',
+                marker=dict(
+                    showscale=True,
+                    colorscale='Viridis',
+                    color=node_color,
+                    size=10,
+                    colorbar=dict(
+                        thickness=15,
+                        title='Node Color',
+                        xanchor='left',
+                        titleside='right'
+                    )
+                ),
+                text=[str(n) for n in G.nodes()]
+            )
+            fig = go.Figure(data=[edge_trace, node_trace],
+                            layout=go.Layout(
+                                title='Interactive Network',
+                                showlegend=False,
+                                hovermode='closest',
+                                margin=dict(b=20,l=5,r=5,t=40),
+                                xaxis=dict(showgrid=False, zeroline=False),
+                                yaxis=dict(showgrid=False, zeroline=False)
+                            ))
+            fig.show()
+        except Exception as e:
+            log.info(f"Plotly interactive network failed: {e}")
+            # fallback to matplotlib
+            plt.figure(figsize=(12, 8))
+            pos = nx.spring_layout(G)
+            if submodule_mode != "none":
+                node_cols = [G.nodes[n]["submodule_color"] for n in G.nodes()]
+            else:
+                node_cols = [G.nodes[n]["datatype_color"] for n in G.nodes()]
+            nx.draw(G, pos, with_labels=False, node_size=200,
+                    node_color=node_cols, font_size=1)
+            plt.show()
 
 def _annotate_and_save_submodules(
     submodules: List[Tuple[str, nx.Graph]],
@@ -1088,7 +1191,7 @@ def find_mx_parent_folder(
         datatype = "quant"
 
     if filtered_mx and datatype == "quant":
-        print("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
+        log.info("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
         return None
     
     if polarity == "multipolarity":
@@ -1096,11 +1199,11 @@ def find_mx_parent_folder(
     elif polarity in ["positive", "negative"]:
         mx_data_pattern = f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}.csv"
     else:
-        print(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
+        log.info(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
         return None
 
     if glob.glob(os.path.expanduser(mx_data_pattern)) and not overwrite:
-        print("MX folder already downloaded and linked.")
+        log.info("MX folder already downloaded and linked.")
         return None
     elif glob.glob(os.path.expanduser(mx_data_pattern)) and overwrite:
         raise ValueError("You are not currently authorized to download or overwrite metabolomics data from source. Please contact your JGI project manager for access.")
@@ -1109,7 +1212,7 @@ def find_mx_parent_folder(
 
     # Find project folder
     cmd = f"rclone lsd JGI_Metabolomics_Projects: | grep -E '{pid}|{pi_name}'"
-    print("Finding MX parent folders...\n")
+    log.info("Finding MX parent folders...\n")
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     
     if result.stdout:
@@ -1120,7 +1223,7 @@ def find_mx_parent_folder(
         mx_parent = mx_parent[["ix", "date", "time", "folder"]]
         mx_final_folders = []
         # For each possible project folder (some will not be the right "final" folder)
-        print("Finding MX final folders...\n")
+        log.info("Finding MX final folders...\n")
         for project_folder in mx_parent["folder"].values:
             cmd = f"rclone lsd --max-depth 2 JGI_Metabolomics_Projects:{project_folder}"
             try:
@@ -1146,11 +1249,11 @@ def find_mx_parent_folder(
             ~mx_final_combined["folder"].str.contains("pilot", case=False)
         ]
         if untargeted_mx_final.shape[0] > 1:
-            print("Warning! Multiple untargeted MX final folders found:")
-            print(untargeted_mx_final)
+            log.info("Warning! Multiple untargeted MX final folders found:")
+            log.info(untargeted_mx_final)
             return None
         elif untargeted_mx_final.shape[0] == 0:
-            print("Warning! No untargeted MX final folders found.")
+            log.info("Warning! No untargeted MX final folders found.")
             return None
         else:
             final_results_folder = f"{untargeted_mx_final['parent_folder'].values[0]}/{untargeted_mx_final['folder'].values[0]}"
@@ -1160,11 +1263,11 @@ def find_mx_parent_folder(
             script_file.write(f"cd {script_dir}/\n")
             script_file.write(f"rclone lsd --max-depth 2 JGI_Metabolomics_Projects:{untargeted_mx_final['parent_folder'].values[0]}")
         
-        print("Using the following metabolomics final results folder for further analysis:\n")
-        print(untargeted_mx_final)
+        log.info("Using the following metabolomics final results folder for further analysis:\n")
+        log.info(untargeted_mx_final)
         return final_results_folder
     else:
-        print(f"Warning! No folders could be found with rclone lsd command: {cmd}")
+        log.info(f"Warning! No folders could be found with rclone lsd command: {cmd}")
         return None
 
 def gather_mx_files(
@@ -1200,7 +1303,7 @@ def gather_mx_files(
         datatype = "quant"
 
     if filtered_mx and datatype == "quant":
-        print("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
+        log.info("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
         return None
 
     if polarity == "multipolarity":
@@ -1208,11 +1311,11 @@ def gather_mx_files(
     elif polarity in ["positive", "negative"]:
         mx_data_pattern = f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}.csv"
     else:
-        print(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
+        log.info(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
         return None
 
     if glob.glob(os.path.expanduser(mx_data_pattern)) and not overwrite:
-        print("MX data already linked.")
+        log.info("MX data already linked.")
         return "Archive already linked", "Archive already extracted"
     else:
         raise ValueError("You are not currently authorized to download metabolomics data from source. Please contact your JGI project manager for access.")
@@ -1226,7 +1329,7 @@ def gather_mx_files(
         script_file.write(f"cd {script_dir}/\n")
         script_file.write(f"rclone copy --include '*{chromatography}*.zip' --stats-one-line -v --max-depth 1 JGI_Metabolomics_Projects:{mx_untargeted_remote} {mx_dir};")
     
-    print("Linking MX files...\n")
+    log.info("Linking MX files...\n")
     result = subprocess.run(f"chmod +x {script_name} && {script_name}", shell=True, check=True, capture_output=True, text=True)
 
     if result.stdout or result.stderr:
@@ -1240,7 +1343,7 @@ def gather_mx_files(
         else:
             return archives
     else:
-        print(f"Warning! No files could be found with rclone copy command in {script_name}")
+        log.info(f"Warning! No files could be found with rclone copy command in {script_name}")
         return None
 
 def extract_mx_archives(mx_dir: str, chromatography: str) -> pd.DataFrame:
@@ -1256,7 +1359,7 @@ def extract_mx_archives(mx_dir: str, chromatography: str) -> pd.DataFrame:
     """
     
     cmd = f"for archive in {mx_dir}/*{chromatography}*zip; do newdir={mx_dir}/$(basename $archive .zip); rm -rf $newdir; mkdir -p $newdir; unzip -j $archive -d $newdir; done"
-    print("Extracting the following archive to be used for MX data input:\n")
+    log.info("Extracting the following archive to be used for MX data input:\n")
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     
     if result.stdout:
@@ -1266,7 +1369,7 @@ def extract_mx_archives(mx_dir: str, chromatography: str) -> pd.DataFrame:
         df.iloc[:, 1] = df.iloc[:, 1].str.replace(f"{mx_dir}/", "", regex=False)
         return df
     else:
-        print(f"No archives could be decompressed with unzip command: {cmd}")
+        log.info(f"No archives could be decompressed with unzip command: {cmd}")
         return None
 
 
@@ -1292,7 +1395,7 @@ def find_tx_files(
     """
     
     if os.path.exists(f"{tx_dir}/tx_files.txt") and overwrite is False:
-        print("TX files already found.")
+        log.info("TX files already found.")
         return pd.DataFrame()
     else:
         raise ValueError("You are not currently authorized to download transcriptomics data from source. Please contact your JGI project manager for access.")
@@ -1305,14 +1408,14 @@ def find_tx_files(
     if not os.path.exists(os.path.dirname(script_name)):
         os.makedirs(os.path.dirname(script_name))
     
-    print("Creating script to find TX files...\n")
+    log.info("Creating script to find TX files...\n")
     script_content = (
         f"jamo report select _id,metadata.analysis_project.analysis_project_id,metadata.library_name,metadata.analysis_project.status_name where "
         f"metadata.proposal_id={pid} file_name=counts.txt "
         f"| sed 's/\\[//g' | sed 's/\\]//g' | sed 's/u'\\''//g' | sed 's/'\\''//g' | sed 's/ //g' > {file_list}"
     )
 
-    print("Finding TX files...\n")
+    log.info("Finding TX files...\n")
     subprocess.run(
         f"echo \"{script_content}\" > {script_name} && chmod +x {script_name} && module load jamo && source {script_name}",
         shell=True, check=True
@@ -1343,7 +1446,7 @@ def find_tx_files(
             ref_data["APID"] = apid
             return ref_data
         except Exception as e:
-            print(f"Error fetching refs for {apid}: {e}")
+            log.info(f"Error fetching refs for {apid}: {e}")
             return pd.DataFrame({"ref_name": [np.nan], "ref_genome": [np.nan], "ref_transcriptome": [np.nan], "ref_gff": [np.nan], "ref_protein_kegg": [np.nan], "APID": [apid]})
     
     refs = pd.concat([fetch_refs(apid) for apid in files["APID"].unique()], ignore_index=True)
@@ -1355,12 +1458,12 @@ def find_tx_files(
     files.reset_index(drop=True)
     
     if files.shape[0] > 0:
-        print(f"Using the value of 'tx_index' ({tx_index}) from the config file to choose the correct 'ix' column (change if incorrect): \n")
+        log.info(f"Using the value of 'tx_index' ({tx_index}) from the config file to choose the correct 'ix' column (change if incorrect): \n")
         files.to_csv(f"{tx_dir}/jamo_report_tx_files.txt", sep="\t", index=False)
         display(files)
         return files
     else:
-        print("No files found.")
+        log.info("No files found.")
         return None
 
 def gather_tx_files(
@@ -1385,7 +1488,7 @@ def gather_tx_files(
     """
 
     if glob.glob(f"{tx_dir}/*counts.txt") and os.path.exists(f"{tx_dir}/tx_files.txt") and overwrite is False:
-        print("TX files already linked.")
+        log.info("TX files already linked.")
         tx_files = pd.read_csv(f"{tx_dir}/jamo_report_tx_files.txt", sep="\t")
         apid = int(tx_files.iloc[tx_index-1:,2].values)
         return apid
@@ -1394,12 +1497,12 @@ def gather_tx_files(
 
 
     if tx_index is None:
-        print("There may be multiple APIDS or analyses for a given PI/Proposal ID and you have not specified which one to use!")
-        print("Please set 'tx_index' in the project config file by choosing the correct row from the table above.\n")
+        log.info("There may be multiple APIDS or analyses for a given PI/Proposal ID and you have not specified which one to use!")
+        log.info("Please set 'tx_index' in the project config file by choosing the correct row from the table above.\n")
         sys.exit(1)
 
     script_name = f"{script_dir}/gather_tx_files.sh"
-    print("Linking TX files...\n")
+    log.info("Linking TX files...\n")
 
     with open(script_name, "w") as script_file:
         script_file.write(f"cd {script_dir}/\n")
@@ -1438,7 +1541,7 @@ def gather_tx_files(
                             ln -sf {file_path} {tx_dir}/
                         """)
                 except:
-                    print(f"\tError linking {file_type} file for APID {apid}. File does not exist or you may need to wait for files to be restored.")
+                    log.info(f"\tError linking {file_type} file for APID {apid}. File does not exist or you may need to wait for files to be restored.")
                     continue
 
     subprocess.run(f"chmod +x {script_name} && {script_name}", shell=True, check=True)
@@ -1446,10 +1549,10 @@ def gather_tx_files(
     if apid:
         with open(f"{tx_dir}/apid.txt", "w") as f:
             f.write(str(apid))
-        print(f"\nWorking with APID: {apid} from tx_index {tx_index}.\n")
+        log.info(f"\nWorking with APID: {apid} from tx_index {tx_index}.\n")
         return apid
     else:
-        print("Warning: Did not find APID. Check the index you selected from the tx_files object.")
+        log.info("Warning: Did not find APID. Check the index you selected from the tx_files object.")
         return None
 
 def get_mx_data(
@@ -1481,14 +1584,14 @@ def get_mx_data(
     if datatype == "peak-area":
         datatype = "quant"
     if filtered_mx and datatype == "quant":
-        print("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
+        log.info("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
         return None
     if polarity == "multipolarity":
         mx_data_pattern = f"{input_dir}/*{chromatography}*/*_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{input_dir}/*{chromatography}*/*_{datatype}.csv"
     elif polarity in ["positive", "negative"]:
         mx_data_pattern = f"{input_dir}/*{chromatography}*/*{polarity}_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{input_dir}/*{chromatography}*/*{polarity}_{datatype}.csv"
     else:
-        print(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
+        log.info(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
         return None
 
     mx_data_files = glob.glob(os.path.expanduser(mx_data_pattern))
@@ -1516,7 +1619,7 @@ def get_mx_data(
                     mx_data['CompoundID'] = 'mx_' + mx_data['CompoundID'].astype(str) + "_" + str(file_polarity)
                 multipolarity_datasets.append(mx_data)
             multipolarity_data = pd.concat(multipolarity_datasets, axis=0)
-            print(f"MX data loaded from {mx_data_files}:\n")
+            log.info(f"MX data loaded from {mx_data_files}:\n")
             #display(multipolarity_data.head())
             write_integration_file(data=multipolarity_data, output_dir=output_dir, filename=output_filename, indexing=False)
             return multipolarity_data
@@ -1534,16 +1637,16 @@ def get_mx_data(
             mx_data = mx_data.drop(columns=[col for col in mx_data.columns if "Unnamed" in col])
             if pd.api.types.is_numeric_dtype(mx_data['CompoundID']):
                 mx_data['CompoundID'] = 'mx_' + mx_data['CompoundID'].astype(str)
-            print(f"MX data loaded from {mx_data_filename}:\n")
+            log.info(f"MX data loaded from {mx_data_filename}:\n")
             write_integration_file(data=mx_data, output_dir=output_dir, filename=output_filename, indexing=False)
             #display(mx_data.head())
             return mx_data
         else:
-            print("No MX data files found.")
+            log.info("No MX data files found.")
             return None
 
     else:
-        print(f"MX data file matching pattern {mx_data_pattern} not found.")
+        log.info(f"MX data file matching pattern {mx_data_pattern} not found.")
         return None
 
 def get_mx_metadata(
@@ -1587,7 +1690,7 @@ def get_mx_metadata(
                 multiploarity_metadata.append(mx_metadata)
             multiploarity_metadatum = pd.concat(multiploarity_metadata, axis=0)
             multiploarity_metadatum.drop_duplicates(inplace=True)
-            print(f"MX metadata loaded from {mx_metadata_files}\n")
+            log.info(f"MX metadata loaded from {mx_metadata_files}\n")
             write_integration_file(data=multiploarity_metadatum, output_dir=output_dir, filename=output_filename, indexing=False)
             #display(multiploarity_metadatum.head())
             return multiploarity_metadatum
@@ -1598,13 +1701,13 @@ def get_mx_metadata(
             mx_metadata['filename'] = mx_metadata['filename'].str.replace('.mzML', '', regex=False)
             mx_metadata = mx_metadata.rename(columns={mx_metadata.columns[0]: 'file'})
             mx_metadata.insert(0, 'ix', mx_metadata.index + 1)
-            print(f"MX metadata loaded from {mx_metadata_filename}\n")
-            print("Writing MX metadata to file...")
+            log.info(f"MX metadata loaded from {mx_metadata_filename}\n")
+            log.info("Writing MX metadata to file...")
             write_integration_file(data=mx_metadata, output_dir=output_dir, filename=output_filename, indexing=False)
             #display(mx_metadata.head())
             return mx_metadata
     else:
-        print(f"MX data file matching pattern {mx_metadata_pattern} not found.")
+        log.info(f"MX data file matching pattern {mx_metadata_pattern} not found.")
         return None
 
 def get_tx_data(
@@ -1632,8 +1735,8 @@ def get_tx_data(
     
     if tx_data_files:
         if len(tx_data_files) > 1:
-            print(f"Multiple TX data files found matching pattern {tx_data_pattern}.")
-            print("Please specify the correct file.")
+            log.info(f"Multiple TX data files found matching pattern {tx_data_pattern}.")
+            log.info("Please specify the correct file.")
             return None
         tx_data_filename = tx_data_files[0]  # Assuming you want the first (and only) match
         tx_data = pd.read_csv(tx_data_filename, sep='\t')
@@ -1642,12 +1745,12 @@ def get_tx_data(
         # Add prefix 'tx_' if not already present
         tx_data['GeneID'] = tx_data['GeneID'].apply(lambda x: x if str(x).startswith('tx_') else f'tx_{x}')
         
-        print(f"TX data loaded from {tx_data_filename} and processing...\n")
+        log.info(f"TX data loaded from {tx_data_filename} and processing...\n")
         write_integration_file(data=tx_data, output_dir=output_dir, filename=output_filename, indexing=False)
         #display(tx_data.head())
         return tx_data
     else:
-        print(f"TX data file matching pattern {tx_data_pattern} not found.")
+        log.info(f"TX data file matching pattern {tx_data_pattern} not found.")
         return None
     
 def get_tx_metadata(
@@ -1672,7 +1775,7 @@ def get_tx_metadata(
     """
 
     if os.path.exists(f"{output_dir}/portal_metadata.csv") and overwrite is False:
-        print("TX metadata already extracted.")
+        log.info("TX metadata already extracted.")
         tx_metadata = pd.read_csv(f"{output_dir}/portal_metadata.csv")
         return tx_metadata
     else:
@@ -1736,7 +1839,7 @@ def get_tx_metadata(
     tx_metadata = tx_metadata[['ix'] + [col for col in tx_metadata.columns if col != 'ix']]
     tx_metadata = tx_metadata[tx_metadata['APID'].astype(str) == str(apid)]
 
-    print("Saving TX metadata...")
+    log.info("Saving TX metadata...")
     write_integration_file(data=tx_metadata, output_dir=output_dir, filename="portal_metadata", indexing=False)
     #display(tx_metadata.head())
     return tx_metadata
@@ -1871,7 +1974,7 @@ def check_annotation_ids(
     else:
         annotated_data.index = dtype+"_" + annotated_data[id_col].astype(str)
     if len(annotated_data.index.intersection(annotated_data.index)) == 0:
-        print(f"Warning! No matching indexes between integrated_data and annotation done with {method}. Please check the annotation file.")
+        log.info(f"Warning! No matching indexes between integrated_data and annotation done with {method}. Please check the annotation file.")
         return None
     return annotated_data
 
@@ -1918,7 +2021,7 @@ def annotate_integrated_data(
     
     annotated_data_filename = f"integrated_data_annotated"
     if os.path.exists(f"{output_dir}/{annotated_data_filename}.csv") and overwrite is False:
-        print(f"Integrated data already annotated: {output_dir}/{annotated_data_filename}.csv")
+        log.info(f"Integrated data already annotated: {output_dir}/{annotated_data_filename}.csv")
         annotated_data = pd.read_csv(f"{output_dir}/{annotated_data_filename}.csv", index_col=0)
         return annotated_data
 
@@ -1932,7 +2035,7 @@ def annotate_integrated_data(
         tx_annotation = check_annotation_ids(tx_annotation, "tx", tx_id_col, tx_annotation_method)
 
     elif tx_annotation_method == "jgi":
-        print("JGI annotation method not yet implemented!!")
+        log.info("JGI annotation method not yet implemented!!")
         return None
 
     elif tx_annotation_method == "magi2":
@@ -1982,7 +2085,7 @@ def annotate_integrated_data(
     else:
         raise ValueError("Please select a valid mx_annotation_method: fbmn, custom, or magi2.")
 
-    print("Annotating features in integrated data...")
+    log.info("Annotating features in integrated data...")
     tx_annotation = tx_annotation.dropna(subset=[tx_id_col])
     mx_annotation = mx_annotation.dropna(subset=[mx_id_col])
     tx_annotation[tx_annotation_col] = tx_annotation[tx_annotation_col].replace("<NA>","Unassigned").fillna("Unassigned")
@@ -1995,7 +2098,7 @@ def annotate_integrated_data(
     annotated_data['annotation'] = annotated_data['tx_annotation'].combine_first(annotated_data['mx_annotation'])
     
     result = annotated_data[['annotation']]
-    print("Writing annotated data to file...")
+    log.info("Writing annotated data to file...")
     write_integration_file(data=result, output_dir=output_dir, filename=annotated_data_filename, indexing=True)
     return result
 
@@ -2039,7 +2142,7 @@ def link_metadata_with_custom_script(
 
     # Save results if output directory provided
     for ds in datasets:
-        print(f"Saving linked metadata for {ds.dataset_name}...")
+        log.info(f"Saving linked metadata for {ds.dataset_name}...")
         write_integration_file(linked_metadata[ds.dataset_name], ds.output_dir, ds._linked_metadata_filename, indexing=True)
 
     return linked_metadata
@@ -2072,7 +2175,7 @@ def link_data_across_datasets(
     sample_sets = {}
     # Process each dataset
     for ds in datasets:
-        print(f"\nProcessing {ds.dataset_name} metadata and data...")
+        log.info(f"\nProcessing {ds.dataset_name} metadata and data...")
 
         # Find the column that maps data columns to unified sample names
         unifying_col = 'unique_group'
@@ -2097,7 +2200,7 @@ def link_data_across_datasets(
 
     # Restrict to overlapping samples if requested
     if overlap_only and len(unified_data) > 1:
-        print("\tRestricting matching samples to only those present in all datasets...")
+        log.info("\tRestricting matching samples to only those present in all datasets...")
         overlapping_columns = set.intersection(*sample_sets.values())
         
         if not overlapping_columns:
@@ -2113,7 +2216,7 @@ def link_data_across_datasets(
 
     # Save results if output directory provided
     for ds in datasets:
-        print(f"Saving linked data for {ds.dataset_name}...")
+        log.info(f"Saving linked data for {ds.dataset_name}...")
         df = unified_data[ds.dataset_name]
         df = df.set_index(df.columns[0])
         write_integration_file(df, ds.output_dir, ds._linked_data_filename, indexing=True)
@@ -2124,7 +2227,7 @@ def link_data_across_datasets(
 
 def integrate_metadata(
     datasets: list,
-    metadata_vars: list[str] = [],
+    metadata_vars: List[str] = [],
     unifying_col: str = 'unique_group',
     output_filename: str = "integrated_metadata",
     output_dir: str = None
@@ -2142,7 +2245,7 @@ def integrate_metadata(
         pd.DataFrame: Integrated metadata DataFrame.
     """
 
-    print("Creating a single integrated (shared) metadata table across datasets...")
+    log.info("Creating a single integrated (shared) metadata table across datasets...")
 
     metadata_tables = [ds.linked_metadata for ds in datasets if hasattr(ds, "linked_metadata")]
 
@@ -2170,7 +2273,7 @@ def integrate_metadata(
     integrated_metadata.drop_duplicates(inplace=True)
     integrated_metadata.set_index('sample', inplace=True)
 
-    print("Writing integrated metadata table...")
+    log.info("Writing integrated metadata table...")
     write_integration_file(data=integrated_metadata, output_dir=output_dir, filename=output_filename)
     
     return integrated_metadata
@@ -2193,7 +2296,7 @@ def integrate_data(
         pd.DataFrame: Integrated feature matrix with all datasets combined.
     """
     
-    print("Creating a single integrated feature matrix across datasets...")
+    log.info("Creating a single integrated feature matrix across datasets...")
     
     # Collect normalized data from all datasets
     dataset_data = {}
@@ -2208,13 +2311,13 @@ def integrate_data(
             
             dataset_data[ds.dataset_name] = data_copy
             sample_sets[ds.dataset_name] = set(data_copy.columns)
-            print(f"\tAdding {data_copy.shape[0]} features from {ds.dataset_name}")
+            log.info(f"\tAdding {data_copy.shape[0]} features from {ds.dataset_name}")
         else:
             raise ValueError(f"Dataset {ds.dataset_name} missing normalized_data. Run processing pipeline first.")
     
     # Handle overlapping samples if requested
     if overlap_only and len(dataset_data) > 1:
-        print("\tRestricting to overlapping samples across all datasets...")
+        log.info("\tRestricting to overlapping samples across all datasets...")
         overlapping_samples = set.intersection(*sample_sets.values())
         
         if not overlapping_samples:
@@ -2224,18 +2327,18 @@ def integrate_data(
         for ds_name, data in dataset_data.items():
             overlapping_cols = [col for col in overlapping_samples if col in data.columns]
             dataset_data[ds_name] = data[overlapping_cols]
-            print(f"\t{ds_name}: {len(overlapping_cols)} overlapping samples")
+            log.info(f"\t{ds_name}: {len(overlapping_cols)} overlapping samples")
     
     # Combine all datasets vertically (concatenate features)
     integrated_data = pd.concat(dataset_data.values(), axis=0)
     integrated_data.index.name = 'features'
     integrated_data = integrated_data.fillna(0)
     
-    print(f"Final integrated dataset: {integrated_data.shape[0]} features x {integrated_data.shape[1]} samples")
+    log.info(f"Final integrated dataset: {integrated_data.shape[0]} features x {integrated_data.shape[1]} samples")
     
     # Save result if output directory provided
     if output_dir:
-        print("Writing integrated data table...")
+        log.info("Writing integrated data table...")
         write_integration_file(integrated_data, output_dir, output_filename, indexing=True)
     
     return integrated_data
@@ -2261,7 +2364,7 @@ def remove_uniform_percent_low_variance_features(data: pd.DataFrame, filter_perc
     
     # Check if the variance of variances is very low
     if np.var(row_variances) < 0.001:
-        print("Low variance detected. Is data already autoscaled?")
+        log.info("Low variance detected. Is data already autoscaled?")
         return None
     
     # Determine the variance threshold
@@ -2271,7 +2374,7 @@ def remove_uniform_percent_low_variance_features(data: pd.DataFrame, filter_perc
     feat_keep = row_variances >= var_thresh
     filtered_df = data[feat_keep]
 
-    print(f"Started with {data.shape[0]} features; filtered out {filter_percent}% ({data.shape[0] - filtered_df.shape[0]}) to keep {filtered_df.shape[0]}.")
+    log.info(f"Started with {data.shape[0]} features; filtered out {filter_percent}% ({data.shape[0] - filtered_df.shape[0]}) to keep {filtered_df.shape[0]}.")
 
     return filtered_df
 
@@ -2280,8 +2383,8 @@ def filter_data(
     data: pd.DataFrame,
     dataset_name: str,
     data_type: str,
-    output_filename: str,
     output_dir: str,
+    output_filename: str,
     filter_method: str,
     filter_value: float,
 ) -> pd.DataFrame:
@@ -2303,25 +2406,25 @@ def filter_data(
     # Filter data based on the specified method
     if filter_method == "minimum":
         row_means = data.mean(axis=1)
-        print(f"Filtering out features with {filter_method} method in {dataset_name} that have an average {data_type} value less than {filter_value} across samples...")
+        log.info(f"Filtering out features with {filter_method} method in {dataset_name} that have an average {data_type} value less than {filter_value} across samples...")
         filtered_data = data[row_means >= filter_value]
-        print(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - filtered_data.shape[0]} to keep {filtered_data.shape[0]}.")
+        log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - filtered_data.shape[0]} to keep {filtered_data.shape[0]}.")
     elif filter_method == "proportion":
-        print(f"Filtering out features with {filter_method} method in {dataset_name} that were observed in fewer than {filter_value}% samples...")
+        log.info(f"Filtering out features with {filter_method} method in {dataset_name} that were observed in fewer than {filter_value}% samples...")
         row_min = max(data.min(axis=1), 0)
         min_count = (data.eq(row_min, axis=0)).sum(axis=1)
         min_proportion = min_count / data.shape[1]
         filtered_data = data[min_proportion <= filter_value / 100]
-        print(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - filtered_data.shape[0]} to keep {filtered_data.shape[0]}.")
+        log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - filtered_data.shape[0]} to keep {filtered_data.shape[0]}.")
     elif filter_method == "none":
-        print("Not filtering any features.")
-        print(f"Keeping all {data.shape[0]} features.")
+        log.info("Not filtering any features.")
+        log.info(f"Keeping all {data.shape[0]} features.")
         filtered_data = data
     else:
-        print(f"Invalid filter method '{filter_method}'. Please choose 'minimum', 'proportion', or 'none'.")
+        log.info(f"Invalid filter method '{filter_method}'. Please choose 'minimum', 'proportion', or 'none'.")
         return None
 
-    print(f"Saving filtered data for {dataset_name}...")
+    log.info(f"Saving filtered data for {dataset_name}...")
     write_integration_file(filtered_data, output_dir, output_filename, indexing=True)
     return filtered_data
 
@@ -2348,17 +2451,17 @@ def devariance_data(
     """
 
     if devariance_mode == "percent":
-        print(f"Removing {filter_value}% of features with the lowest variance in {dataset_name}...")
+        log.info(f"Removing {filter_value}% of features with the lowest variance in {dataset_name}...")
         data_filtered = remove_uniform_percent_low_variance_features(data=data, filter_percent=filter_value)
     elif devariance_mode == "none":
-        print(f"\tNot removing any features based on variance in {dataset_name}. Retaining all {data.shape[0]} features.")
-        print(f"Saving devarianced data for {dataset_name}...")
+        log.info(f"\tNot removing any features based on variance in {dataset_name}. Retaining all {data.shape[0]} features.")
+        log.info(f"Saving devarianced data for {dataset_name}...")
         data_filtered = data
     else:
-        print(f"Invalid devariance mode '{devariance_mode}'. Please choose 'percent' or 'none'.")
+        log.info(f"Invalid devariance mode '{devariance_mode}'. Please choose 'percent' or 'none'.")
         return None
     
-    print(f"Saving devarianced data for {dataset_name}...")
+    log.info(f"Saving devarianced data for {dataset_name}...")
     write_integration_file(data_filtered, output_dir, output_filename, indexing=True)
     return data_filtered
 
@@ -2385,19 +2488,19 @@ def scale_data(
     """
 
     if norm_method == "none":
-        print("Not scaling data.")
+        log.info("Not scaling data.")
         scaled_df = df
     else:
         if log2 is True:
-            print(f"Transforming {dataset_name} data by log2 before z-scoring...")
+            log.info(f"Transforming {dataset_name} data by log2 before z-scoring...")
             unscaled_df = df.copy()
             df = unscaled_df.apply(pd.to_numeric, errors='coerce')
             df = np.log2(df + 1)
         if norm_method == "zscore":
-            print(f"Scaling {dataset_name} data to z-scores...")
+            log.info(f"Scaling {dataset_name} data to z-scores...")
             scaled_df = df.apply(lambda x: (x - x.mean()) / x.std(), axis=0)
         elif norm_method == "modified_zscore":
-            print(f"Scaling {dataset_name} data to modified z-scores...")
+            log.info(f"Scaling {dataset_name} data to modified z-scores...")
             scaled_df = df.apply(lambda x: ((x - x.median()) * 0.6745) / (x - x.median()).abs().median(), axis=0)
         else:
             raise ValueError("Please select a valid norm_method: 'zscore' or 'modified_zscore'.")
@@ -2407,7 +2510,7 @@ def scale_data(
     scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan)
     scaled_df = scaled_df.fillna(0)
 
-    print(f"Saving scaled data for {dataset_name}...")
+    log.info(f"Saving scaled data for {dataset_name}...")
     write_integration_file(scaled_df, output_dir, output_filename, indexing=True)
     return scaled_df
 
@@ -2439,7 +2542,7 @@ def remove_low_replicable_features(
     """
 
     if method == "none":
-        print(f"\tNot removing any features based on replicability in {dataset_name}. Retaining all {data.shape[0]} features.")
+        log.info(f"\tNot removing any features based on replicability in {dataset_name}. Retaining all {data.shape[0]} features.")
         replicable_data = data
     elif method == "variance":
         variability_func = lambda x: x.std(axis=1, skipna=True)
@@ -2453,7 +2556,7 @@ def remove_low_replicable_features(
         }
 
         keep_mask = []
-        print(f"Removing features with high within-group variability (threshold: {threshold})...")
+        log.info(f"Removing features with high within-group variability (threshold: {threshold})...")
         for idx, row in data.iterrows():
             high_var = False
             enough_replicates = False
@@ -2471,11 +2574,11 @@ def remove_low_replicable_features(
             keep_mask.append(not high_var or not enough_replicates)
 
         replicable_data = data.loc[keep_mask]
-        print(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - replicable_data.shape[0]} to keep {replicable_data.shape[0]}.")
+        log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - replicable_data.shape[0]} to keep {replicable_data.shape[0]}.")
     else:
         raise ValueError("Currently only 'variance' or 'none' methods are supported for removing low replicable features.")
 
-    print(f"Saving replicable data for {dataset_name}...")
+    log.info(f"Saving replicable data for {dataset_name}...")
     write_integration_file(replicable_data, output_dir, output_filename, indexing=True)
     return replicable_data
 
@@ -2515,7 +2618,7 @@ def plot_pca(
         df_samples = df.columns.tolist()
         metadata_samples = metadata['unique_group'].tolist()
         if not set(df_samples).intersection(set(metadata_samples)):
-            print(f"Warning: No matching samples between {df_type} data and metadata. Skipping PCA plot for {df_type}.")
+            log.info(f"Warning: No matching samples between {df_type} data and metadata. Skipping PCA plot for {df_type}.")
             continue
         common_samples = list(set(df_samples).intersection(set(metadata_samples)))
         metadata_input = metadata[metadata['unique_group'].isin(common_samples)]
@@ -2565,18 +2668,18 @@ def plot_pca(
             if output_dir:
                 filename = f"PCA_of_{df_type}_data_by_{metadata_variable}_for_{dataset_name}.pdf"
                 output_plot = f"{output_dir}/{filename}"
-                print(f"Saving plot to {output_plot}")
+                log.info(f"Saving plot to {output_plot}")
                 plt.savefig(output_plot)
                 plot_paths[df_type].append(output_plot)
                 plt.close()
             else:
-                print("Not saving plot to disk.")
+                log.info("Not saving plot to disk.")
 
     plot_pdf_grids(plot_paths, output_dir, metadata_variables, output_filename)
 
     return
 
-def plot_pdf_grids(plot_paths: dict[str, list[str]], output_dir: str, variables: List[str], output_filename: str) -> None:
+def plot_pdf_grids(plot_paths: dict[str, List[str]], output_dir: str, variables: List[str], output_filename: str) -> None:
     """
     Combine PDF plots into a grid PDF (rows: data types, columns: metadata variables).
 
@@ -2629,12 +2732,12 @@ def plot_pdf_grids(plot_paths: dict[str, list[str]], output_dir: str, variables:
                     page.show_pdf_page(rect, src, 0, mat)
                     src.close()
                 except Exception as e:
-                    print(f"Error processing {pdf}: {e}")
+                    log.info(f"Error processing {pdf}: {e}")
 
     output_pdf = os.path.join(output_dir, output_filename)
     doc.save(output_pdf)
     doc.close()
-    print(f"Combined PDF saved as {output_pdf}")
+    log.info(f"Combined PDF saved as {output_pdf}")
     return
 
 def plot_data_variance_indv_histogram(
@@ -2675,7 +2778,7 @@ def plot_data_variance_indv_histogram(
         output_subdir = f"{output_dir}/data_distributions"
         os.makedirs(output_subdir, exist_ok=True)
         filename = f"distribution_of_{dataset_name}.pdf"
-        print(f"Saving plot to {output_subdir}/{filename}")
+        log.info(f"Saving plot to {output_subdir}/{filename}")
         plt.savefig(f"{output_subdir}/{filename}")
     
     plt.show()
@@ -2731,10 +2834,10 @@ def plot_data_variance_histogram(
     output_subdir = f"{output_dir}/dataset_distributions"
     os.makedirs(output_subdir, exist_ok=True)
     filename = f"distribution_of_{datatype}_datasets.pdf"
-    print(f"Saving plot to {output_subdir}/{filename}...")
+    log.info(f"Saving plot to {output_subdir}/{filename}...")
     plt.savefig(f"{output_subdir}/{filename}")
     if show_plot is True:
-        print("\nDatasets should follow similar distributions, while quantitative values can be slightly shifted:")
+        log.info("\nDatasets should follow similar distributions, while quantitative values can be slightly shifted:")
         plt.show()
     plt.close()
 
@@ -2742,7 +2845,7 @@ def plot_feature_abundance_by_metadata(
     data: pd.DataFrame,
     metadata: pd.DataFrame,
     feature: str,
-    metadata_group: str | list[str]
+    metadata_group: str | List[str]
 ) -> None:
     """
     Plot the abundance of a single feature across metadata groups.
@@ -2824,7 +2927,7 @@ def plot_replicate_correlation(
     os.makedirs(output_subdir, exist_ok=True)
     output_plot = f"{output_subdir}/{filename}"
     if os.path.exists(output_plot) and not overwrite:
-        print(f"Replicate heatmap plot already exists: {output_plot}. Not overwriting.")
+        log.info(f"Replicate heatmap plot already exists: {output_plot}. Not overwriting.")
         return
     
     corr_matrix = data.corr(method=method)
@@ -2857,11 +2960,11 @@ def plot_replicate_correlation(
 
     # Save the plot if output_dir is specified
     if output_dir:
-        print(f"Saving plot to {output_plot}")
+        log.info(f"Saving plot to {output_plot}")
         g.figure.savefig(output_plot)
         plt.close(g.figure)
     else:
-        print("Not saving plot to disk.")
+        log.info("Not saving plot to disk.")
     
     return
 
@@ -2898,7 +3001,7 @@ def plot_heatmap_with_dendrogram(
     os.makedirs(output_subdir, exist_ok=True)
     output_plot = f"{output_subdir}/{filename}"
     if os.path.exists(output_plot) and not overwrite:
-        print(f"Heatmap plot already exists: {output_plot}. Not overwriting.")
+        log.info(f"Heatmap plot already exists: {output_plot}. Not overwriting.")
         return
 
     # Compute the correlation matrix
@@ -2928,127 +3031,14 @@ def plot_heatmap_with_dendrogram(
 
     # Save the plot if output_dir is specified
     if output_dir:
-        print(f"Saving plot to {output_plot}")
+        log.info(f"Saving plot to {output_plot}")
         g.savefig(output_plot)
         plt.close(g.figure)
     else:
-        print("Not saving plot to disk.")
+        log.info("Not saving plot to disk.")
 
     plt.show()
     plt.close()
-
-def plot_correlated_features(
-    data: pd.DataFrame,
-    correlation_matrix: pd.DataFrame,
-    metadata: pd.DataFrame,
-    output_dir: str,
-    overwrite: bool = False,
-    only_bipartite: bool = True,
-    top_n_features: int = 10
-) -> None:
-    """
-    Plot scatterplots for the top correlated feature pairs colored by metadata.
-
-    Args:
-        data (pd.DataFrame): Feature matrix.
-        correlation_matrix (pd.DataFrame): Correlation matrix DataFrame.
-        metadata (pd.DataFrame): Metadata DataFrame.
-        output_dir (str): Output directory for plots.
-        overwrite (bool): Overwrite existing plots.
-        only_bipartite (bool): Exclude pairs from the same dataset prefix.
-        top_n_features (int): Number of top pairs to plot.
-
-    Returns:
-        None
-    """
-
-    output_subdir = f"{output_dir}/feature_correlation"
-    os.makedirs(output_subdir, exist_ok=True)
-    output_subdir2 = f"{output_subdir}/correlation_plots"
-    
-    if os.path.exists(output_subdir2) and overwrite is False:
-        print(f"Correlation plots already exist! Not overwriting plots.")
-        return
-    elif not os.path.exists(output_subdir2):
-        os.makedirs(output_subdir2, exist_ok=True)
-
-    if only_bipartite is True:
-        print("Filtering out pairs with the same prefix (same dataset)...")
-        correlation_matrix = correlation_matrix[~correlation_matrix.apply(lambda row: row['feature_1'][:3] == row['feature_2'][:3], axis=1)]
-
-    # Get the top-X most highly correlated pairs
-    top_pairs = correlation_matrix.nlargest(top_n_features, 'correlation')
-    print(f"Plotting top {top_n_features} most highly correlated features:\n")
-    print(top_pairs)
-    print("\n")
-
-    for i, row in top_pairs.iterrows():
-        feature1 = row['feature_1']
-        feature2 = row['feature_2']
-        plt.figure(figsize=(7, 4))
-        plot = sns.scatterplot(x=data.loc[feature1], y=data.loc[feature2], hue=metadata["group"])
-        plt.title(f'Correlation between {feature1} and {feature2}: {row["correlation"]:.3f}')
-        plt.xlabel(feature1)
-        plt.ylabel(feature2)
-        plt.grid(True)
-        plt.tight_layout()
-        plot.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-
-        os.makedirs(output_subdir2, exist_ok=True)
-        output_plot = f"{output_subdir2}/{feature1}_vs_{feature2}_correlation.pdf"
-        plt.savefig(output_plot, bbox_inches='tight')
-        plt.close()
-
-    print(f"Saved all plots of best feature pair correlation in {output_subdir2}")
-    return
-
-def plot_specific_correlated_features(
-    correlation_matrix: pd.DataFrame,
-    feature_list: list[str],
-    data: pd.DataFrame,
-    metadata: pd.DataFrame,
-    metadata_group: str,
-    output_dir: str = None
-) -> None:
-    """
-    Plot scatterplots for specific correlated feature pairs.
-
-    Args:
-        correlation_matrix (pd.DataFrame): Correlation matrix DataFrame.
-        feature_list (list of str): List of features to plot.
-        data (pd.DataFrame): Feature matrix.
-        metadata (pd.DataFrame): Metadata DataFrame.
-        metadata_group (str): Metadata variable to color by.
-        output_dir (str, optional): Output directory for plots.
-
-    Returns:
-        None
-    """
-    
-    # Get the top-X most highly correlated pairs
-    correlation_matrix_subset = correlation_matrix[correlation_matrix['feature_1'].isin(feature_list) & correlation_matrix['feature_2'].isin(feature_list)]
-
-    for _, row in correlation_matrix_subset.iterrows():
-        feature1 = row['feature_1']
-        feature2 = row['feature_2']
-        plt.figure(figsize=(7, 4))
-        plot = sns.scatterplot(x=data.loc[feature1], y=data.loc[feature2], hue=metadata[metadata_group])
-        plt.title(f'Correlation between {feature1} and {feature2}: {row["correlation"]:.3f}')
-        plt.xlabel(feature1)
-        plt.ylabel(feature2)
-        plt.grid(True)
-        plt.tight_layout()
-        
-        # Move the legend outside the plot
-        plot.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-
-        if output_dir:
-            plot_subdir = f"{output_dir}/correlated_features"
-            os.makedirs(plot_subdir, exist_ok=True)
-            plt.savefig(f"{plot_subdir}/{feature1}_vs_{feature2}_correlation.pdf", bbox_inches='tight')
-        
-        plt.show()
-        plt.close()
 
 def plot_alluvial_for_submodules(
     submodules_dir: str,
@@ -3070,10 +3060,10 @@ def plot_alluvial_for_submodules(
     """
 
     if os.path.exists(os.path.join(submodules_dir, "submodule_sankeys")) and overwrite is False:
-        print(f"Submodule Sankey diagrams already exist in {os.path.join(submodules_dir, 'submodule_sankeys')}. Set overwrite=True to regenerate.")
+        log.info(f"Submodule Sankey diagrams already exist in {os.path.join(submodules_dir, 'submodule_sankeys')}. Set overwrite=True to regenerate.")
         return
     elif os.path.exists(os.path.join(submodules_dir, "submodule_sankeys")) and overwrite is True:
-        print(f"Overwriting existing submodule Sankey diagrams in {os.path.join(submodules_dir, 'submodule_sankeys')}.")
+        log.info(f"Overwriting existing submodule Sankey diagrams in {os.path.join(submodules_dir, 'submodule_sankeys')}.")
         shutil.rmtree(os.path.join(submodules_dir, "submodule_sankeys"))
         os.makedirs(os.path.join(submodules_dir, "submodule_sankeys"), exist_ok=True)
     elif not os.path.exists(os.path.join(submodules_dir, "submodule_sankeys")):
@@ -3181,7 +3171,7 @@ def plot_alluvial_for_submodules(
 
 def run_full_mofa2_analysis(
     integrated_data: pd.DataFrame,
-    mofa2_views: list[str],
+    mofa2_views: List[str],
     metadata: pd.DataFrame,
     output_dir: str,
     output_filename: str,
@@ -3228,7 +3218,7 @@ def run_full_mofa2_analysis(
     mofa_data = mofa_data[['sample', 'group', 'features', 'view', 'value']]
     mofa_data = mofa_data.rename(columns={'features': 'feature'})
 
-    print("Converted omics data to mofa2 format:\n")
+    log.info("Converted omics data to mofa2 format:\n")
 
     # Run the model and load to memory
     model_file = run_mofa2_model(data=mofa_data, output_dir=output_dir, output_filename=output_filename,
@@ -3250,7 +3240,7 @@ def run_full_mofa2_analysis(
     info_file_path = os.path.join(output_dir, f"mofa2_model_summary.txt")
     with open(info_file_path, 'w') as f:
         f.write(info_text)
-    print(info_text)
+    log.info(info_text)
 
     # Calculate and save model stats
     calculate_mofa2_feature_weights_and_r2(model=model, output_dir=output_dir, num_factors=num_factors)        
@@ -3316,7 +3306,7 @@ def run_mofa2_model(
 
     ent.run()
 
-    print(f"Exporting model to disk as {outfile}...\n")
+    log.info(f"Exporting model to disk as {outfile}...\n")
     ent.save(outfile=outfile,save_data=True)
     return outfile
 
@@ -3358,7 +3348,7 @@ def calculate_mofa2_feature_weights_and_r2(
 
     r2_table = model.get_r2(factors=list(range(num_factors))).sort_values("R2", ascending=False)
 
-    print(f"Saving mofa2 factor weights and R2 tables...\n")
+    log.info(f"Saving mofa2 factor weights and R2 tables...\n")
     write_integration_file(feature_weight_per_factor, output_dir, f"mofa2_feature_weight_per_factor", index_label='Feature')
     write_integration_file(r2_table, output_dir, f"mofa2_r2_per_factor", indexing=False)
 
@@ -3373,7 +3363,7 @@ def plot_mofa2_factor_r2(
     Args:
         model: MOFA2 model object.
         output_dir (str): Output directory to save the plot.
-        num_factors (int): Number of MOFA factors.
+        num_factors (int): Number of MOFA factors to compute.
 
     Returns:
         plt.Figure: The matplotlib figure object for the R2 plot.
@@ -3381,7 +3371,7 @@ def plot_mofa2_factor_r2(
 
     r2_plot = mofax.plot_r2(model, factors=list(range(num_factors)), cmap="Blues")
 
-    print(f"Printing and saving mofa2 factor R2 plot...\n")
+    log.info(f"Printing and saving mofa2 factor R2 plot...\n")
     r2_plot.figure.savefig(f'{output_dir}/mofa2_r2_per_factor.pdf')
 
     return r2_plot
@@ -3406,7 +3396,7 @@ def plot_mofa2_feature_weights_linear(
     feature_plot = mofax.plot_weights(model, n_features=num_features, label_size=7)
     feature_plot.figure.set_size_inches(16, 8)
 
-    print(f"Printing and saving mofa2 feature weights linear plot...\n")
+    log.info(f"Printing and saving mofa2 feature weights linear plot...\n")
     feature_plot.figure.savefig(f'{output_dir}/mofa2_feature_weights_linear_plot_combined_data.pdf')
 
     return feature_plot
@@ -3448,7 +3438,7 @@ def plot_mofa2_feature_weights_scatter(
     )
     feature_plot.figure.set_size_inches(10, 10)
 
-    print(f"Printing and saving {data_type} mofa2 feature weights scatter plot...\n")
+    log.info(f"Printing and saving {data_type} mofa2 feature weights scatter plot...\n")
     feature_plot.figure.savefig(f'{output_dir}/mofa2_feature_weights_scatter_plot_{data_type}_data.pdf')
 
     return feature_plot
@@ -3478,7 +3468,7 @@ def plot_mofa2_feature_importance_per_factor(
                                         w_abs=True, 
                                         yticklabels_size=8)
 
-    print(f"Printing and saving {data_type} mofa2 feature importance per factor plot...\n")
+    log.info(f"Printing and saving {data_type} mofa2 feature importance per factor plot...\n")
     plot.figure.savefig(f'{output_dir}/mofa2_feature_importance_per_factor_for_{data_type}_data.pdf')
 
     return plot
@@ -3511,15 +3501,19 @@ def run_magi2(
     """
 
     if os.path.exists(f"{output_dir}/{run_name}/output_{run_name}") and overwrite is False:
-        print(f"MAGI2 results directory already exists: {output_dir}/{run_name}/output_{run_name}. \nNot queueing new job.")
-        print("Returning path to existing results files.")
+        log.info(f"MAGI2 results directory already exists: {output_dir}/{run_name}/output_{run_name}. \nNot queueing new job.")
+        log.info("Returning path to existing results files.")
         compound_results_file = f"{output_dir}/{run_name}/output_{run_name}/magi2_compounds.csv"
         gene_results_file = f"{output_dir}/{run_name}/output_{run_name}/magi2_gene_results.csv"
         return compound_results_file, gene_results_file
     elif os.path.exists(f"{output_dir}/{run_name}/output_{run_name}/") and overwrite is True:
-        print(f"MAGI2 results directory already exists: {output_dir}/{run_name}/output_{run_name}. Overwriting...\n.")
+        log.info(f"Overwriting existing submodule Sankey diagrams in {os.path.join(submodules_dir, 'submodule_sankeys')}.")
+        shutil.rmtree(os.path.join(output_dir, "magi2_sankeys"))
+        os.makedirs(os.path.join(output_dir, "magi2_sankeys"), exist_ok=True)
+    elif not os.path.exists(f"{output_dir}/{run_name}/output_{run_name}/"):
+        os.makedirs(f"{output_dir}/{run_name}/output_{run_name}/", exist_ok=True)
 
-    print("Queueing MAGI2 with sbatch...\n")
+    log.info("Queueing MAGI2 with sbatch...\n")
 
     SLURM_PERLMUTTER_HEADER = """#!/bin/bash
 
@@ -3550,7 +3544,7 @@ def run_magi2(
         job_id = sbatch_output_str.split()[-1]
 
     user = os.getenv('USER')
-    print(f"MAGI2 job submitted with ID: {job_id}. Check status with 'squeue -u {user}'.")
+    log.info(f"MAGI2 job submitted with ID: {job_id}. Check status with 'squeue -u {user}'.")
     return "",""
 
 def get_magi2_sequences_input(
@@ -3574,7 +3568,7 @@ def get_magi2_sequences_input(
 
     output_filename = f"{output_dir}/magi2_sequences.fasta"
     if os.path.exists(output_filename) and overwrite is False:
-        print(f"MAGI2 sequences file already exists: {output_filename}. \nReturning this file.")
+        log.info(f"MAGI2 sequences file already exists: {output_filename}. \nReturning this file.")
         return output_filename
 
     if fasta_filename is None:
@@ -3583,25 +3577,25 @@ def get_magi2_sequences_input(
                        not f.lower().startswith('aa_') and
                        not 'scaffold' in f.lower()]
         if len(fasta_files) == 0:
-            print("No fasta files found.")
+            log.info("No fasta files found.")
             return None
         elif len(fasta_files) > 1:
-            print(f"Multiple fasta files found: {fasta_files}. \n\nPlease check {sequence_dir} to verify and use the fasta_filename argument.")
+            log.info(f"Multiple fasta files found: {fasta_files}. \n\nPlease check {sequence_dir} to verify and use the fasta_filename argument.")
             return None
         elif len(fasta_files) == 1:
             fasta_filename = fasta_files[0]
-            print(f"Using the single fasta file found in the sequence directory: {fasta_filename}")
+            log.info(f"Using the single fasta file found in the sequence directory: {fasta_filename}")
     else:
-        print(f"Using the provided fasta file: {fasta_filename}.")
+        log.info(f"Using the provided fasta file: {fasta_filename}.")
     
     input_fasta = f"{sequence_dir}/{fasta_filename}"
     open_func = gzip.open if input_fasta.endswith('.gz') else open
     protein_fasta = []
 
-    with open_func(input_fasta, "rt") as handle:
+    with open_func(input_fasta, 'rt') as handle:
         for record in SeqIO.parse(handle, "fasta"):
             if set(record.seq.upper()).issubset(set("ACGTN")):
-                print("Nucleotide sequence detected. Converting to amino acid sequence...")
+                log.info("Nucleotide sequence detected. Converting to amino acid sequence...")
                 protein_fasta = convert_nucleotides_to_amino_acids(input_fasta)
                 break
             else:
@@ -3635,11 +3629,11 @@ def get_magi2_compound_input(
 
     magi_output_filename = f"{output_dir}/magi2_compounds.txt"
     if os.path.exists(magi_output_filename) and overwrite is False:
-        print(f"MAGI2 compounds file already exists: {magi_output_filename}. \nReturning this file.")
+        log.info(f"MAGI2 compounds file already exists: {magi_output_filename}. \nReturning this file.")
         return magi_output_filename
     
     if compound_filename is None:
-        print(f"Using the compound file(s) from fbmn results directory: {fbmn_results_dir}.")
+        log.info(f"Using the compound file(s) from fbmn results directory: {fbmn_results_dir}.")
         try:
             if polarity == "multipolarity":
                 compound_files = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*library-results.tsv"))
@@ -3658,31 +3652,31 @@ def get_magi2_compound_input(
                             multipolarity_datasets.append(mx_data)
                         compound_data = pd.concat(multipolarity_datasets, axis=0)
                     elif len(compound_files) == 1:
-                        print(f"Warning: Only single compound files found with polarity set to multipolarity.")
+                        log.info(f"Warning: Only single compound files found with polarity set to multipolarity.")
                         compound_data = pd.read_csv(compound_files[0], sep='\t')
             elif polarity in ["positive", "negative"]:
                 compound_file = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*{polarity}*library-results.tsv"))
                 if len(compound_file) > 1:
-                    print(f"Multiple compound files found: {compound_file}. \n\nPlease check {fbmn_results_dir} to verify and use the compound_filename argument.")
+                    log.info(f"Multiple compound files found: {compound_file}. \n\nPlease check {fbmn_results_dir} to verify and use the compound_filename argument.")
                     return None
                 elif len(compound_file) == 0:
-                    print(f"No compound files found for {polarity} polarity.")
+                    log.info(f"No compound files found for {polarity} polarity.")
                     return None
                 elif len(compound_file) == 1:
                     compound_data = pd.read_csv(compound_file[0], sep='\t')
                     compound_data["#Scan#"] = "mx_" + compound_data["#Scan#"].astype(str) + "_" + file_polarity
-                print(f"\nUsing metabolomics compound file at {compound_file}")
+                log.info(f"\nUsing metabolomics compound file at {compound_file}")
         except Exception as e:
-            print(f"Compound file could not be read due to {e}")
+            log.info(f"Compound file could not be read due to {e}")
             return None
     elif compound_filename is not None:
-        print(f"Using the provided compound file: {compound_filename}.")
+        log.info(f"Using the provided compound file: {compound_filename}.")
         if "csv" in compound_filename:
             compound_data = pd.read_csv(compound_filename)
         else:
             compound_data = pd.read_csv(compound_filename, sep='\t')
 
-    print("\tConverting to MAGI2 input format.")
+    log.info("\tConverting to MAGI2 input format.")
     fbmn_data = compound_data.rename(columns={"Smiles": 'original_compound'})
     fbmn_data['original_compound'] = fbmn_data['original_compound'].str.strip().replace(r'^\s*$', None, regex=True)
 
@@ -3722,10 +3716,10 @@ def summarize_fbmn_results(
 
     fbmn_output_filename = f"{fbmn_results_dir}/fbmn_compounds.csv"
     if os.path.exists(fbmn_output_filename) and overwrite is False:
-        print(f"FBMN output summary already exists: {fbmn_output_filename}. Not overwriting.")
+        log.info(f"FBMN output summary already exists: {fbmn_output_filename}. Not overwriting.")
         return
     
-    print(f"Summarizing FBMN file {fbmn_output_filename}.")
+    log.info(f"Summarizing FBMN file {fbmn_output_filename}.")
     try:
         if polarity == "multipolarity":
             compound_files = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*library-results.tsv"))
@@ -3744,25 +3738,25 @@ def summarize_fbmn_results(
                         multipolarity_datasets.append(mx_data)
                     fbmn_summary = pd.concat(multipolarity_datasets, axis=0)
                 elif len(compound_files) == 1:
-                    print(f"Warning: Only single compound files found with polarity set to multipolarity.")
+                    log.info(f"Warning: Only single compound files found with polarity set to multipolarity.")
                     fbmn_summary = pd.read_csv(compound_files[0], sep='\t')
         elif polarity in ["positive", "negative"]:
             compound_file = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*{polarity}*library-results.tsv"))
             if len(compound_file) > 1:
-                print(f"Multiple compound files found: {compound_file}. \n\nPlease check {fbmn_results_dir} to verify and use the compound_filename argument.")
+                log.info(f"Multiple compound files found: {compound_file}. \n\nPlease check {fbmn_results_dir} to verify and use the compound_filename argument.")
                 return None
             elif len(compound_file) == 0:
-                print(f"No compound files found for {polarity} polarity.")
+                log.info(f"No compound files found for {polarity} polarity.")
                 return None
             elif len(compound_file) == 1:
                 fbmn_summary = pd.read_csv(compound_file[0], sep='\t')
                 fbmn_summary["#Scan#"] = "mx_" + fbmn_summary["#Scan#"].astype(str) + "_" + file_polarity
-            print(f"\nUsing metabolomics compound file at {compound_file}")
+            log.info(f"\nUsing metabolomics compound file at {compound_file}")
     except Exception as e:
-        print(f"Compound file could not be read due to {e}")
+        log.info(f"Compound file could not be read due to {e}")
         return None
 
-    print("\tConverting FBMN outputs to summary format.")
+    log.info("\tConverting FBMN outputs to summary format.")
     fbmn_data = fbmn_summary.rename(columns={"Smiles": 'original_compound'})
     fbmn_data['original_compound'] = fbmn_data['original_compound'].str.strip().replace(r'^\s*$', None, regex=True)
 
@@ -3809,7 +3803,7 @@ def convert_nucleotides_to_amino_acids(
             new_record.seq = amino_acid_seq
             amino_acid_sequences.append(new_record)
     
-    print(f"\tConverted nucleotide -> amino acid sequences.")
+    log.info(f"\tConverted nucleotide -> amino acid sequences.")
     return amino_acid_sequences
 
 # ====================================
@@ -3836,7 +3830,7 @@ def create_excel_metadata_sheet(
     """
 
     # Create the data for the "Instructions" tab
-    print("Creating metadata Excel file...\n")
+    log.info("Creating metadata Excel file...\n")
     instructions_text = (
         "Placeholder\n\n"
     )
@@ -3960,7 +3954,7 @@ def create_excel_metadata_sheet(
             cell.font = Font(italic=True, color="D3D3D3")
     worksheet.freeze_panes = worksheet['A14']
 
-    print(f"\tMetadata instructions Excel file exported to {output_path}")
+    log.info(f"\tMetadata instructions Excel file exported to {output_path}")
     # Save the workbook
     workbook.save(output_path)
 
@@ -3992,7 +3986,7 @@ def copy_data(
         if os.path.exists(src_path):
             shutil.copy(src_path, dst_path)
         else:
-            print(f"Warning: Source file not found: {src_path}")
+            log.info(f"Warning: Source file not found: {src_path}")
 
     if not plots:
         return
@@ -4086,7 +4080,7 @@ def create_user_output_directory(
             intermediate_dir = os.path.join(dst, project_name, f"output_{project_name}", "intermediate_files")
             shutil.rmtree(intermediate_dir)
 
-    print(f"User output directory structure created at {final_dir}\n")
+    log.info(f"User output directory structure created at {final_dir}\n")
 
     return
 
@@ -4103,22 +4097,22 @@ def upload_to_google_drive(
     orig_folder = project_folder
 
     if overwrite is True:
-        print("Warning! Overwriting existing files in Google Drive.")
+        log.info("Warning! Overwriting existing files in Google Drive.")
         upload_command = (
             f'/global/cfs/cdirs/m342/USA/shared-envs/rclone/bin/rclone sync '
             f'"{orig_folder}/" "{dest_folder}"'
         )
     else:
-        print("Warning! Not overwriting existing files in Google Drive, may have previous files in the output.")
+        log.info("Warning! Not overwriting existing files in Google Drive, may have previous files in the output.")
         upload_command = (
             f'/global/cfs/cdirs/m342/USA/shared-envs/rclone/bin/rclone copy --ignore-existing '
             f'"{orig_folder}/" "{dest_folder}"'
         )
     try:
-        print(f"Uploading to Google Drive with command:\n\t{upload_command}")
+        log.info(f"Uploading to Google Drive with command:\n\t{upload_command}")
         subprocess.check_output(upload_command, shell=True)
     except Exception as e:
-        print(f"Warning! Google Drive upload failed with exception: {e}\nCommand: {upload_command}")
+        log.info(f"Warning! Google Drive upload failed with exception: {e}\nCommand: {upload_command}")
         return
 
     # Check that upload worked
@@ -4128,13 +4122,13 @@ def upload_to_google_drive(
     try:
         check_upload_out = subprocess.check_output(check_upload_command, shell=True)
         if check_upload_out.decode('utf-8').strip():
-            print(f"\nGoogle Drive upload confirmed!")
+            log.info(f"\nGoogle Drive upload confirmed!")
             return
         else:
-            print(f"Warning! Google Drive upload check failed because no data was returned with command:\n{check_upload_command}.\nUpload may not have been successful.")
+            log.info(f"Warning! Google Drive upload check failed because no data was returned with command:\n{check_upload_command}.\nUpload may not have been successful.")
             return
     except Exception as e:
-        print(f"Warning! Google Drive upload failed on upload check with exception: {e}\nCommand: {check_upload_command}")
+        log.info(f"Warning! Google Drive upload failed on upload check with exception: {e}\nCommand: {check_upload_command}")
         return
 
 # ====================================
@@ -4175,7 +4169,7 @@ def upload_to_google_drive(
     
 #     # Check if the variance of variances is very low
 #     if np.var(row_variances) < 0.001:
-#         print("Low variance detected. Is data already autoscaled?")
+#         log.info("Low variance detected. Is data already autoscaled?")
 #         return None
     
 #     # Sort dataframe by row variance (higher on top)
@@ -4184,7 +4178,7 @@ def upload_to_google_drive(
 #     # Keep the top n rows where n is the min_rows parameter
 #     filtered_data = sorted_data.iloc[:min_rows]
     
-#     print(f"Started with {data.shape[0]} features; kept top {min_rows} features.")
+#     log.info(f"Started with {data.shape[0]} features; kept top {min_rows} features.")
 
 #     return filtered_data
 
@@ -4232,7 +4226,7 @@ def upload_to_google_drive(
 #     integrated_data = pd.concat(datasets.values(), join='inner', ignore_index=False)
 #     integrated_data.index.name = 'features'
 #     integrated_data = integrated_data.fillna(0)
-#     print("Saving integrated dataset to disk...")
+#     log.info("Saving integrated dataset to disk...")
 #     write_integration_file(integrated_data, output_dir, "integrated_data", indexing=True)
 #     return integrated_data
 
@@ -4251,7 +4245,7 @@ def upload_to_google_drive(
 #         None
 #     """
 
-#     print("Saving integrated metadata for individual data types...")
+#     log.info("Saving integrated metadata for individual data types...")
 #     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
 #     return
 
@@ -4278,7 +4272,7 @@ def upload_to_google_drive(
 #         tuple: (tx_data_subset, mx_data_subset) with matched columns.
 #     """
 
-#     print("Creating dataframes with matching sample names...")
+#     log.info("Creating dataframes with matching sample names...")
 
 #     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
 #     def data_colnames_to_replace(metadata, data):
@@ -4290,7 +4284,7 @@ def upload_to_google_drive(
 #         return None
     
 #     # Process tx_metadata
-#     print("Processing tx_metadata...")
+#     log.info("Processing tx_metadata...")
 #     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
 #     library_names_tx = tx_metadata[tx_sample_col].tolist()
 #     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
@@ -4299,7 +4293,7 @@ def upload_to_google_drive(
 #     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
 
 #     # Process mx_metadata
-#     print("Processing mx_metadata...")
+#     log.info("Processing mx_metadata...")
 #     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
 #     library_names_mx = mx_metadata[mx_sample_col].tolist()
 #     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
@@ -4309,7 +4303,7 @@ def upload_to_google_drive(
 #     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
 
 #     if overlap_only is True:
-#         print("\tRestricting matching samples to only those present in both datasets...")
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
 #         # Find overlapping columns
 #         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
 
@@ -4327,550 +4321,2226 @@ def upload_to_google_drive(
 #         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
 
 #         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
-#             print(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
 
 #     return tx_data_subset, mx_data_subset
 
 
-# def write_integrated_data(
-#     data: pd.DataFrame,
-#     output_dir: str = None,
-#     dataset_name: str = None
-# ) -> pd.DataFrame:
-#     """
-#     Save integrated data to disk.
-
-#     Args:
-#         data (pd.DataFrame): DataFrame to save.
-#         output_dir (str, optional): Output directory.
-#         dataset_name (str, optional): Name for output file.
-
-#     Returns:
-#         pd.DataFrame: The same DataFrame.
-#     """
-
-#     print("Saving integrated data...")
-#     write_integration_file(data, output_dir, dataset_name)
-#     return data
-
-# def calculate_correlated_features(
-#     data: pd.DataFrame,
-#     output_filename: str,
-#     output_dir: str,
-#     corr_method: str = "pearson",
-#     corr_cutoff: float = 0.5,
-#     overwrite: bool = False,
-#     keep_negative: bool = False,
-#     only_bipartite: bool = False,
-#     save_corr_matrix: bool = False,
-#     block_size: int = 500
-# ) -> pd.DataFrame:
-#     """
-#     Memory-efficient calculation and filtering of feature-feature correlation matrix.
-#     Only stores pairs above cutoff in memory.
-
-#     Args:
-#         data (pd.DataFrame): Feature matrix (features x samples).
-#         output_dir (str): Output directory for results.
-#         corr_method (str): Correlation method.
-#         corr_cutoff (float): Correlation threshold.
-#         overwrite (bool): Overwrite existing results.
-#         keep_negative (bool): Keep negative correlations if True.
-#         only_bipartite (bool): Only keep bipartite correlations.
-#         save_corr_matrix (bool): Save correlation matrix to disk.
-
-#     Returns:
-#         pd.DataFrame: Filtered correlation matrix.
-#     """
-
-#     output_subdir = output_dir
-#     os.makedirs(output_subdir, exist_ok=True)
-#     existing_output = f"{output_subdir}/{output_filename}"
-#     if os.path.exists(existing_output) and not overwrite:
-#         print(f"Correlation table already exists at {existing_output}. \nSkipping calculation and returning existing matrix.")
-#         return pd.read_csv(existing_output, sep=',')
-
-#     data_input = data.T
-#     features = data_input.columns.tolist()
-#     n = len(features)
-#     print(f"Calculating feature correlations for {n} features using block size {block_size}...")
-
-#     results = []
-#     for i_start in range(0, n, block_size):
-#         i_end = min(i_start + block_size, n)
-#         block_i = data_input.iloc[:, i_start:i_end]
-#         for j_start in range(i_start, n, block_size):
-#             j_end = min(j_start + block_size, n)
-#             block_j = data_input.iloc[:, j_start:j_end]
-#             # Compute correlation matrix between block_i and block_j
-#             corr_matrix = block_i.corrwith(block_j, axis=0, method=corr_method) if block_i.shape[1] == 1 or block_j.shape[1] == 1 else block_i.corr(block_j, method=corr_method)
-#             # Only keep upper triangle for self-blocks to avoid duplicates
-#             for ii, f1 in enumerate(block_i.columns):
-#                 for jj, f2 in enumerate(block_j.columns):
-#                     if (i_start == j_start and jj <= ii):
-#                         continue  # skip lower triangle and diagonal
-#                     corr = corr_matrix.iloc[ii, jj]
-#                     if pd.isnull(corr):
-#                         continue
-#                     if keep_negative:
-#                         if abs(corr) >= corr_cutoff and abs(corr) != 1:
-#                             results.append((f1, f2, corr))
-#                     else:
-#                         if corr >= corr_cutoff and corr != 1:
-#                             results.append((f1, f2, corr))
-#     print(f"\tFiltered to {len(results)} pairs above cutoff of {corr_cutoff}.")
-
-#     if only_bipartite:
-#         print("Filtering for only bipartite correlations...")
-#         results = [r for r in results if r[0][:3] != r[1][:3]]
-#         print(f"\tCorrelation matrix filtered to {len(results)} pairs.")
-
-#     melted_corr = pd.DataFrame(results, columns=['feature_1', 'feature_2', 'correlation'])
-
-#     if save_corr_matrix:
-#         print(f"Saving feature correlation table to disk...")
-#         write_integration_file(melted_corr, output_dir, output_filename, indexing=False)
-
-#     return melted_corr
-
-
-
-# def calculate_correlated_features(
-#     data: pd.DataFrame,
-#     output_filename: str,
-#     output_dir: str,
-#     corr_method: str = "pearson",
-#     corr_cutoff: float = 0.5,
-#     overwrite: bool = False,
-#     keep_negative: bool = False,
-#     only_bipartite: bool = False,
-#     save_corr_matrix: bool = False
-# ) -> pd.DataFrame:
-#     """
-#     Memory-efficient calculation and filtering of feature-feature correlation matrix.
-#     Only stores pairs above cutoff in memory.
-
-#     Args:
-#         data (pd.DataFrame): Feature matrix (features x samples).
-#         output_dir (str): Output directory for results.
-#         corr_method (str): Correlation method.
-#         corr_cutoff (float): Correlation threshold.
-#         overwrite (bool): Overwrite existing results.
-#         keep_negative (bool): Keep negative correlations if True.
-#         only_bipartite (bool): Only keep bipartite correlations.
-#         save_corr_matrix (bool): Save correlation matrix to disk.
-
-#     Returns:
-#         pd.DataFrame: Filtered correlation matrix.
-#     """
-
-#     output_subdir = output_dir
-#     os.makedirs(output_subdir, exist_ok=True)
-#     existing_output = f"{output_subdir}/{output_filename}"
-#     if os.path.exists(existing_output) and not overwrite:
-#         print(f"Correlation table already exists at {existing_output}. Returning existing matrix.")
-#         return pd.read_csv(existing_output, sep=',')
-
-#     data_input = data.T
-#     features = data_input.columns.tolist()
-#     n = len(features)
-#     print(f"Calculating feature correlations for {n} features...")
-
-#     # Use numpy for speed and memory
-#     arr = data_input.values
-#     means = np.mean(arr, axis=0)
-#     stds = np.std(arr, axis=0)
-#     arr_centered = arr - means
-
-#     # Only store pairs above cutoff
-#     results = []
-#     for i in range(n):
-#         for j in range(i + 1, n):
-#             corr = pd.Series(arr[:, i]).corr(pd.Series(arr[:, j]), method=corr_method)
-#             if keep_negative:
-#                 if abs(corr) >= corr_cutoff and abs(corr) != 1:
-#                     results.append((features[i], features[j], corr))
-#             else:
-#                 if corr >= corr_cutoff and corr != 1:
-#                     results.append((features[i], features[j], corr))
-
-#     print(f"\tFiltered to {len(results)} pairs above cutoff of {corr_cutoff}.")
-
-#     # Only bipartite
-#     if only_bipartite:
-#         print("Filtering for only bipartite correlations...")
-#         results = [r for r in results if r[0][:3] != r[1][:3]]
-#         print(f"\tCorrelation matrix filtered to {len(results)} pairs.")
-
-#     # Build DataFrame
-#     melted_corr = pd.DataFrame(results, columns=['feature_1', 'feature_2', 'correlation'])
-
-#     if save_corr_matrix:
-#         print(f"Saving feature correlation table to disk...")
-#         write_integration_file(melted_corr, output_subdir, output_filename, indexing=False)
-
-#     return melted_corr
-
-# def calculate_correlated_features(
-#     data: pd.DataFrame,
-#     output_filename: str,
-#     output_dir: str,
-#     corr_method: str = "pearson",
-#     corr_cutoff: float = 0.5,
-#     overwrite: bool = False,
-#     keep_negative: bool = False,
-#     only_bipartite: bool = False,
-#     save_corr_matrix: bool = False
-# ) -> pd.DataFrame:
-#     """
-#     Calculate and filter feature-feature correlation matrix.
-
-#     Args:
-#         data (pd.DataFrame): Feature matrix (features x samples).
-#         output_dir (str): Output directory for results.
-#         corr_method (str): Correlation method.
-#         corr_cutoff (float): Correlation threshold.
-#         overwrite (bool): Overwrite existing results.
-#         keep_negative (bool): Keep negative correlations if True.
-#         only_bipartite (bool): Only keep bipartite correlations.
-#         save_corr_matrix (bool): Save correlation matrix to disk.
-
-#     Returns:
-#         pd.DataFrame: Filtered correlation matrix.
-#     """
-
-#     output_subdir = output_dir
-#     #output_subdir = f"{output_dir}/feature_correlation"
-#     os.makedirs(output_subdir, exist_ok=True)
-
-#     existing_output = f"{output_subdir}/{output_filename}"
-#     if os.path.exists(existing_output) and overwrite is False:
-#         print(f"Correlation table already exists at {existing_output}. \nSkipping calculation and returning existing matrix.")
-#         return pd.read_csv(existing_output, sep=',')
-
-#     data_input = data.T
-
-#     print(f"Calculating feature correlation matrix...")
-#     correlation_matrix = data_input.corr(method=corr_method)
-#     melted_corr = correlation_matrix.reset_index().melt(id_vars='features', var_name='features_2', value_name='correlation')
-#     melted_corr.rename(columns={'features': 'feature_1', 'features_2': 'feature_2'}, inplace=True)
-#     print(f"\tCorrelation matrix calculated with {melted_corr.shape[0]} pairs.")
-
-#     print(f"Filtering correlation matrix by cutoff value {corr_cutoff}...")
-#     if keep_negative is True:
-#         melted_corr = melted_corr[(abs(melted_corr['correlation']) >= corr_cutoff) & (melted_corr['correlation'] != 1) & (melted_corr['correlation'] != -1)]
-#     else:
-#         melted_corr = melted_corr[(melted_corr['correlation'] >= corr_cutoff) & (melted_corr['correlation'] != 1)]
-#     print(f"\tCorrelation matrix filtered to {melted_corr.shape[0]} pairs.")
-
-#     if only_bipartite is True:
-#         print("Filtering for only bipartite correlations...")
-#         melted_corr = melted_corr[melted_corr['feature_1'].str[:3] != melted_corr['feature_2'].str[:3]]
-#         print(f"\tCorrelation matrix filtered to {melted_corr.shape[0]} pairs.")
-
-#     if save_corr_matrix is True:
-#         print(f"Saving and returning feature correlation table to disk...")
-#         write_integration_file(melted_corr, output_subdir, output_filename, indexing=False)
-
-#     return melted_corr
-
-# def run_custom_metadata_integration_script(
-#     tx_dir: str,
-#     mx_dir: str,
-#     apid: str,
-#     config: dict
-# ) -> tuple[pd.DataFrame, pd.DataFrame]:
-#     """
-#     Run a custom script to integrate transcriptomics and metabolomics metadata.
-
-#     Args:
-#         tx_dir (str): Transcriptomics data directory.
-#         mx_dir (str): Metabolomics data directory.
-#         apid (str): Analysis project ID.
-#         config (dict): Project configuration dictionary.
-
-#     Returns:
-#         tuple: (tx_metadata_input, mx_metadata_input) DataFrames.
-#     """
-
-#     # Get the path to the custom integration script
-#     custom_script_path = os.path.join(os.path.expandvars(config['integration']['metadata_script']), f"sample_integration_{config['integration']['proposal_ID']}.py")
-#     print(f"Using the following script to merge metadata: {custom_script_path}\n")
-
-#     # Load the custom integration script
-#     spec = importlib.util.spec_from_file_location("custom_integration", custom_script_path)
-#     custom_integration = importlib.util.module_from_spec(spec)
-#     spec.loader.exec_module(custom_integration)
-
-#     # Call the integration function from the custom script
-#     tx_metadata_input, mx_metadata_input = custom_integration.integrate_metadata(tx_dir, mx_dir, apid)
-
-#     summarize_group_differences(tx_metadata_input, mx_metadata_input)
-
-#     return tx_metadata_input, mx_metadata_input
-
-# def summarize_group_differences(df1: pd.DataFrame, df2: pd.DataFrame) -> None:
-#     """
-#     Print a summary of unique and shared groups between two metadata DataFrames.
-
-#     Args:
-#         df1 (pd.DataFrame): First metadata DataFrame, must contain a 'group' column.
-#         df2 (pd.DataFrame): Second metadata DataFrame, must contain a 'group' column.
-
-#     Returns:
-#         None
-#     """
-#     combined_groups = pd.concat([df1['group'], df2['group']], axis=0, keys=['df1', 'df2']).reset_index(level=0)
-#     group_counts = combined_groups['group'].value_counts()
-#     unique_groups = group_counts[group_counts == 1].index
-#     shared_groups = group_counts[group_counts > 1].index
-    
-#     print("Unique groups (appear in only one dataframe):")
-#     for group in unique_groups:
-#         source_df = combined_groups[combined_groups['group'] == group]['level_0'].values[0]
-#         count = group_counts[group]
-#         print(f"{group} (from {source_df}, count: {count})")
-    
-#     print("\nShared groups (appear in both dataframes):")
-#     for group in shared_groups:
-#         count = group_counts[group]
-#         print(f"{group} (count: {count})")
-
-# def plot_correlation_network(
-#     correlation_matrix: pd.DataFrame,
-#     feature_prefixes: list,
-#     integrated_data: pd.DataFrame,
-#     integrated_metadata: pd.DataFrame,
-#     output_filenames: dict,
-#     annotation_df: str = None,
-#     network_mode: str = "bipartite",
-#     submodule_mode: str = "community",
-#     show_plot_in_notebook: bool = False,
-#     corr_cutoff: float = 0.5
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
 # ) -> None:
 #     """
-#     Plot and export a correlation network from a correlation matrix, with optional submodule extraction.
+#     Save integrated metadata to disk.
 
 #     Args:
-#         correlation_matrix (pd.DataFrame): DataFrame with columns ['feature_1', 'feature_2', 'correlation'].
-#         feature_prefixes (list): List of feature prefixes (e.g., ['tx', 'mx']).
-#         integrated_data (pd.DataFrame): Feature matrix.
-#         integrated_metadata (pd.DataFrame): Metadata DataFrame.
-#         output_filenames (dict): Dictionary with keys 'graph', 'node_table', 'edge_table' for output filenames.
-#         annotation_df (pd.DataFrame): DataFrame with feature annotations.
-#         network_mode (str): 'bipartite' or 'full'.
-#         submodule_mode (str): 'community' or 'subgraphs' or 'none'
-#         show_plot_in_notebook (bool): Whether to display the plot.
-#         corr_cutoff (float): Correlation threshold for edges.
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
 
 #     Returns:
 #         None
 #     """
 
-#     # Create a correlation matrix
-#     if network_mode == "bipartite":
-#         print("Filtering correlation matrix to bipartite relationships...")
-#         correlation_matrix = correlation_matrix[~correlation_matrix.apply(lambda row: row['feature_1'][:3] == row['feature_2'][:3], axis=1)]
-        
-#     print("Pivoting data...")
-#     correlation_df = correlation_matrix.pivot(index='feature_2', columns='feature_1', values='correlation')
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
 
-#     # Create a graph from the correlation matrix
-#     print("Creating graph...")
-#     G = nx.Graph()
-
-#     # Use vectorized operations to add nodes and edges based on the threshold
-#     print(f"Filtering edges based on correlation threshold of {corr_cutoff}...")
-#     mask = np.abs(correlation_df.values) >= corr_cutoff
-#     np.fill_diagonal(mask, False)  # Exclude self-loops
-#     edges = np.column_stack(np.where(mask))
-#     #print(f"\t{len(edges)} edges added to the graph.")
-#     if network_mode == "full":
-#         for i, j in edges:
-#             G.add_edge(correlation_df.index[i], correlation_df.columns[j], weight=correlation_df.iloc[i, j])
-#     elif network_mode == "bipartite":
-#         for i, j in edges:
-#             node_i = correlation_df.index[i]
-#             node_j = correlation_df.columns[j]
-#             if (any(prefix in node_i for prefix in feature_prefixes) and 
-#                 any(prefix in node_j for prefix in feature_prefixes) and 
-#                 node_i[:2] != node_j[:2]):  # Ensure nodes are from different groups
-#                 G.add_edge(node_i, node_j, weight=float((correlation_df.iloc[i, j]*100)**2))
-#     else:
-#         raise ValueError("Invalid network_mode. Please select 'full' or 'bipartite'.")
-#     print(f"\t{G.number_of_edges()} edges added to the graph.")
-#     print(f"\t{G.number_of_nodes()} nodes added to the graph.")
-
-#     # Define node colors based on datatype
-#     print("Adding node aesthetics...")
-#     viridis_colors = viridis(np.linspace(0, 1, 3))  # Generate 3 distinct colors from viridis colormap
-#     viridis_colors_hex = [to_hex(color) for color in viridis_colors]  # Convert to hex color strings
-#     for node in G.nodes():
-#         if any(keyword in node for keyword in feature_prefixes):
-#             for i, keyword in enumerate(feature_prefixes):
-#                 if keyword in node:
-#                     G.nodes[node]['datatype_color'] = viridis_colors_hex[i % len(viridis_colors_hex)]
-#                     G.nodes[node]['datatype_shape'] = "Round Rectangle" if keyword == "tx" else "Diamond"
-#         else:
-#             G.nodes[node]['datatype_color'] = "gray"
-#             G.nodes[node]['datatype_shape'] = "Rectangle" 
-
-#     # Annotate nodes and edges with functional information if available
-#     if annotation_df is not None and not annotation_df.empty:
-#         print("Annotating nodes and edges with functional information...")
-#         annotation_df['node_id'] = annotation_df.index
-#         node_annotations = annotation_df.set_index('node_id')['annotation'].fillna("Unassigned").to_dict()
-#         for node in G.nodes():
-#             if node in node_annotations:
-#                 annotation_string = str(node_annotations[node])
-#                 if annotation_string == "Unassigned":
-#                     node_shape = "Round Rectangle"
-#                 else:
-#                     node_shape = "Diamond"
-#                 G.nodes[node]['annotation'] = annotation_string
-#                 G.nodes[node]['annotation_shape'] = node_shape
-#         for edge in G.edges():
-#             if edge[0] in node_annotations:
-#                 G.edges[edge]['source_annotation'] = str(node_annotations[edge[0]])
-#             if edge[1] in node_annotations:
-#                 G.edges[edge]['target_annotation'] = str(node_annotations[edge[1]])
-
-#     # Remove isolated groups of exactly 2 nodes
-#     small_components = [c for c in nx.connected_components(G) if len(c) < 3]
-#     for comp in small_components:
-#         G.remove_nodes_from(comp)    
-
-#     print(f"Exporting node/edge tables and correlation network...")
-#     nx.write_graphml(G, output_filenames['graph'])
-#     edge_table = nx.to_pandas_edgelist(G)
-#     edge_table.index.name = 'edge_index'
-#     node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient='index')
-#     node_table.index.name = 'node_id'
-#     node_table.to_csv(output_filenames['node_table'], index=True, index_label='node_index')
-#     edge_table.to_csv(output_filenames['edge_table'], index=True, index_label='edge_index')
-
-#     print("Drawing graph...")
-#     if show_plot_in_notebook is True:
-#         plt.figure(figsize=(12, 8))
-#         #pos = nx.spring_layout(G)
-#         pos = nx.forceatlas2_layout(G)
-#         node_colors = [G.nodes[node]['datatype_color'] for node in G.nodes()]
-#         nx.draw(G, pos, with_labels=True, node_size=200, node_color=node_colors, font_size=1)
-#         plt.show()
-
-#     if submodule_mode != "none" and network_mode == "bipartite":
-#         print("Extracting submodules from the bipartite network...")
-#         G = extract_submodules_from_bipartite_network(graph=G, integrated_data=integrated_data, metadata=integrated_metadata,
-#                                                       output_filenames=output_filenames, submodule_mode=submodule_mode)
-#         print(f"Updating main graphml file and edge/node tables with submodule information...")
-#         nx.write_graphml(G, output_filenames['graph'])
-#         edge_table = nx.to_pandas_edgelist(G)
-#         edge_table.index.name = 'edge_index'
-#         node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient='index')
-#         node_table.index.name = 'node_id'
-#         node_table.to_csv(output_filenames['node_table'], index=True, index_label='node_index')
-#         edge_table.to_csv(output_filenames['edge_table'], index=True, index_label='edge_index')
-#     elif submodule_mode != "none" and network_mode == "full":
-#         raise ValueError("Submodule creation is currently only supported for the 'bipartite' network mode.")
-
-# def extract_submodules_from_bipartite_network(
-#     graph: 'nx.Graph',
-#     integrated_data: pd.DataFrame,
-#     metadata: pd.DataFrame,
-#     output_filenames: dict,
-#     submodule_mode: str,
-#     save_plots: bool = True,
-# ) -> 'nx.Graph':
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
 #     """
-#     Extract submodules (connected components or communities) from a bipartite network and save results.
+#     Integrate transcriptomics and metabolomics data by matching sample names.
 
 #     Args:
-#         graph (nx.Graph): Bipartite network graph.
-#         integrated_data (pd.DataFrame): Feature matrix.
-#         metadata (pd.DataFrame): Metadata DataFrame.
-#         output_filenames (dict): Dictionary with keys 'graph', 'node_table', 'edge_table' for output filenames.
-#         submodule_mode (str): 'subgraphs' or 'community'.
-#         save_plots (bool): Whether to save abundance plots.
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
 
 #     Returns:
-#         nx.Graph: Annotated main graph with submodule information.
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
 #     """
 
-#     if submodule_mode == "subgraphs": # Find connected components in the graph
-#         submodules = [graph.subgraph(c).copy() for c in nx.connected_components(graph)]
-#     elif submodule_mode == "community": # Detect communities in the graph and group nodes into submodules by their community
-#         partition = community_louvain.best_partition(graph)
-#         submodules = []
-#         for community_id in set(partition.values()):
-#             nodes_in_community = [node for node, community in partition.items() if community == community_id]
-#             submodules.append(graph.subgraph(nodes_in_community).copy())
-#     else:
-#         raise ValueError("Invalid submodule_mode. Please select 'subgraphs' or 'community'.")
+#     log.info("Creating dataframes with matching sample names...")
 
-#     # Define module colors based on index text and add as node attribute
-#     submodule_num = len(submodules)
-#     viridis_colors = viridis(np.linspace(0, 1, submodule_num))  # Generate distinct colors from viridis colormap
-#     viridis_colors_hex = [to_hex(color) for color in viridis_colors]  # Convert to hex color strings
-#     random.shuffle(viridis_colors_hex)
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
 
-#     for idx, submodule in enumerate(submodules):
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
 
-#         # Annotate nodes in submodules and main graph with submodule IDs
-#         for node in submodule.nodes():
-#             if node in graph.nodes():
-#                 graph.nodes[node]['submodule'] = f"submodule_{idx+1}"
-#                 graph.nodes[node]['submodule_color'] = viridis_colors_hex[idx % len(viridis_colors_hex)]
-#             submodule.nodes[node]['submodule'] = f"submodule_{idx+1}"
-#             submodule.nodes[node]['submodule_color'] = viridis_colors_hex[idx % len(viridis_colors_hex)]
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
 
-#         # Save each submodule as a GraphML file
-#         graph_filename = os.path.basename(output_filenames['graph'])
-#         os.makedirs(output_filenames['submodule_path'], exist_ok=True)
-#         submodule_graph_name = f"{output_filenames['submodule_path']}/{graph_filename.replace('.graphml', '_submodule')}{idx+1}.graphml"
-#         nx.write_graphml(submodule, submodule_graph_name)
-#         print(f"\tSubmodule {idx + 1} saved to {submodule_graph_name}")
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
 
-#         # Write node and edge tables for each submodule
-#         node_table = pd.DataFrame.from_dict(dict(submodule.nodes(data=True)), orient='index')
-#         node_table.index.name = 'node_id'
-#         edge_table = nx.to_pandas_edgelist(submodule)
-#         edge_table.index.name = 'node_id'
-#         node_table_filename = os.path.basename(output_filenames['node_table'])
-#         edge_table_filename = os.path.basename(output_filenames['edge_table'])
-#         submodule_node_table_name = f"{output_filenames['submodule_path']}/{node_table_filename.replace('.csv', '_submodule')}{idx+1}.csv"
-#         submodule_edge_table_name = f"{output_filenames['submodule_path']}/{edge_table_filename.replace('.csv', '_submodule')}{idx+1}.csv"
-#         node_table.to_csv(submodule_node_table_name, index=True)
-#         edge_table.to_csv(submodule_edge_table_name, index=True)
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
 
-#         # Graph the abundance of features in each submodule across metadata
-#         if save_plots is True:
-#             nodes_df = pd.DataFrame(node_table.index, columns=['node_id'])
-#             nodes_df = nodes_df.set_index('node_id')
-#             abundance_df = integrated_data.apply(pd.to_numeric, errors='coerce')
-#             linked_df = nodes_df.join(abundance_df, how='inner')
-#             if linked_df.empty:
-#                 print(f"\tNo data available for plotting submodule {idx+1}. Skipping...")
-#                 continue
-#             else:
-#                 data_series = linked_df.mean(axis=0)
-            
-#             final_df = pd.DataFrame(data_series, columns=['abundance'])
-#             plot_df = final_df.join(metadata, how='inner')
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
 
-#             plt.figure(figsize=(10, 10))
-#             sns.violinplot(x='group', y='abundance', data=plot_df, inner=None, palette='viridis')
-#             sns.stripplot(x='group', y='abundance', data=plot_df, color='k', alpha=0.5)
-#             plt.title(f'Mean abundance of nodes in submodule{idx+1} across group')
-#             plt.xlabel('group')
-#             plt.ylabel(f'Mean abundance')
-#             plt.xticks(rotation=90)
-#             plt.tight_layout()
+#     return tx_data_subset, mx_data_subset
 
-#             submodule_boxplot_name = f"{output_filenames['submodule_path']}/submodule_{idx+1}_abundance_boxplot.pdf"
-#             plt.savefig(submodule_boxplot_name, dpi=300, format='pdf')
-#             plt.close()
 
-#     if save_plots is True:
-#         print(f"\n\tSubmodule node abundance boxplots plots saved.")
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
 
-#     return graph
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir (str, optional): Output directory.
+
+#     Returns:
+#         None
+#     """
+
+#     log.info("Saving integrated metadata for individual data types...")
+#     write_integration_file(metadata, output_dir, "integrated_metadata", indexing=False)
+#     return
+
+# def integrate_data(
+#     tx_metadata: pd.DataFrame,
+#     tx_data: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     mx_data: pd.DataFrame,
+#     unifying_col: str = 'unique_group',
+#     overlap_only: bool = False
+# ) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     """
+#     Integrate transcriptomics and metabolomics data by matching sample names.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata.
+#         tx_data (pd.DataFrame): Transcriptomics data.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata.
+#         mx_data (pd.DataFrame): Metabolomics data.
+#         unifying_col (str): Column to unify sample names.
+#         overlap_only (bool): If True, restrict to overlapping samples.
+
+#     Returns:
+#         tuple: (tx_data_subset, mx_data_subset) with matched columns.
+#     """
+
+#     log.info("Creating dataframes with matching sample names...")
+
+#     # Figure out which tx_metadata columns represents the column names in tx_data (prior to replacement)
+#     def data_colnames_to_replace(metadata, data):
+#         data_columns = data.columns.tolist()[1:]
+#         for column in metadata.columns:
+#             metadata_columns = set(metadata[column])
+#             if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
+#                 return column
+#         return None
+    
+#     # Process tx_metadata
+#     log.info("Processing tx_metadata...")
+#     tx_sample_col = data_colnames_to_replace(tx_metadata, tx_data)
+#     library_names_tx = tx_metadata[tx_sample_col].tolist()
+#     tx_data_subset = tx_data[[tx_data.columns[0]] + [col for col in tx_data.columns if col in library_names_tx]]
+#     mapping_tx = dict(zip(tx_metadata[tx_sample_col], tx_metadata[unifying_col]))
+#     tx_data_subset.columns = [tx_data_subset.columns[0]] + [mapping_tx.get(col, col) for col in tx_data_subset.columns[1:]]
+#     tx_data_subset.set_index(tx_data_subset.columns[0], inplace=True)
+
+#     # Process mx_metadata
+#     log.info("Processing mx_metadata...")
+#     mx_sample_col = data_colnames_to_replace(mx_metadata, mx_data)
+#     library_names_mx = mx_metadata[mx_sample_col].tolist()
+#     mx_data_subset = mx_data[[mx_data.columns[0]] + [col for col in mx_data.columns if col in library_names_mx]]
+#     mapping_mx = dict(zip(mx_metadata[mx_sample_col], mx_metadata[unifying_col]))
+#     mx_data_subset.columns = [mx_data_subset.columns[0]] + [mapping_mx.get(col, col) for col in mx_data_subset.columns[1:]]
+#     mx_data_subset.set_index(mx_data_subset.columns[0], inplace=True)
+#     mx_data_subset = mx_data_subset.groupby(mx_data_subset.columns, axis=1).sum() # This is needed for multipolarity
+
+#     if overlap_only is True:
+#         log.info("\tRestricting matching samples to only those present in both datasets...")
+#         # Find overlapping columns
+#         overlapping_columns_samples = list(set(mx_data_subset.columns).intersection(set(tx_data_subset.columns)))
+
+#         def get_overlapping_columns(data, base_columns_list, specific_column):
+#             base_columns_list.append(specific_column)
+#             data = data[base_columns_list]
+#             base_columns_list.remove(specific_column)
+#             cols = data.columns.tolist()
+#             cols = [cols[-1]] + cols[:-1]
+#             output = data[cols]
+#             output.set_index(output.columns[0], inplace=True)
+#             return output
+
+#         tx_data_subset = get_overlapping_columns(tx_data_subset, overlapping_columns_samples, tx_data.columns[0])
+#         mx_data_subset = get_overlapping_columns(mx_data_subset, overlapping_columns_samples, mx_data.columns[0])
+
+#         if tx_data_subset.shape[1] != mx_data_subset.shape[1]:
+#             log.info(f"Overlap only is True but number of rows DO NOT match between tx output data ({tx_data_subset.shape[1]}) and mx output data ({mx_data_subset.shape[1]}). Something might be wrong.")
+
+#     return tx_data_subset, mx_data_subset
+
+
+# def write_integrated_metadata(
+#     metadata: pd.DataFrame,
+#     output_dir: str = None
+# ) -> None:
+#     """
+#     Save integrated metadata to disk.
+
+#     Args:
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         output_dir

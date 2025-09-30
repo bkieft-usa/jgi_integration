@@ -8,12 +8,21 @@ import shutil
 from typing import Dict, Any, List, Optional
 from IPython.display import display
 import tools.helpers as hlp
+import logging
+
+log = logging.getLogger(__name__)
+if not log.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    fmt = "\033[47m%(levelname)s – %(message)s\033[0m"
+    handler.setFormatter(logging.Formatter(fmt))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
 
 class Project:
     """Project configuration and directory management."""
 
     def __init__(self, config):
-        print("\n=== Initializing Project ===")
+        log.info("=== Initializing Project ===")
         self.config = config
         self.project_config = config['project']
         self.user_settings = config['user_settings']
@@ -26,7 +35,7 @@ class Project:
         self.raw_data_dir = self.project_config['raw_data_path']
         self.project_dir = f"{self.output_dir}/{self.project_name}"
         os.makedirs(self.project_dir, exist_ok=True)
-        print(f"Project directory: {self.project_dir}")
+        log.info(f"Project directory: {self.project_dir}")
 
 class BaseDataHandler:
     """Base class with common data handling functionality."""
@@ -64,9 +73,9 @@ class BaseDataHandler:
         if attribute_name in self._cache and not overwrite:
             setattr(self, attribute_name, self._cache[attribute_name])
             if hasattr(self, 'dataset_name'):
-                print(f"{attribute_name} already loaded in memory for {self.dataset_name}. Using cached attribute.")
+                log.info(f"{attribute_name} already loaded in memory for {self.dataset_name}. Using cached attribute.")
             else:
-                print(f"{attribute_name} already loaded in memory. Using cached attribute.")
+                log.info(f"{attribute_name} already loaded in memory. Using cached attribute.")
             return True
             
         # Check disk
@@ -74,16 +83,16 @@ class BaseDataHandler:
             self.clear_cache(attribute_name)
             setattr(self, attribute_name, getattr(self, attribute_name))
             if hasattr(self, 'dataset_name'):
-                print(f"{attribute_name} file found on disk for {self.dataset_name}. Loading from file.")
+                log.info(f"{attribute_name} file found on disk for {self.dataset_name}. Loading from file.")
             else:
-                print(f"{attribute_name} file found on disk. Loading from file.")
+                log.info(f"{attribute_name} file found on disk. Loading from file.")
             return True
             
         if overwrite:
             if hasattr(self, 'dataset_name'):
-                print(f"{attribute_name} exists for {self.dataset_name} but overwrite=True. Regenerating...")
+                log.info(f"{attribute_name} exists for {self.dataset_name} but overwrite=True. Regenerating...")
             else:
-                print(f"{attribute_name} exists but overwrite=True. Regenerating...")
+                log.info(f"{attribute_name} exists but overwrite=True. Regenerating...")
 
         return False
     
@@ -96,7 +105,7 @@ class Dataset(BaseDataHandler):
     """Simplified Dataset class using hybrid approach."""
 
     def __init__(self, dataset_name: str, project: Project, overwrite: bool = False):
-        print("\n=== Initializing Datasets ===")
+        log.info("=== Initializing Datasets ===")
         self.project = project
         self.dataset_name = dataset_name
         self.datasets_config = self.project.config['datasets']
@@ -129,15 +138,15 @@ class Dataset(BaseDataHandler):
         )
         if os.path.exists(processing_dir):
             if overwrite:
-                print(f"Overwriting existing dataset processing directory for {dataset_name} at {processing_dir}.")
+                log.info(f"Overwriting existing dataset processing directory for {dataset_name} at {processing_dir}.")
                 #shutil.rmtree(processing_dir)
                 return processing_dir
             else:
-                print(f"ERROR: Dataset processing directory already exists for {dataset_name} at {processing_dir}")
-                print("\nPlease choose a different tag, delete the existing directory, or use the overwrite=True flag before proceeding.")
+                log.info(f"ERROR: Dataset processing directory already exists for {dataset_name} at {processing_dir}")
+                log.info("\nPlease choose a different tag, delete the existing directory, or use the overwrite=True flag before proceeding.")
                 sys.exit(1)
         else:
-            print(f"Set up {dataset_name} dataset output directory: {processing_dir}")
+            log.info(f"Set up {dataset_name} dataset output directory: {processing_dir}")
             return processing_dir
 
     #def _setup_dataset_filenames(self, file_storage):
@@ -265,12 +274,12 @@ class Dataset(BaseDataHandler):
     
     def plot_pca(self, overwrite: bool = False, **kwargs) -> None:
         """Hybrid: Class setup + external hlp.plot_pca function."""
-        print("\n=== Plotting individual PCAs and grid ===")
+        log.info("=== Plotting individual PCAs and grid ===")
         plot_subdir = "plots"
         plot_dir = os.path.join(self.output_dir, plot_subdir)
         os.makedirs(plot_dir, exist_ok=True)
         if os.path.exists(os.path.join(plot_dir, self._pca_grid_filename)) and not overwrite:
-            print(f"PCA grid plot already exists at {plot_dir}. Skipping.")
+            log.info(f"PCA grid plot already exists at {plot_dir}. Skipping.")
             return
         
         call_params = {
@@ -313,9 +322,9 @@ class MX(Dataset):
         self.datatype = "peak-height" # Currently only peak-height supported, not configurable
 
     def get_raw_data(self, overwrite: bool = False) -> None:
-        print("\n=== Getting Raw Data (MX) ===")
+        log.info("=== Getting Raw Data (MX) ===")
         if self.check_and_load_attribute('raw_data', self._raw_data_filename, overwrite):
-            print(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.")
+            log.info(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.")
             return
 
         result = hlp.get_mx_data(
@@ -328,12 +337,12 @@ class MX(Dataset):
             filtered_mx=False,
         )
         self.raw_data = result
-        print(f"\tCreated raw data for MX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.\n")
+        log.info(f"\tCreated raw data for MX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.\n")
 
     def get_raw_metadata(self, overwrite: bool = False) -> None:
-        print("\n=== Getting Raw Metadata (MX) ===")
+        log.info("=== Getting Raw Metadata (MX) ===")
         if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, overwrite):
-            print(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
+            log.info(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
             return
 
         mx_data_pattern = f"{self.dataset_raw_dir}/*{self.chromatography}*/*_{self.datatype}.csv"
@@ -369,7 +378,7 @@ class MX(Dataset):
             polarity=self.polarity
         )
         self.raw_metadata = result
-        print(f"\tCreated raw metadata for MX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.\n")
+        log.info(f"\tCreated raw metadata for MX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.\n")
 
 
 class TX(Dataset):
@@ -383,9 +392,9 @@ class TX(Dataset):
         self.datatype = "counts" # Currently only counts supported, not configurable
 
     def get_raw_data(self, overwrite: bool = False) -> None:
-        print("\n=== Getting Raw Data (TX) ===")
+        log.info("=== Getting Raw Data (TX) ===")
         if self.check_and_load_attribute('raw_data', self._raw_data_filename, overwrite):
-            print(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.")
+            log.info(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.")
             return
         
         result = hlp.get_tx_data(
@@ -396,13 +405,13 @@ class TX(Dataset):
             overwrite=overwrite
         )
         self.raw_data = result
-        print(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.\n")
+        log.info(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.\n")
 
     def get_raw_metadata(self, overwrite: bool = False) -> None:
-        print("\n=== Getting Raw Metadata (TX) ===")
+        log.info("=== Getting Raw Metadata (TX) ===")
         if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, overwrite):
             self.apid = self.raw_metadata['APID'].iloc[0] if 'APID' in self.raw_metadata.columns else None
-            print(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
+            log.info(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
             return
         
         tx_files_path = os.path.join(self.dataset_raw_dir, "all_tx_portal_files.txt")
@@ -438,13 +447,13 @@ class TX(Dataset):
             overwrite=overwrite
         )
         self.raw_metadata = result
-        print(f"\tCreated raw metadata for TX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.\n")
+        log.info(f"\tCreated raw metadata for TX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.\n")
 
 class Analysis(BaseDataHandler):
     """Simplified Analysis class using consistent hybrid approach."""
 
     def __init__(self, project: Project, datasets: list = None, overwrite: bool = False):
-        print("\n=== Initializing Analysis ===")
+        log.info("=== Initializing Analysis ===")
         self.project = project
         self.datasets_config = self.project.config['datasets']
         self.analysis_config = self.project.config['analysis']
@@ -463,9 +472,9 @@ class Analysis(BaseDataHandler):
         self.analysis_parameters = self.analysis_config.get('analysis_parameters', {})
         self.datasets = datasets or []
     
-        print(f"Created analysis with {len(self.datasets)} datasets.")
+        log.info(f"Created analysis with {len(self.datasets)} datasets.")
         for ds in self.datasets:
-            print(f"\t- {ds.dataset_name} with output directory: {ds.output_dir}")
+            log.info(f"\t- {ds.dataset_name} with output directory: {ds.output_dir}")
 
     @staticmethod
     def set_up_analysis_outdir(project: Project, datasets_config: dict, analysis_config: dict, overwrite: bool = False) -> str:
@@ -477,15 +486,15 @@ class Analysis(BaseDataHandler):
         )
         if os.path.exists(analysis_dir):
             if overwrite:
-                print(f"Overwriting existing analysis directory {analysis_dir}.")
+                log.info(f"Overwriting existing analysis directory {analysis_dir}.")
                 #shutil.rmtree(analysis_dir)
                 return analysis_dir
             else:
-                print(f"ERROR: Analysis directory already exists for {dataset_name} at {analysis_dir}")
-                print("\nPlease choose a different tag, delete the existing directory, or use the overwrite=True flag before proceeding.")
+                log.info(f"ERROR: Analysis directory already exists for {dataset_name} at {analysis_dir}")
+                log.info("\nPlease choose a different tag, delete the existing directory, or use the overwrite=True flag before proceeding.")
                 sys.exit(1)
         else:
-            print(f"Set up analysis output directory: {analysis_dir}")
+            log.info(f"Set up analysis output directory: {analysis_dir}")
             return analysis_dir
 
     #def _setup_analysis_filenames(self, file_storage):
@@ -535,43 +544,43 @@ class Analysis(BaseDataHandler):
 
     def filter_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply filtering to all datasets in the analysis."""
-        print("\n=== Filtering Data ===")
+        log.info("=== Filtering Data ===")
         for ds in self.datasets:
-            print(f"Filtering {ds.dataset_name} dataset...")
+            log.info(f"Filtering {ds.dataset_name} dataset...")
             ds.filter_data(overwrite=overwrite, **kwargs)
 
     def devariance_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply devariancing to all datasets in the analysis."""
-        print("\n=== Devariancing Data ===")
+        log.info("=== Devariancing Data ===")
         for ds in self.datasets:
-            print(f"Devariancing {ds.dataset_name} dataset...")
+            log.info(f"Devariancing {ds.dataset_name} dataset...")
             ds.devariance_data(overwrite=overwrite, **kwargs)
 
     def scale_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply scaling to all datasets in the analysis."""
-        print("\n=== Scaling Data ===")
+        log.info("=== Scaling Data ===")
         for ds in self.datasets:
-            print(f"Scaling {ds.dataset_name} dataset...")
+            log.info(f"Scaling {ds.dataset_name} dataset...")
             ds.scale_data(overwrite=overwrite, **kwargs)
 
     def replicability_test_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Remove low replicable features from all datasets in the analysis."""
-        print("\n=== Removing Unreplicable Features ===")
+        log.info("=== Removing Unreplicable Features ===")
         for ds in self.datasets:
-            print(f"Removing low replicable features from {ds.dataset_name} dataset...")
+            log.info(f"Removing low replicable features from {ds.dataset_name} dataset...")
             ds.remove_low_replicable_features(overwrite=overwrite, **kwargs)
 
     def plot_pca_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Plot PCA for all datasets in the analysis."""
-        print("\n=== Plotting Individual PCAs and Grid ===")
+        log.info("=== Plotting Individual PCAs and Grid ===")
         for ds in self.datasets:
-            print(f"Plotting PCA for {ds.dataset_name} dataset...")
+            log.info(f"Plotting PCA for {ds.dataset_name} dataset...")
             ds.plot_pca(overwrite=overwrite, **kwargs)
 
     def link_metadata(self, overwrite: bool = False) -> None:
         """Hybrid: Class orchestration + external hlp.link_metadata_with_custom_script function."""
 
-        print("\n=== Linking analysis datasets along shared metadata ===")
+        log.info("=== Linking analysis datasets along shared metadata ===")
 
         # Check if datasets already have linked metadata
         datasets_to_process = [
@@ -588,12 +597,12 @@ class Analysis(BaseDataHandler):
         # Set results back to datasets
         for ds in self.datasets:
             ds.linked_metadata = linked_metadata[ds.dataset_name]
-            print(f"Created linked_metadata for {ds.dataset_name} with {ds.linked_metadata.shape[0]} samples and {ds.linked_metadata.shape[1]} metadata fields.\n")
+            log.info(f"Created linked_metadata for {ds.dataset_name} with {ds.linked_metadata.shape[0]} samples and {ds.linked_metadata.shape[1]} metadata fields.\n")
 
     def link_data(self, overlap_only: bool = True, overwrite: bool = False) -> None:
         """Hybrid: Class orchestration + external hlp.link_data_across_datasets function."""
 
-        print("\n=== Linking analysis datasets along shared samples ===")
+        log.info("=== Linking analysis datasets along shared samples ===")
 
         # Check if all datasets already have linked data
         datasets_to_process = [
@@ -615,7 +624,7 @@ class Analysis(BaseDataHandler):
         # Set results back to datasets
         for ds in self.datasets:
             ds.linked_data = linked_data[ds.dataset_name]
-            print(f"Created linked_data for {ds.dataset_name} with {ds.linked_data.shape[1]} samples and {ds.linked_data.shape[0]} features.\n")
+            log.info(f"Created linked_data for {ds.dataset_name} with {ds.linked_data.shape[1]} samples and {ds.linked_data.shape[0]} features.\n")
         
         return
 
@@ -623,7 +632,7 @@ class Analysis(BaseDataHandler):
         """
         Plot histograms of feature values for each dataset in the analysis.
         """
-        print("\n=== Plotting feature value distributions for all datasets ===")
+        log.info("=== Plotting feature value distributions for all datasets ===")
         if datatype == "normalized":
             dataframes = {ds.dataset_name: ds.normalized_data for ds in self.datasets if hasattr(ds, "normalized_data")}
         elif datatype == "nonnormalized":
@@ -641,8 +650,9 @@ class Analysis(BaseDataHandler):
 
     def integrate_metadata(self, overwrite: bool = False) -> None:
         """Hybrid: Class validation + external hlp.integrate_metadata function."""
-        print("\n=== Integrating metadata across data types ===")
+        log.info("=== Integrating metadata across data types ===")
         if self.check_and_load_attribute('integrated_metadata', self._integrated_metadata_filename, overwrite):
+            log.info(f"\tIntegrated metadata object 'integrated_metadata' with {self.integrated_metadata.shape[0]} samples and {self.integrated_metadata.shape[1]} metadata fields.")
             return
         
         result = hlp.integrate_metadata(
@@ -653,12 +663,13 @@ class Analysis(BaseDataHandler):
             output_dir=self.output_dir
         )
         self.integrated_metadata = result
-        print(f"Created a single integrated metadata table with {self.integrated_metadata.shape[0]} samples and {self.integrated_metadata.shape[1]} metadata fields.\n")
+        log.info(f"Created a single integrated metadata table with {self.integrated_metadata.shape[0]} samples and {self.integrated_metadata.shape[1]} metadata fields.\n")
     
     def integrate_data(self, overlap_only: bool = True, overwrite: bool = False) -> None:
         """Hybrid: Class validation + external hlp.integrate_data function."""
-        print("\n=== Integrating data matrices across data types ===")
+        log.info("=== Integrating data matrices across data types ===")
         if self.check_and_load_attribute('integrated_data', self._integrated_data_filename, overwrite):
+            log.info(f"\tIntegrated data object 'integrated_data' with {self.integrated_data.shape[0]} features and {self.integrated_data.shape[1]} samples.")
             return
         
         result = hlp.integrate_data(
@@ -668,43 +679,35 @@ class Analysis(BaseDataHandler):
             output_dir=self.output_dir
         )
         self.integrated_data = result
-        print(f"Created a single integrated data table with {self.integrated_data.shape[0]} samples and {self.integrated_data.shape[1]} features.\n")
+        log.info(f"Created a single integrated data table with {self.integrated_data.shape[0]} samples and {self.integrated_data.shape[1]} features.\n")
 
     def perform_feature_selection(self, overwrite: bool = False, **kwargs) -> None:
         """Hybrid: Class parameter setup + external hlp.perform_feature_selection function."""
-        print("=== Subsetting Features before Network Analysis ===")
+        log.info("=== Subsetting Features before Network Analysis ===")
         if self.check_and_load_attribute('integrated_data_selected', self._integrated_data_selected_filename, overwrite):
+            log.info(f"\tFeature selection data object 'integrated_data_selected' with {self.integrated_data_selected.shape[0]} features and {self.integrated_data_selected.shape[1]} samples.")
             return
         
         feature_selection_params = self.analysis_parameters.get('feature_selection', {})
-        selected_method = feature_selection_params.get('selected_method', 'variance')
-        method_params = feature_selection_params.get(selected_method, {})
-
         call_params = {
             'data': self.integrated_data,
             'metadata': self.integrated_metadata,
-            'output_filename': self._integrated_data_selected_filename,
-            'subset_method': selected_method,
+            'config': feature_selection_params, 
+            'max_features': feature_selection_params.get('max_features', 5000),
             'output_dir': self.output_dir,
-            'overwrite': overwrite,
-            'feature_cutoff': method_params.get('max_features', 5000),
-            'category_column': method_params.get('metadata_category', None),
-            'reference_group': method_params.get('metadata_category_reference', None),
-            'significance_level': method_params.get('significance_level', 0.05),
-            'lfc_level': method_params.get('log_fold_level', 0.5),
-            'feature_list_file': method_params.get('feature_list_file', None)
+            'output_filename': self._integrated_data_selected_filename,
         }
-
         call_params.update(kwargs)
 
         result = hlp.perform_feature_selection(**call_params)
         self.integrated_data_selected = result
-        print(f"Created a subset of the integrated data with {self.integrated_data_selected.shape[0]} samples and {self.integrated_data_selected.shape[1]} features for network analysis.\n")
+        log.info(f"Created a subset of the integrated data with {self.integrated_data_selected.shape[0]} samples and {self.integrated_data_selected.shape[1]} features for network analysis.\n")
 
     def calculate_correlated_features(self, overwrite: bool = False, **kwargs) -> None:
         """Hybrid: Class validation + external hlp.calculate_correlated_features function."""
-        print("=== Calculating Correlated Features ===")
+        log.info("=== Calculating Correlated Features ===")
         if self.check_and_load_attribute('feature_correlation_table', self._feature_correlation_table_filename, overwrite):
+            log.info(f"\tFeature correlation table object 'feature_correlation_table' with {self.feature_correlation_table.shape[0]} feature pairs.")
             return
         
         # Get parameters from config with defaults
@@ -725,10 +728,10 @@ class Analysis(BaseDataHandler):
         
         result = hlp.bipartite_correlation(**call_params)
         self.feature_correlation_table = result
-        print(f"Created a feature correlation table with {self.feature_correlation_table.shape[0]} feature pairs.\n")
+        log.info(f"Created a feature correlation table with {self.feature_correlation_table.shape[0]} feature pairs.\n")
 
     def plot_correlation_network(self, overwrite: bool = False, **kwargs) -> None:
-        print("=== Plotting Correlation Network ===")
+        log.info("=== Plotting Correlation Network ===")
         network_subdir = "feature_network"
         submodule_subdir = "submodules"
         network_dir = os.path.join(self.output_dir, network_subdir)
@@ -753,7 +756,7 @@ class Analysis(BaseDataHandler):
         }
 
         call_params = {
-            'correlation_matrix': self.feature_correlation_table,
+            'corr_table': self.feature_correlation_table,
             'feature_prefixes': [ds.dataset_name for ds in self.datasets],
             'integrated_data': self.integrated_data_selected,
             'integrated_metadata': self.integrated_metadata,
@@ -761,22 +764,22 @@ class Analysis(BaseDataHandler):
             'annotation_df': getattr(self, 'feature_annotation_table', None),
             'network_mode': networking_params.get('network_mode', 'bipartite'),
             'submodule_mode': networking_params.get('submodule_mode', 'community'),
-            'show_plot_in_notebook': False,
+            'show_plot_in_notebook': networking_params.get('interactive', False),
             'corr_cutoff': correlation_params.get('corr_cutoff', 0.5)
         }
         call_params.update(kwargs)
         
         hlp.plot_correlation_network(**call_params)
-        print("Created correlation network graph and associated node/edge tables.\n")
+        log.info("Created correlation network graph and associated node/edge tables.\n")
 
     def run_mofa2_analysis(self, overwrite: bool = False, **kwargs) -> None:
         """Hybrid: Class parameter setup + external hlp.run_full_mofa2_analysis function."""
         mofa_subdir = "mofa"
         mofa_dir = os.path.join(self.output_dir, mofa_subdir)
         os.makedirs(mofa_dir, exist_ok=True)
-        print("=== Running MOFA2 Analysis ===")
+        log.info("=== Running MOFA2 Analysis ===")
         if os.path.exists(os.path.join(mofa_subdir, self._mofa_model_filename)) and not overwrite:
-            print(f"MOFA2 model already exists in {mofa_dir}. Skipping.")
+            log.info(f"MOFA2 model already exists in {mofa_dir}. Skipping.")
             return
 
         mofa2_params = self.analysis_parameters.get('mofa', {})
