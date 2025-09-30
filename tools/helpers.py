@@ -1052,8 +1052,7 @@ def plot_correlation_network(
                     colorbar=dict(
                         thickness=15,
                         title='Node Color',
-                        xanchor='left',
-                        titleside='right'
+                        xanchor='left'
                     )
                 ),
                 text=[str(n) for n in G.nodes()]
