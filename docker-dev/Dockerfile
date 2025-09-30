@@ -8,19 +8,26 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 RUN chmod +x /home/jovyan/.local/bin/uv
 
-RUN mkdir -p /home/jovyan/.cache/matplotlib && chown -R jovyan:users /home/jovyan/.cache
+RUN mkdir -p /home/jovyan/.cache/matplotlib
+
+RUN chown -R jovyan:users /home/jovyan/.cache
+
+RUN chown -R jovyan:users /home/jovyan/.local
 
 WORKDIR /home/jovyan/work
 
-RUN git clone https://github.com/bkieft-usa/jgi_integration.git
+COPY docker-dev/requirements.txt /home/jovyan/work/tmp/requirements.txt
 
-RUN /home/jovyan/.local/bin/uv pip install --system --no-cache -r /home/jovyan/work/jgi_integration/docker/requirements.txt
+RUN /home/jovyan/.local/bin/uv pip install --system --no-cache -r /home/jovyan/work/tmp/requirements.txt
+
+RUN rm -rf /home/jovyan/work/tmp/
 
 USER jovyan
 
+ENV HOME=/home/jovyan
+
 RUN python -m ipykernel install --user --name=jgi-integration --display-name "JGI Integration"
 
-RUN rm -rf /home/jovyan/work/tmp/jgi_integration
-
 ENV PYTHONPATH="/home/jovyan/work/jgi_integration"
+
 ENV MPLCONFIGDIR="/home/jovyan/.cache/matplotlib"
