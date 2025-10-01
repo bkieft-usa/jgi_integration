@@ -765,7 +765,6 @@ class Analysis(BaseDataHandler):
             'network_mode': networking_params.get('network_mode', 'bipartite'),
             'submodule_mode': networking_params.get('submodule_mode', 'community'),
             'interactive_network_in_nb': networking_params.get('interactive', False),
-            'lite_mode': networking_params.get('lite_mode', True),
             'interactive_layout': networking_params.get('interactive_layout', 'spring'),
             'corr_cutoff': correlation_params.get('corr_cutoff', 0.5)
         }
