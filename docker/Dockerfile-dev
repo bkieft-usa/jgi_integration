@@ -13,21 +13,22 @@ ENV HOME=/home/jovyan
 ENV WORK=${HOME}/work
 ENV MPLCONFIGDIR="${HOME}/.cache/matplotlib"
 ENV PYTHONPATH="${WORK}/jgi_integration"
+ENV JUPYTER_SERVER_APP_IOPUB_MSG_RATE_LIMIT=1000000
 RUN mkdir -p ${WORK} ${MPLCONFIGDIR}
 WORKDIR ${WORK}
+
+######## Copy local files into the container for development
+COPY venv/pyproject.toml venv/uv.lock ${WORK}
+COPY notebooks/integration_workflow.ipynb ${WORK}
+COPY docker/jupyter_server_config.py ${HOME}/.jupyter/jupyter_server_config.py
 
 ######## Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="${HOME}/.local/bin:${PATH}"
 
 ######## Set up software environment with uv
-RUN git clone https://github.com/bkieft-usa/jgi_integration.git && \
-    cd jgi_integration && \
-    cp notebooks/integration_workflow.ipynb ../ && \
-    cp docker/jupyter_server_config.py ${HOME}/.jupyter/jupyter_server_config.py && \
-    cd venv && \
-    uv sync --locked
-ENV VIRTUAL_ENV=${WORK}/jgi_integration/venv/.venv
+RUN uv sync --locked
+ENV VIRTUAL_ENV=${WORK}/.venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
 ######## Set up user workflow environment
