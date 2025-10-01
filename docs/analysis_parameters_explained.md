@@ -14,6 +14,14 @@ This document describes the practical effect of each option in the **analysis** 
 
 ## 2. Feature Selection
 
+  **selected_method**
+
+  The type of feature selection method implemented to determine significant features used in downstream analysis (see methods below).
+
+  **max_features**
+
+  Maximum number of features to retain after feature selection (default: 5,000). This helps constrain the number of features passed to correlation calculations and network production and should be set to a value lower than 10,000 when possible.
+
 ### Options:
 
   **variance** \[default\]
@@ -22,9 +30,9 @@ This document describes the practical effect of each option in the **analysis** 
 
   #### Parameters:
 
-  * _max_features_
+  * _top_n_ (integer > 0)
 
-    Maximum number of features to retain (integer > 0; default: 5,000)
+    Number of highest variation features to return (default: 5,000)
 
   **glm**
 
@@ -40,17 +48,13 @@ This document describes the practical effect of each option in the **analysis** 
 
     Reference group for the GLM - a specific group within the selected metadata category.
 
-  *  _significance_level_
+  *  _significance_level_ (real number between 0 and 1)
 
-    FDR-corrected p-value cutoff (real number between 0 and 1; default: 0.05).
+    FDR-corrected p-value cutoff (default: 0.05).
 
-  * _log_fold_level_
+  * _log_fold_level_ (real number > 0)
 
-    Minimum absolute log2 fold change to consider significant (real number > 0; default: 0.5).
-
-  *  _max_features_
-
-    Maximum number of features to retain (integer > 0; default: 5,000).
+    Minimum absolute log2 fold change to consider significant (default: 0.5).
 
   **kruskalwallis**
 
@@ -62,17 +66,13 @@ This document describes the practical effect of each option in the **analysis** 
 
     Metadata column to use for group comparison (must match a variable in the user_settings->variable_list in the configuration file).
 
-  * _significance_level_
+  * _significance_level_ (real number between 0 and 1)
 
-    FDR-corrected p-value cutoff (real number between 0 and 1; default: 0.05).
+    FDR-corrected p-value cutoff (default: 0.05).
 
-  * _log_fold_level_
+  * _log_fold_level_ (real number > 0)
 
-    Minimum absolute log2 fold change to consider significant (real number > 0; default: 0.5).
-
-  * _max_features_
-
-    Maximum number of features to retain (integer > 0; default: 5,000)
+    Minimum absolute log2 fold change to consider significant (default: 0.5).
 
   **feature_list**
 
@@ -84,10 +84,6 @@ This document describes the practical effect of each option in the **analysis** 
 
     Filename containing the list of features to keep. This file must be saved into the correct analysis output directory (e.g., /output_data/project_name/Data_Processing--TAG/Analysis--TAG/). You can drop this file directly into the folder via the JupyterLab interface.
 
-  * _max_features_
-
-    Maximum number of features to retain (integer > 0; default: 5,000)
-
   **lasso**
 
   Uses Lasso regression to select features most predictive of a continuous metadata variable. Features are ranked by absolute coefficient magnitude.
@@ -97,10 +93,6 @@ This document describes the practical effect of each option in the **analysis** 
   * _metadata_category_
 
     Metadata column to use as the target variable (must be continuous).
-
-  * _max_features_
-
-    Maximum number of features to retain (integer > 0; default: 5,000)
 
   **random_forest**
 
@@ -112,10 +104,6 @@ This document describes the practical effect of each option in the **analysis** 
 
     Metadata column to use as the target variable.
 
-  * _max_features_
-
-    Maximum number of features to retain (integer > 0; default: 5,000)
-
   **mutual_info**
 
   Selects features with highest mutual information with a metadata variable (continuous or categorical). Captures non-linear associations.
@@ -126,21 +114,9 @@ This document describes the practical effect of each option in the **analysis** 
 
     Metadata column to use as the target variable.
 
-  * _max_features_
-
-    Maximum number of features to retain (integer > 0; default: 5,000)
-
   **none**
 
-  No feature selection is performed; all features are retained, up to the max_features limit.
-
-  #### Parameters:
-
-  * _max_features_
-
-    Maximum number of features to retain (integer > 0; default: 5,000). _Warning_: currently, a limit still needs to be imposed even when no feature selection is performed due to memory constraints when calculating large correlation matrices/networks. The top features are selected in the order they appear in the data table.
-
-    _Note_: the max_features option during feature selection, which shows up in almost all modes, restricts the number of features that go into downstream correlation analysis and networking - this is designed to reduce the size and scale of calculations and should be set to a value lower than 10,000 when possible.
+  No feature selection is performed. All features are retained, up to the max_features limit.
 
 ## 3. Feature Correlation
 
@@ -172,21 +148,21 @@ This document describes the practical effect of each option in the **analysis** 
 
     Calculates biweight midcorrelation (robust correlation using median and MAD).
 
-  **corr_cutoff**
+  **corr_cutoff** (real number between 0 and 1)
 
-  Correlation threshold for including edges in the network (real number between 0 and 1; default: 0.5). Only feature pairs with correlation above this value are included.
+  Correlation threshold for including edges in the network (default: 0.5). Only feature pairs with correlation above this value are included.
 
   **keep_negative**
 
   If true, includes both positive and negative correlations above the absolute threshold. If false (default), only positive correlations are included.
 
-  **block_size**
+  **block_size** (integer > 0)
 
-  Number of features processed per block during correlation calculation (integer > 0; default: 500). Larger blocks may use more memory but can be faster.
+  Number of features processed per block during correlation calculation (default: 500). Larger blocks may use more memory but can be faster.
 
-  **n_jobs**
+  **n_jobs** (integer)
 
-  Number of parallel jobs for block-wise correlation calculation (integer; default: 1). Use -1 to utilize all available cores.
+  Number of parallel jobs for block-wise correlation calculation (default: 1). Use -1 to utilize all available cores.
 
   **only_bipartite**
 
@@ -244,17 +220,17 @@ This document describes the practical effect of each option in the **analysis** 
 
 ### Options:
 
-  **num_mofa_factors**
+  **num_mofa_factors** (integer > 0)
 
-    Number of latent factors to compute in the MOFA model (integer > 0; default: 5). Controls model complexity.
+    Number of latent factors to compute in the MOFA model (default: 5). Controls model complexity.
 
-  **num_mofa_iterations**
+  **num_mofa_iterations** (integer > 0)
 
-    Number of training iterations for MOFA (integer > 0; default: 1,000). Higher values may improve convergence.
+    Number of training iterations for MOFA (default: 1,000). Higher values may improve convergence.
 
-  **seed_for_training**
+  **seed_for_training** (integer > 0)
 
-    Random seed for reproducibility (integer > 0; default: 555). Ensures consistent results across runs – set a different random seed to produce a different (non-deterministic) result.
+    Random seed for reproducibility (default: 555). Ensures consistent results across runs – set a different random seed to produce a different (non-deterministic) result.
 
 ## Example
 
