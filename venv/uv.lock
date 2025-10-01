@@ -195,6 +195,15 @@ wheels = [
 ]
 
 [[package]]
+name = "backoff"
+version = "2.2.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/47/d7/5bbeb12c44d7c4f2fb5b56abce497eb5ed9f34d85701de869acedd602619/backoff-2.2.1.tar.gz", hash = "sha256:03f829f5bb1923180821643f8753b0502c3b682293992485b0eef2807afa5cba", size = 17001, upload_time = "2022-10-05T19:19:32.061Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/df/73/b6e24bd22e6720ca8ee9a85a0c4a2971af8497d8f3193fa05390cbd46e09/backoff-2.2.1-py3-none-any.whl", hash = "sha256:63579f9a0628e06278f7e47b7d7d5b6ce20dc65c5e96a6f3ca99a6adca0396e8", size = 15148, upload_time = "2022-10-05T19:19:30.546Z" },
+]
+
+[[package]]
 name = "beautifulsoup4"
 version = "4.13.5"
 source = { registry = "https://pypi.org/simple" }
@@ -336,6 +345,15 @@ wheels = [
 ]
 
 [[package]]
+name = "chardet"
+version = "5.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f3/0d/f7b6ab21ec75897ed80c17d79b15951a719226b9fababf1e40ea74d69079/chardet-5.2.0.tar.gz", hash = "sha256:1b3b6ff479a8c414bc3fa2c0852995695c4a026dcd6d0633b2dd092ca39c1cf7", size = 2069618, upload_time = "2023-08-01T19:23:02.662Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/38/6f/f5fbc992a329ee4e0f288c1fe0e2ad9485ed064cac731ed2fe47dcc38cbf/chardet-5.2.0-py3-none-any.whl", hash = "sha256:e1cf59446890a00105fe7b7912492ea04b6e6f06d4b742b2c788469e34c82970", size = 199385, upload_time = "2023-08-01T19:23:00.661Z" },
+]
+
+[[package]]
 name = "charset-normalizer"
 version = "3.3.2"
 source = { registry = "https://pypi.org/simple" }
@@ -381,6 +399,24 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697, upload_time = "2022-10-25T02:36:22.414Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload_time = "2022-10-25T02:36:20.889Z" },
+]
+
+[[package]]
+name = "colorbrewer"
+version = "0.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c3/31/698268893515b154f7e130dc35365d477f9a7f1f3b627664b533036a1659/colorbrewer-0.3.tar.gz", hash = "sha256:0f9e46fc91eba29f5824b1ca379daea18eed57a1ee1024bf621b7bf1544fc868", size = 10888, upload_time = "2025-02-26T17:05:39.951Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/92/62/df99823a9811a18cbdbe51da541012a421579ff3038d082883e02c002fb4/colorbrewer-0.3-py3-none-any.whl", hash = "sha256:3522b50af7e875423ab86ebfb7d80f0f23d22832be2245b402eb76ae60b40abf", size = 10187, upload_time = "2025-02-26T17:05:38.348Z" },
+]
+
+[[package]]
+name = "colour"
+version = "0.1.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a0/d4/5911a7618acddc3f594ddf144ecd8a03c29074a540f4494670ad8f153efe/colour-0.1.5.tar.gz", hash = "sha256:af20120fefd2afede8b001fbef2ea9da70ad7d49fafdb6489025dae8745c3aee", size = 24776, upload_time = "2017-11-19T23:20:08.015Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/74/46/e81907704ab203206769dee1385dc77e1407576ff8f50a0681d0a6b541be/colour-0.1.5-py2.py3-none-any.whl", hash = "sha256:33f6db9d564fadc16e59921a56999b79571160ce09916303d35346dddc17978c", size = 23772, upload_time = "2017-11-19T23:20:04.56Z" },
 ]
 
 [[package]]
@@ -994,6 +1030,7 @@ dependencies = [
     { name = "psutil" },
     { name = "ptyprocess" },
     { name = "pure-eval" },
+    { name = "py4cytoscape" },
     { name = "pycparser" },
     { name = "pygments" },
     { name = "pymupdf" },
@@ -1140,6 +1177,7 @@ requires-dist = [
     { name = "psutil", specifier = "==7.0.0" },
     { name = "ptyprocess", specifier = "==0.7.0" },
     { name = "pure-eval", specifier = "==0.2.3" },
+    { name = "py4cytoscape", specifier = ">=1.12.0" },
     { name = "pycparser", specifier = "==2.22" },
     { name = "pygments", specifier = "==2.19.1" },
     { name = "pymupdf", specifier = "==1.26.4" },
@@ -2214,6 +2252,26 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/cd/05/0a34433a064256a578f1783a10da6df098ceaa4a57bbeaa96a6c0352786b/pure_eval-0.2.3.tar.gz", hash = "sha256:5f4e983f40564c576c7c8635ae88db5956bb2229d7e9237d03b3c0b0190eaf42", size = 19752, upload_time = "2024-07-21T12:58:21.801Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8e/37/efad0257dc6e593a18957422533ff0f87ede7c9c6ea010a2177d738fb82f/pure_eval-0.2.3-py3-none-any.whl", hash = "sha256:1db8e35b67b3d218d818ae653e27f06c3aa420901fa7b081ca98cbedc874e0d0", size = 11842, upload_time = "2024-07-21T12:58:20.04Z" },
+]
+
+[[package]]
+name = "py4cytoscape"
+version = "1.12.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "backoff" },
+    { name = "chardet" },
+    { name = "colorbrewer" },
+    { name = "colour" },
+    { name = "decorator" },
+    { name = "igraph" },
+    { name = "networkx" },
+    { name = "pandas" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e0/61/30c5a4cfda1786493888d2630c2b09e20985fda8a33ae1b0eebddc6ffa74/py4cytoscape-1.12.0.tar.gz", hash = "sha256:b3d7843a727879c1fb5c055b4bc3b257cac0a94e96e842cb60db30db9e4186f6", size = 249123, upload_time = "2025-04-18T21:47:33.775Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a6/e7/10cb8cb4f1dcb16fe5c98dd00ff745dca303671073ac29511306a6118d57/py4cytoscape-1.12.0-py3-none-any.whl", hash = "sha256:462d2bc62a82d382c1185acf2213dda90ee97ce364378fde06bd60172cc69996", size = 195370, upload_time = "2025-04-18T21:47:32.11Z" },
 ]
 
 [[package]]

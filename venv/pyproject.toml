@@ -99,6 +99,7 @@ dependencies = [
     "psutil==7.0.0",
     "ptyprocess==0.7.0",
     "pure-eval==0.2.3",
+    "py4cytoscape>=1.12.0",
     "pycparser==2.22",
     "pygments==2.19.1",
     "pymupdf==1.26.4",
