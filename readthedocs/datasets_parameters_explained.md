@@ -37,7 +37,7 @@ All normalization sub‑sections share the same path pattern: `datasets.<dataset
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
 | `method` | string | `"minimum"` | Filtering method. Options: `minimum`, `proportion`, `none`. |
-| `value` | number | — | Threshold for the chosen method. <br>• **minimum** – real > 0 (absolute value). <br>• **proportion** – real 0‑100 (percentage of samples). <br>• **none** – ignored. |
+| `value` | number | — | Threshold for the chosen method. <br>• **minimum** – real > 0 (abundance value). Mean abundance (across all samples) of features must be above this value. <br>• **proportion** – real 0‑100 (percentage of samples). Proportion of total samples where a feature must be observed above background. <br>• **none** – ignored. |
 
 ### Devariancing <a id="devariancing"></a>
 

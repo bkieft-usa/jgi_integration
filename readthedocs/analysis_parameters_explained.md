@@ -11,7 +11,7 @@ This document describes the practical effect of each option in the **analysis** 
 ## Table of Contents
 1. [Tagging](#tagging)  
 2. [Feature Selection](#feature-selection)  
-   - [Common options](#feature-selection-common-options)  
+   - [Shared options](#feature-selection-shared-options)  
    - [Methods](#feature-selection-methods)  
 3. [Feature Correlation](#feature-correlation)  
 4. [Network Analysis](#network-analysis)  
@@ -32,18 +32,18 @@ This document describes the practical effect of each option in the **analysis** 
 
 Configuration path: `analysis.analysis_parameters.feature_selection`
 
-### Common options <a id="feature-selection-common-options"></a>
+### Shared options <a id="feature-selection-shared-options"></a>
 
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `selected_method` | string | `"variance"` | Method used to pick informative features. Allowed values: `variance`, `glm`, `kruskalwallis`, `feature_list`, `lasso`, `random_forest`, `mutual_info`, `none`. |
+| `selected_method` | string | `"variance"` | Method used to pick informative features. Allowed values: `variance`, `glm`, `kruskalwallis`, `feature_list`, `lasso`, `random_forest`, `mutual_info`, `none`. See table below for details. |
 | `max_features` | integer | `5000` | Upper bound on the number of features kept after selection (must be ≤ 10 000 for performance). |
 
 ### Methods <a id="feature-selection-methods"></a>
 
 Below each method’s *method‑specific* parameters are shown. All method blocks are optional **unless** that method is chosen via `selected_method`.
 
-| Method | Config block (dot notation) | Parameter | Type | Default | Description |
+| Method | Config block | Parameter | Type | Default | Description |
 |--------|----------------------------|-----------|------|---------|-------------|
 | **variance** | `variance` | `top_n` | integer > 0 | `5000` | Number of highest‑variance features to retain. |
 | **glm** | `glm` | `metadata_category` | string | – | Column in `user_settings.variable_list` used for group comparison. |
@@ -84,9 +84,9 @@ Configuration path: `analysis.analysis_parameters.networking`
 |------------|------|---------|-------------|
 | `network_mode` | string | `"bipartite"` | Edge topology. Options: `bipartite` (cross‑type only) or `full` (all pairwise). |
 | `submodule_mode` | string | `"louvain"` | Sub‑module extraction method. Options: `none`, `subgraphs`, `louvain`, `leiden`, `wgcna`. |
+| `wgcna_params` *(required only if `submodule_mode: wgcna`)* | mapping | {5, 10, 0.25} | `beta`, `min_module_size`, `distance_cutoff`. |
 | `interactive` | boolean | `false` | Render interactive network in the notebook (`true`) or generate static files (`false`). |
-| `interactive_layout` *(optional)* | string | `spring` | Layout algorithm for interactive view (`spring`, `circular`, `kamada_kawai`, …). |
-| `wgcna` *(required only if `submodule_mode: wgcna`)* | mapping | — | `beta` (soft‑threshold power), `min_module_size`, `distance_cutoff`. |
+| `interactive_layout` | string | `spring` | Layout algorithm for interactive view (`spring`, `force`, `bipartite`, `pydot`, `random`, `circular`, `kamada_kawai`). Ignored if interactive is `false`. |
 
 ---  
 
