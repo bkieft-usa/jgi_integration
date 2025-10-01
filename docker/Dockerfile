@@ -20,15 +20,11 @@ USER jovyan
 
 RUN git clone https://github.com/bkieft-usa/jgi_integration.git
 
-COPY docker/requirements.txt /home/jovyan/work/tmp/requirements.txt
-
-RUN /home/jovyan/.local/bin/uv pip install --system --no-cache -r /home/jovyan/work/tmp/requirements.txt
+RUN /home/jovyan/.local/bin/uv pip install --system --no-cache -r /home/jovyan/work/jgi_integration/docker/requirements.txt ipykernel
 
 RUN python -m ipykernel install --user --name=jgi-integration --display-name "JGI Integration"
 
 RUN cp /home/jovyan/work/jgi_integration/notebooks/integration_workflow.ipynb /home/jovyan/work/
-
-RUN rm -rf /home/jovyan/work/tmp/
 
 ENV PYTHONPATH="/home/jovyan/work/jgi_integration"
 
