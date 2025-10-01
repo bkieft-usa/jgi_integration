@@ -2501,3 +2501,172 @@
 
 #     cyto.set_layout(name=layout, animate=animate, randomize=False, fit=True)
 #     return cyto
+
+# def _nx_to_cytoscape_layout(
+#     G,
+#     layout_name="perfuse-force-directed",
+#     seed=42,
+#     max_iterations=1000,
+#     temp_dir=None
+# ):
+#     """
+#     Use Cytoscape to compute node positions for a NetworkX graph.
+    
+#     Parameters
+#     ----------
+#     G : networkx.Graph
+#         Graph to layout
+#     layout_name : str
+#         Cytoscape layout algorithm name
+#     seed : int
+#         Random seed for reproducible layouts
+#     max_iterations : int
+#         Maximum iterations for layout algorithm
+#     temp_dir : str, optional
+#         Directory for temporary files
+        
+#     Returns
+#     -------
+#     dict
+#         Node positions as {node_id: (x, y)}
+#     """
+    
+#     if layout_name not in [
+#         "perfuse-force-directed",
+#         "prefuse-force-directed",
+#         "organic",
+#         "circular",
+#         "hierarchical",
+#         "grid"]:
+#         raise ValueError(f"Unsupported Cytoscape layout '{layout_name}'")
+
+#     if temp_dir is None:
+#         temp_dir = tempfile.mkdtemp()
+    
+#     # Export graph to Cytoscape JSON format
+#     cyjs_file = os.path.join(temp_dir, "network.cyjs")
+#     positions_file = os.path.join(temp_dir, "positions.json")
+    
+#     # Convert NetworkX to Cytoscape JSON format
+#     cyjs_data = {
+#         "elements": {
+#             "nodes": [
+#                 {
+#                     "data": {
+#                         "id": str(node),
+#                         "name": str(node),
+#                         **data
+#                     }
+#                 }
+#                 for node, data in G.nodes(data=True)
+#             ],
+#             "edges": [
+#                 {
+#                     "data": {
+#                         "id": f"{source}_{target}",
+#                         "source": str(source),
+#                         "target": str(target),
+#                         "weight": data.get("weight", 1.0)
+#                     }
+#                 }
+#                 for source, target, data in G.edges(data=True)
+#             ]
+#         }
+#     }
+    
+#     # Save network to file
+#     with open(cyjs_file, 'w') as f:
+#         json.dump(cyjs_data, f)
+    
+#     # Create Cytoscape automation script
+#     automation_script = f"""
+# import json
+# import py4cytoscape as p4c
+# import time
+
+# # Connect to Cytoscape
+# try:
+#     p4c.cytoscape_ping()
+# except:
+#     print("Error: Cytoscape is not running. Please start Cytoscape first.")
+#     exit(1)
+
+# # Load network
+# network_suid = p4c.import_network_from_file('{cyjs_file}')
+# p4c.set_current_network(network_suid)
+
+# # Apply layout with parameters
+# layout_params = {{
+#     'randomSeed': {seed},
+#     'maxIterations': {max_iterations}
+# }}
+
+# p4c.layout_network(layout_name='{layout_name}', **layout_params)
+
+# # Give layout time to complete
+# time.sleep(2)
+
+# # Get node positions
+# node_table = p4c.get_table_columns('node', ['name', 'x', 'y'])
+# positions = {{}}
+# for i, row in node_table.iterrows():
+#     positions[row['name']] = [row['x'], row['y']]
+
+# # Save positions
+# with open('{positions_file}', 'w') as f:
+#     json.dump(positions, f)
+
+# # Clean up
+# p4c.delete_network(network_suid)
+# print("Layout completed successfully")
+# """
+    
+#     script_file = os.path.join(temp_dir, "layout_script.py")
+#     with open(script_file, 'w') as f:
+#         f.write(automation_script)
+    
+#     try:
+#         # Run the Cytoscape automation script
+#         log.info("Computing layout using Cytoscape...")
+#         print(script_file)
+#         result = subprocess.run([
+#             'python3', script_file
+#         ], capture_output=True, text=True, timeout=120)
+        
+#         if result.returncode != 0:
+#             raise RuntimeError(f"Cytoscape layout failed: {result.stderr}")
+        
+#         # Load the computed positions
+#         if os.path.exists(positions_file):
+#             with open(positions_file, 'r') as f:
+#                 positions = json.load(f)
+            
+#             # Convert string keys back to original node types and normalize coordinates
+#             pos_dict = {}
+#             if positions:
+#                 x_vals = [pos[0] for pos in positions.values()]
+#                 y_vals = [pos[1] for pos in positions.values()]
+#                 x_min, x_max = min(x_vals), max(x_vals)
+#                 y_min, y_max = min(y_vals), max(y_vals)
+                
+#                 # Normalize to [0, 1] range
+#                 for node, (x, y) in positions.items():
+#                     if x_max != x_min and y_max != y_min:
+#                         norm_x = (x - x_min) / (x_max - x_min)
+#                         norm_y = (y - y_min) / (y_max - y_min)
+#                     else:
+#                         norm_x, norm_y = 0.5, 0.5
+#                     pos_dict[node] = (norm_x, norm_y)
+            
+#             return pos_dict
+#         else:
+#             raise RuntimeError("Cytoscape did not generate position file")
+            
+#     except Exception as e:
+#         log.warning(f"Cytoscape layout failed: {e}")
+#         return None
+#     finally:
+#         # Clean up temporary files
+#         for file in [cyjs_file, positions_file, script_file]:
+#             if os.path.exists(file):
+#                 os.remove(file)
