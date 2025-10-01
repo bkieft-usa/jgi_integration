@@ -15,6 +15,8 @@ import yaml
 from tqdm import tqdm
 import warnings
 import logging
+import json
+import tempfile
 
 # --- Display and plotting ---
 from IPython.display import display
@@ -1018,17 +1020,17 @@ def plot_correlation_network(
         log.info("Rendering interactive network in notebook…")
         color_attr = "submodule_color" if submodule_mode != "none" else "datatype_color"
         try:
-            log.info("Using lite mode to pre-compute network layout...")
+            log.info("Pre-computing network layout...")
             widget = _nx_to_plotly_widget(
                 G,
-                node_color_attr="submodule_color",
+                node_color_attr=color_attr,
                 node_size_attr="node_size",
-                layout=interactive_layout,
+                layout="cytoscape",
                 seed=42,
             )
             display(widget)
         except Exception as e:  # fallback to static Matplotlib rendering
-            log.info(f"Render of ipycytoscape interactive network failed, plotting static network: {e}")
+            log.info(f"Render of Cytoscape interactive network failed, plotting static network: {e}")
             plt.figure(figsize=(12, 8))
             pos = nx.spring_layout(G, seed=42)
             node_cols = [G.nodes[n][color_attr] for n in G.nodes()]
@@ -1054,7 +1056,7 @@ def _nx_to_plotly_widget(
         Node attribute containing a CSS colour string.
     node_size_attr : str, optional
         Node attribute containing a numeric size (in pts).
-    layout : {"spring","circular","kamada_kawai","random"}, optional
+    layout : {"spring","circular","kamada_kawai","random","cytoscape"}, optional
         Layout algorithm used to compute (x, y) coordinates.
     seed : int, optional
         Random seed for deterministic layouts (spring & random).
@@ -1064,17 +1066,24 @@ def _nx_to_plotly_widget(
     plotly.graph_objects.FigureWidget
         Interactive widget ready for display in JupyterLab.
     """
-    # Compute node positions (only once)
+    # Compute node positions
     if layout == "spring":
-        pos = nx.spring_layout(G, seed=seed)
+        pos = nx.spring_layout(G, seed=seed, k=2/np.sqrt(len(G.nodes())), iterations=100, weight='weight')
     elif layout == "circular":
         pos = nx.circular_layout(G)
     elif layout == "kamada_kawai":
         pos = nx.kamada_kawai_layout(G)
     elif layout == "random":
         pos = nx.random_layout(G, seed=seed)
+    elif layout == "cytoscape":
+        log.info("Using Cytoscape for layout computation...")
+        pos = _nx_to_cytoscape_layout(G, seed=seed, layout_name="perfuse-force-directed")
+        if pos is None:
+            log.warning("Cytoscape layout failed, falling back to spring layout")
+            pos = nx.spring_layout(G, seed=seed, k=2/np.sqrt(len(G.nodes())), iterations=100, weight='weight')
     else:
         raise ValueError(f"Unsupported layout `{layout}`")
+    
     log.info(f"Using layout '{layout}' for interactive Plotly network.")
 
     # Build edge trace
@@ -1103,10 +1112,14 @@ def _nx_to_plotly_widget(
         node_y.append(y)
         node_color.append(data.get(node_color_attr, "#1f78b4"))
         node_size.append(data.get(node_size_attr, 10))
-        hover_txt.append(
-            f"<b>{n}</b><br>"
-            + "<br>".join(f"{k}: {v}" for k, v in data.items())
-        )
+        
+        # Create hover text with node name prominently displayed
+        hover_lines = [f"<b>Node: {n}</b>"]
+        for k, v in data.items():
+            if k not in ['node_id', node_color_attr, node_size_attr]:
+                hover_lines.append(f"{k}: {v}")
+        hover_txt.append("<br>".join(hover_lines))
+    
     node_trace = go.Scattergl(
         x=node_x,
         y=node_y,
@@ -1114,10 +1127,11 @@ def _nx_to_plotly_widget(
         marker=dict(
             size=node_size,
             color=node_color,
+            opacity=0.9,
             line=dict(width=1, color="#222"),
         ),
-        hoverinfo="text",
-        hovertext=hover_txt,
+        hovertemplate="%{text}<extra></extra>",
+        text=hover_txt,
         showlegend=False,
         customdata=list(G.nodes()),
     )
@@ -1140,34 +1154,173 @@ def _nx_to_plotly_widget(
     )
     return fig
 
-# def nx_to_cytoscape(G,
-#                     node_color_attr="submodule_color",
-#                     node_size_attr="size",
-#                     layout="cose",
-#                     animate=True):
-#     """Convert a NetworkX graph to a styled ipycytoscape widget."""
-#     cyto = CytoscapeWidget()
-#     cyto.graph.add_graph_from_networkx(G)
+def _nx_to_cytoscape_layout(
+    G,
+    layout_name="perfuse-force-directed",
+    seed=42,
+    max_iterations=1000,
+    temp_dir=None
+):
+    """
+    Use Cytoscape to compute node positions for a NetworkX graph.
+    
+    Parameters
+    ----------
+    G : networkx.Graph
+        Graph to layout
+    layout_name : str
+        Cytoscape layout algorithm name
+    seed : int
+        Random seed for reproducible layouts
+    max_iterations : int
+        Maximum iterations for layout algorithm
+    temp_dir : str, optional
+        Directory for temporary files
+        
+    Returns
+    -------
+    dict
+        Node positions as {node_id: (x, y)}
+    """
+    
+    if layout_name not in [
+        "perfuse-force-directed",
+        "prefuse-force-directed",
+        "organic",
+        "circular",
+        "hierarchical",
+        "grid"]:
+        raise ValueError(f"Unsupported Cytoscape layout '{layout_name}'")
 
-#     # Default stylesheet – you can extend/customize as needed
-#     cyto.set_style([
-#         {"selector": "node",
-#          "style": {
-#             "background-color": f"data({node_color_attr})",
-#             "width": f"data({node_size_attr})",
-#             "height": f"data({node_size_attr})",
-#             "label": "data(name)",
-#             "font-size": 10,
-#             "color": "#fff"
-#          }},
-#         {"selector": "edge",
-#          "style": {"line-color": "#888", "width": 1}},
-#         {"selector": "node:selected",
-#          "style": {"border-color": "#ff0", "border-width": 3}}
-#     ])
+    if temp_dir is None:
+        temp_dir = tempfile.mkdtemp()
+    
+    # Export graph to Cytoscape JSON format
+    cyjs_file = os.path.join(temp_dir, "network.cyjs")
+    positions_file = os.path.join(temp_dir, "positions.json")
+    
+    # Convert NetworkX to Cytoscape JSON format
+    cyjs_data = {
+        "elements": {
+            "nodes": [
+                {
+                    "data": {
+                        "id": str(node),
+                        "name": str(node),
+                        **data
+                    }
+                }
+                for node, data in G.nodes(data=True)
+            ],
+            "edges": [
+                {
+                    "data": {
+                        "id": f"{source}_{target}",
+                        "source": str(source),
+                        "target": str(target),
+                        "weight": data.get("weight", 1.0)
+                    }
+                }
+                for source, target, data in G.edges(data=True)
+            ]
+        }
+    }
+    
+    # Save network to file
+    with open(cyjs_file, 'w') as f:
+        json.dump(cyjs_data, f)
+    
+    # Create Cytoscape automation script
+    automation_script = f"""
+import json
+import py4cytoscape as p4c
+import time
 
-#     cyto.set_layout(name=layout, animate=animate, randomize=False, fit=True)
-#     return cyto
+# Connect to Cytoscape
+try:
+    p4c.cytoscape_ping()
+except:
+    print("Error: Cytoscape is not running. Please start Cytoscape first.")
+    exit(1)
+
+# Load network
+network_suid = p4c.import_network_from_file('{cyjs_file}')
+p4c.set_current_network(network_suid)
+
+# Apply layout with parameters
+layout_params = {{
+    'randomSeed': {seed},
+    'maxIterations': {max_iterations}
+}}
+
+p4c.layout_network(layout_name='{layout_name}', **layout_params)
+
+# Give layout time to complete
+time.sleep(2)
+
+# Get node positions
+node_table = p4c.get_table_columns('node', ['name', 'x', 'y'])
+positions = {{}}
+for i, row in node_table.iterrows():
+    positions[row['name']] = [row['x'], row['y']]
+
+# Save positions
+with open('{positions_file}', 'w') as f:
+    json.dump(positions, f)
+
+# Clean up
+p4c.delete_network(network_suid)
+print("Layout completed successfully")
+"""
+    
+    script_file = os.path.join(temp_dir, "layout_script.py")
+    with open(script_file, 'w') as f:
+        f.write(automation_script)
+    
+    try:
+        # Run the Cytoscape automation script
+        log.info("Computing layout using Cytoscape...")
+        result = subprocess.run([
+            'python', script_file
+        ], capture_output=True, text=True, timeout=120)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"Cytoscape layout failed: {result.stderr}")
+        
+        # Load the computed positions
+        if os.path.exists(positions_file):
+            with open(positions_file, 'r') as f:
+                positions = json.load(f)
+            
+            # Convert string keys back to original node types and normalize coordinates
+            pos_dict = {}
+            if positions:
+                x_vals = [pos[0] for pos in positions.values()]
+                y_vals = [pos[1] for pos in positions.values()]
+                x_min, x_max = min(x_vals), max(x_vals)
+                y_min, y_max = min(y_vals), max(y_vals)
+                
+                # Normalize to [0, 1] range
+                for node, (x, y) in positions.items():
+                    if x_max != x_min and y_max != y_min:
+                        norm_x = (x - x_min) / (x_max - x_min)
+                        norm_y = (y - y_min) / (y_max - y_min)
+                    else:
+                        norm_x, norm_y = 0.5, 0.5
+                    pos_dict[node] = (norm_x, norm_y)
+            
+            return pos_dict
+        else:
+            raise RuntimeError("Cytoscape did not generate position file")
+            
+    except Exception as e:
+        log.warning(f"Cytoscape layout failed: {e}")
+        return None
+    finally:
+        # Clean up temporary files
+        for file in [cyjs_file, positions_file, script_file]:
+            if os.path.exists(file):
+                os.remove(file)
 
 def _annotate_and_save_submodules(
     submodules: List[Tuple[str, nx.Graph]],

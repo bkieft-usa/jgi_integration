@@ -2472,3 +2472,32 @@
 #     cyto.set_layout(name=layout, animate=animate, randomize=False, fit=True)
 
 #     return cyto
+
+# def nx_to_cytoscape(G,
+#                     node_color_attr="submodule_color",
+#                     node_size_attr="size",
+#                     layout="cose",
+#                     animate=True):
+#     """Convert a NetworkX graph to a styled ipycytoscape widget."""
+#     cyto = CytoscapeWidget()
+#     cyto.graph.add_graph_from_networkx(G)
+
+#     # Default stylesheet – you can extend/customize as needed
+#     cyto.set_style([
+#         {"selector": "node",
+#          "style": {
+#             "background-color": f"data({node_color_attr})",
+#             "width": f"data({node_size_attr})",
+#             "height": f"data({node_size_attr})",
+#             "label": "data(name)",
+#             "font-size": 10,
+#             "color": "#fff"
+#          }},
+#         {"selector": "edge",
+#          "style": {"line-color": "#888", "width": 1}},
+#         {"selector": "node:selected",
+#          "style": {"border-color": "#ff0", "border-width": 3}}
+#     ])
+
+#     cyto.set_layout(name=layout, animate=animate, randomize=False, fit=True)
+#     return cyto
