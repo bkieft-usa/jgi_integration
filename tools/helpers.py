@@ -66,6 +66,7 @@ import networkx as nx
 import community as community_louvain
 import igraph as ig
 import leidenalg
+from ipycytoscape import CytoscapeWidget
 
 # --- Cheminformatics ---
 from rdkit import Chem
@@ -824,6 +825,7 @@ def _assign_node_attributes(
     shape_dict = {name: shape_map.get(p, "Rectangle") for name, p in zip(node_names, node_pref)}
     nx.set_node_attributes(G, color_dict, "datatype_color")
     nx.set_node_attributes(G, shape_dict, "datatype_shape")
+    nx.set_node_attributes(G, 0.5, "node_size")
 
     #  optional functional annotation
     if annotation_df is not None and not annotation_df.empty:
@@ -930,7 +932,9 @@ def plot_correlation_network(
     annotation_df: Optional[pd.DataFrame] = None,
     network_mode: str = "bipartite",
     submodule_mode: str = "louvain",
-    show_plot_in_notebook: bool = False,
+    interactive_network_in_nb: bool = False,
+    lite_mode: bool = True,
+    interactive_layout: str = "spring",
     corr_cutoff: float = 0.5,
 ) -> None:
     """
@@ -989,7 +993,6 @@ def plot_correlation_network(
         submods = _detect_submodules(
             G,
             method=submodule_mode,
-            # WGCNA specific defaults -  you can pass extra kwargs via **kwargs in future
             beta=6,
             min_module_size=30,
             distance_cutoff=0.25,
@@ -1012,73 +1015,242 @@ def plot_correlation_network(
         log.info("\tMain graph updated with submodule annotations and written to disk.")
 
     # interactive plot
-    if show_plot_in_notebook:
+    if interactive_network_in_nb:
+        color_attr = "submodule_color" if submodule_mode != "none" else "datatype_color"
         try:
-            import plotly.graph_objects as go
-            pos = nx.spring_layout(G, seed=42)  # or use nx.forceatlas2_layout(G) if available
-            edge_x = []
-            edge_y = []
-            for edge in G.edges():
-                x0, y0 = pos[edge[0]]
-                x1, y1 = pos[edge[1]]
-                edge_x += [x0, x1, None]
-                edge_y += [y0, y1, None]
-            edge_trace = go.Scatter(
-                x=edge_x, y=edge_y,
-                line=dict(width=0.5, color='#888'),
-                hoverinfo='none',
-                mode='lines'
-            )
-            node_x = []
-            node_y = []
-            node_color = []
-            for node in G.nodes():
-                x, y = pos[node]
-                node_x.append(x)
-                node_y.append(y)
-                if submodule_mode != "none":
-                    node_color.append(G.nodes[node].get("submodule_color", "#888"))
-                else:
-                    node_color.append(G.nodes[node].get("datatype_color", "#888"))
-            node_trace = go.Scatter(
-                x=node_x, y=node_y,
-                mode='markers',
-                hoverinfo='text',
-                marker=dict(
-                    showscale=True,
-                    colorscale='Viridis',
-                    color=node_color,
-                    size=10,
-                    colorbar=dict(
-                        thickness=15,
-                        title='Node Color',
-                        xanchor='left'
-                    )
-                ),
-                text=[str(n) for n in G.nodes()]
-            )
-            fig = go.Figure(data=[edge_trace, node_trace],
-                            layout=go.Layout(
-                                title='Interactive Network',
-                                showlegend=False,
-                                hovermode='closest',
-                                margin=dict(b=20,l=5,r=5,t=40),
-                                xaxis=dict(showgrid=False, zeroline=False),
-                                yaxis=dict(showgrid=False, zeroline=False)
-                            ))
-            fig.show()
-        except Exception as e:
-            log.info(f"Plotly interactive network failed: {e}")
-            # fallback to matplotlib
-            plt.figure(figsize=(12, 8))
-            pos = nx.spring_layout(G)
-            if submodule_mode != "none":
-                node_cols = [G.nodes[n]["submodule_color"] for n in G.nodes()]
+            if lite_mode:
+                network_widget = nx_to_plotly_widget(
+                    G,
+                    node_color_attr="submodule_color",
+                    node_size_attr="node_size",
+                    layout=interactive_layout,
+                    seed=42,
+                )
+                # if interactive_layout == "fruchterman_reingold":
+                #     pos = nx.spring_layout(G, iterations=50, seed=42)
+                # elif interactive_layout == "circular":
+                #     pos = nx.circular_layout(G)
+                # else:
+                #     raise ValueError(f"Invalid interactive_layout '{interactive_layout}'. Choose valid layout for networkx.")
+                # widget = _nx_to_cytoscape(
+                #     G,
+                #     node_color_attr=color_attr,
+                #     layout="cose",
+                #     animate=True,
+                #     precomputed_pos=pos,
+                # )
             else:
-                node_cols = [G.nodes[n]["datatype_color"] for n in G.nodes()]
+                widget = _nx_to_cytoscape(
+                    G,
+                    node_color_attr=color_attr,
+                    layout="cose", # any layout name supported by Cytoscape
+                    animate=True,
+                    precomputed_pos=None,
+                )
+            network_widget
+            #display(widget)
+        except Exception as e:  # fallback to static Matplotlib rendering
+            log.info(f"Render of ipycytoscape interactive network failed, plotting static network: {e}")
+            plt.figure(figsize=(12, 8))
+            if lite_mode:
+                pos = nx.spring_layout(G, seed=42)
+            else:
+                pos = nx.spring_layout(G)
+            node_cols = [G.nodes[n][color_attr] for n in G.nodes()]
             nx.draw(G, pos, with_labels=False, node_size=200,
                     node_color=node_cols, font_size=1)
             plt.show()
+
+def _nx_to_cytoscape(
+    G,
+    node_color_attr="submodule_color",
+    node_size_attr="node_size",
+    layout="cose",
+    animate=True,
+    precomputed_pos=None,
+):
+    """
+    Convert a NetworkX graph to an ipycytoscape widget.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+        Graph to visualise.
+    node_color_attr : str
+        Node attribute that holds a colour string.
+    node_size_attr : str
+        Node attribute that holds a numeric size.
+    layout : str
+        Cytoscape layout name (e.g. "cose", "grid", …). Ignored if
+        ``precomputed_pos`` is supplied - “preset” will be forced.
+    animate : bool
+        Whether the layout animation should be streamed. Ignored for
+        “preset”.
+    precomputed_pos : dict or None
+        Mapping ``node → (x, y)`` produced by a NetworkX layout function.
+        If given the positions are written into ``node["position"]`` and
+        the widget uses the static “preset” layout.
+    """
+
+    if precomputed_pos is not None:
+        for n, (x, y) in precomputed_pos.items():
+            G.nodes[n]["position"] = {"x": float(x), "y": float(y)}
+        layout = "preset"
+        animate = False
+
+    cyto = CytoscapeWidget()
+    cyto.graph.add_graph_from_networkx(G)
+
+    cyto.set_style([
+        {
+            "selector": "node",
+            "style": {
+                "background-color": f"data({node_color_attr})",
+                "width": f"data({node_size_attr})",
+                "height": f"data({node_size_attr})",
+                "label": "data(name)",
+                "font-size": 10,
+                "color": "#fff",
+            },
+        },
+        {"selector": "edge", "style": {"line-color": "#888", "width": 1}},
+        {"selector": "node:selected", "style": {"border-color": "#ff0", "border-width": 3}},
+    ])
+
+    cyto.set_layout(name=layout, animate=animate, randomize=False, fit=True)
+
+    return cyto
+
+def nx_to_plotly_widget(
+    G,
+    node_color_attr="submodule_color",
+    node_size_attr="node_size",
+    layout="spring",
+    seed=42,
+):
+    """
+    Convert a NetworkX graph to a Plotly FigureWidget.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+        Graph to visualise.
+    node_color_attr : str, optional
+        Node attribute containing a CSS colour string.
+    node_size_attr : str, optional
+        Node attribute containing a numeric size (in pts).
+    layout : {"spring","circular","kamada_kawai","random"}, optional
+        Layout algorithm used to compute (x, y) coordinates.
+    seed : int, optional
+        Random seed for deterministic layouts (spring & random).
+
+    Returns
+    -------
+    plotly.graph_objects.FigureWidget
+        Interactive widget ready for display in JupyterLab.
+    """
+    # Compute node positions (only once)
+    if layout == "spring":
+        pos = nx.spring_layout(G, seed=seed)
+    elif layout == "circular":
+        pos = nx.circular_layout(G)
+    elif layout == "kamada_kawai":
+        pos = nx.kamada_kawai_layout(G)
+    elif layout == "random":
+        pos = nx.random_layout(G, seed=seed)
+    else:
+        raise ValueError(f"Unsupported layout `{layout}`")
+
+    # Build edge trace
+    edge_x, edge_y = [], []
+    for u, v in G.edges():
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        edge_x += [x0, x1, None]
+        edge_y += [y0, y1, None]
+
+    edge_trace = go.Scattergl(
+        x=edge_x,
+        y=edge_y,
+        mode="lines",
+        line=dict(width=1, color="#888"),
+        hoverinfo="none",
+        showlegend=False,
+    )
+
+    # Build node trace (colour / size / hover text)
+    node_x, node_y, node_color, node_size, hover_txt = [], [], [], [], []
+    for n, data in G.nodes(data=True):
+        x, y = pos[n]
+        node_x.append(x)
+        node_y.append(y)
+        node_color.append(data.get(node_color_attr, "#1f78b4"))
+        node_size.append(data.get(node_size_attr, 10))
+        hover_txt.append(
+            f"<b>{n}</b><br>"
+            + "<br>".join(f"{k}: {v}" for k, v in data.items())
+        )
+
+    node_trace = go.Scattergl(
+        x=node_x,
+        y=node_y,
+        mode="markers",
+        marker=dict(
+            size=node_size,
+            color=node_color,
+            line=dict(width=1, color="#222"),
+        ),
+        hoverinfo="text",
+        hovertext=hover_txt,
+        showlegend=False,
+        customdata=list(G.nodes()),
+    )
+
+    # Assemble figure widget
+    fig = go.FigureWidget(
+        data=[edge_trace, node_trace],
+        layout=go.Layout(
+            title="Network graph (interactive)",
+            title_x=0.5,
+            showlegend=False,
+            hovermode="closest",
+            margin=dict(l=20, r=20, t=40, b=20),
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            height=600,
+            clickmode="event+select",
+        ),
+    )
+    return fig
+
+# def nx_to_cytoscape(G,
+#                     node_color_attr="submodule_color",
+#                     node_size_attr="size",
+#                     layout="cose",
+#                     animate=True):
+#     """Convert a NetworkX graph to a styled ipycytoscape widget."""
+#     cyto = CytoscapeWidget()
+#     cyto.graph.add_graph_from_networkx(G)
+
+#     # Default stylesheet – you can extend/customize as needed
+#     cyto.set_style([
+#         {"selector": "node",
+#          "style": {
+#             "background-color": f"data({node_color_attr})",
+#             "width": f"data({node_size_attr})",
+#             "height": f"data({node_size_attr})",
+#             "label": "data(name)",
+#             "font-size": 10,
+#             "color": "#fff"
+#          }},
+#         {"selector": "edge",
+#          "style": {"line-color": "#888", "width": 1}},
+#         {"selector": "node:selected",
+#          "style": {"border-color": "#ff0", "border-width": 3}}
+#     ])
+
+#     cyto.set_layout(name=layout, animate=animate, randomize=False, fit=True)
+#     return cyto
 
 def _annotate_and_save_submodules(
     submodules: List[Tuple[str, nx.Graph]],
