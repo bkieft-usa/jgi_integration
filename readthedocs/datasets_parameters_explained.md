@@ -1,137 +1,91 @@
 # Datasets Parameters Explained
 
-This document describes the practical effect of each option in the **datasets** section of the integration workflow configuration file (`/input_data/config/project_config.yml`), including the data processing tag and the four normalization steps used in omics data processing (filtering, devariancing, scaling, and replicate handling). Each section lists available methods, their options, and default values, and at the end there is an example of a full data processing workflow.
+---  
 
-# Setup Parameters
+## Overview
 
-## 1. Tagging
+This document describes the practical effect of each option in the **datasets** section of the integration workflow configuration file (`/input_data/config/project_config.yml`). It covers the data‑processing tag, the dataset directory, and the four normalization steps applied to each omics dataset (filtering, devariancing, scaling, and replicate handling). Each option lists available methods, their parameters, default values, and a short description. An example configuration and a brief walk‑through are provided at the end.
 
-  **data_processing_tag**
+---
 
-  Allows user to create a new data processing folder (`Data_Processing--TAG`) to store results. This is useful if data processing and normalization settings are changed (see below) and a new set of outputs should be produced that is separate from previous runs. Default: “0”.
+## Table of Contents
+- [Tagging](#tagging)  
+- [Normalization Parameters](#normalization-parameters)  
+  - [2.1 Filtering](#filtering)  
+  - [2.2 Devariancing](#devariancing)  
+  - [2.3 Scaling](#scaling)  
+  - [2.4 Replicate Handling](#replicate-handling)  
+- [Example Configuration](#example-configuration)  
 
-  _Note_: If a data processing folder already exists with the supplied tag and overwriting is disabled, the workflow will return an error message indicating that you should change the tag.
+---
 
-  **dataset_dir**
+## Tagging <a id="tagging"></a>
 
-  This is currently fixed based on the workflow structure, so do not change it.
+| Config key | Type | Default | Description |
+|------------|------|---------|-------------|
+| `datasets.data_processing_tag` | string | `"0"` | Tag used to create a sub‑folder `Data_Processing--<TAG>` under the data‑processing output. Changing the tag creates a fresh output directory and prevents overwriting previous runs. |
+| `datasets.<omics>.dataset_dir` | string | *fixed* (e.g., `transcriptomics`, `metabolomics`) | Directory name for the omics type. **Do not modify**; it is tied to the workflow structure. |
 
-# Normalization Parameters
+---
 
-## 2. Filtering
+## Normalization Parameters <a id="normalization-parameters"></a>
 
-### Options:
+> All normalization sub‑sections share the same path pattern: `datasets.<omics>.normalization_parameters.<step>`.
 
-  **method**
+### Filtering <a id="filtering"></a>
 
-  #### Parameters:
+| Config key | Type | Default | Description |
+|------------|------|---------|-------------|
+| `datasets.<omics>.normalization_parameters.filtering.method` | string | `"minimum"` | Filtering method. Options: `minimum`, `proportion`, `none`. |
+| `datasets.<omics>.normalization_parameters.filtering.value` | number | — | Threshold for the chosen method. <br>• **minimum** – real > 0 (absolute value). <br>• **proportion** – real 0‑100 (percentage of samples). <br>• **none** – ignored. |
 
-  * _minimum_ \[default\]
+### Devariancing <a id="devariancing"></a>
 
-    Removes features whose average observed value across samples is below the specified threshold. Useful for excluding low-abundance or low-count features that may be noise or low confidence observations.
+| Config key | Type | Default | Description |
+|------------|------|---------|-------------|
+| `datasets.<omics>.normalization_parameters.devariancing.method` | string | `"percent"` | Devariancing method. Options: `percent`, `none`. |
+| `datasets.<omics>.normalization_parameters.devariancing.value` | number | — | Percent of features with lowest variance to drop (0‑100). Ignored when method is `none`. |
 
-  * _proportion_
+### Scaling <a id="scaling"></a>
 
-    Removes features that are observed at higher abundance than the detection limit in fewer than a specified percentage of samples. Helps filter out features that are rarely detected.
+| Config key | Type | Default | Description |
+|------------|------|---------|-------------|
+| `datasets.<omics>.normalization_parameters.scaling.log2` | boolean | `true` | If `true`, apply `log2(x + 1)` to all values before scaling. |
+| `datasets.<omics>.normalization_parameters.scaling.method` | string | `"modified_zscore"` | Scaling method. Options: `modified_zscore`, `zscore`, `none`. <br>• **modified_zscore** – median‑MAD based standardization (robust to outliers). <br>• **zscore** – mean‑std standardization. <br>• **none** – raw values (not recommended for integration). |
 
-  * _none_
+### Replicate Handling <a id="replicate-handling"></a>
 
-    No filtering is performed; all features are retained regardless of abundance or prevalence.
+| Config key | Type | Default | Description |
+|------------|------|---------|-------------|
+| `datasets.<omics>.normalization_parameters.replicate_handling.method` | string | `"variance"` | Replicate‑handling method. Options: `variance`, `none`. |
+| `datasets.<omics>.normalization_parameters.replicate_handling.group` | string | `"group"` | Metadata column used to define replicate groups (must be listed in `user_settings.variable_list`). Ignored when method is `none`. |
+| `datasets.<omics>.normalization_parameters.replicate_handling.value` | number | `0.5` | Maximum allowed within‑group variability (e.g., variance or MAD). Features exceeding this threshold are removed. Ignored when method is `none`. |
 
-  **value**
+---
 
-  Value determines the minimum or proportion value for filtering. It represents either observed quantitative values from the raw data (_minimum_; real numbers > 0) or percentage of samples (_proportion_; real numbers 0-100).
+## Example Configuration <a id="example-configuration"></a>
 
-## 2. Devariancing
-
-### Options:
-
-  **method**
-
-  #### Parameters:
-
-  * _percent_ \[default\]
-
-    Removes a specified percentage of features with the lowest variance across samples. This keeps only the most variable features, which are more likely to be informative.
-
-  * _none_
-
-    No variance-based filtering is performed; all features are retained regardless of their variance.
-
-  **value**
-
-  Value determines percent value for removing low variance features (real numbers 0-100). It represents percent of total features.
-
-## 3. Scaling
-
-### Options:
-
-  **log2** \[default\]
-
-  If enabled, applies a log2(x+1) transformation to all values before scaling. This reduces skewness and compresses large values.
-
-  **method**
-
-  #### Parameters:
-
-  * _modified_zscore_ \[default\]
-
-    Standardizes each feature using the median and median absolute deviation, making it more robust to outliers than standard z-score and makes features comparable regardless of their original scale.
-
-  * _zscore_
-
-    Standardizes each feature to have mean zero and unit variance across samples. This makes features comparable regardless of their original scale.
-
-  * _none_
-
-    No scaling is performed; features retain their original values. Not recommended because datasets will not fall along the same distribution and integration will be difficult to interpret.
-
-## 4. Replicate Handling
-
-### Options:
-
-  **method**
-
-  #### Parameters:
-
-  * _variance_ \[default\]
-
-    Removes features with high variability among replicates within each group (or specified metadata category - see below). Only features with consistent observed values within a replicate group are retained.
-
-  * _none_
-
-    No replicate handling is performed; all features are retained.
-
-  **group**
-
-  If method is not _none_, **group** is any column from the dataset metadata (i.e., a variable in the `user_settings->variable_list` in the configuration file) for grouping samples as replicates - defaults to the meta-variable 'group', which is the combination of all listed metadata categories.
-
-  **value**
-
-  If method is not _none_, this sets the threshold for maximum allowable within-group variability. Features with variability above this threshold are removed (default: 0.5). _Note_: this step typically is performed after data scaling, so mean and variance will be standardized.
-
-# Example
-
-Suppose you start with the following configuration:
+Below is a minimal yet complete `datasets` block for a transcriptomics dataset (`tx`). The same structure can be duplicated for other omics types (e.g., `mx`).
 
 ```yaml
 datasets:
-    tx:
-        dataset_dir: transcriptomics
-        normalization_parameters:
-            filtering:
-                method: minimum
-                value: 10
-            devariancing:
-                method: percent
-                value: 20
-            scaling:
-                log2: true
-                method: modified_zscore
-            replicate_handling:
-                method: variance
-                group: group
-                value: 0.5
+  data_processing_tag: 0
+  tx:
+    dataset_dir: transcriptomics
+    normalization_parameters:
+      filtering:
+        method: minimum
+        value: 10
+      devariancing:
+        method: percent
+        value: 20
+      scaling:
+        log2: true
+        method: modified_zscore
+      replicate_handling:
+        method: variance
+        group: group
+        value: 0.5
 ```
 
 And the following transcriptomics dataset (features as rows, samples as columns), with two sample groupings (high or low):
