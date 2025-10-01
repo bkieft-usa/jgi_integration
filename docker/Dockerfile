@@ -34,3 +34,8 @@ ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 RUN python -m ipykernel install --user \
     --name=jgi-integration \
     --display-name="JGI Integration"
+
+######## Ensure proper permissions after setting up container
+USER root
+RUN chown -R jovyan:users ${HOME}
+USER jovyan
