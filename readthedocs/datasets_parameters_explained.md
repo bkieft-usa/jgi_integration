@@ -23,43 +23,43 @@ This document describes the practical effect of each option in the **datasets** 
 
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `datasets.data_processing_tag` | string | `"0"` | Tag used to create a sub‑folder `Data_Processing--<TAG>` under the data‑processing output. Changing the tag creates a fresh output directory and prevents overwriting previous runs. |
-| `datasets.<omics>.dataset_dir` | string | *fixed* (e.g., `transcriptomics`, `metabolomics`) | Directory name for the omics type. **Do not modify**; it is tied to the workflow structure. |
+| `data_processing_tag` | string | `"0"` | Tag used to create a sub‑folder `Data_Processing--<TAG>` under the data‑processing output. Changing the tag creates a fresh output directory and prevents overwriting previous runs. |
+| `dataset_dir` | string | *fixed* (e.g., `transcriptomics`, `metabolomics`) | Directory name for the omics type. **Do not modify**; it is currently tied to the workflow structure. |
 
 ---
 
 ## Normalization Parameters <a id="normalization-parameters"></a>
 
-> All normalization sub‑sections share the same path pattern: `datasets.<omics>.normalization_parameters.<step>`.
+All normalization sub‑sections share the same path pattern: `datasets.<dataset_name>.normalization_parameters.<step>`.
 
 ### Filtering <a id="filtering"></a>
 
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `datasets.<omics>.normalization_parameters.filtering.method` | string | `"minimum"` | Filtering method. Options: `minimum`, `proportion`, `none`. |
-| `datasets.<omics>.normalization_parameters.filtering.value` | number | — | Threshold for the chosen method. <br>• **minimum** – real > 0 (absolute value). <br>• **proportion** – real 0‑100 (percentage of samples). <br>• **none** – ignored. |
+| `method` | string | `"minimum"` | Filtering method. Options: `minimum`, `proportion`, `none`. |
+| `value` | number | — | Threshold for the chosen method. <br>• **minimum** – real > 0 (absolute value). <br>• **proportion** – real 0‑100 (percentage of samples). <br>• **none** – ignored. |
 
 ### Devariancing <a id="devariancing"></a>
 
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `datasets.<omics>.normalization_parameters.devariancing.method` | string | `"percent"` | Devariancing method. Options: `percent`, `none`. |
-| `datasets.<omics>.normalization_parameters.devariancing.value` | number | — | Percent of features with lowest variance to drop (0‑100). Ignored when method is `none`. |
+| `method` | string | `"percent"` | Devariancing method. Options: `percent`, `none`. |
+| `value` | number | — | Percent of features with lowest variance to drop (0‑100). Ignored when method is `none`. |
 
 ### Scaling <a id="scaling"></a>
 
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `datasets.<omics>.normalization_parameters.scaling.log2` | boolean | `true` | If `true`, apply `log2(x + 1)` to all values before scaling. |
-| `datasets.<omics>.normalization_parameters.scaling.method` | string | `"modified_zscore"` | Scaling method. Options: `modified_zscore`, `zscore`, `none`. <br>• **modified_zscore** – median‑MAD based standardization (robust to outliers). <br>• **zscore** – mean‑std standardization. <br>• **none** – raw values (not recommended for integration). |
+| `log2` | boolean | `true` | If `true`, apply `log2(x + 1)` to all values before scaling. |
+| `method` | string | `"modified_zscore"` | Scaling method. Options: `modified_zscore`, `zscore`, `none`. <br>• **modified_zscore** – median‑MAD based standardization (robust to outliers). <br>• **zscore** – mean‑std standardization. <br>• **none** – raw values (not recommended for integration). |
 
 ### Replicate Handling <a id="replicate-handling"></a>
 
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `datasets.<omics>.normalization_parameters.replicate_handling.method` | string | `"variance"` | Replicate‑handling method. Options: `variance`, `none`. |
-| `datasets.<omics>.normalization_parameters.replicate_handling.group` | string | `"group"` | Metadata column used to define replicate groups (must be listed in `user_settings.variable_list`). Ignored when method is `none`. |
-| `datasets.<omics>.normalization_parameters.replicate_handling.value` | number | `0.5` | Maximum allowed within‑group variability (e.g., variance or MAD). Features exceeding this threshold are removed. Ignored when method is `none`. |
+| `method` | string | `"variance"` | Replicate‑handling method. Options: `variance`, `none`. |
+| `group` | string | `"group"` | Metadata column used to define replicate groups (must be listed in `user_settings.variable_list`). Ignored when method is `none`. |
+| `value` | number | `0.5` | Maximum allowed within‑group variability (e.g., variance or MAD). Features exceeding this threshold are removed. Ignored when method is `none`. |
 
 ---
 
