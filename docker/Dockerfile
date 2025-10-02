@@ -1,6 +1,6 @@
 FROM jupyter/base-notebook:latest
 
-######## Set up user permissions to install base software
+######## Install base software
 USER root
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -8,12 +8,15 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 ######## Set up user environment
-USER jovyan
 ENV HOME=/home/jovyan
 ENV WORK=${HOME}/work
 ENV MPLCONFIGDIR="${HOME}/.cache/matplotlib"
 ENV PYTHONPATH="${WORK}/jgi_integration"
-RUN mkdir -p ${WORK} ${MPLCONFIGDIR}
+RUN mkdir -p ${WORK} ${HOME}/.cache/matplotlib ${HOME}/.cache/uv && \
+    chown -R jovyan:users ${WORK} ${HOME}/.cache
+
+######## Start as jovyan
+USER jovyan
 WORKDIR ${WORK}
 
 ######## Install uv
