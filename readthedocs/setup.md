@@ -35,6 +35,7 @@ _Note:_ The tutorial examples provided are for setup via a Unix-style command li
       └── project_data
         ├── input_data
         │   ├── config
+        │   ├── dev        
         │   ├── docker-compose.yml
         │   ├── link_script
         │   └── raw_data
