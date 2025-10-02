@@ -2831,3 +2831,178 @@
 #     print(os.path.exists(output_pdf))
 #     display(IFrame(output_pdf, width=900, height=600))
 #     return
+
+
+# def glm_selection(
+#     data: pd.DataFrame,
+#     metadata: pd.DataFrame,
+#     category: str,
+#     reference: str,
+#     significance_level: float = 0.05,
+#     log2fc_cutoff: float = 0.25,
+#     max_features: int = 10000,
+# ) -> pd.DataFrame:
+#     """
+#     Fit a Gaussian GLM for each feature vs. a categorical metadata column.
+#     Returns a subset of features that satisfy BOTH a p-value threshold
+#     (FDR-adjusted) and an absolute log2-fold-change threshold.
+#     """
+#     # Merge once
+#     df = data.T.join(metadata)
+#     if category not in df.columns:
+#         raise ValueError(f"Metadata column '{category}' not found.")
+#     # Force ordered categorical with reference first
+#     uniq = df[category].dropna().unique()
+#     if reference not in uniq:
+#         raise ValueError(f"Reference group '{reference}' not present in '{category}'.")
+#     ordered_cats = [reference] + [c for c in uniq if c != reference]
+#     df[category] = pd.Categorical(df[category], categories=ordered_cats, ordered=True)
+
+#     log.info(f"GLM: fitting {data.shape[0]} features against '{category}' (ref={reference})")
+#     coeffs = {}
+#     pvals = {}
+#     for feat in data.index:
+#         formula = f'Q("{feat}") ~ C({category})'
+#         try:
+#             res = smf.glm(formula=formula, data=df, family=sm.families.Gaussian()).fit()
+#             # The first non-intercept term corresponds to the reference contrast
+#             term = [t for t in res.params.index if t != "Intercept"][0]
+#             coeffs[feat] = res.params[term]
+#             pvals[feat] = res.pvalues[term]
+#         except Exception as exc:  # pragma: no cover
+#             log.debug(f"GLM failed for {feat}: {exc}")
+#             coeffs[feat] = np.nan
+#             pvals[feat] = np.nan
+
+#     coeffs_s = pd.Series(coeffs, name="coef")
+#     pvals_s = pd.Series(pvals, name="pvalue")
+#     # Multiple-testing correction
+#     adj, sig_mask = _fdr_correct(pvals_s.values, alpha=significance_level)
+#     adj_s = pd.Series(adj, index=pvals_s.index, name="adj_pvalue")
+
+#     # Build a DataFrame of filters
+#     passes = (sig_mask) & (coeffs_s.abs() >= log2fc_cutoff)
+#     selected = passes[passes].index.tolist()
+#     if len(selected) > max_features:
+#         # rank by absolute coefficient (largest effect first)
+#         selected = coeffs_s.loc[selected].abs().sort_values(ascending=False).index[:max_features].tolist()
+#     log.info(f"GLM selected {len(selected)} features (max_features={max_features})")
+#     return data.loc[selected]
+
+# def kruskal_selection(
+#     data: pd.DataFrame,
+#     metadata: pd.DataFrame,
+#     category: str,
+#     significance_level: float = 0.05,
+#     lfc_cutoff: float = 0.5,
+#     max_features: int = 10000,
+# ) -> pd.DataFrame:
+#     """
+#     Kruskal-Wallis test per feature against a categorical metadata column.
+#     Returns features that satisfy both an FDR-adjusted p-value < `significance_level`
+#     and an absolute median-difference (as a proxy for effect size) >= `lfc_cutoff`.
+#     """
+#     if category not in metadata.columns:
+#         raise ValueError(f"Metadata column '{category}' missing.")
+#     groups = metadata[category].dropna().unique()
+#     if len(groups) < 2:
+#         raise ValueError(f"Need at least two groups in '{category}' for Kruskal-Wallis.")
+#     # Build dict of sample indices per group
+#     idx_by_grp = {g: metadata[metadata[category] == g].index for g in groups}
+#     pvals = {}
+#     effects = {}
+#     log.info(f"Kruskal-Wallis test: evaluating {data.shape[0]} features for '{category}'")
+#     for feat in data.index:
+#         samples = [data.loc[feat, idx_by_grp[g]].values for g in groups]
+#         # Constant vectors yield p=1
+#         if all(np.allclose(s, s[0]) for s in samples):
+#             p = 1.0
+#             eff = 0.0
+#         else:
+#             _, p = stats.kruskal(*samples)
+#             medians = [np.median(s) for s in samples]
+#             eff = max(abs(m1 - m2) for i, m1 in enumerate(medians)
+#                                           for m2 in medians[i + 1 :])
+#         pvals[feat] = p
+#         effects[feat] = eff
+
+#     pvals_s = pd.Series(pvals, name="pvalue")
+#     eff_s = pd.Series(effects, name="effect")
+#     adj, sig_mask = _fdr_correct(pvals_s.values, alpha=significance_level)
+#     adj_s = pd.Series(adj, index=pvals_s.index, name="adj_pvalue")
+#     # Apply both thresholds
+#     passes = (sig_mask) & (eff_s.abs() >= lfc_cutoff)
+#     selected = passes[passes].index.tolist()
+#     if len(selected) > max_features:
+#         selected = eff_s.loc[selected].abs().sort_values(ascending=False).index[:max_features].tolist()
+#     log.info(f"Kruskal-Wallis selected {len(selected)} features")
+#     return data.loc[selected]
+
+
+# def remove_low_replicable_features(
+#     data: pd.DataFrame,
+#     metadata: pd.DataFrame,
+#     dataset_name: str,
+#     output_filename: str,
+#     output_dir: str,
+#     method: str = "variance",
+#     group_col: str = "group",
+#     threshold: float = 0.6,
+# ):
+#     """
+#     Remove features (rows) from `data` with high within-group variability.
+
+#     Args:
+#         data: DataFrame, features as rows, samples as columns.
+#         metadata: DataFrame, index are sample names, must contain group_col.
+#         dataset_name: str, Name of the dataset (used for output).
+#         output_dir: str, Directory to save the filtered data.
+#         output_filename: str, Name for output file.
+#         method: Method to assess variability ('variance' supported).
+#         group_col: Name of the column in metadata for group assignment.
+#         threshold: Maximum allowed within-group variability (default 0.6).
+
+#     Returns:
+#         Filtered DataFrame.
+#     """
+
+#     if method == "none":
+#         log.info(f"\tNot removing any features based on replicability in {dataset_name}. Retaining all {data.shape[0]} features.")
+#         replicable_data = data
+#     elif method == "variance":
+#         variability_func = lambda x: x.std(axis=1, skipna=True)
+
+#         if group_col not in metadata.columns:
+#             raise ValueError(f"Column '{group_col}' not found in metadata.")
+#         groups = metadata[group_col].unique()
+#         group_samples = {
+#             group: metadata[metadata[group_col] == group]['unique_group'].tolist()
+#             for group in groups
+#         }
+
+#         keep_mask = []
+#         log.info(f"Removing features with high within-group variability (threshold: {threshold})...")
+#         for idx, row in data.iterrows():
+#             high_var = False
+#             enough_replicates = False
+#             for group, samples in group_samples.items():
+#                 samples_in_data = [s for s in samples if s in data.columns]
+#                 if len(samples_in_data) < 2:
+#                     continue 
+#                 enough_replicates = True
+#                 vals = row[samples_in_data]
+#                 var = variability_func(vals.to_frame().T)
+#                 if var.values[0] > threshold:
+#                     high_var = True
+#                     break
+#             # If there are not enough replicates in any group, keep the feature
+#             keep_mask.append(not high_var or not enough_replicates)
+
+#         replicable_data = data.loc[keep_mask]
+#         log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - replicable_data.shape[0]} to keep {replicable_data.shape[0]}.")
+#     else:
+#         raise ValueError("Currently only 'variance' or 'none' methods are supported for removing low replicable features.")
+
+#     log.info(f"Saving replicable data for {dataset_name}...")
+#     write_integration_file(replicable_data, output_dir, output_filename, indexing=True)
+#     return replicable_data

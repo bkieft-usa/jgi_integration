@@ -549,28 +549,28 @@ class Analysis(BaseDataHandler):
     def filter_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply filtering to all datasets in the analysis."""
         log.info("Filtering Data")
-        for ds in tqdm(self.datasets, desc=f"Filtering {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green", ncols=500):
+        for ds in tqdm(self.datasets, desc=f"Filtering {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green", ncols=800):
             log.info(f"Filtering {ds.dataset_name} dataset...")
             ds.filter_data(overwrite=overwrite, **kwargs)
 
     def devariance_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply devariancing to all datasets in the analysis."""
         log.info("Devariancing Data")
-        for ds in tqdm(self.datasets, desc=f"Devariancing {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green", ncols=500):
+        for ds in tqdm(self.datasets, desc=f"Devariancing {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green", ncols=800):
             log.info(f"Devariancing {ds.dataset_name} dataset...")
             ds.devariance_data(overwrite=overwrite, **kwargs)
 
     def scale_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply scaling to all datasets in the analysis."""
         log.info("Scaling Data")
-        for ds in tqdm(self.datasets, desc=f"Scaling {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green", ncols=500):
+        for ds in tqdm(self.datasets, desc=f"Scaling {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green", ncols=800):
             log.info(f"Scaling {ds.dataset_name} dataset...")
             ds.scale_data(overwrite=overwrite, **kwargs)
 
     def replicability_test_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Remove low replicable features from all datasets in the analysis."""
         log.info("Removing Unreplicable Features")
-        for ds in tqdm(self.datasets, desc=f"Removing low replicable features from {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green", ncols=500):
+        for ds in tqdm(self.datasets, desc=f"Removing low replicable features from {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green", ncols=800):
             log.info(f"Removing low replicable features from {ds.dataset_name} dataset...")
             ds.remove_low_replicable_features(overwrite=overwrite, **kwargs)
 
@@ -746,9 +746,8 @@ class Analysis(BaseDataHandler):
         submodule_dir = os.path.join(network_dir, submodule_subdir)
         os.makedirs(network_dir, exist_ok=True)
         os.makedirs(submodule_dir, exist_ok=True)
-        if self.check_and_load_attribute('feature_network_graph', os.path.join(network_subdir, self._feature_network_graph_filename), overwrite) or \
-            self.check_and_load_attribute('feature_network_node_table', os.path.join(network_subdir, self._feature_network_node_table_filename), overwrite) or \
-                self.check_and_load_attribute('feature_network_edge_table', os.path.join(network_subdir, self._feature_network_edge_table_filename), overwrite):
+        if self.check_and_load_attribute('feature_network_node_table', os.path.join(network_subdir, self._feature_network_node_table_filename), overwrite) or \
+            self.check_and_load_attribute('feature_network_edge_table', os.path.join(network_subdir, self._feature_network_edge_table_filename), overwrite):
             return
         else: # necessary to clear carryover from previous analyses
             hlp.clear_directory(network_dir)
