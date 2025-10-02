@@ -12,7 +12,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 import yaml
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 import warnings
 import logging
 import json
@@ -29,6 +29,9 @@ import numpy as np
 import pandas as pd
 import scipy.stats as stats
 from scipy.stats import rankdata
+from scipy.stats import kruskal
+from scipy import linalg
+from scipy.stats import t
 import scipy.sparse as sp
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
@@ -185,47 +188,185 @@ def glm_selection(
     Returns a subset of features that satisfy BOTH a p-value threshold
     (FDR-adjusted) and an absolute log2-fold-change threshold.
     """
-    # Merge once
+    # Merge once and prepare data
     df = data.T.join(metadata)
     if category not in df.columns:
         raise ValueError(f"Metadata column '{category}' not found.")
+    
     # Force ordered categorical with reference first
     uniq = df[category].dropna().unique()
     if reference not in uniq:
         raise ValueError(f"Reference group '{reference}' not present in '{category}'.")
     ordered_cats = [reference] + [c for c in uniq if c != reference]
     df[category] = pd.Categorical(df[category], categories=ordered_cats, ordered=True)
-
+    
+    # Remove rows with missing category values
+    df_clean = df.dropna(subset=[category]).copy()
+    
+    # Prepare design matrix using pandas get_dummies (much faster than repeated formula parsing)
+    design_matrix = pd.get_dummies(df_clean[category], prefix=category, drop_first=True)
+    design_matrix.insert(0, 'intercept', 1)  # Add intercept
+    
+    # Get feature data as numpy array for vectorized operations
+    feature_data = df_clean[data.index].values  # samples x features
+    X = design_matrix.values  # Design matrix
+    
     log.info(f"GLM: fitting {data.shape[0]} features against '{category}' (ref={reference})")
-    coeffs = {}
-    pvals = {}
-    for feat in data.index:
-        formula = f'Q("{feat}") ~ C({category})'
-        try:
-            res = smf.glm(formula=formula, data=df, family=sm.families.Gaussian()).fit()
-            # The first non-intercept term corresponds to the reference contrast
-            term = [t for t in res.params.index if t != "Intercept"][0]
-            coeffs[feat] = res.params[term]
-            pvals[feat] = res.pvalues[term]
-        except Exception as exc:  # pragma: no cover
-            log.debug(f"GLM failed for {feat}: {exc}")
-            coeffs[feat] = np.nan
-            pvals[feat] = np.nan
-
-    coeffs_s = pd.Series(coeffs, name="coef")
-    pvals_s = pd.Series(pvals, name="pvalue")
+    
+    # Vectorized GLM fitting using numpy/scipy
+    try:
+        XtX_inv = linalg.inv(X.T @ X)
+        XtY = X.T @ feature_data
+        coeffs_matrix = XtX_inv @ XtY
+        
+        # Calculate residuals and standard errors
+        fitted_values = X @ coeffs_matrix
+        residuals = feature_data - fitted_values
+        
+        # Degrees of freedom
+        n, p = X.shape
+        df_resid = n - p
+        
+        # Mean squared error for each feature
+        mse = np.sum(residuals**2, axis=0) / df_resid
+        
+        # Standard errors for the first non-intercept coefficient (reference contrast)
+        coeff_idx = 1
+        se_coeff = np.sqrt(mse * XtX_inv[coeff_idx, coeff_idx])
+        
+        # Extract coefficients and calculate t-statistics
+        coeffs = coeffs_matrix[coeff_idx, :]
+        t_stats = coeffs / se_coeff
+        
+        # Calculate p-values
+        pvals = 2 * (1 - t.cdf(np.abs(t_stats), df_resid))
+        
+    except Exception as e:
+        # Fallback to individual fitting if matrix is singular
+        log.warning(f"Matrix singular, falling back to individual GLM fitting: {e}")
+    
+    # Create series with results
+    coeffs_s = pd.Series(coeffs, index=data.index, name="coef")
+    pvals_s = pd.Series(pvals, index=data.index, name="pvalue")
+    
     # Multiple-testing correction
     adj, sig_mask = _fdr_correct(pvals_s.values, alpha=significance_level)
-    adj_s = pd.Series(adj, index=pvals_s.index, name="adj_pvalue")
-
-    # Build a DataFrame of filters
-    passes = (sig_mask) & (coeffs_s.abs() >= log2fc_cutoff)
-    selected = passes[passes].index.tolist()
+    
+    # Apply both filters
+    passes = sig_mask & (np.abs(coeffs) >= log2fc_cutoff)
+    selected = data.index[passes].tolist()
+    
     if len(selected) > max_features:
-        # rank by absolute coefficient (largest effect first)
+        # Rank by absolute coefficient (largest effect first)
         selected = coeffs_s.loc[selected].abs().sort_values(ascending=False).index[:max_features].tolist()
+    
     log.info(f"GLM selected {len(selected)} features (max_features={max_features})")
     return data.loc[selected]
+
+# def glm_selection(
+#     data: pd.DataFrame,
+#     metadata: pd.DataFrame,
+#     category: str,
+#     reference: str,
+#     significance_level: float = 0.05,
+#     log2fc_cutoff: float = 0.25,
+#     max_features: int = 10000,
+# ) -> pd.DataFrame:
+#     """
+#     Fit a Gaussian GLM for each feature vs. a categorical metadata column.
+#     Returns a subset of features that satisfy BOTH a p-value threshold
+#     (FDR-adjusted) and an absolute log2-fold-change threshold.
+#     """
+#     # Merge once
+#     df = data.T.join(metadata)
+#     if category not in df.columns:
+#         raise ValueError(f"Metadata column '{category}' not found.")
+#     # Force ordered categorical with reference first
+#     uniq = df[category].dropna().unique()
+#     if reference not in uniq:
+#         raise ValueError(f"Reference group '{reference}' not present in '{category}'.")
+#     ordered_cats = [reference] + [c for c in uniq if c != reference]
+#     df[category] = pd.Categorical(df[category], categories=ordered_cats, ordered=True)
+
+#     log.info(f"GLM: fitting {data.shape[0]} features against '{category}' (ref={reference})")
+#     coeffs = {}
+#     pvals = {}
+#     for feat in data.index:
+#         formula = f'Q("{feat}") ~ C({category})'
+#         try:
+#             res = smf.glm(formula=formula, data=df, family=sm.families.Gaussian()).fit()
+#             # The first non-intercept term corresponds to the reference contrast
+#             term = [t for t in res.params.index if t != "Intercept"][0]
+#             coeffs[feat] = res.params[term]
+#             pvals[feat] = res.pvalues[term]
+#         except Exception as exc:  # pragma: no cover
+#             log.debug(f"GLM failed for {feat}: {exc}")
+#             coeffs[feat] = np.nan
+#             pvals[feat] = np.nan
+
+#     coeffs_s = pd.Series(coeffs, name="coef")
+#     pvals_s = pd.Series(pvals, name="pvalue")
+#     # Multiple-testing correction
+#     adj, sig_mask = _fdr_correct(pvals_s.values, alpha=significance_level)
+#     adj_s = pd.Series(adj, index=pvals_s.index, name="adj_pvalue")
+
+#     # Build a DataFrame of filters
+#     passes = (sig_mask) & (coeffs_s.abs() >= log2fc_cutoff)
+#     selected = passes[passes].index.tolist()
+#     if len(selected) > max_features:
+#         # rank by absolute coefficient (largest effect first)
+#         selected = coeffs_s.loc[selected].abs().sort_values(ascending=False).index[:max_features].tolist()
+#     log.info(f"GLM selected {len(selected)} features (max_features={max_features})")
+#     return data.loc[selected]
+
+# def kruskal_selection(
+#     data: pd.DataFrame,
+#     metadata: pd.DataFrame,
+#     category: str,
+#     significance_level: float = 0.05,
+#     lfc_cutoff: float = 0.5,
+#     max_features: int = 10000,
+# ) -> pd.DataFrame:
+#     """
+#     Kruskal-Wallis test per feature against a categorical metadata column.
+#     Returns features that satisfy both an FDR-adjusted p-value < `significance_level`
+#     and an absolute median-difference (as a proxy for effect size) >= `lfc_cutoff`.
+#     """
+#     if category not in metadata.columns:
+#         raise ValueError(f"Metadata column '{category}' missing.")
+#     groups = metadata[category].dropna().unique()
+#     if len(groups) < 2:
+#         raise ValueError(f"Need at least two groups in '{category}' for Kruskal-Wallis.")
+#     # Build dict of sample indices per group
+#     idx_by_grp = {g: metadata[metadata[category] == g].index for g in groups}
+#     pvals = {}
+#     effects = {}
+#     log.info(f"Kruskal-Wallis test: evaluating {data.shape[0]} features for '{category}'")
+#     for feat in data.index:
+#         samples = [data.loc[feat, idx_by_grp[g]].values for g in groups]
+#         # Constant vectors yield p=1
+#         if all(np.allclose(s, s[0]) for s in samples):
+#             p = 1.0
+#             eff = 0.0
+#         else:
+#             _, p = stats.kruskal(*samples)
+#             medians = [np.median(s) for s in samples]
+#             eff = max(abs(m1 - m2) for i, m1 in enumerate(medians)
+#                                           for m2 in medians[i + 1 :])
+#         pvals[feat] = p
+#         effects[feat] = eff
+
+#     pvals_s = pd.Series(pvals, name="pvalue")
+#     eff_s = pd.Series(effects, name="effect")
+#     adj, sig_mask = _fdr_correct(pvals_s.values, alpha=significance_level)
+#     adj_s = pd.Series(adj, index=pvals_s.index, name="adj_pvalue")
+#     # Apply both thresholds
+#     passes = (sig_mask) & (eff_s.abs() >= lfc_cutoff)
+#     selected = passes[passes].index.tolist()
+#     if len(selected) > max_features:
+#         selected = eff_s.loc[selected].abs().sort_values(ascending=False).index[:max_features].tolist()
+#     log.info(f"Kruskal-Wallis selected {len(selected)} features")
+#     return data.loc[selected]
 
 def kruskal_selection(
     data: pd.DataFrame,
@@ -242,37 +383,105 @@ def kruskal_selection(
     """
     if category not in metadata.columns:
         raise ValueError(f"Metadata column '{category}' missing.")
+    
     groups = metadata[category].dropna().unique()
     if len(groups) < 2:
         raise ValueError(f"Need at least two groups in '{category}' for Kruskal-Wallis.")
+    
     # Build dict of sample indices per group
     idx_by_grp = {g: metadata[metadata[category] == g].index for g in groups}
-    pvals = {}
-    effects = {}
+    
     log.info(f"Kruskal-Wallis test: evaluating {data.shape[0]} features for '{category}'")
-    for feat in data.index:
-        samples = [data.loc[feat, idx_by_grp[g]].values for g in groups]
-        # Constant vectors yield p=1
-        if all(np.allclose(s, s[0]) for s in samples):
-            p = 1.0
-            eff = 0.0
-        else:
-            _, p = stats.kruskal(*samples)
-            medians = [np.median(s) for s in samples]
-            eff = max(abs(m1 - m2) for i, m1 in enumerate(medians)
-                                          for m2 in medians[i + 1 :])
-        pvals[feat] = p
-        effects[feat] = eff
+    
+    # Vectorized approach using scipy.stats
+    try:
+        # Pre-allocate arrays for results
+        n_features = data.shape[0]
+        pvals = np.full(n_features, np.nan)
+        effects = np.full(n_features, np.nan)
+        
+        # Group data into arrays for vectorized processing
+        group_data = []
+        for g in groups:
+            group_samples = [s for s in idx_by_grp[g] if s in data.columns]
+            if group_samples:
+                group_data.append(data[group_samples].values)
+            else:
+                raise ValueError(f"No valid samples found for group {g}")
+        
+        # Check for constant features across all groups
+        all_data = np.concatenate(group_data, axis=1)
+        constant_features = np.var(all_data, axis=1) < 1e-10
+        
+        # Vectorized Kruskal-Wallis test
+        if not constant_features.all():
+            # For non-constant features, run vectorized Kruskal-Wallis
+            valid_features = ~constant_features
+            valid_indices = np.where(valid_features)[0]
+            
+            for i, feat_idx in enumerate(valid_indices):
+                samples_by_group = [group_data[j][feat_idx, :] for j in range(len(groups))]
+                try:
+                    _, p = kruskal(*samples_by_group)
+                    pvals[feat_idx] = p
+                    
+                    # Calculate effect size (max pairwise median difference)
+                    medians = [np.median(samples) for samples in samples_by_group]
+                    max_diff = max(abs(m1 - m2) for i, m1 in enumerate(medians)
+                                                  for m2 in medians[i + 1:])
+                    effects[feat_idx] = max_diff
+                except Exception:
+                    pvals[feat_idx] = 1.0
+                    effects[feat_idx] = 0.0
+        
+        # Set constant features to p=1, effect=0
+        pvals[constant_features] = 1.0
+        effects[constant_features] = 0.0
+        
+        # Alternative: Use joblib for parallel processing if many features
+        if n_features > 5000:
+            log.info("Large dataset detected, using parallel processing...")
+            
+            def process_feature(feat_idx):
+                if constant_features[feat_idx]:
+                    return 1.0, 0.0
+                
+                samples_by_group = [group_data[j][feat_idx, :] for j in range(len(groups))]
+                try:
+                    _, p = kruskal(*samples_by_group)
+                    medians = [np.median(samples) for samples in samples_by_group]
+                    max_diff = max(abs(m1 - m2) for i, m1 in enumerate(medians)
+                                                  for m2 in medians[i + 1:])
+                    return p, max_diff
+                except Exception:
+                    return 1.0, 0.0
+            
+            # Parallel processing
+            results = Parallel(n_jobs=-1, backend="threading")(
+                delayed(process_feature)(i) for i in range(n_features)
+            )
+            
+            pvals, effects = zip(*results)
+            pvals = np.array(pvals)
+            effects = np.array(effects)
+            
+    except Exception as e:
+        log.warning(f"Vectorized approach to KW test failed: {e}")
 
-    pvals_s = pd.Series(pvals, name="pvalue")
-    eff_s = pd.Series(effects, name="effect")
+    # Create series with results
+    pvals_s = pd.Series(pvals, index=data.index, name="pvalue")
+    eff_s = pd.Series(effects, index=data.index, name="effect")
+    
+    # Multiple-testing correction
     adj, sig_mask = _fdr_correct(pvals_s.values, alpha=significance_level)
-    adj_s = pd.Series(adj, index=pvals_s.index, name="adj_pvalue")
+    
     # Apply both thresholds
-    passes = (sig_mask) & (eff_s.abs() >= lfc_cutoff)
-    selected = passes[passes].index.tolist()
+    passes = sig_mask & (eff_s.abs() >= lfc_cutoff)
+    selected = data.index[passes].tolist()
+    
     if len(selected) > max_features:
         selected = eff_s.loc[selected].abs().sort_values(ascending=False).index[:max_features].tolist()
+    
     log.info(f"Kruskal-Wallis selected {len(selected)} features")
     return data.loc[selected]
 
@@ -569,10 +778,11 @@ def _block_pair(
         for k in range(ii.size)
     ]
 
-def bipartite_correlation(
+def calculate_correlated_features(
     data: pd.DataFrame,
     output_filename: str,
     output_dir: str,
+    feature_prefixes: List[str] = None,
     method: str = "pearson",
     cutoff: float = 0.75,
     keep_negative: bool = False,
@@ -581,14 +791,17 @@ def bipartite_correlation(
     only_bipartite: bool = True,
 ) -> pd.DataFrame:
     """
-    Compute bipartite (transcript ↔ metabolite) similarity on a
-    already normalised feature-by-sample matrix.
+    Compute feature correlation on an already normalised feature-by-sample matrix.
 
     Parameters
     ------
     data : pd.DataFrame
-        Rows = features (transcripts + metabolites), columns = samples.
+        Rows = features, columns = samples.
         Must already be log-scaled / z-scored etc.
+    feature_prefixes : list of str, optional
+        List of feature prefixes to distinguish datatypes.
+        If None, defaults to ["tx_", "mx_"].
+        Example: ["tx_", "mx_", "px_"]
     method : str, default 'pearson'
         Similarity to compute - ``'pearson'``, ``'spearman'``,
         ``'cosine'``, ``'centered_cosine'`` or ``'bicor'``.
@@ -602,28 +815,30 @@ def bipartite_correlation(
         Number of features processed per block (memory ~= 4 x block_size x n_samples bytes).
     n_jobs : int, default 1
         Parallelism over transcript blocks.  ``-1`` uses all cores.
+    only_bipartite : bool, default True
+        If True, only compute correlations between different datatypes.
+        If False, compute all pairwise correlations.
 
     Returns
     ---
     pd.DataFrame
-        Columns ``['transcript', 'metabolite', 'correlation']``.
+        Columns ``['feature_1', 'feature_2', 'correlation']``.
     """
 
-    log.info("Starting bipartite correlation computation...")
+    log.info("Starting feature correlation computation...")
+    
     # Create feature type designation based on prefixes
-    ftype = pd.Series(
-        [
-            "transcript" if name.startswith("tx_") else
-            "metabolite" if name.startswith("mx_") else
-            None
-            for name in data.index
-        ],
-        index=data.index,
-    )
+    ftype = pd.Series(index=data.index, dtype=object)
+    ftype[:] = None  # Initialize with None
+    
+    for i, prefix in enumerate(feature_prefixes):
+        mask = data.index.str.startswith(prefix)
+        ftype[mask] = f"datatype_{i}"  # Generic datatype labels
+    
     if ftype.isnull().any():
         invalid = ftype[ftype.isnull()].index.tolist()
         log.info(f"Invalid feature names detected: {invalid}")
-        raise ValueError(f"Feature names must start with 'tx_' or 'mx_'. Invalid: {invalid}")
+        raise ValueError(f"Feature names must start with one of {feature_prefixes}. Invalid: {invalid}")
 
     # Basic checks
     if not isinstance(ftype, pd.Series):
@@ -637,27 +852,34 @@ def bipartite_correlation(
 
     log.info(f"Using method: {method}, cutoff: {cutoff}, keep_negative: {keep_negative}, block_size: {block_size}, n_jobs: {n_jobs}, only_bipartite: {only_bipartite}")
 
-    # Identify transcript & metabolite column indices (after transpose)
+    # Identify feature indices for each datatype
     X = data.T.values.astype(np.float64, copy=False)   # (n_samples, n_features)
     feature_names = data.index.to_numpy()
     n_features = X.shape[1]
 
-    is_transcript = ftype.str.lower().eq("transcript").values
-    trans_idx = np.where(is_transcript)[0]
-    metab_idx = np.where(~is_transcript)[0]
+    # Create indices for each datatype
+    datatype_indices = {}
+    for i, prefix in enumerate(feature_prefixes):
+        datatype_name = f"datatype_{i}"
+        mask = ftype.eq(datatype_name).values
+        datatype_indices[datatype_name] = np.where(mask)[0]
+        log.info(f"Found {len(datatype_indices[datatype_name])} features with prefix '{prefix}'.")
 
-    log.info(f"Found {len(trans_idx)} transcripts and {len(metab_idx)} metabolites.")
-
-    # If only_bipartite, keep current logic
-    # If not, set both indices to all features
+    # Determine which pairs to compute
     if only_bipartite:
-        pairs = [(trans_idx, metab_idx)]
-        log.info("Computing only bipartite correlations (transcript ↔ metabolite).")
+        # Only compute between different datatypes
+        pairs = []
+        datatypes = list(datatype_indices.keys())
+        for i, dtype1 in enumerate(datatypes):
+            for dtype2 in datatypes[i+1:]:  # Only unique pairs
+                pairs.append((datatype_indices[dtype1], datatype_indices[dtype2]))
+                pairs.append((datatype_indices[dtype2], datatype_indices[dtype1]))  # Both directions
+        log.info(f"Computing bipartite correlations between {len(pairs)//2} datatype pairs.")
     else:
         # All pairs (including within group)
         all_idx = np.arange(n_features)
         pairs = [(all_idx, all_idx)]
-        log.info("Computing all pairwise correlations (including within group).")
+        log.info("Computing all pairwise correlations (including within datatype).")
 
     # Transform data once according to the requested similarity
     log.info("Transforming data matrix for correlation computation...")
@@ -684,17 +906,17 @@ def bipartite_correlation(
                     keep_negative,
                 )
             )
-        log.info(f"Processed block {t_start}:{t_end} of transcripts against metabolites.")
+        log.info(f"Processed block {t_start}:{t_end} against target features.")
         return block_results
 
     # Parallel over blocks
     all_pairs: List[Tuple[int, int, float]] = []
     for i_idx, j_idx in pairs:
-        log.info(f"Processing {len(i_idx)} transcript features in blocks of {block_size}...")
+        log.info(f"Processing {len(i_idx)} source features in blocks of {block_size}...")
+        block_ranges = list(range(0, len(i_idx), block_size))
         if n_jobs == 1:
-            for t_start in range(0, len(i_idx), block_size):
+            for t_start in tqdm(block_ranges, desc="Blocks", unit="block"):
                 t_end = min(t_start + block_size, len(i_idx))
-                log.info(f"Processing transcript block {t_start}:{t_end}...")
                 all_pairs.extend(_process_block(i_idx, j_idx, t_start, t_end))
         else:
             n_jobs_eff = -1 if n_jobs == -1 else n_jobs
@@ -702,13 +924,13 @@ def bipartite_correlation(
             parallel = Parallel(n_jobs=n_jobs_eff, backend="loky", verbose=0)
             chunks = parallel(
                 delayed(_process_block)(i_idx, j_idx, t_start, min(t_start + block_size, len(i_idx)))
-                for t_start in range(0, len(i_idx), block_size)
+                for t_start in tqdm(block_ranges, desc="Blocks", unit="block")
             )
             log.info("Parallel block processing complete.")
             all_pairs.extend([pair for sublist in chunks for pair in sublist])
 
     if not all_pairs:
-        empty_df = pd.DataFrame(columns=["transcript", "metabolite", "correlation"])
+        empty_df = pd.DataFrame(columns=["feature_1", "feature_2", "correlation"])
         log.info("Warning: No pairs passed the correlation cutoff. Returning empty DataFrame.")
         write_integration_file(data=empty_df, output_dir=output_dir, filename=output_filename, indexing=True)
         return empty_df
@@ -861,7 +1083,7 @@ def _detect_submodules(
         return [(f"submodule_{i+1}", G.subgraph(c).copy())
                 for i, c in enumerate(comps)]
 
-    if method == "louvain":
+    elif method == "louvain":
         partition = community_louvain.best_partition(G, weight="weight")
         modules: Dict[int, List[str]] = {}
         for node, comm in partition.items():
@@ -869,7 +1091,7 @@ def _detect_submodules(
         return [(f"submodule_{i+1}", G.subgraph(nodes).copy())
                 for i, (comm, nodes) in enumerate(sorted(modules.items()))]
 
-    if method == "leiden":
+    elif method == "leiden":
         if ig is None or leidenalg is None:
             raise ImportError("igraph + leidenalg not installed -  `pip install igraph leidenalg`")
         # Convert to igraph (preserves node names)
@@ -883,7 +1105,7 @@ def _detect_submodules(
             modules.append((f"submodule_{i+1}", G.subgraph(nodes).copy()))
         return modules
 
-    if method == "wgcna":
+    elif method == "wgcna":
         # build adjacency from the correlation matrix (soft-threshold)
         beta: int = kwargs.get("beta", 6)
         min_mod_sz: int = kwargs.get("min_module_size", 10)
@@ -920,7 +1142,8 @@ def _detect_submodules(
                 if len(nodes) >= min_mod_sz]
         return kept
 
-    raise ValueError(f"Invalid submodule method '{method}'. "
+    else:
+        raise ValueError(f"Invalid submodule method '{method}'. "
                      "Choose from 'subgraphs', 'louvain', 'leiden', 'wgcna'.")
 
 def plot_correlation_network(

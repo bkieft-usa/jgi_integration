@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional
 from IPython.display import display
 import tools.helpers as hlp
 import logging
+from tqdm.notebook import tqdm
 
 log = logging.getLogger(__name__)
 if not log.handlers:
@@ -548,28 +549,28 @@ class Analysis(BaseDataHandler):
     def filter_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply filtering to all datasets in the analysis."""
         log.info("Filtering Data")
-        for ds in self.datasets:
+        for ds in tqdm(self.datasets, desc=f"Filtering {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green", ncols=80):
             log.info(f"Filtering {ds.dataset_name} dataset...")
             ds.filter_data(overwrite=overwrite, **kwargs)
 
     def devariance_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply devariancing to all datasets in the analysis."""
         log.info("Devariancing Data")
-        for ds in self.datasets:
+        for ds in tqdm(self.datasets, desc=f"Devariancing {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green", ncols=80):
             log.info(f"Devariancing {ds.dataset_name} dataset...")
             ds.devariance_data(overwrite=overwrite, **kwargs)
 
     def scale_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply scaling to all datasets in the analysis."""
         log.info("Scaling Data")
-        for ds in self.datasets:
+        for ds in tqdm(self.datasets, desc=f"Scaling {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green", ncols=80):
             log.info(f"Scaling {ds.dataset_name} dataset...")
             ds.scale_data(overwrite=overwrite, **kwargs)
 
     def replicability_test_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Remove low replicable features from all datasets in the analysis."""
         log.info("Removing Unreplicable Features")
-        for ds in self.datasets:
+        for ds in tqdm(self.datasets, desc=f"Removing low replicable features from {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green", ncols=80):
             log.info(f"Removing low replicable features from {ds.dataset_name} dataset...")
             ds.remove_low_replicable_features(overwrite=overwrite, **kwargs)
 
@@ -723,6 +724,7 @@ class Analysis(BaseDataHandler):
             'data': self.integrated_data_selected,
             'output_filename': self._feature_correlation_table_filename,
             'output_dir': self.output_dir,
+            'feature_prefixes': [ds.dataset_name + "_" for ds in self.datasets],
             'method': correlation_params.get('corr_method', 'pearson'),
             'cutoff': correlation_params.get('corr_cutoff', 0.5),
             'keep_negative': correlation_params.get('keep_negative', False),
@@ -732,7 +734,7 @@ class Analysis(BaseDataHandler):
         }
         call_params.update(kwargs)
         
-        result = hlp.bipartite_correlation(**call_params)
+        result = hlp.calculate_correlated_features(**call_params)
         self.feature_correlation_table = result
         log.info(f"Created a feature correlation table with {self.feature_correlation_table.shape[0]} feature pairs.\n")
 
@@ -763,7 +765,7 @@ class Analysis(BaseDataHandler):
 
         call_params = {
             'corr_table': self.feature_correlation_table,
-            'feature_prefixes': [ds.dataset_name for ds in self.datasets],
+            'feature_prefixes': [ds.dataset_name + "_" for ds in self.datasets],
             'integrated_data': self.integrated_data_selected,
             'integrated_metadata': self.integrated_metadata,
             'output_filenames': output_filenames,
