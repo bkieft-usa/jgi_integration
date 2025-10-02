@@ -906,7 +906,7 @@ def calculate_correlated_features(
                     keep_negative,
                 )
             )
-        log.info(f"Processed block {t_start}:{t_end} against target features.")
+        #log.info(f"Processed block {t_start}:{t_end} against target features.")
         return block_results
 
     # Parallel over blocks
@@ -2998,8 +2998,8 @@ def plot_pdf_grids(
     If *show_plot* is True (default) the figure is displayed inline (Jupyter).
     Returns the path to the grid PDF.
     """
-
-    metadata_variables.remove("group")
+    if "group" in metadata_variables:
+        metadata_variables.remove("group")
     data_types = list(pca_frames.keys())
     n_rows, n_cols = len(data_types), len(metadata_variables)
 
