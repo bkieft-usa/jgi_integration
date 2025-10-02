@@ -82,11 +82,11 @@ Configuration path: `analysis.analysis_parameters.networking`
 
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `network_mode` | string | `"bipartite"` | Edge topology. Options: `bipartite` (cross‑type only) or `full` (all pairwise). |
+| `network_mode` | string | `"bipartite"` | Edge topology. Options: `bipartite` (cross‑type only) or `full` (all pairwise). `full` is not currently recommended due to computational constraints. |
 | `submodule_mode` | string | `"louvain"` | Sub‑module extraction method. Options: `none`, `subgraphs`, `louvain`, `leiden`, `wgcna`. |
 | `wgcna_params` *(required only if `submodule_mode: wgcna`)* | mapping | {5, 10, 0.25} | `beta`, `min_module_size`, `distance_cutoff`. |
-| `interactive` | boolean | `false` | Render interactive network in the notebook (`true`) or generate static files (`false`). |
-| `interactive_layout` | string | `spring` | Layout algorithm for interactive view (`spring`, `fr`, `force`, `bipartite`, `pydot`, `random`, `circular`, `kamada_kawai`). Ignored if interactive is `false`. |
+| `interactive_plot` | boolean | `true` | Render interactive network in the notebook (`true`) or generate static files (`false`). |
+| `interactive_layout` | string | `spring` | Layout algorithm for interactive view (`spring`, `fr`, `force`, `bipartite`, `pydot`, `random`, `circular`, `kamada_kawai`). Ignored if `interactive_plot` is `false`. |
 
 ---  
 

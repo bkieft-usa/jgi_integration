@@ -62,4 +62,6 @@ _Note:_ The tutorial examples provided are for setup via a Unix-style command li
 
 1.  JupyterLab will render in your web browser. Details about how to navigate the JupyterLab interface can be found on the [Jupyter documentation page](https://docs.jupyter.org/en/latest/).
 
+_Note:_ If you have another JupyterLab instance running in the background or on your browser, you may see a window appear that asks you to input a token or password to access the workflow page. This is likely due to a collision between JupyterLab server instances and you will have to close the existing one to open the new one (inputting your token from the address to this page will not work).
+
 2.  Switch to the _run.md_ instructions to run the workflow!
