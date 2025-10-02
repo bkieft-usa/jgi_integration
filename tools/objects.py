@@ -22,7 +22,7 @@ class Project:
     """Project configuration and directory management."""
 
     def __init__(self, config):
-        log.info("=== Initializing Project ===")
+        log.info("Initializing Project")
         self.config = config
         self.project_config = config['project']
         self.user_settings = config['user_settings']
@@ -105,7 +105,7 @@ class Dataset(BaseDataHandler):
     """Simplified Dataset class using hybrid approach."""
 
     def __init__(self, dataset_name: str, project: Project, overwrite: bool = False):
-        log.info("=== Initializing Datasets ===")
+        log.info("Initializing Datasets")
         self.project = project
         self.dataset_name = dataset_name
         self.datasets_config = self.project.config['datasets']
@@ -272,15 +272,17 @@ class Dataset(BaseDataHandler):
         result = hlp.remove_low_replicable_features(**call_params)
         self.normalized_data = result
     
-    def plot_pca(self, overwrite: bool = False, **kwargs) -> None:
+    def plot_pca(self, overwrite: bool = False, analysis_outdir = None, show_plot = True, **kwargs) -> None:
         """Hybrid: Class setup + external hlp.plot_pca function."""
-        log.info("=== Plotting individual PCAs and grid ===")
-        plot_subdir = "plots"
+        log.info("Plotting individual PCAs and grid")
+        plot_subdir = "pca_plots"
         plot_dir = os.path.join(self.output_dir, plot_subdir)
         os.makedirs(plot_dir, exist_ok=True)
         if os.path.exists(os.path.join(plot_dir, self._pca_grid_filename)) and not overwrite:
             log.info(f"PCA grid plot already exists at {plot_dir}. Skipping.")
             return
+        else: # necessary to clear carryover from previous analyses
+            hlp.clear_directory(plot_dir)
         
         call_params = {
             'data': {"linked": self.linked_data, "normalized": self.normalized_data},
@@ -289,7 +291,8 @@ class Dataset(BaseDataHandler):
             'alpha': 0.75,
             'output_dir': plot_dir,
             'output_filename': self._pca_grid_filename,
-            'dataset_name': self.dataset_name
+            'dataset_name': self.dataset_name,
+            'show_plot': show_plot
         }
         call_params.update(kwargs)
         hlp.plot_pca(**call_params)
@@ -322,7 +325,7 @@ class MX(Dataset):
         self.datatype = "peak-height" # Currently only peak-height supported, not configurable
 
     def get_raw_data(self, overwrite: bool = False) -> None:
-        log.info("=== Getting Raw Data (MX) ===")
+        log.info("Getting Raw Data (MX)")
         if self.check_and_load_attribute('raw_data', self._raw_data_filename, overwrite):
             log.info(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.")
             return
@@ -340,7 +343,7 @@ class MX(Dataset):
         log.info(f"\tCreated raw data for MX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.\n")
 
     def get_raw_metadata(self, overwrite: bool = False) -> None:
-        log.info("=== Getting Raw Metadata (MX) ===")
+        log.info("Getting Raw Metadata (MX)")
         if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, overwrite):
             log.info(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
             return
@@ -392,7 +395,7 @@ class TX(Dataset):
         self.datatype = "counts" # Currently only counts supported, not configurable
 
     def get_raw_data(self, overwrite: bool = False) -> None:
-        log.info("=== Getting Raw Data (TX) ===")
+        log.info("Getting Raw Data (TX)")
         if self.check_and_load_attribute('raw_data', self._raw_data_filename, overwrite):
             log.info(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.")
             return
@@ -408,7 +411,7 @@ class TX(Dataset):
         log.info(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.\n")
 
     def get_raw_metadata(self, overwrite: bool = False) -> None:
-        log.info("=== Getting Raw Metadata (TX) ===")
+        log.info("Getting Raw Metadata (TX)")
         if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, overwrite):
             self.apid = self.raw_metadata['APID'].iloc[0] if 'APID' in self.raw_metadata.columns else None
             log.info(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
@@ -453,7 +456,7 @@ class Analysis(BaseDataHandler):
     """Simplified Analysis class using consistent hybrid approach."""
 
     def __init__(self, project: Project, datasets: list = None, overwrite: bool = False):
-        log.info("=== Initializing Analysis ===")
+        log.info("Initializing Analysis")
         self.project = project
         self.datasets_config = self.project.config['datasets']
         self.analysis_config = self.project.config['analysis']
@@ -544,43 +547,46 @@ class Analysis(BaseDataHandler):
 
     def filter_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply filtering to all datasets in the analysis."""
-        log.info("=== Filtering Data ===")
+        log.info("Filtering Data")
         for ds in self.datasets:
             log.info(f"Filtering {ds.dataset_name} dataset...")
             ds.filter_data(overwrite=overwrite, **kwargs)
 
     def devariance_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply devariancing to all datasets in the analysis."""
-        log.info("=== Devariancing Data ===")
+        log.info("Devariancing Data")
         for ds in self.datasets:
             log.info(f"Devariancing {ds.dataset_name} dataset...")
             ds.devariance_data(overwrite=overwrite, **kwargs)
 
     def scale_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply scaling to all datasets in the analysis."""
-        log.info("=== Scaling Data ===")
+        log.info("Scaling Data")
         for ds in self.datasets:
             log.info(f"Scaling {ds.dataset_name} dataset...")
             ds.scale_data(overwrite=overwrite, **kwargs)
 
     def replicability_test_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Remove low replicable features from all datasets in the analysis."""
-        log.info("=== Removing Unreplicable Features ===")
+        log.info("Removing Unreplicable Features")
         for ds in self.datasets:
             log.info(f"Removing low replicable features from {ds.dataset_name} dataset...")
             ds.remove_low_replicable_features(overwrite=overwrite, **kwargs)
 
-    def plot_pca_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
+    def plot_pca_all_datasets(self, overwrite: bool = False, show_plot: bool = True, **kwargs) -> None:
         """Plot PCA for all datasets in the analysis."""
-        log.info("=== Plotting Individual PCAs and Grid ===")
+        log.info("Plotting Individual PCAs and Grid")
         for ds in self.datasets:
             log.info(f"Plotting PCA for {ds.dataset_name} dataset...")
-            ds.plot_pca(overwrite=overwrite, **kwargs)
+            ds.plot_pca(overwrite=overwrite, 
+                        analysis_outdir=self.output_dir, 
+                        show_plot=show_plot, 
+                        **kwargs)
 
     def link_metadata(self, overwrite: bool = False) -> None:
         """Hybrid: Class orchestration + external hlp.link_metadata_with_custom_script function."""
 
-        log.info("=== Linking analysis datasets along shared metadata ===")
+        log.info("Linking analysis datasets along shared metadata")
 
         # Check if datasets already have linked metadata
         datasets_to_process = [
@@ -602,7 +608,7 @@ class Analysis(BaseDataHandler):
     def link_data(self, overlap_only: bool = True, overwrite: bool = False) -> None:
         """Hybrid: Class orchestration + external hlp.link_data_across_datasets function."""
 
-        log.info("=== Linking analysis datasets along shared samples ===")
+        log.info("Linking analysis datasets along shared samples")
 
         # Check if all datasets already have linked data
         datasets_to_process = [
@@ -632,7 +638,7 @@ class Analysis(BaseDataHandler):
         """
         Plot histograms of feature values for each dataset in the analysis.
         """
-        log.info("=== Plotting feature value distributions for all datasets ===")
+        log.info("Plotting feature value distributions for all datasets")
         if datatype == "normalized":
             dataframes = {ds.dataset_name: ds.normalized_data for ds in self.datasets if hasattr(ds, "normalized_data")}
         elif datatype == "nonnormalized":
@@ -650,7 +656,7 @@ class Analysis(BaseDataHandler):
 
     def integrate_metadata(self, overwrite: bool = False) -> None:
         """Hybrid: Class validation + external hlp.integrate_metadata function."""
-        log.info("=== Integrating metadata across data types ===")
+        log.info("Integrating metadata across data types")
         if self.check_and_load_attribute('integrated_metadata', self._integrated_metadata_filename, overwrite):
             log.info(f"\tIntegrated metadata object 'integrated_metadata' with {self.integrated_metadata.shape[0]} samples and {self.integrated_metadata.shape[1]} metadata fields.")
             return
@@ -667,7 +673,7 @@ class Analysis(BaseDataHandler):
     
     def integrate_data(self, overlap_only: bool = True, overwrite: bool = False) -> None:
         """Hybrid: Class validation + external hlp.integrate_data function."""
-        log.info("=== Integrating data matrices across data types ===")
+        log.info("Integrating data matrices across data types")
         if self.check_and_load_attribute('integrated_data', self._integrated_data_filename, overwrite):
             log.info(f"\tIntegrated data object 'integrated_data' with {self.integrated_data.shape[0]} features and {self.integrated_data.shape[1]} samples.")
             return
@@ -683,7 +689,7 @@ class Analysis(BaseDataHandler):
 
     def perform_feature_selection(self, overwrite: bool = False, **kwargs) -> None:
         """Hybrid: Class parameter setup + external hlp.perform_feature_selection function."""
-        log.info("=== Subsetting Features before Network Analysis ===")
+        log.info("Subsetting Features before Network Analysis")
         if self.check_and_load_attribute('integrated_data_selected', self._integrated_data_selected_filename, overwrite):
             log.info(f"\tFeature selection data object 'integrated_data_selected' with {self.integrated_data_selected.shape[0]} features and {self.integrated_data_selected.shape[1]} samples.")
             return
@@ -705,7 +711,7 @@ class Analysis(BaseDataHandler):
 
     def calculate_correlated_features(self, overwrite: bool = False, **kwargs) -> None:
         """Hybrid: Class validation + external hlp.calculate_correlated_features function."""
-        log.info("=== Calculating Correlated Features ===")
+        log.info("Calculating Correlated Features")
         if self.check_and_load_attribute('feature_correlation_table', self._feature_correlation_table_filename, overwrite):
             log.info(f"\tFeature correlation table object 'feature_correlation_table' with {self.feature_correlation_table.shape[0]} feature pairs.")
             return
@@ -731,7 +737,7 @@ class Analysis(BaseDataHandler):
         log.info(f"Created a feature correlation table with {self.feature_correlation_table.shape[0]} feature pairs.\n")
 
     def plot_correlation_network(self, overwrite: bool = False, **kwargs) -> None:
-        log.info("=== Plotting Correlation Network ===")
+        log.info("Plotting Correlation Network")
         network_subdir = "feature_network"
         submodule_subdir = "submodules"
         network_dir = os.path.join(self.output_dir, network_subdir)
@@ -764,7 +770,7 @@ class Analysis(BaseDataHandler):
             'annotation_df': getattr(self, 'feature_annotation_table', None),
             'network_mode': networking_params.get('network_mode', 'bipartite'),
             'submodule_mode': networking_params.get('submodule_mode', 'community'),
-            'interactive_network_in_nb': networking_params.get('interactive', False),
+            'show_plot': networking_params.get('interactive_plot', False),
             'interactive_layout': networking_params.get('interactive_layout', None),
             'corr_cutoff': correlation_params.get('corr_cutoff', 0.5),
             'wgcna_params': networking_params.get('wgcna_params', {"beta": 5, "min_module_size": 10, "distance_cutoff": 0.25})
@@ -779,7 +785,7 @@ class Analysis(BaseDataHandler):
         mofa_subdir = "mofa"
         mofa_dir = os.path.join(self.output_dir, mofa_subdir)
         os.makedirs(mofa_dir, exist_ok=True)
-        log.info("=== Running MOFA2 Analysis ===")
+        log.info("Running MOFA2 Analysis")
         if os.path.exists(os.path.join(mofa_subdir, self._mofa_model_filename)) and not overwrite:
             log.info(f"MOFA2 model already exists in {mofa_dir}. Skipping.")
             return

@@ -19,7 +19,7 @@ import json
 import tempfile
 
 # --- Display and plotting ---
-from IPython.display import display
+from IPython.display import display, Image
 import fitz  # PyMuPDF
 
 # --- Typing ---
@@ -58,7 +58,6 @@ import gff3_parser
 from Bio import SeqIO
 
 # --- PDF and Excel handling ---
-import fitz
 from openpyxl import load_workbook
 from openpyxl.worksheet.formula import ArrayFormula
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
@@ -88,7 +87,7 @@ import plotly.io as pio
 log = logging.getLogger(__name__)
 if not log.handlers:
     handler = logging.StreamHandler(sys.stdout)
-    fmt = "\033[47m%(levelname)s – %(message)s\033[0m"
+    fmt = "\033[47m%(levelname)s - %(message)s\033[0m"
     handler.setFormatter(logging.Formatter(fmt))
     log.addHandler(handler)
     log.setLevel(logging.INFO)
@@ -294,7 +293,7 @@ def feature_list_selection(
     if not intersect:
         log.warning("No features from the list were present in the data matrix.")
         return pd.DataFrame()
-    # Respect max_features – keep order as in the original list (if possible)
+    # Respect max_features - keep order as in the original list (if possible)
     ordered = [f for f in feature_list if f in intersect][:max_features]
     log.info(f"Feature list selection: using file {feature_list_file}, max {max_features} features.")
     return data.loc[ordered]
@@ -743,7 +742,7 @@ def _make_prefix_maps(prefixes: List[str]) -> Tuple[Dict[str, str], Dict[str, st
     colors = [to_hex(c) for c in palette]
     shape_map = {}
     for i, pref in enumerate(prefixes):
-        shape_map[pref] = "Round Rectangle" if i == 0 else "Diamond"
+        shape_map[pref] = "circle" if i == 0 else "diamond"
     color_map = {pref: colors[i % len(colors)] for i, pref in enumerate(prefixes)}
     return color_map, shape_map
 
@@ -827,13 +826,13 @@ def _assign_node_attributes(
     shape_dict = {name: shape_map.get(p, "Rectangle") for name, p in zip(node_names, node_pref)}
     nx.set_node_attributes(G, color_dict, "datatype_color")
     nx.set_node_attributes(G, shape_dict, "datatype_shape")
-    nx.set_node_attributes(G, 5, "node_size")
+    nx.set_node_attributes(G, 10, "node_size")
 
     #  optional functional annotation
     if annotation_df is not None and not annotation_df.empty:
         # annotation_df must have an index that matches node IDs
         ann = annotation_df["annotation"].fillna("Unassigned").to_dict()
-        ann_shape = {n: ("Diamond" if a != "Unassigned" else "Round Rectangle")
+        ann_shape = {n: ("diamond" if a != "Unassigned" else "circle")
                      for n, a in ann.items()}
         nx.set_node_attributes(G, ann, "annotation")
         nx.set_node_attributes(G, ann_shape, "annotation_shape")
@@ -934,7 +933,7 @@ def plot_correlation_network(
     annotation_df: Optional[pd.DataFrame] = None,
     network_mode: str = "bipartite",
     submodule_mode: str = "louvain",
-    interactive_network_in_nb: bool = False,
+    show_plot: bool = False,
     interactive_layout: str = None,
     corr_cutoff: float = 0.5,
     wgcna_params: dict = {}
@@ -1017,7 +1016,7 @@ def plot_correlation_network(
         log.info("\tMain graph updated with submodule annotations and written to disk.")
 
     # interactive plot
-    if interactive_network_in_nb:
+    if show_plot:
         log.info("Rendering interactive network in notebook…")
         color_attr = "submodule_color" if submodule_mode != "none" else "datatype_color"
         log.info("Pre-computing network layout...")
@@ -1035,6 +1034,7 @@ def _nx_to_plotly_widget(
     G,
     node_color_attr="submodule_color",
     node_size_attr="node_size",
+    node_shape_attr="datatype_shape",
     layout=None,
     seed=42,
 ):
@@ -1064,13 +1064,18 @@ def _nx_to_plotly_widget(
     if layout == "spring":
         pos = nx.spring_layout(G, seed=seed, k=10/np.sqrt(len(G.nodes())), weight="weight", iterations=100)
     elif layout == "bipartite":
-        pos = nx.bipartite_layout(G, nodes=[n for n, d in G.nodes(data=True) if d.get("datatype_shape") == "Round Rectangle"])
+        pos = nx.bipartite_layout(G, nodes=[n for n, d in G.nodes(data=True) if d.get("datatype_shape") == "circle"])
+    elif layout == "fr":
+        pos = nx.fruchterman_reingold_layout(G)
     elif layout == "pydot":
         pos = nx.nx_pydot.graphviz_layout(G, prog="dot")
     elif layout == "force":
-        pos = nx.forceatlas2_layout(G, seed=seed, max_iter=100, weight="weight")
+        pos = nx.forceatlas2_layout(G, store_pos_as="pos")
     elif layout == "circular":
         pos = nx.circular_layout(G)
+    elif layout == "pydot":
+        H = nx.convert_node_labels_to_integers(G, label_attribute="node_label")
+        pos = nx.nx_pydot.pydot_layout(H, prog="neato")
     elif layout == "kamada_kawai":
         pos = nx.kamada_kawai_layout(G)
     elif layout == "random":
@@ -1087,7 +1092,7 @@ def _nx_to_plotly_widget(
         edge_x += [x0, x1, None]
         edge_y += [y0, y1, None]
 
-    edge_trace = go.Scattergl(
+    edge_trace = go.Scatter(
         x=edge_x, y=edge_y,
         mode="lines",
         line=dict(width=1, color="#888"),
@@ -1097,18 +1102,19 @@ def _nx_to_plotly_widget(
 
     # Build node trace (colour / size / hover text)
     log.info("Building node traces...")
-    node_x, node_y, node_color, node_size, hover_txt = [], [], [], [], []
+    node_x, node_y, node_color, node_size, node_shape, hover_txt = [], [], [], [], [], []
     for n, data in G.nodes(data=True):
         x, y = pos[n]
         node_x.append(x)
         node_y.append(y)
         node_color.append(data.get(node_color_attr, "#1f78b4"))
+        node_shape.append(data.get(node_shape_attr, "Circle"))
         node_size.append(data.get(node_size_attr, 10))
 
-        # Only show submodule number in hover text (if present)
+        # Show node name and submodule (if present) in hover text
         submodule = data.get("submodule", None)
         if submodule:
-            hover_txt.append(str(submodule))
+            hover_txt.append(f"{n}<br>({submodule})")
         else:
             hover_txt.append(str(n))
     
@@ -1118,6 +1124,7 @@ def _nx_to_plotly_widget(
         marker=dict(
             size=node_size,
             color=node_color,
+            symbol=node_shape,
             opacity=0.9,
             line=dict(width=1, color="#222"),
         ),
@@ -1140,7 +1147,8 @@ def _nx_to_plotly_widget(
             margin=dict(l=20, r=20, t=40, b=20),
             xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            height=600,
+            height=900,
+            width=900,
             clickmode="event+select",
         ),
     )
@@ -2651,159 +2659,320 @@ def remove_low_replicable_features(
 # Plotting functions
 # ====================================
 
+def _draw_pca(ax, pca_df: pd.DataFrame, hue_col: str,
+              title: str, alpha: float = 0.75) -> None:
+    """Add KDE + scatter to *ax* for the supplied PCA DataFrame."""
+    sns.kdeplot(
+        data=pca_df,
+        x="PCA1",
+        y="PCA2",
+        hue=hue_col,
+        fill=True,
+        alpha=alpha,
+        palette="viridis",
+        bw_adjust=2,
+        ax=ax,
+    )
+    sns.scatterplot(
+        data=pca_df,
+        x="PCA1",
+        y="PCA2",
+        hue=hue_col,
+        palette="viridis",
+        alpha=alpha,
+        s=50,
+        edgecolor="w",
+        linewidth=0.5,
+        ax=ax,
+    )
+    ax.set_xlabel("PCA1")
+    ax.set_ylabel("PCA2")
+    ax.set_title(title, fontsize=10)
+    ax.legend(title=hue_col, loc="best", fontsize=8)
+
 def plot_pca(
-    data: dict[str, pd.DataFrame],
+    data: Dict[str, pd.DataFrame],
     metadata: pd.DataFrame,
     metadata_variables: List[str],
-    alpha: float = 0.75,
     output_dir: str = None,
     output_filename: str = None,
     dataset_name: str = None,
-) -> None:
+    alpha: float = 0.75,
+    show_plot: bool = False,
+) -> Tuple[Dict[str, Dict[str, Path]], Dict[str, pd.DataFrame]]:
     """
-    Plot a PCA of the data colored by a metadata variable.
+    For each DataFrame in *data* (e.g. “linked”, “normalized”)
+    compute a 2-component PCA on the intersecting samples,
+    draw a seaborn plot for every *metadata_variable*, and
+    store the figure as a PDF.
 
-    Args:
-        data (dict): A dictionary containing two DataFrames: {"linked": linked_data, "normalized": normalized_data}.
-        metadata (pd.DataFrame): Metadata DataFrame.
-        metadata_variables (List[str]): List of metadata variables to plot.
-        alpha (float): Transparency for points.
-        output_dir (str, optional): Output directory for plots.
-        output_filename (str, optional): Name for output file.
-        dataset_name (str, optional): Name for output file.
-
-    Returns:
-        None
+    Returns
+    -------
+    plot_paths : dict[data_type][metadata_variable] → Path to PDF
+    pca_frames : dict[data_type] → PCA-augmented DataFrame (used later for the grid)
     """
 
-    clear_directory(output_dir)
-    plot_paths = {}
-    for df_type, df in data.items():
-        plot_paths[df_type] = []
-        df_samples = df.columns.tolist()
-        metadata_samples = metadata['unique_group'].tolist()
-        if not set(df_samples).intersection(set(metadata_samples)):
-            log.info(f"Warning: No matching samples between {df_type} data and metadata. Skipping PCA plot for {df_type}.")
+    plot_paths: Dict[str, Dict[str, Path]] = {}
+    pca_frames: Dict[str, pd.DataFrame] = {}
+
+    for d_type, df in data.items():
+        # match samples
+        df_samples = set(df.columns)
+        meta_samples = set(metadata["unique_group"])
+        common = list(df_samples & meta_samples)
+
+        if not common:
+            log.warning(f"No common samples for {d_type}; skipping.")
             continue
-        common_samples = list(set(df_samples).intersection(set(metadata_samples)))
-        metadata_input = metadata[metadata['unique_group'].isin(common_samples)]
-        data_input = df.T
-        data_input = data_input.loc[common_samples]
-        data_input = data_input.fillna(0)
-        data_input = data_input.replace([np.inf, -np.inf], 0)
 
-        # Perform PCA
+        # build PCA matrix
+        X = df.T.loc[common].fillna(0).replace([np.inf, -np.inf], 0)
+
         pca = PCA(n_components=2)
-        pca_result = pca.fit_transform(data_input)
+        pcs = pca.fit_transform(X)
+        pca_df = pd.DataFrame(pcs, columns=["PCA1", "PCA2"], index=X.index)
+        pca_df = pca_df.reset_index().rename(columns={"index": "unique_group"})
+
+        # attach metadata columns (all of them - KD-plot can use any)
+        pca_df = pca_df.merge(metadata, on="unique_group", how="left")
+        pca_frames[d_type] = pca_df
+
+        # individual PDF plots
+        plot_paths[d_type] = {}
+        for meta_var in metadata_variables:
+            if meta_var == "group":
+                continue
+            fig, ax = plt.subplots(figsize=(6, 5))
+            title = f"{dataset_name} - {d_type} - {meta_var}"
+            _draw_pca(ax, pca_df, hue_col=meta_var, title=title, alpha=alpha)
+
+            pdf_path = f"{output_dir}/pca_of_{dataset_name}_{d_type}_by_{meta_var}.pdf"
+            fig.savefig(pdf_path, bbox_inches="tight")
+            plt.close(fig)
+
+            plot_paths[d_type][meta_var] = pdf_path
+
+    plot_pdf_grids(
+        pca_frames=pca_frames,
+        metadata_variables=metadata_variables,
+        output_dir=output_dir,
+        output_filename=output_filename,
+        alpha=alpha,
+        show_plot=show_plot,
+    )
+
+    return
+
+def plot_pdf_grids(
+    pca_frames: Dict[str, pd.DataFrame],
+    metadata_variables: List[str],
+    output_dir: str,
+    output_filename: str = None,
+    alpha: float = 0.75,
+    show_plot: bool = True,
+) -> Path:
+    """
+    Build a Matplotlib grid (rows = data types, columns = metadata variables)
+    from the PCA DataFrames created by :func:`plot_pca`.
+
+    If *show_plot* is True (default) the figure is displayed inline (Jupyter).
+    Returns the path to the grid PDF.
+    """
+
+    data_types = list(pca_frames.keys())
+    n_rows, n_cols = len(data_types), len(metadata_variables)
+
+    # create a figure with enough space for all sub-plots
+    fig, axes = plt.subplots(
+        nrows=n_rows,
+        ncols=n_cols,
+        figsize=(n_cols * 4, n_rows * 3.5),
+        constrained_layout=True,
+    )
+    # ensure a 2-D array even if n_rows == 1 or n_cols == 1
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+    if n_cols == 1:
+        axes = axes[:, np.newaxis]
+
+    for i, d_type in enumerate(data_types):
+        pca_df = pca_frames[d_type]
+        for j, meta_var in enumerate(metadata_variables):
+            ax = axes[i, j]
+            title = f"{d_type} - {meta_var}"
+            _draw_pca(ax, pca_df, hue_col=meta_var, title=title, alpha=alpha)
+
+    grid_pdf = f"{output_dir}/{output_filename}"
+    #grid_png = output_dir / output_filename.replace(".pdf", ".png")
+    fig.savefig(grid_pdf, format="pdf", bbox_inches="tight")
+    #fig.savefig(grid_png, format="png", dpi=150, bbox_inches="tight")
+    if show_plot:
+        plt.show()
+    plt.close(fig)
+    # if display_grid:
+    #     display(Image(filename=str(grid_png)))
+
+    return
+
+# def plot_pca(
+#     data: dict[str, pd.DataFrame],
+#     metadata: pd.DataFrame,
+#     metadata_variables: List[str],
+#     alpha: float = 0.75,
+#     output_dir: str = None,
+#     analysis_outdir: str = None,
+#     output_filename: str = None,
+#     dataset_name: str = None,
+#     show_plot: bool = False,
+# ) -> None:
+#     """
+#     Plot a PCA of the data colored by a metadata variable.
+
+#     Args:
+#         data (dict): A dictionary containing two DataFrames: {"linked": linked_data, "normalized": normalized_data}.
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         metadata_variables (List[str]): List of metadata variables to plot.
+#         alpha (float): Transparency for points.
+#         output_dir (str, optional): Output directory for plots.
+#         output_filename (str, optional): Name for output file.
+#         dataset_name (str, optional): Name for output file.
+
+#     Returns:
+#         None
+#     """
+
+#     clear_directory(output_dir)
+#     plot_paths = {}
+#     for df_type, df in data.items():
+#         plot_paths[df_type] = []
+#         df_samples = df.columns.tolist()
+#         metadata_samples = metadata['unique_group'].tolist()
+#         if not set(df_samples).intersection(set(metadata_samples)):
+#             log.info(f"Warning: No matching samples between {df_type} data and metadata. Skipping PCA plot for {df_type}.")
+#             continue
+#         common_samples = list(set(df_samples).intersection(set(metadata_samples)))
+#         metadata_input = metadata[metadata['unique_group'].isin(common_samples)]
+#         data_input = df.T
+#         data_input = data_input.loc[common_samples]
+#         data_input = data_input.fillna(0)
+#         data_input = data_input.replace([np.inf, -np.inf], 0)
+
+#         # Perform PCA
+#         pca = PCA(n_components=2)
+#         pca_result = pca.fit_transform(data_input)
         
-        # Merge PCA results with metadata
-        pca_df = pd.DataFrame(data=pca_result, columns=['PCA1', 'PCA2'], index=data_input.index)
-        pca_df = pca_df.reset_index().rename(columns={'index': 'unique_group'})
-        pca_df = pca_df.merge(metadata_input, on='unique_group', how='left')
+#         # Merge PCA results with metadata
+#         pca_df = pd.DataFrame(data=pca_result, columns=['PCA1', 'PCA2'], index=data_input.index)
+#         pca_df = pca_df.reset_index().rename(columns={'index': 'unique_group'})
+#         pca_df = pca_df.merge(metadata_input, on='unique_group', how='left')
         
-        # Plot PCA using seaborn
-        for metadata_variable in metadata_variables:
-            plt.figure(figsize=(8, 6))
-            sns.kdeplot(
-                data=pca_df, 
-                x='PCA1', 
-                y='PCA2', 
-                hue=metadata_variable, 
-                fill=True, 
-                alpha=alpha, 
-                palette='viridis',
-                bw_adjust=2
-            )
-            sns.scatterplot(
-                x='PCA1', y='PCA2', 
-                hue=metadata_variable, 
-                palette='viridis', 
-                data=pca_df, 
-                alpha=alpha,
-                s=100,
-                edgecolor='w',
-                linewidth=0.5
-            )
-            plt.xlabel('PCA1')
-            plt.ylabel('PCA2')
-            plt.title(f"{dataset_name} {df_type} data PCA by {metadata_variable}")
-            plt.legend(title=metadata_variable)
+#         # Plot PCA using seaborn
+#         for metadata_variable in metadata_variables:
+#             plt.figure(figsize=(8, 6))
+#             sns.kdeplot(
+#                 data=pca_df, 
+#                 x='PCA1', 
+#                 y='PCA2', 
+#                 hue=metadata_variable, 
+#                 fill=True, 
+#                 alpha=alpha, 
+#                 palette='viridis',
+#                 bw_adjust=2
+#             )
+#             sns.scatterplot(
+#                 x='PCA1', y='PCA2', 
+#                 hue=metadata_variable, 
+#                 palette='viridis', 
+#                 data=pca_df, 
+#                 alpha=alpha,
+#                 s=100,
+#                 edgecolor='w',
+#                 linewidth=0.5
+#             )
+#             plt.xlabel('PCA1')
+#             plt.ylabel('PCA2')
+#             plt.title(f"{dataset_name} {df_type} data PCA by {metadata_variable}")
+#             plt.legend(title=metadata_variable)
             
-            # Save the plot if output_dir is specified
-            if output_dir:
-                filename = f"PCA_of_{df_type}_data_by_{metadata_variable}_for_{dataset_name}.pdf"
-                output_plot = f"{output_dir}/{filename}"
-                log.info(f"Saving plot to {output_plot}")
-                plt.savefig(output_plot)
-                plot_paths[df_type].append(output_plot)
-                plt.close()
-            else:
-                log.info("Not saving plot to disk.")
+#             # Save the plot if output_dir is specified
+#             if output_dir:
+#                 filename = f"PCA_of_{df_type}_data_by_{metadata_variable}_for_{dataset_name}.pdf"
+#                 output_plot = f"{output_dir}/{filename}"
+#                 log.info(f"Saving plot to {output_plot}")
+#                 plt.savefig(output_plot)
+#                 plot_paths[df_type].append(output_plot)
+#                 if show_plot:
+#                     plt.show()
+#                 plt.close()
+#             else:
+#                 log.info("Not saving plot to disk.")
 
-    plot_pdf_grids(plot_paths, output_dir, metadata_variables, output_filename)
+#     plot_pdf_grids(plot_paths, analysis_outdir, metadata_variables, output_filename)
 
-    return
+#     return
 
-def plot_pdf_grids(plot_paths: dict[str, List[str]], output_dir: str, variables: List[str], output_filename: str) -> None:
-    """
-    Combine PDF plots into a grid PDF (rows: data types, columns: metadata variables).
+# def plot_pdf_grids(plot_paths: dict[str, List[str]], output_dir: str, variables: List[str], output_filename: str) -> None:
+#     """
+#     Combine PDF plots into a grid PDF (rows: data types, columns: metadata variables).
 
-    Args:
-        plot_paths (dict): {"linked": [...], "normalized": [...]}, each a list of PDF paths.
-        variables (List[str]): Metadata variable names (columns).
-        output_dir (str): Output directory for combined PDF.
-        output_filename (str): Name for output PDF.
+#     Args:
+#         plot_paths (dict): {"linked": [...], "normalized": [...]}, each a list of PDF paths.
+#         variables (List[str]): Metadata variable names (columns).
+#         output_dir (str): Output directory for combined PDF.
+#         output_filename (str): Name for output PDF.
 
-    Returns:
-        None
-    """
-    # Build grid: each row is a data type, each column is a variable
-    grid = []
-    for data_type, paths in plot_paths.items():
-        grid_row = []
-        for var in variables:
-            match = next((f for f in paths if f and f"_by_{var}_" in f), None)
-            grid_row.append(match)
-        grid.append(grid_row)
+#     Returns:
+#         None
+#     """
+#     # Build grid: each row is a data type, each column is a variable
+#     grid = []
+#     for data_type, paths in plot_paths.items():
+#         grid_row = []
+#         for var in variables:
+#             match = next((f for f in paths if f and f"_by_{var}_" in f), None)
+#             grid_row.append(match)
+#         grid.append(grid_row)
 
-    # Set page size based on grid
-    n_rows = len(grid)
-    n_cols = len(variables)
-    page_height = 250 * n_rows
-    page_width = 250 * n_cols
+#     # Set page size based on grid
+#     n_rows = len(grid)
+#     n_cols = len(variables)
+#     page_height = 250 * n_rows
+#     page_width = 250 * n_cols
 
-    doc = fitz.open()
-    page = doc.new_page(width=page_width, height=page_height)
+#     doc = fitz.open()
+#     page = doc.new_page(width=page_width, height=page_height)
 
-    img_w = page_width / n_cols
-    img_h = page_height / n_rows
+#     img_w = page_width / n_cols
+#     img_h = page_height / n_rows
 
-    for i, grid_row in enumerate(grid):
-        for j, pdf in enumerate(grid_row):
-            if pdf and os.path.exists(pdf):
-                try:
-                    src = fitz.open(pdf)
-                    src_page = src[0]
-                    scale_x = img_w / src_page.rect.width
-                    scale_y = img_h / src_page.rect.height
-                    scale = min(scale_x, scale_y)
-                    mat = fitz.Matrix(scale, scale)
-                    rect = fitz.Rect(
-                        j * img_w,
-                        i * img_h,
-                        (j + 1) * img_w,
-                        (i + 1) * img_h
-                    )
-                    page.show_pdf_page(rect, src, 0, mat)
-                    src.close()
-                except Exception as e:
-                    log.info(f"Error processing {pdf}: {e}")
+#     for i, grid_row in enumerate(grid):
+#         for j, pdf in enumerate(grid_row):
+#             if pdf and os.path.exists(pdf):
+#                 try:
+#                     src = fitz.open(pdf)
+#                     src_page = src[0]
+#                     scale_x = img_w / src_page.rect.width
+#                     scale_y = img_h / src_page.rect.height
+#                     scale = min(scale_x, scale_y)
+#                     mat = fitz.Matrix(scale, scale)
+#                     rect = fitz.Rect(
+#                         j * img_w,
+#                         i * img_h,
+#                         (j + 1) * img_w,
+#                         (i + 1) * img_h
+#                     )
+#                     page.show_pdf_page(rect, src, 0, mat)
+#                     src.close()
+#                 except Exception as e:
+#                     log.info(f"Error processing {pdf}: {e}")
 
-    output_pdf = os.path.join(output_dir, output_filename)
-    doc.save(output_pdf)
-    doc.close()
-    log.info(f"Combined PDF saved as {output_pdf}")
-    return
+#     output_pdf = os.path.join(output_dir, output_filename)
+#     doc.save(output_pdf)
+#     doc.close()
+#     log.info(f"Combined PDF saved as {output_pdf}")
+#     print(os.path.exists(output_pdf))
+#     display(IFrame(output_pdf, width=900, height=600))
+#     return
 
 def plot_data_variance_indv_histogram(
     data: pd.DataFrame,
@@ -2902,7 +3071,7 @@ def plot_data_variance_histogram(
     log.info(f"Saving plot to {output_subdir}/{filename}...")
     plt.savefig(f"{output_subdir}/{filename}")
     if show_plot is True:
-        log.info("\nDatasets should follow similar distributions, while quantitative values can be slightly shifted:")
+        log.info("Datasets should follow similar distributions, while quantitative values can be slightly shifted:")
         plt.show()
     plt.close()
 
