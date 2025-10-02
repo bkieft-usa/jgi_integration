@@ -56,7 +56,7 @@ _Note:_ This tutorial assumes you’ve already completed all stages of the workf
 
     - To view the outputs on your system (which is mounted to the docker container), navigate to `$INTEGRATION_DIR/project_data/output_data` directory (see _setup.md_ if you do not have this directory) and view output files as you would normally on your local filesystem.
 
-## **Exiting the Worklow Container**
+## **Exiting the Workflow Container**
 
 1.  When you are finished running the workflow and producing outputs, it is best to close it down gracefully rather than simply close your browser window and exit the Docker Desktop app. There are three methods to properly close down the docker container, any of which will work equally well:
 
