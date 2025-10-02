@@ -6,3 +6,4 @@
 readthedocs/*.docx
 readthedocs/*.pdf
 readthedocs/~$*
+venv/.venv
