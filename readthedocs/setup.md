@@ -14,6 +14,8 @@ _Note:_ The tutorial examples provided are for setup via a Unix-style command li
 
 **Docker Desktop installed on your system.** If you do not have the application, download it from the [official Docker website](https://www.docker.com/products/docker-desktop). Make sure to choose the correct version for your system. This program will be used to set up the software environment for running the integration workflow.
 
+[Optional] **Cytoscape Desktop installed on your system** If you want to view the feature coexpression network in the Cytoscape IDE (which has more exploration tools than the interactive network displayed in the JupyterLab notebook), you can download and install the program from the [official Cytoscape website](https://cytoscape.org/download.html). The `.graphml` file(s) produced during the workflow can be opened in Cytoscape by importing them as network files using the instructions in the [official app documentation](https://manual.cytoscape.org/en/stable/Quick_Tour_of_Cytoscape.html#the-menus). 
+
 ## **Step 1: Download and Unzip the Project Data Folder**
 
 1.  Create a dedicated directory on your system that will run and store results from the workflow, then navigate into it. For example (use your own path here):
