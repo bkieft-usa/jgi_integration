@@ -2739,8 +2739,6 @@ def plot_pca(
         # individual PDF plots
         plot_paths[d_type] = {}
         for meta_var in metadata_variables:
-            if meta_var == "group":
-                continue
             fig, ax = plt.subplots(figsize=(6, 5))
             title = f"{dataset_name} - {d_type} - {meta_var}"
             _draw_pca(ax, pca_df, hue_col=meta_var, title=title, alpha=alpha)
@@ -2778,6 +2776,7 @@ def plot_pdf_grids(
     Returns the path to the grid PDF.
     """
 
+    metadata_variables.remove("group")
     data_types = list(pca_frames.keys())
     n_rows, n_cols = len(data_types), len(metadata_variables)
 
