@@ -2670,3 +2670,164 @@
 #         for file in [cyjs_file, positions_file, script_file]:
 #             if os.path.exists(file):
 #                 os.remove(file)
+
+
+# def plot_pca(
+#     data: dict[str, pd.DataFrame],
+#     metadata: pd.DataFrame,
+#     metadata_variables: List[str],
+#     alpha: float = 0.75,
+#     output_dir: str = None,
+#     analysis_outdir: str = None,
+#     output_filename: str = None,
+#     dataset_name: str = None,
+#     show_plot: bool = False,
+# ) -> None:
+#     """
+#     Plot a PCA of the data colored by a metadata variable.
+
+#     Args:
+#         data (dict): A dictionary containing two DataFrames: {"linked": linked_data, "normalized": normalized_data}.
+#         metadata (pd.DataFrame): Metadata DataFrame.
+#         metadata_variables (List[str]): List of metadata variables to plot.
+#         alpha (float): Transparency for points.
+#         output_dir (str, optional): Output directory for plots.
+#         output_filename (str, optional): Name for output file.
+#         dataset_name (str, optional): Name for output file.
+
+#     Returns:
+#         None
+#     """
+
+#     clear_directory(output_dir)
+#     plot_paths = {}
+#     for df_type, df in data.items():
+#         plot_paths[df_type] = []
+#         df_samples = df.columns.tolist()
+#         metadata_samples = metadata['unique_group'].tolist()
+#         if not set(df_samples).intersection(set(metadata_samples)):
+#             log.info(f"Warning: No matching samples between {df_type} data and metadata. Skipping PCA plot for {df_type}.")
+#             continue
+#         common_samples = list(set(df_samples).intersection(set(metadata_samples)))
+#         metadata_input = metadata[metadata['unique_group'].isin(common_samples)]
+#         data_input = df.T
+#         data_input = data_input.loc[common_samples]
+#         data_input = data_input.fillna(0)
+#         data_input = data_input.replace([np.inf, -np.inf], 0)
+
+#         # Perform PCA
+#         pca = PCA(n_components=2)
+#         pca_result = pca.fit_transform(data_input)
+        
+#         # Merge PCA results with metadata
+#         pca_df = pd.DataFrame(data=pca_result, columns=['PCA1', 'PCA2'], index=data_input.index)
+#         pca_df = pca_df.reset_index().rename(columns={'index': 'unique_group'})
+#         pca_df = pca_df.merge(metadata_input, on='unique_group', how='left')
+        
+#         # Plot PCA using seaborn
+#         for metadata_variable in metadata_variables:
+#             plt.figure(figsize=(8, 6))
+#             sns.kdeplot(
+#                 data=pca_df, 
+#                 x='PCA1', 
+#                 y='PCA2', 
+#                 hue=metadata_variable, 
+#                 fill=True, 
+#                 alpha=alpha, 
+#                 palette='viridis',
+#                 bw_adjust=2
+#             )
+#             sns.scatterplot(
+#                 x='PCA1', y='PCA2', 
+#                 hue=metadata_variable, 
+#                 palette='viridis', 
+#                 data=pca_df, 
+#                 alpha=alpha,
+#                 s=100,
+#                 edgecolor='w',
+#                 linewidth=0.5
+#             )
+#             plt.xlabel('PCA1')
+#             plt.ylabel('PCA2')
+#             plt.title(f"{dataset_name} {df_type} data PCA by {metadata_variable}")
+#             plt.legend(title=metadata_variable)
+            
+#             # Save the plot if output_dir is specified
+#             if output_dir:
+#                 filename = f"PCA_of_{df_type}_data_by_{metadata_variable}_for_{dataset_name}.pdf"
+#                 output_plot = f"{output_dir}/{filename}"
+#                 log.info(f"Saving plot to {output_plot}")
+#                 plt.savefig(output_plot)
+#                 plot_paths[df_type].append(output_plot)
+#                 if show_plot:
+#                     plt.show()
+#                 plt.close()
+#             else:
+#                 log.info("Not saving plot to disk.")
+
+#     plot_pdf_grids(plot_paths, analysis_outdir, metadata_variables, output_filename)
+
+#     return
+
+# def plot_pdf_grids(plot_paths: dict[str, List[str]], output_dir: str, variables: List[str], output_filename: str) -> None:
+#     """
+#     Combine PDF plots into a grid PDF (rows: data types, columns: metadata variables).
+
+#     Args:
+#         plot_paths (dict): {"linked": [...], "normalized": [...]}, each a list of PDF paths.
+#         variables (List[str]): Metadata variable names (columns).
+#         output_dir (str): Output directory for combined PDF.
+#         output_filename (str): Name for output PDF.
+
+#     Returns:
+#         None
+#     """
+#     # Build grid: each row is a data type, each column is a variable
+#     grid = []
+#     for data_type, paths in plot_paths.items():
+#         grid_row = []
+#         for var in variables:
+#             match = next((f for f in paths if f and f"_by_{var}_" in f), None)
+#             grid_row.append(match)
+#         grid.append(grid_row)
+
+#     # Set page size based on grid
+#     n_rows = len(grid)
+#     n_cols = len(variables)
+#     page_height = 250 * n_rows
+#     page_width = 250 * n_cols
+
+#     doc = fitz.open()
+#     page = doc.new_page(width=page_width, height=page_height)
+
+#     img_w = page_width / n_cols
+#     img_h = page_height / n_rows
+
+#     for i, grid_row in enumerate(grid):
+#         for j, pdf in enumerate(grid_row):
+#             if pdf and os.path.exists(pdf):
+#                 try:
+#                     src = fitz.open(pdf)
+#                     src_page = src[0]
+#                     scale_x = img_w / src_page.rect.width
+#                     scale_y = img_h / src_page.rect.height
+#                     scale = min(scale_x, scale_y)
+#                     mat = fitz.Matrix(scale, scale)
+#                     rect = fitz.Rect(
+#                         j * img_w,
+#                         i * img_h,
+#                         (j + 1) * img_w,
+#                         (i + 1) * img_h
+#                     )
+#                     page.show_pdf_page(rect, src, 0, mat)
+#                     src.close()
+#                 except Exception as e:
+#                     log.info(f"Error processing {pdf}: {e}")
+
+#     output_pdf = os.path.join(output_dir, output_filename)
+#     doc.save(output_pdf)
+#     doc.close()
+#     log.info(f"Combined PDF saved as {output_pdf}")
+#     print(os.path.exists(output_pdf))
+#     display(IFrame(output_pdf, width=900, height=600))
+#     return
