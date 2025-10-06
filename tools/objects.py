@@ -269,7 +269,12 @@ class Project:
         self.raw_data_dir = self.project_config['raw_data_path']
         self.project_dir = f"{self.output_dir}/{self.project_name}"
         os.makedirs(self.project_dir, exist_ok=True)
+
         log.info(f"Project directory: {self.project_dir}")
+
+        # Save configuration with this run
+        self._save_run_config()
+
         self._complete_tracking('init_project')
 
     def _complete_tracking(self, step_id: str):
@@ -277,6 +282,33 @@ class Project:
         # Mark as completed and show updated status (green)
         self.workflow_tracker.mark_completed(step_id)
         self.workflow_tracker.plot(show_plot=True)
+
+    def _save_run_config(self):
+        """Save the current configuration with timestamp and tags for this run."""
+        data_processing_tag = self.config['datasets']['data_processing_tag']
+        data_analysis_tag = self.config['analysis']['data_analysis_tag']
+        
+        # Create configs directory
+        config_dir = os.path.join(self.project_dir, "configs")
+        os.makedirs(config_dir, exist_ok=True)
+        
+        # Save with analysis tag if present
+        config_filename = f"Dataset_Processing--{data_processing_tag}_Analysis--{data_analysis_tag}_config.yml"
+        config_path = os.path.join(config_dir, config_filename)
+        
+        # Add metadata to config
+        config_with_metadata = self.config.copy()
+        config_with_metadata['_metadata'] = {
+            'created_at': pd.Timestamp.now().isoformat(),
+            'data_processing_tag': data_processing_tag,
+            'data_analysis_tag': data_analysis_tag
+        }
+        
+        with open(config_path, 'w') as f:
+            yaml.dump(config_with_metadata, f, default_flow_style=False, sort_keys=False)
+        
+        log.info(f"Configuration saved to: {config_path}")
+        self.saved_config_path = config_path
 
 class BaseDataHandler:
     """Base class with common data handling functionality."""
