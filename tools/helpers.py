@@ -41,6 +41,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.cm import viridis
 from matplotlib.colors import to_hex
+from plotly.subplots import make_subplots
 
 # --- Machine learning & statistics ---
 from sklearn.decomposition import PCA
@@ -139,6 +140,86 @@ def write_integration_file(
         log.info(f"\tData saved to {fname}\n")
     else:
         log.info("Not saving data to disk.")
+
+def list_project_configs() -> None:
+    """
+    List all saved configuration files for a project and print to standard output.
+    """
+    config_pattern = os.path.join("/home/jovyan/work/output_data", "**/configs/*.yml")
+    config_files = glob.glob(config_pattern, recursive=True)
+    default_config = "/home/jovyan/work/input_data/config/project_config.yml"
+    config_files.append(default_config)
+
+    config_info = []
+    for config_file in config_files:
+        try:
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+
+            if config_file == default_config:
+                metadata = {
+                    'created_at': 'Default',
+                    'data_processing_tag': config.get('datasets', {}).get('data_processing_tag', 'Unknown'),
+                    'data_analysis_tag': config.get('datasets', {}).get('data_analysis_tag', 'Unknown')
+                }
+            else:
+                metadata = config.get('_metadata', {})
+            config_info.append({
+                'path': config_file,
+                'filename': os.path.basename(config_file),
+                'created_at': metadata.get('created_at', 'Unknown'),
+                'data_processing_tag': metadata.get('data_processing_tag', 'Unknown'),
+                'data_analysis_tag': metadata.get('data_analysis_tag', 'Unknown')
+            })
+        except Exception as e:
+            log.warning(f"Could not read config {config_file}: {e}")
+
+    config_info_sorted = sorted(config_info, key=lambda x: x['created_at'], reverse=True)
+    print(f"{'Created At':40} {'Data Tag':20} {'Analysis Tag':20} {'Path'}")
+    print("-" * 120)
+    for cfg in config_info_sorted:
+        print(f"{str(cfg['created_at']):40} {str(cfg['data_processing_tag']):20} {str(cfg['data_analysis_tag']):20} {cfg['path']}")
+
+def load_project_config(config_path: str = None, project_name: str = None, 
+                       data_processing_tag: str = None, data_analysis_tag: str = None, default: bool = True) -> dict:
+    """
+    Load a project configuration by path or by searching for tags.
+    
+    Args:
+        config_path (str): Direct path to config file
+        project_name (str): Project name to search within
+        data_processing_tag (str): Data processing tag to find
+        data_analysis_tag (str): Analysis tag to find
+        
+    Returns:
+        dict: Configuration dictionary
+    """
+    if default is True:
+        default_path = "/home/jovyan/work/input_data/config/project_config.yml"
+        with open(default_path, 'r') as f:
+            config = yaml.safe_load(f)
+        log.info(f"Loaded default configuration file from {default_path}")
+    elif config_path:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        log.info(f"Loaded configuration from {config_path}")
+    elif project_name and data_processing_tag and data_analysis_tag:
+        pattern = f"**/output_data/{project_name}/configs/Dataset_Processing--{data_processing_tag}_Analysis--{data_analysis_tag}_config.yml"
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            with open(matches[0], 'r') as f:
+                config = yaml.safe_load(f)
+        else:
+            raise FileNotFoundError(f"No config found for tags: data={data_processing_tag}, analysis={data_analysis_tag}")
+        log.info(f"Loaded configuration from {matches[0]}")
+    else:
+        raise ValueError("Must provide either config_path or (project_name, data_processing_tag, data_analysis_tag) or set default=True")
+
+    # Remove metadata
+    if '_metadata' in config:
+        del config['_metadata']
+    
+    return config
 
 # ====================================
 # Analysis step functions
@@ -1964,11 +2045,12 @@ def get_tx_metadata(
         pd.DataFrame: TX metadata DataFrame.
     """
 
-    if os.path.exists(f"{output_dir}/portal_metadata.csv") and overwrite is False:
-        log.info("TX metadata already extracted.")
+    if os.path.exists(f"{output_dir}/portal_metadata.csv"):
+        log.info("TX metadata already pulled from source.")
         tx_metadata = pd.read_csv(f"{output_dir}/portal_metadata.csv")
         return tx_metadata
     else:
+        log.info(f"Source file {output_dir}/portal_metadata.csv does not exist.")
         raise ValueError("You are not currently authorized to download transcriptomics metadata from source. Please contact your JGI project manager for access.")
 
     myfields = [
