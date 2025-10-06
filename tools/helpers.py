@@ -41,6 +41,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.cm import viridis
 from matplotlib.colors import to_hex
+from plotly.subplots import make_subplots
 
 # --- Machine learning & statistics ---
 from sklearn.decomposition import PCA
@@ -1964,11 +1965,12 @@ def get_tx_metadata(
         pd.DataFrame: TX metadata DataFrame.
     """
 
-    if os.path.exists(f"{output_dir}/portal_metadata.csv") and overwrite is False:
-        log.info("TX metadata already extracted.")
+    if os.path.exists(f"{output_dir}/portal_metadata.csv"):
+        log.info("TX metadata already pulled from source.")
         tx_metadata = pd.read_csv(f"{output_dir}/portal_metadata.csv")
         return tx_metadata
     else:
+        log.info(f"Source file {output_dir}/portal_metadata.csv does not exist.")
         raise ValueError("You are not currently authorized to download transcriptomics metadata from source. Please contact your JGI project manager for access.")
 
     myfields = [
