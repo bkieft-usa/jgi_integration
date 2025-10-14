@@ -422,8 +422,9 @@ class Dataset(BaseDataHandler):
                 #shutil.rmtree(processing_dir)
                 return processing_dir
             else:
-                log.error(f"ERROR: Dataset processing directory already exists for {dataset_name} at {processing_dir}")
-                log.error("Please choose a different data processing tag or delete the existing directory before proceeding.")
+                error_msg = f"Dataset processing directory already exists for {dataset_name} at {processing_dir}\n" \
+                            "Please choose a different data processing tag, delete the existing directory, or use the overwrite=True flag before proceeding."
+                log.error(error_msg)
                 sys.exit(1)
         else:
             log.info(f"Set up {dataset_name} dataset output directory: {processing_dir}")
@@ -874,8 +875,9 @@ class Analysis(BaseDataHandler):
                 #shutil.rmtree(analysis_dir)
                 return analysis_dir
             else:
-                log.error(f"ERROR: Analysis directory already exists for {dataset_name} at {analysis_dir}")
-                log.error("Please choose a different analysis tag, delete the existing directory, or use the overwrite=True flag before proceeding.")
+                error_msg = f"Analysis directory already exists for {dataset_name} at {analysis_dir}\n" \
+                            "Please choose a different analysis tag, delete the existing directory, or use the overwrite=True flag before proceeding."
+                log.error(error_msg)
                 sys.exit(1)
         else:
             log.info(f"Set up analysis output directory: {analysis_dir}")

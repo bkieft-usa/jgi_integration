@@ -160,7 +160,7 @@ def list_project_configs() -> None:
                 metadata = {
                     'created_at': 'Default',
                     'data_processing_tag': config.get('datasets', {}).get('data_processing_tag', 'Unknown'),
-                    'data_analysis_tag': config.get('datasets', {}).get('data_analysis_tag', 'Unknown')
+                    'data_analysis_tag': config.get('analysis', {}).get('data_analysis_tag', 'Unknown')
                 }
             else:
                 metadata = config.get('_metadata', {})
