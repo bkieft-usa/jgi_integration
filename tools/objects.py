@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import shutil
 from typing import Dict, Any, List, Optional
-from IPython.display import display
+from IPython.display import display, Javascript
 import tools.helpers as hlp
 import logging
 from tqdm.notebook import tqdm
@@ -14,6 +14,9 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import inspect
 import re
+import time
+import hashlib
+import ipynbname
 
 log = logging.getLogger(__name__)
 if not log.handlers:
@@ -269,12 +272,7 @@ class Project:
         self.raw_data_dir = self.project_config['raw_data_path']
         self.project_dir = f"{self.output_dir}/{self.project_name}"
         os.makedirs(self.project_dir, exist_ok=True)
-
         log.info(f"Project directory: {self.project_dir}")
-
-        # Save configuration with this run
-        self._save_run_config()
-
         self._complete_tracking('init_project')
 
     def _complete_tracking(self, step_id: str):
@@ -283,32 +281,55 @@ class Project:
         self.workflow_tracker.mark_completed(step_id)
         self.workflow_tracker.plot(show_plot=True)
 
-    def _save_run_config(self):
-        """Save the current configuration with timestamp and tags for this run."""
+    def save_persistent_config_and_notebook(self):
+        """Save the current configuration and notebook with timestamp and tags for this run."""
+        
+        # Get tags for naming
         data_processing_tag = self.config['datasets']['data_processing_tag']
         data_analysis_tag = self.config['analysis']['data_analysis_tag']
         
-        # Create configs directory
+        # Create base filename pattern
+        base_filename = f"Dataset_Processing--{data_processing_tag}_Analysis--{data_analysis_tag}"
+        
+        # Setup directories
         config_dir = os.path.join(self.project_dir, "configs")
+        notebooks_dir = os.path.join(self.project_dir, "notebooks")
         os.makedirs(config_dir, exist_ok=True)
+        os.makedirs(notebooks_dir, exist_ok=True)
         
-        # Save with analysis tag if present
-        config_filename = f"Dataset_Processing--{data_processing_tag}_Analysis--{data_analysis_tag}_config.yml"
+        # Define configuration filename
+        config_filename = f"{base_filename}_config.yml"
         config_path = os.path.join(config_dir, config_filename)
+        if os.path.exists(config_path):
+            log.warning(f"Configuration file already exists at {config_path}. It will be updated.")
         
-        # Add metadata to config
-        config_with_metadata = self.config.copy()
-        config_with_metadata['_metadata'] = {
-            'created_at': pd.Timestamp.now().isoformat(),
-            'data_processing_tag': data_processing_tag,
-            'data_analysis_tag': data_analysis_tag
-        }
-        
+        # Save config to disk
         with open(config_path, 'w') as f:
-            yaml.dump(config_with_metadata, f, default_flow_style=False, sort_keys=False)
-        
+            yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
         log.info(f"Configuration saved to: {config_path}")
-        self.saved_config_path = config_path
+
+        # Define notebook filename
+        notebook_filename = f"{base_filename}_notebook.ipynb"
+        new_notebook_path = os.path.join(notebooks_dir, notebook_filename)
+        if os.path.exists(new_notebook_path):
+            log.warning(f"Notebook file already exists at {new_notebook_path}. It will be updated.")
+        
+        # Get initial hash
+        this_notebook_path = ipynbname.path()
+        start_md5 = hashlib.md5(open(this_notebook_path,'rb').read()).hexdigest()
+
+        # Trigger save
+        display(Javascript('IPython.notebook.save_checkpoint();'))
+        current_md5 = start_md5
+        
+        # Wait for save to complete
+        while start_md5 == current_md5:
+            time.sleep(4)
+            current_md5 = hashlib.md5(open(this_notebook_path,'rb').read()).hexdigest()
+
+        # Copy to output directory
+        shutil.copy2(this_notebook_path, new_notebook_path)
+        log.info(f"Notebook saved to: {new_notebook_path}")
 
 class BaseDataHandler:
     """Base class with common data handling functionality."""
@@ -417,15 +438,17 @@ class Dataset(BaseDataHandler):
             dataset_config['dataset_dir']
         )
         if os.path.exists(processing_dir):
-            if overwrite:
-                log.info(f"Overwriting existing dataset processing directory for {dataset_name} at {processing_dir}.")
-                #shutil.rmtree(processing_dir)
-                return processing_dir
-            else:
-                error_msg = f"Dataset processing directory already exists for {dataset_name} at {processing_dir}\n" \
-                            "Please choose a different data processing tag, delete the existing directory, or use the overwrite=True flag before proceeding."
-                log.error(error_msg)
-                sys.exit(1)
+            log.info(f"Dataset processing directory already exists. Proceeding with output directory as {processing_dir}")
+            return processing_dir
+            # if overwrite:
+            #     log.info(f"Overwriting existing dataset processing directory for {dataset_name} at {processing_dir}.")
+            #     #shutil.rmtree(processing_dir)
+            #     return processing_dir
+            # else:
+            #     error_msg = f"Dataset processing directory already exists for {dataset_name} at {processing_dir}\n" \
+            #                 "Please choose a different data processing tag, delete the existing directory, or use the overwrite=True flag before proceeding."
+            #     log.error(error_msg)
+            #     sys.exit(1)
         else:
             log.info(f"Set up {dataset_name} dataset output directory: {processing_dir}")
             return processing_dir
@@ -875,7 +898,7 @@ class Analysis(BaseDataHandler):
                 #shutil.rmtree(analysis_dir)
                 return analysis_dir
             else:
-                error_msg = f"Analysis directory already exists for {dataset_name} at {analysis_dir}\n" \
+                error_msg = f"Analysis directory already exists at {analysis_dir}\n" \
                             "Please choose a different analysis tag, delete the existing directory, or use the overwrite=True flag before proceeding."
                 log.error(error_msg)
                 sys.exit(1)

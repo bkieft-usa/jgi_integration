@@ -180,8 +180,7 @@ def list_project_configs() -> None:
     for cfg in config_info_sorted:
         print(f"{str(cfg['created_at']):40} {str(cfg['data_processing_tag']):20} {str(cfg['data_analysis_tag']):20} {cfg['path']}")
 
-def load_project_config(config_path: str = None, project_name: str = None, 
-                       data_processing_tag: str = None, data_analysis_tag: str = None, default: bool = True) -> dict:
+def load_project_config(config_path: str = None) -> dict:
     """
     Load a project configuration by path or by searching for tags.
     
@@ -194,30 +193,17 @@ def load_project_config(config_path: str = None, project_name: str = None,
     Returns:
         dict: Configuration dictionary
     """
-    if default is True:
+    if config_path is not None:
+        if not os.path.isfile(config_path):
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        log.info(f"Loaded configuration from {config_path}")
+    else:
         default_path = "/home/jovyan/work/input_data/config/project_config.yml"
         with open(default_path, 'r') as f:
             config = yaml.safe_load(f)
         log.info(f"Loaded default configuration file from {default_path}")
-    elif config_path:
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
-        log.info(f"Loaded configuration from {config_path}")
-    elif project_name and data_processing_tag and data_analysis_tag:
-        pattern = f"**/output_data/{project_name}/configs/Dataset_Processing--{data_processing_tag}_Analysis--{data_analysis_tag}_config.yml"
-        matches = glob.glob(pattern, recursive=True)
-        if matches:
-            with open(matches[0], 'r') as f:
-                config = yaml.safe_load(f)
-        else:
-            raise FileNotFoundError(f"No config found for tags: data={data_processing_tag}, analysis={data_analysis_tag}")
-        log.info(f"Loaded configuration from {matches[0]}")
-    else:
-        raise ValueError("Must provide either config_path or (project_name, data_processing_tag, data_analysis_tag) or set default=True")
-
-    # Remove metadata
-    if '_metadata' in config:
-        del config['_metadata']
     
     return config
 
