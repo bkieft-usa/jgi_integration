@@ -7,6 +7,7 @@ import numpy as np
 import shutil
 from typing import Dict, Any, List, Optional
 from IPython.display import display, Javascript
+from IPython import get_ipython
 import tools.helpers as hlp
 import logging
 from tqdm.notebook import tqdm
@@ -16,7 +17,6 @@ import inspect
 import re
 import time
 import hashlib
-import ipynbname
 
 log = logging.getLogger(__name__)
 if not log.handlers:
@@ -281,9 +281,10 @@ class Project:
         self.workflow_tracker.mark_completed(step_id)
         self.workflow_tracker.plot(show_plot=True)
 
-    def save_persistent_config_and_notebook(self):
-        """Save the current configuration and notebook with timestamp and tags for this run."""
-        
+def save_persistent_config_and_notebook(self):
+    """Save the current configuration and notebook with timestamp and tags for this run."""
+    
+    try:
         # Get tags for naming
         data_processing_tag = self.config['datasets']['data_processing_tag']
         data_analysis_tag = self.config['analysis']['data_analysis_tag']
@@ -297,39 +298,81 @@ class Project:
         os.makedirs(config_dir, exist_ok=True)
         os.makedirs(notebooks_dir, exist_ok=True)
         
-        # Define configuration filename
+        # Define new configuration filename
         config_filename = f"{base_filename}_config.yml"
         config_path = os.path.join(config_dir, config_filename)
         if os.path.exists(config_path):
             log.warning(f"Configuration file already exists at {config_path}. It will be updated.")
         
+        # Add metadata to config
+        config_with_metadata = self.config.copy()
+        config_with_metadata['_metadata'] = {
+            'created_at': pd.Timestamp.now().isoformat(),
+            'data_processing_tag': data_processing_tag,
+            'data_analysis_tag': data_analysis_tag
+        }
+
         # Save config to disk
         with open(config_path, 'w') as f:
-            yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
+            yaml.dump(config_with_metadata, f, default_flow_style=False, sort_keys=False)
         log.info(f"Configuration saved to: {config_path}")
 
-        # Define notebook filename
-        notebook_filename = f"{base_filename}_notebook.ipynb"
-        new_notebook_path = os.path.join(notebooks_dir, notebook_filename)
-        if os.path.exists(new_notebook_path):
-            log.warning(f"Notebook file already exists at {new_notebook_path}. It will be updated.")
-        
-        # Get initial hash
-        this_notebook_path = ipynbname.path()
-        start_md5 = hashlib.md5(open(this_notebook_path,'rb').read()).hexdigest()
+        this_notebook_path = None
+        # Try using IPython's get_ipython() for notebook name
+        if this_notebook_path is None:
+            ipython = get_ipython()
+            if ipython and hasattr(ipython, 'kernel'):
+                # Try to get the connection file
+                connection_file = ipython.kernel.config['IPKernelApp']['connection_file']
+                kernel_id = connection_file.split('-', 1)[1].split('.')[0]
+                # Look for notebook files in common locations
+                possible_paths = [
+                    f"/notebooks/*.ipynb",
+                    f"/work/*.ipynb", 
+                    f"*.ipynb",
+                    f"/home/jovyan/*.ipynb"
+                ]
+                for pattern in possible_paths:
+                    notebooks = glob.glob(pattern)
+                    if notebooks:
+                        # Use the most recently modified notebook
+                        this_notebook_path = max(notebooks, key=os.path.getmtime)
+                        log.info(f"Notebook path identified using fallback method: {this_notebook_path}")
+                        break
 
-        # Trigger save
-        display(Javascript('IPython.notebook.save_checkpoint();'))
-        current_md5 = start_md5
-        
-        # Wait for save to complete
-        while start_md5 == current_md5:
-            time.sleep(4)
-            current_md5 = hashlib.md5(open(this_notebook_path,'rb').read()).hexdigest()
+        if this_notebook_path and os.path.exists(this_notebook_path):
+            # Define new notebook filename
+            notebook_filename = f"{base_filename}_notebook.ipynb"
+            new_notebook_path = os.path.join(notebooks_dir, notebook_filename)
+            if os.path.exists(new_notebook_path):
+                log.warning(f"Notebook file already exists at {new_notebook_path}. It will be updated.")
+            
+            # Get initial hash
+            start_md5 = hashlib.md5(open(this_notebook_path,'rb').read()).hexdigest()
 
-        # Copy to output directory
-        shutil.copy2(this_notebook_path, new_notebook_path)
-        log.info(f"Notebook saved to: {new_notebook_path}")
+            # Trigger save
+            display(Javascript('IPython.notebook.save_checkpoint();'))
+            current_md5 = start_md5
+            
+            # Wait for save to complete (with timeout)
+            max_wait_time = 30  # seconds
+            wait_time = 0
+            while start_md5 == current_md5 and wait_time < max_wait_time:
+                time.sleep(2)
+                wait_time += 2
+                if os.path.exists(this_notebook_path):
+                    current_md5 = hashlib.md5(open(this_notebook_path,'rb').read()).hexdigest()
+
+            # Copy to output directory
+            shutil.copy2(this_notebook_path, new_notebook_path)
+            log.info(f"Notebook saved to: {new_notebook_path}")
+        else:
+            log.warning("Could not locate notebook file. Only configuration was saved.")
+            log.info("To manually save the notebook, copy your .ipynb file to a persistent location such as:")
+            log.info(f"  {os.path.join(notebooks_dir, f'{base_filename}_notebook.ipynb')}")
+    
+    except Exception as e:
+        log.error(f"Failed to save configuration and notebook: {e}")
 
 class BaseDataHandler:
     """Base class with common data handling functionality."""
