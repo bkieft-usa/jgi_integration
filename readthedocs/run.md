@@ -14,6 +14,8 @@ The general stages of the workflow are:
 
 *   Running multi-omics factor analysis
 
+*   Saving your configuration and notebook files to create persistent copies of the workflow run
+
 _Note:_ This tutorial assumes you’ve already completed all stages of the workflow and environment setup detailed in _setup.md._
 
 ## **Running the Notebook**
@@ -40,7 +42,7 @@ _Note:_ This tutorial assumes you’ve already completed all stages of the workf
 
     - Edit the `/input_data/config/project_config.yml` file to update workflow parameters. Use the guides provided in the `/jgi_integration/docs/*_parameters_explained.md` files to understand how parameters work.
 
-    _Note_: Make sure to change the `data_processing_tag` and/or `data_analysis_tag` configuration parameters – these create a new output directory to store the results and keep them distinct from previous runs. Alternatively, you can set “overwrite=True” in the cells that create the dataset and/or analysis object to overwrite a previous run. If you do not change the tag or overwrite, the notebook console will print an error informing you of your options.
+    _Note_: Make sure to change the `data_processing_tag` and/or `data_analysis_tag` configuration parameters – these create a nested (processing->analysis) output directory to store the results and keep them distinct from previous runs. You can run multiple analysis stages within a single data processing stage. Alternatively, you can set “overwrite=True” in the cells that create the dataset and/or analysis object to overwrite a previous run. If you do not change the tag or overwrite, the notebook console will print an error informing you of your options.
 
     - Rerun the notebook as described above from the beginning to re-load the updated configuration settings and run a full workflow with new parameters.
 
@@ -55,6 +57,12 @@ _Note:_ This tutorial assumes you’ve already completed all stages of the workf
     _Note_: to see the names of all possible attributes that you can view for each object (dataset or analysis), run a cell with the command `vars(<object>).keys()`. For example, `vars(analysis).keys()` or `vars(mx_dataset).keys()`.
 
     - To view the outputs on your system (which is mounted to the docker container), navigate to `$INTEGRATION_DIR/project_data/output_data` directory (see _setup.md_ if you do not have this directory) and view output files as you would normally on your local filesystem.
+
+## **Persistent Configuration and Motebook Files**
+
+*   The config file that you start with will contain a set of default parameters that can be used right from the outset, but these can be changed during your analysis and exploration of the data. Each time the config parameters are changed and the workflow is run, the last cell of the notebook will save the configuration file to a persistent directory in `/output_data/<your_project_name>/configs`. This configuration file can then be accessed in the future if you want to recreate the results from that particular run.
+
+*   Similarly, the notebook itself (which includes some logging/error printouts, plots, a configuration file path, and other cells you may have added) will be saved to a persistent directory in `/output_data/<your_project_name>/notebooks` to revisit.
 
 ## **Exiting the Workflow Container**
 
@@ -72,6 +80,6 @@ _Note:_ This tutorial assumes you’ve already completed all stages of the workf
 
 *   You will not be able to delete directories on the JupyterLab file browser (the left navigation panel), so if you need to remove a directory for any reason you can do so from your local file browser (for the directories mounted to your system) or via the built-in JupyterLab terminal with `rm -rf <directory>`.
 
-*   The default working directory for JupyterLab is `/home/joyvan/work` – this is set by the docker image and should not be changed for security purposes.
+*   The default working directory for JupyterLab is `/home/joyvan/work`, which throughout these instructions is referred to as the root directory `/` – this is set by the docker image and should not be changed for security purposes.
 
 *   Details about how to navigate the JupyterLab interface can be found on the [Jupyter documentation page](https://docs.jupyter.org/en/latest/).

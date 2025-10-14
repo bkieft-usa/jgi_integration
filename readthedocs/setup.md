@@ -56,7 +56,7 @@ _Note:_ The tutorial examples provided are for setup via a Unix-style command li
 
 3.  Run the docker compose file to pull and run the container. In the command below, substitute `tag=<arch>` for the following architecture depending on your operating system: Windows, `tag=windows-amd64`; MacOS Apple, `tag=mac-arm64`; MacOS Intel, `tag=mac-amd64`; Linux, `tag=linux-amd64`. The `--build` flag is optional, but it will always build the container from the updated image regardless of whether it is already pulled into your local docker images repository, so it is recommended. 
 
-    `> tag=<arch> docker compose -p jgi-integration up --build`
+    `> tag=<arch> docker compose -p jgi-integration up --force-recreate`
 
 4.  This will print details about the docker container boot to standard output, and most can be ignored. About halfway down, after the line `Jupyter Server 2.8.0 is running at:`, there will be two web addresses. Copy the one beginning with `http://127.0.0.1:8888/lab...` (should be the second URL and indented) into a web browser search bar (or cmd/ctrl-click).
 
