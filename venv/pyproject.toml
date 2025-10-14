@@ -44,7 +44,6 @@ dependencies = [
     "igraph==0.11.9",
     "ipycytoscape>=1.3.3",
     "ipykernel==6.29.5",
-    "ipynbname>=2025.8.0.0",
     "ipython==9.1.0",
     "ipython-pygments-lexers==1.1.1",
     "isoduration==20.11.0",
