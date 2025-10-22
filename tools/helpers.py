@@ -5,6 +5,7 @@ import importlib.util
 import io
 import itertools
 import os
+import re
 import random
 import shutil
 import subprocess
@@ -35,6 +36,8 @@ from scipy.stats import t
 import scipy.sparse as sp
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
+from scipy.stats import fisher_exact
+from statsmodels.stats.multitest import multipletests
 
 # --- Plotting ---
 import matplotlib.pyplot as plt
@@ -255,6 +258,7 @@ def glm_selection(
     Returns a subset of features that satisfy BOTH a p-value threshold
     (FDR-adjusted) and an absolute log2-fold-change threshold.
     """
+    
     # Merge once and prepare data
     df = data.T.join(metadata)
     if category not in df.columns:
@@ -272,14 +276,14 @@ def glm_selection(
     
     # Prepare design matrix using pandas get_dummies (much faster than repeated formula parsing)
     design_matrix = pd.get_dummies(df_clean[category], prefix=category, drop_first=True)
-    design_matrix.insert(0, 'intercept', 1)  # Add intercept
+    design_matrix.insert(0, 'intercept', 1)
     
     # Get feature data as numpy array for vectorized operations
-    feature_data = df_clean[data.index].values  # samples x features
-    X = design_matrix.values  # Design matrix
+    feature_data = df_clean[data.index].values
+    X = design_matrix.values.astype(np.float64)
     
     log.info(f"GLM: fitting {data.shape[0]} features against '{category}' (ref={reference})")
-    
+
     # Vectorized GLM fitting using numpy/scipy
     try:
         XtX_inv = linalg.inv(X.T @ X)
@@ -311,6 +315,43 @@ def glm_selection(
     except Exception as e:
         # Fallback to individual fitting if matrix is singular
         log.warning(f"Matrix singular, falling back to individual GLM fitting: {e}")
+        
+        # Initialize arrays for fallback results
+        coeffs = np.zeros(data.shape[0])
+        pvals = np.ones(data.shape[0])
+        
+        # Fit individual GLMs
+        for i, feature in enumerate(data.index):
+            try:
+                # Prepare data for this feature
+                feature_df = df_clean[[category]].copy()
+                feature_df['response'] = df_clean[feature]
+                feature_df = feature_df.dropna()
+                
+                if len(feature_df) < 3:  # Need at least 3 observations
+                    coeffs[i] = 0
+                    pvals[i] = 1.0
+                    continue
+                
+                # Fit GLM using statsmodels
+                import statsmodels.api as sm
+                y = feature_df['response']
+                X_feature = pd.get_dummies(feature_df[category], drop_first=True)
+                X_feature = sm.add_constant(X_feature)
+                
+                model = sm.OLS(y, X_feature).fit()
+                
+                # Extract coefficient for first non-intercept term
+                if len(model.params) > 1:
+                    coeffs[i] = model.params.iloc[1]
+                    pvals[i] = model.pvalues.iloc[1]
+                else:
+                    coeffs[i] = 0
+                    pvals[i] = 1.0
+                    
+            except Exception as feature_error:
+                coeffs[i] = 0
+                pvals[i] = 1.0
     
     # Create series with results
     coeffs_s = pd.Series(coeffs, index=data.index, name="coef")
@@ -750,7 +791,7 @@ def calculate_correlated_features(
     keep_negative: bool = False,
     block_size: int = 500,
     n_jobs: int = 1,
-    only_bipartite: bool = True,
+    corr_mode: str = "bipartite",
 ) -> pd.DataFrame:
     """
     Compute feature correlation on an already normalised feature-by-sample matrix.
@@ -777,9 +818,12 @@ def calculate_correlated_features(
         Number of features processed per block (memory ~= 4 x block_size x n_samples bytes).
     n_jobs : int, default 1
         Parallelism over transcript blocks.  ``-1`` uses all cores.
-    only_bipartite : bool, default True
-        If True, only compute correlations between different datatypes.
-        If False, compute all pairwise correlations.
+    corr_mode : str, default "bipartite"
+        Correlation mode:
+        - "bipartite": Only compute correlations between different datatypes
+        - "full": Compute all pairwise correlations
+        - Any other string: Should match a feature prefix; only compute correlations
+          between features with that prefix (intra-datatype)
 
     Returns
     ---
@@ -812,7 +856,7 @@ def calculate_correlated_features(
     }:
         raise ValueError(f"Unsupported method '{method}'.")
 
-    log.info(f"Using method: {method}, cutoff: {cutoff}, keep_negative: {keep_negative}, block_size: {block_size}, n_jobs: {n_jobs}, only_bipartite: {only_bipartite}")
+    log.info(f"Using method: {method}, cutoff: {cutoff}, keep_negative: {keep_negative}, block_size: {block_size}, n_jobs: {n_jobs}, corr_mode: {corr_mode}")
 
     # Identify feature indices for each datatype
     X = data.T.values.astype(np.float64, copy=False)   # (n_samples, n_features)
@@ -827,8 +871,8 @@ def calculate_correlated_features(
         datatype_indices[datatype_name] = np.where(mask)[0]
         log.info(f"Found {len(datatype_indices[datatype_name])} features with prefix '{prefix}'.")
 
-    # Determine which pairs to compute
-    if only_bipartite:
+    # Determine which pairs to compute based on corr_mode
+    if corr_mode == "bipartite":
         # Only compute between different datatypes
         pairs = []
         datatypes = list(datatype_indices.keys())
@@ -837,11 +881,51 @@ def calculate_correlated_features(
                 pairs.append((datatype_indices[dtype1], datatype_indices[dtype2]))
                 pairs.append((datatype_indices[dtype2], datatype_indices[dtype1]))  # Both directions
         log.info(f"Computing bipartite correlations between {len(pairs)//2} datatype pairs.")
-    else:
+    elif corr_mode == "full":
         # All pairs (including within group)
         all_idx = np.arange(n_features)
         pairs = [(all_idx, all_idx)]
         log.info("Computing all pairwise correlations (including within datatype).")
+    else:
+        # Check if corr_mode matches a feature prefix
+        matching_prefix = None
+        for prefix in feature_prefixes:
+            if corr_mode == prefix.rstrip('_'):  # Allow both "tx" and "tx_"
+                matching_prefix = prefix
+                break
+        
+        # Also check if corr_mode exactly matches any feature prefix including underscore
+        if matching_prefix is None:
+            for prefix in feature_prefixes:
+                if corr_mode == prefix:
+                    matching_prefix = prefix
+                    break
+        
+        # Check if any features start with the corr_mode string
+        if matching_prefix is None:
+            feature_first_parts = [feature.split('_')[0] + '_' for feature in data.index]
+            if any(corr_mode + '_' == part for part in feature_first_parts):
+                matching_prefix = corr_mode + '_'
+            elif any(corr_mode == part.rstrip('_') for part in feature_first_parts):
+                matching_prefix = corr_mode + '_'
+        
+        if matching_prefix is None:
+            raise ValueError(f"corr_mode '{corr_mode}' does not match 'bipartite', 'full', or any feature prefix from {feature_prefixes}")
+        
+        # Find the datatype index for the matching prefix
+        target_datatype = None
+        for i, prefix in enumerate(feature_prefixes):
+            if prefix == matching_prefix or prefix.rstrip('_') == corr_mode:
+                target_datatype = f"datatype_{i}"
+                break
+        
+        if target_datatype is None or target_datatype not in datatype_indices:
+            raise ValueError(f"No features found with prefix matching '{corr_mode}'")
+        
+        # Only compute correlations within this datatype
+        target_indices = datatype_indices[target_datatype]
+        pairs = [(target_indices, target_indices)]
+        log.info(f"Computing intra-datatype correlations for prefix '{matching_prefix}' ({len(target_indices)} features).")
 
     # Transform data once according to the requested similarity
     log.info("Transforming data matrix for correlation computation...")
@@ -911,7 +995,7 @@ def calculate_correlated_features(
 
     log.info(f"Writing correlation results to {output_dir}/{output_filename}.csv")
     write_integration_file(data=df, output_dir=output_dir, filename=output_filename, indexing=True)
-    log.info("Bipartite correlation computation complete.")
+    log.info("Correlation computation complete.")
     return df
 
 def _make_prefix_maps(prefixes: List[str]) -> Tuple[Dict[str, str], Dict[str, str]]:
@@ -932,43 +1016,24 @@ def _make_prefix_maps(prefixes: List[str]) -> Tuple[Dict[str, str], Dict[str, st
 def _build_sparse_adj(
     corr_df: pd.DataFrame,
     prefixes: List[str],
-    corr_cutoff: float,
-    network_mode: str,
 ) -> sp.coo_matrix:
     """
     Returns a COO-format sparse matrix where the data are the *edge weights*.
-    For `bipartite` mode only edges that link two different prefixes are kept.
+
+    Includes all non-zero correlations from corr_df (diagonal excluded).
     """
-    # Boolean mask of values above cutoff 
-    corr_vals = corr_df.values
-    mask = np.abs(corr_vals) >= corr_cutoff
+    # Ensure NaNs become zeros
+    corr_vals = corr_df.fillna(0.0).values
+
+    # Keep all non-zero entries (the correlation caller already applied any cutoff)
+    mask = corr_vals != 0.0
     np.fill_diagonal(mask, False)
 
-    #  If bipartite, enforce prefix mismatch 
-    if network_mode == "bipartite":
-        rows = corr_df.index.to_numpy()
-        cols = corr_df.columns.to_numpy()
-        def _assign_prefix(arr):
-            out = np.empty(len(arr), dtype=object)
-            out[:] = ""
-            arr_str = arr.astype(str)
-            for pref in prefixes:
-                hits = np.char.startswith(arr_str, pref)
-                out[hits] = pref
-            return out
-        row_pref = _assign_prefix(rows)
-        col_pref = _assign_prefix(cols)
-        # keep only pairs whose prefixes differ (and are non-empty)
-        pref_mask = (row_pref[:, None] != col_pref[None, :]) & (row_pref[:, None] != "") & (col_pref[None, :] != "")
-        mask &= pref_mask
-
-    #  Extract the sparse representation 
+    # Extract sparse representation
     row_idx, col_idx = np.where(mask)
     weights = corr_vals[row_idx, col_idx]
-
-    weights = (np.abs(weights) * 100) ** 2
-
     n = corr_df.shape[0]
+
     return sp.coo_matrix((weights, (row_idx, col_idx)), shape=(n, n))
 
 def _graph_from_sparse(
@@ -991,39 +1056,70 @@ def _assign_node_attributes(
     annotation_df: Optional[pd.DataFrame] = None,
 ) -> None:
     """
-    Mutates G in-place -  adds:
-        * datatype_color, datatype_shape
-        * annotation, annotation_shape (if annotation_df supplied)
+    Mutates G in-place - adds:
+        * datatype_color, datatype_shape, node_size
+        * All annotation columns as double semicolon-separated strings (if annotation_df supplied)
+        * Handles multiple annotations per feature by storing as ";;"-separated strings
     """
-    #  color / shape based on prefix
+    # Color / shape based on prefix
     node_names = np.array(list(G.nodes()))
-    # vectorised prefix lookup
+    # Vectorised prefix lookup
     node_pref = np.empty(len(node_names), dtype=object)
     node_pref[:] = ""
     for pref in prefixes:
         hits = np.char.startswith(node_names, pref)
         node_pref[hits] = pref
 
-    # build dicts for networkx.set_node_attributes
+    # Build dicts for networkx.set_node_attributes
     color_dict = {name: color_map.get(p, "gray") for name, p in zip(node_names, node_pref)}
     shape_dict = {name: shape_map.get(p, "Rectangle") for name, p in zip(node_names, node_pref)}
     nx.set_node_attributes(G, color_dict, "datatype_color")
     nx.set_node_attributes(G, shape_dict, "datatype_shape")
     nx.set_node_attributes(G, 10, "node_size")
 
-    #  optional functional annotation
+    # Add all annotation columns as separate node attributes
     if annotation_df is not None and not annotation_df.empty:
-        # annotation_df must have an index that matches node IDs
-        ann = annotation_df["annotation"].fillna("Unassigned").to_dict()
-        ann_shape = {n: ("diamond" if a != "Unassigned" else "circle")
-                     for n, a in ann.items()}
-        nx.set_node_attributes(G, ann, "annotation")
-        nx.set_node_attributes(G, ann_shape, "annotation_shape")
-
-        # edge-level annotation (source/target)
-        for u, v, d in G.edges(data=True):
-            d["source_annotation"] = ann.get(u, "")
-            d["target_annotation"] = ann.get(v, "")
+        log.info(f"Processing {len(annotation_df)} annotation rows for {len(G.nodes())} nodes...")
+        
+        # Group annotations by feature_id to handle multiple annotations per feature
+        annotation_groups = annotation_df.groupby('feature_id')
+        
+        # Initialize annotation dictionaries for each column
+        annotation_columns = [col for col in annotation_df.columns if col != 'feature_id']
+        node_annotations = {col: {} for col in annotation_columns}
+        
+        # Process each feature and its annotations
+        for feature_id, feature_annotations in annotation_groups:
+            if feature_id in G.nodes():
+                for col in annotation_columns:
+                    # Get all non-null, non-"Unassigned" values for this column
+                    values = feature_annotations[col].dropna()
+                    values = values[values != 'Unassigned'].unique().tolist()
+                    
+                    if values:
+                        # Convert list to double semicolon-separated string
+                        node_annotations[col][feature_id] = ";;".join(str(v) for v in values)
+                    else:
+                        # No valid annotations for this column
+                        node_annotations[col][feature_id] = "Unassigned"
+        
+        # Add nodes without any annotations
+        for node in G.nodes():
+            for col in annotation_columns:
+                if node not in node_annotations[col]:
+                    node_annotations[col][node] = "Unassigned"
+        
+        # Set node attributes for each annotation column
+        for col, node_attr_dict in node_annotations.items():
+            nx.set_node_attributes(G, node_attr_dict, col)
+        
+        log.info(f"Added {len(annotation_columns)} annotation attributes to {len(G.nodes())} nodes")
+        
+        # Summary of annotations per node
+        nodes_with_annotations = sum(1 for node in G.nodes() 
+                                   if any(G.nodes[node].get(col, "Unassigned") != "Unassigned" 
+                                         for col in annotation_columns))
+        log.info(f"Nodes with at least one annotation: {nodes_with_annotations}")
 
 def _detect_submodules(
     G: nx.Graph,
@@ -1088,6 +1184,9 @@ def _detect_submodules(
         min_k = np.minimum.outer(k, k)
         denom = min_k + 1 - adj
         tom = (A2 + A) / denom
+        
+        # Convert to dense array before using fill_diagonal
+        tom = tom.toarray()
         np.fill_diagonal(tom, 1.0)
 
         # hierarchical clustering on TOM-distance
@@ -1095,13 +1194,20 @@ def _detect_submodules(
         condensed = squareform(dist, checks=False)
         Z = linkage(condensed, method="average")
         cluster_labels = fcluster(Z, t=dist_cut, criterion="distance")
-        # discard clusters that are too small
+        
+        # discard clusters that are too small and create submodules
         modules = {}
         for lbl, node in zip(cluster_labels, corr.index):
             modules.setdefault(lbl, []).append(node)
-        kept = [(f"submodule_{i+1}", G.subgraph(nodes).copy())
-                for i, (lbl, nodes) in enumerate(sorted(modules.items()))
-                if len(nodes) >= min_mod_sz]
+        
+        # Filter modules by minimum size and create subgraphs
+        kept = []
+        for i, (lbl, nodes) in enumerate(sorted(modules.items())):
+            if len(nodes) >= min_mod_sz:
+                submodule_name = f"submodule_{i+1}"
+                subgraph = G.subgraph(nodes).copy()
+                kept.append((submodule_name, subgraph))
+        
         return kept
 
     else:
@@ -1110,16 +1216,14 @@ def _detect_submodules(
 
 def plot_correlation_network(
     corr_table: pd.DataFrame,
-    feature_prefixes: List[str],
     integrated_data: pd.DataFrame,
     integrated_metadata: pd.DataFrame,
     output_filenames: Dict[str, str],
+    datasets: List = None,
     annotation_df: Optional[pd.DataFrame] = None,
-    network_mode: str = "bipartite",
     submodule_mode: str = "louvain",
     show_plot: bool = False,
     interactive_layout: str = None,
-    corr_cutoff: float = 0.5,
     wgcna_params: dict = {}
 ) -> None:
     """
@@ -1129,29 +1233,30 @@ def plot_correlation_network(
 
     Parameters are identical to your original function; the only
     behavioural change is the expanded ``submodule_mode`` options.
+    
+    datasets : List, optional
+        List of dataset objects with annotation_map attributes
     """
-    # Ensure network_mode is valid
-    if network_mode not in {"bipartite", "full"}:
-        raise ValueError("network_mode must be 'bipartite' or 'full'")
 
     # Get all unique features
     all_features = pd.Index(sorted(set(corr_table["feature_1"]).union(set(corr_table["feature_2"]))))
+    all_prefixes = [ds.dataset_name + "_" for ds in datasets]
+    present_prefixes = [p for p in all_prefixes if any(f.startswith(p) for f in all_features)]
 
     # Pivot and reindex to ensure square matrix
     correlation_df = corr_table.pivot(index="feature_2", columns="feature_1", values="correlation").reindex(index=all_features, columns=all_features, fill_value=0.0)
 
     # Build sparse adjacency (edges only above cutoff)
-    sparse_adj = _build_sparse_adj(
-        correlation_df, feature_prefixes, corr_cutoff, network_mode
-    )
+    sparse_adj = _build_sparse_adj(correlation_df, present_prefixes)
 
     # Create networkx graph (node names = original feature IDs)
     G = _graph_from_sparse(sparse_adj, correlation_df.index.to_numpy())
-    log.info(f"\tGraph built -  {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
+    log.info(f"Graph built -  {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
 
     # Node aesthetics (color / shape) and optional annotation
-    color_map, shape_map = _make_prefix_maps(feature_prefixes)
-    _assign_node_attributes(G, feature_prefixes, color_map, shape_map, annotation_df)
+    log.info("Assigning node attributes...")
+    color_map, shape_map = _make_prefix_maps(present_prefixes)
+    _assign_node_attributes(G, present_prefixes, color_map, shape_map, annotation_df)
 
     # Remove tiny isolated components (size < 3)
     tiny = [c for c in nx.connected_components(G) if len(c) < 3]
@@ -1182,14 +1287,23 @@ def plot_correlation_network(
             min_module_size=wgcna_params["min_module_size"],
             distance_cutoff=wgcna_params["distance_cutoff"],
         )
-        _annotate_and_save_submodules(
-            submods,
-            G,
-            output_filenames,
-            integrated_data,
-            integrated_metadata,
-            save_plots=True,
-        )
+        
+        # Always annotate nodes with submodule information, even if only one submodule
+        if submods:
+            _annotate_and_save_submodules(
+                submods,
+                G,
+                output_filenames,
+                integrated_data,
+                integrated_metadata,
+                save_plots=True,
+            )
+        else:
+            # If no submodules were found, assign all nodes to a single submodule
+            log.info("No submodules detected, assigning all nodes to 'submodule_1'")
+            for node in G.nodes():
+                G.nodes[node]["submodule"] = "submodule_1"
+                G.nodes[node]["submodule_color"] = "#440154"  # First viridis color
 
         # Re-write the *main* graph (now enriched with submodule attributes)
         nx.write_graphml(G, output_filenames["graph"])
@@ -1213,6 +1327,7 @@ def plot_correlation_network(
         )
         display(widget)
 
+    return node_table, edge_table
 
 def _nx_to_plotly_widget(
     G,
@@ -1295,12 +1410,41 @@ def _nx_to_plotly_widget(
         node_shape.append(data.get(node_shape_attr, "Circle"))
         node_size.append(data.get(node_size_attr, 10))
 
-        # Show node name and submodule (if present) in hover text
+        # Build hover text with node annotation
+        hover_parts = [str(n)]
+        
+        # Add submodule if present
         submodule = data.get("submodule", None)
         if submodule:
-            hover_txt.append(f"{n}<br>({submodule})")
+            hover_parts.append(f"{submodule.replace('_','')}")
+        
+        # Determine which annotation to show
+        annotation_text = "Unassigned"
+        
+        # Check for metabolomics compound name
+        mx_compound = data.get("mx_Compound_Name", "Unassigned")
+        if isinstance(mx_compound, str) and mx_compound not in ["Unassigned", "", "NA"]:
+            # Split on double semicolons and take the first annotation
+            compound_names = [name.strip() for name in mx_compound.split(";;") if name.strip()]
+            if compound_names:
+                annotation_text = compound_names[0]  # Show first compound name
+        
+        # Check for transcriptomics GO term if metabolomics annotation not found
+        elif annotation_text == "Unassigned":
+            tx_goterm = data.get("tx_goterm_acc", "Unassigned")
+            if isinstance(tx_goterm, str) and tx_goterm not in ["Unassigned", "", "NA"]:
+                # Split on double semicolons and take the first annotation
+                go_terms = [term.strip() for term in tx_goterm.split(";;") if term.strip()]
+                if go_terms:
+                    annotation_text = go_terms[0]  # Show first GO term
+        
+        # Add annotation to hover text
+        if annotation_text != "Unassigned":
+            hover_parts.append(f"{annotation_text}")
         else:
-            hover_txt.append(str(n))
+            hover_parts.append("Unassigned")
+        
+        hover_txt.append("<br>".join(hover_parts))
     
     node_trace = go.Scatter(
         x=node_x, y=node_y,
@@ -1409,7 +1553,6 @@ def _annotate_and_save_submodules(
                 dpi=300,
             )
             plt.close()
-
 
 # ====================================
 # Dataset acquisition functions
@@ -2106,259 +2249,676 @@ def get_tx_metadata(
 # Feature annotation functions
 # ====================================
 
-def parse_gff3_proteinid_to_id(gff3_path: str) -> dict:
-    """
-    Parse a GFF3 file to map protein IDs to gene IDs.
-
-    Args:
-        gff3_path (str): Path to GFF3 file.
-
-    Returns:
-        dict: Mapping from proteinId to geneId.
-    """
-
-    open_func = gzip.open if gff3_path.endswith('.gz') else open
-    proteinid_to_id = {}
-    with open_func(gff3_path, 'rt') as f:
-        for line in f:
-            if line.startswith('#'):
-                continue
-            fields = line.strip().split('\t')
-            if len(fields) < 9 or fields[2] != 'gene':
-                continue
-            attrs = {kv.split('=')[0]: kv.split('=')[1] for kv in fields[8].split(';') if '=' in kv}
-            protein_id = attrs.get('proteinId')
-            gene_id = attrs.get('ID')
-            if protein_id and gene_id:
-                proteinid_to_id[protein_id.strip()] = gene_id.strip()
-    return proteinid_to_id
-
-def parse_annotation_file(annotation_path: str, tx_id_col: str, tx_annotation_col: str) -> dict:
-    """
-    Parse an annotation file to map IDs to annotation values.
-
-    Args:
-        annotation_path (str): Path to annotation file.
-        tx_id_col (str): Column name for IDs.
-        tx_annotation_col (str): Column name for annotation.
-
-    Returns:
-        dict: Mapping from ID to annotation.
-    """
-    
-    df = pd.read_csv(annotation_path)
-    if tx_id_col not in df.columns or tx_annotation_col not in df.columns:
-        raise ValueError(f"Required columns {tx_id_col} or {tx_annotation_col} not found in annotation file.")
-    df = df.dropna(subset=[tx_id_col, tx_annotation_col])
-    annotation_map = dict(zip(df[tx_id_col].astype(str).str.strip(), df[tx_annotation_col].astype(int).astype(str).str.strip()))
-    return annotation_map
-
-def map_ids_to_annotations(
-    gff3_path: str,
-    annotation_path: str,
-    tx_id_col: str,
-    tx_annotation_col: str
-) -> dict:
-    """
-    Map gene IDs from a GFF3 file to annotation values using an annotation file.
-
-    Args:
-        gff3_path (str): Path to GFF3 file.
-        annotation_path (str): Path to annotation file.
-        tx_id_col (str): ID column name.
-        tx_annotation_col (str): Annotation column name.
-
-    Returns:
-        dict: Mapping from gene ID to annotation.
-    """
-    
-    proteinid_to_id = parse_gff3_proteinid_to_id(gff3_path)
-    annotation_map = parse_annotation_file(annotation_path, tx_id_col, tx_annotation_col)
-    id_to_annotation = {}
-    for protein_id, gene_id in proteinid_to_id.items():
-        for annot_key in annotation_map:
-            if protein_id in annot_key:
-                id_to_annotation[gene_id] = annotation_map[annot_key]
-                break
-    return id_to_annotation
-
-def annotate_genes_to_rhea(
-    gff3_path: str,
-    annotation_path: str,
-    tx_id_col: str,
-    tx_annotation_col: str
-) -> pd.DataFrame:
-    """
-    Annotate gene IDs with Rhea IDs using GFF3 and annotation files.
-
-    Args:
-        gff3_path (str): Path to GFF3 file.
-        annotation_path (str): Path to annotation file.
-        tx_id_col (str): ID column name.
-        tx_annotation_col (str): Annotation column name.
-
-    Returns:
-        pd.DataFrame: DataFrame mapping gene IDs to Rhea IDs.
-    """
-
-    id_to_annotation = map_ids_to_annotations(gff3_path, annotation_path, tx_id_col, tx_annotation_col)
-    id_to_annotation = pd.DataFrame.from_dict(id_to_annotation, orient='index')
-    id_to_annotation.index.name = tx_id_col
-    id_to_annotation.rename(columns={0: tx_annotation_col}, inplace=True)
-    id_to_annotation[tx_id_col] = id_to_annotation.index
-    return id_to_annotation
-
-def check_annotation_ids(
-    annotated_data: pd.DataFrame,
-    dtype: str,
-    id_col: str,
-    method: str
-) -> pd.DataFrame:
-    """
-    Ensure annotation DataFrame has correct index format and matches integrated data.
-
-    Args:
-        annotated_data (pd.DataFrame): Annotation DataFrame.
-        dtype (str): Data type prefix ('tx' or 'mx').
-        id_col (str): ID column name.
-        method (str): Annotation method.
-
-    Returns:
-        pd.DataFrame: Checked annotation DataFrame.
-    """
-
-    if dtype+"_" in annotated_data[id_col].astype(str).values[0]:
-        annotated_data.index = annotated_data[id_col].astype(str)
-    else:
-        annotated_data.index = dtype+"_" + annotated_data[id_col].astype(str)
-    if len(annotated_data.index.intersection(annotated_data.index)) == 0:
-        log.info(f"Warning! No matching indexes between integrated_data and annotation done with {method}. Please check the annotation file.")
-        return None
-    return annotated_data
-
-def annotate_integrated_data(
-    integrated_data: pd.DataFrame,
-    output_dir: str,
-    project_name: str,
-    tx_dir: str,
-    mx_dir: str,
-    magi2_dir: str,
-    tx_annotation_file: str,
-    mx_annotation_file: str,
-    tx_annotation_method: str,
-    mx_annotation_method: str,
-    tx_id_col: str,
-    mx_id_col: str,
-    tx_annotation_col: str,
-    mx_annotation_col: str,
+def generate_tx_annotation_map(
+    raw_data: pd.DataFrame, 
+    dataset_raw_dir: str, 
+    output_dir: str, 
+    output_filename: str,
     overwrite: bool = False
 ) -> pd.DataFrame:
     """
-    Annotate integrated data features with functional information from transcriptomics and metabolomics.
-
+    Generate gene ID to GO annotation mapping table AND MAGI2 sequence input for transcriptomics data.
+    
     Args:
-        integrated_data (pd.DataFrame): Integrated feature matrix.
-        output_dir (str): Output directory.
-        project_name (str): Project name.
-        tx_dir (str): Transcriptomics data directory.
-        mx_dir (str): Metabolomics data directory.
-        magi2_dir (str): MAGI2 results directory.
-        tx_annotation_file (str): Transcriptomics annotation file.
-        mx_annotation_file (str): Metabolomics annotation file.
-        tx_annotation_method (str): Annotation method for transcriptomics.
-        mx_annotation_method (str): Annotation method for metabolomics.
-        tx_id_col (str): Transcriptomics ID column.
-        mx_id_col (str): Metabolomics ID column.
-        tx_annotation_col (str): Transcriptomics annotation column.
-        mx_annotation_col (str): Metabolomics annotation column.
-        overwrite (bool): Overwrite existing results.
-
+        raw_data: Raw transcriptomics data DataFrame with GeneID column
+        dataset_raw_dir: Directory containing GO annotation, GFF files, and sequence files
+        output_dir: Output directory for saving annotation map
+        output_filename: Filename for saving the annotation map
+        overwrite: Overwrite existing output if True
+    
     Returns:
-        pd.DataFrame: DataFrame with feature annotations.
+        pd.DataFrame: annotation_mapping_df
+    """
+
+    # Get file paths from configuration
+    go_annotation_file = os.path.join(dataset_raw_dir, "go_annotation_table.tsv")
+    gff_file = os.path.join(dataset_raw_dir, "genes.gff3")
+    
+    if not os.path.exists(go_annotation_file) or not os.path.exists(gff_file):
+        raise ValueError("GO annotation file and GFF file paths must be valid and exist to generate annotation map.")
+    
+    # Get gene IDs from raw data
+    gene_ids = set(raw_data['GeneID'].unique())
+    log.info(f"Found {len(gene_ids)} genes in raw data")
+    
+    # Parse GFF3 file to create gene_id -> protein_id mapping
+    log.info("Parsing GFF3 file for gene-protein mappings...")
+    gene_to_protein = {}
+    
+    with open(gff_file, 'r') as f:
+        for line in f:
+            if line.startswith('#') or line.strip() == '':
+                continue
+                
+            fields = line.strip().split('\t')
+            if len(fields) >= 9 and fields[2] == 'gene':
+                attributes = fields[8]
+                
+                # Extract gene ID
+                gene_match = re.search(r'ID=([^;]+)', attributes)
+                if not gene_match:
+                    continue
+                gene_id = gene_match.group(1)
+                if not gene_id.startswith('tx_'):
+                    gene_id = f"tx_{gene_id}"
+                
+                # Extract protein ID
+                protein_match = re.search(r'proteinId=([^;]+)', attributes)
+                if protein_match:
+                    protein_id = int(protein_match.group(1))
+                    gene_to_protein[gene_id] = protein_id
+    
+    log.info(f"Found {len(gene_to_protein)} gene-to-protein mappings")
+    
+    # Load GO annotations
+    log.info("Loading GO annotations...")
+    go_df = pd.read_csv(go_annotation_file, sep='\t')
+    if '#proteinId' in go_df.columns:
+        go_df.rename(columns={'#proteinId': 'proteinId'}, inplace=True)
+    log.info(f"Found {len(go_df)} GO annotations for {go_df['proteinId'].nunique()} proteins")
+    
+    # Create the mapping table
+    log.info("Creating gene-GO mapping table...")
+    mapping_records = []
+    
+    for gene_id in gene_ids:
+        if gene_id in gene_to_protein:
+            protein_id = gene_to_protein[gene_id]
+            
+            # Get all GO annotations for this protein
+            protein_annotations = go_df[go_df['proteinId'] == protein_id]
+            
+            if len(protein_annotations) > 0:
+                for _, annotation in protein_annotations.iterrows():
+                    mapping_records.append({
+                        'gene_id': str(gene_id),
+                        'protein_id': str(protein_id),
+                        'goterm_id': int(annotation['gotermId']),
+                        'goterm_name': str(annotation['goName']),
+                        'goterm_type': str(annotation['gotermType']),
+                        'goterm_acc': str(annotation['goAcc'])
+                    })
+            else:
+                # Gene has protein mapping but no GO annotations
+                mapping_records.append({
+                    'gene_id': gene_id,
+                    'protein_id': protein_id,
+                    'goterm_id': None,
+                    'goterm_name': None,
+                    'goterm_type': None,
+                    'goterm_acc': None
+                })
+        else:
+            # Gene has no protein mapping
+            mapping_records.append({
+                'gene_id': gene_id,
+                'protein_id': None,
+                'goterm_id': None,
+                'goterm_name': None,
+                'goterm_type': None,
+                'goterm_acc': None
+            })
+    
+    # Convert to DataFrame and save annotation map
+    mapping_df = pd.DataFrame(mapping_records)
+    os.makedirs(output_dir, exist_ok=True)
+    write_integration_file(data=mapping_df, output_dir=output_dir, filename=output_filename, indexing=True)
+    
+    # Summary statistics for annotation
+    log.info(f"Created gene-GO mapping table with {len(mapping_df)} rows")
+    log.info(f"Genes with protein mappings: {mapping_df['protein_id'].notna().sum()}")
+    log.info(f"Genes with GO annotations: {mapping_df['goterm_id'].notna().sum()}")
+    
+    return mapping_df
+
+def generate_mx_annotation_map(
+    raw_data: pd.DataFrame, 
+    dataset_raw_dir: str, 
+    polarity: str, 
+    output_dir: str, 
+    output_filename: str,
+    overwrite: bool = False
+) -> pd.DataFrame:
+    """
+    Generate metabolite ID to annotation mapping table AND MAGI2 compound input for metabolomics data.
+    
+    Args:
+        raw_data: Raw metabolomics data DataFrame
+        dataset_raw_dir: Directory containing raw dataset files
+        polarity: Polarity setting ('positive', 'negative', 'multipolarity')
+        output_dir: Output directory for saving annotation map
+        output_filename: Filename for saving the annotation map
+        magi2_output_dir: Output directory for MAGI2 files (if None, uses output_dir)
+        overwrite: Overwrite existing output if True
+    
+    Returns:
+        pd.DataFrame: annotation_mapping_df
     """
     
-    annotated_data_filename = f"integrated_data_annotated"
-    if os.path.exists(f"{output_dir}/{annotated_data_filename}.csv") and overwrite is False:
-        log.info(f"Integrated data already annotated: {output_dir}/{annotated_data_filename}.csv")
-        annotated_data = pd.read_csv(f"{output_dir}/{annotated_data_filename}.csv", index_col=0)
-        return annotated_data
-
-    if tx_annotation_method == "custom":
-        if tx_id_col is None or tx_annotation_col is None:
-            raise ValueError("Please provide tx_id_col and tx_annotation_col for custom annotation.")
-        sep = "\t" if tx_annotation_file.endswith((".txt", ".tsv", ".tab")) else ","
-        tx_annotation = pd.read_csv(glob.glob(os.path.expanduser(tx_annotation_file))[0], sep=sep)
-        tx_annotation = tx_annotation.drop_duplicates(subset=[tx_id_col])
-        tx_annotation[tx_annotation_col] = tx_annotation[tx_annotation_col].astype(str)
-        tx_annotation = check_annotation_ids(tx_annotation, "tx", tx_id_col, tx_annotation_method)
-
-    elif tx_annotation_method == "jgi":
-        log.info("JGI annotation method not yet implemented!!")
-        return None
-
-    elif tx_annotation_method == "magi2":
-        tx_id_col = "gene_ID"
-        tx_annotation_col = "rhea_ID_g2r"
-
-        gff_filename = glob.glob(f"{tx_dir}/*gff3*")
-        if len(gff_filename) == 0:
-            raise ValueError(f"No GFF3 file found in {tx_dir}.")
-        elif len(gff_filename) > 1:
-            raise ValueError(f"Multiple GFF3 files found in the specified directory: {gff_filename}. \nPlease specify one.")
-        elif len(gff_filename) == 1:
-            gff_filename = gff_filename[0]
-
-        magi_genes = f"{magi2_dir}/{project_name}/output_{project_name}/magi_gene_results.csv"
-        
-        tx_annotation = annotate_genes_to_rhea(gff_filename, magi_genes, tx_id_col, tx_annotation_col)
-        tx_annotation = check_annotation_ids(tx_annotation, "tx", tx_id_col, tx_annotation_method)
-
+    # Get metabolite IDs from raw data
+    if not raw_data.empty:
+        if 'CompoundID' in raw_data.columns:
+            metabolite_ids = set(raw_data['CompoundID'].tolist())
+        else:
+            metabolite_ids = set(raw_data.index.tolist())
     else:
-        raise ValueError("Please select a valid tx_annotation_method: custom, jgi, or magi2.")
-
-    if mx_annotation_method == "fbmn":
-        mx_id_col = "#Scan#"
-        mx_annotation_col = "Compound_Name"
-        mx_annotation = pd.read_csv(f"{mx_dir}/fbmn_compounds.csv")
-        mx_annotation = mx_annotation.drop_duplicates(subset=[mx_id_col], keep='first')
-        mx_annotation = check_annotation_ids(mx_annotation, "mx", mx_id_col, mx_annotation_method)
-
-    elif mx_annotation_method == "custom":
-        if mx_id_col is None or mx_annotation_col is None:
-            raise ValueError("Please provide mx_id_col and mx_annotation_col for custom annotation.")
-        sep = "\t" if mx_annotation_file.endswith((".txt", ".tsv", ".tab")) else ","
-        mx_annotation = pd.read_csv(glob.glob(os.path.expanduser(mx_annotation_file))[0], sep=sep)
-        mx_annotation = mx_annotation.drop_duplicates(subset=[mx_id_col])
-        mx_annotation = check_annotation_ids(mx_annotation, "mx", mx_id_col, mx_annotation_method)
+        metabolite_ids = set()
+    
+    log.info(f"Found {len(metabolite_ids)} metabolites in raw data")
+    
+    # Find and process FBMN library-results files
+    log.info(f"Looking for FBMN library-results files in {dataset_raw_dir}")
+    
+    fbmn_data = pd.DataFrame()
+    try:
+        if polarity == "multipolarity":
+            compound_files = glob.glob(os.path.expanduser(f"{dataset_raw_dir}/*/*library-results.tsv"))
+            if len(compound_files) > 1:
+                # Process multiple files
+                all_fbmn_data = []
+                for file_path in compound_files:
+                    file_polarity = ("positive" if "positive" in file_path 
+                                else "negative" if "negative" in file_path 
+                                else "unknown")
+                    df = pd.read_csv(file_path, sep='\t')
+                    df['metabolite_id'] = 'mx_' + df['#Scan#'].astype(str) + '_' + file_polarity
+                    all_fbmn_data.append(df)
+                fbmn_data = pd.concat(all_fbmn_data, axis=0, ignore_index=True)
+            elif len(compound_files) == 1:
+                log.warning("Only single compound file found with multipolarity setting.")
+                fbmn_data = pd.read_csv(compound_files[0], sep='\t')
+                fbmn_data['metabolite_id'] = 'mx_' + fbmn_data['#Scan#'].astype(str) + '_unknown'
+                
+        elif polarity in ["positive", "negative"]:
+            compound_files = glob.glob(os.path.expanduser(f"{dataset_raw_dir}/*/*{polarity}*library-results.tsv"))
+            if len(compound_files) == 1:
+                fbmn_data = pd.read_csv(compound_files[0], sep='\t')
+                fbmn_data['metabolite_id'] = 'mx_' + fbmn_data['#Scan#'].astype(str) + '_' + polarity
+                log.info(f"Using compound file: {compound_files[0]}")
+            elif len(compound_files) > 1:
+                log.warning(f"Multiple compound files found: {compound_files}. Using first one.")
+                fbmn_data = pd.read_csv(compound_files[0], sep='\t')
+                fbmn_data['metabolite_id'] = 'mx_' + fbmn_data['#Scan#'].astype(str) + '_' + polarity
+            else:
+                log.warning(f"No compound files found for {polarity} polarity.")
+        else:
+            log.warning(f"Unknown polarity: {polarity}")
+                
+    except Exception as e:
+        log.warning(f"Error reading compound files: {e}")
+    
+    # Create annotation mapping for all metabolites
+    log.info("Creating metabolite annotation mapping...")
+    mapping_data = []
+    for met_id in metabolite_ids:
+        if not fbmn_data.empty:
+            # Find matching annotation
+            match = fbmn_data[fbmn_data['metabolite_id'] == met_id]
+            if len(match) > 0:
+                row = match.iloc[0]
+                # Handle InChiKey variations
+                inchikey_value = (row.get('InChiKey') or 
+                                row.get('InChIKey') or 
+                                row.get('inchikey') or 
+                                row.get('INCHIKEY'))
+                
+                mapping_data.append({
+                    'metabolite_id': met_id,
+                    'molecular_formula': row.get('molecular_formula'),
+                    'Compound_Name': row.get('Compound_Name'),
+                    'INCHI': row.get('INCHI'),
+                    'InChiKey': inchikey_value,
+                    'superclass': row.get('superclass'),
+                    'class': row.get('class'),
+                    'subclass': row.get('subclass'),
+                    'npclassifier_superclass': row.get('npclassifier_superclass'),
+                    'npclassifier_class': row.get('npclassifier_class'),
+                    'npclassifier_pathway': row.get('npclassifier_pathway'),
+                    'library_usi': row.get('library_usi')
+                })
+                continue
         
-    elif mx_annotation_method == "magi2":
-        mx_id_col = "#Scan#"
-        mx_annotation_col = "rhea_ID_r2g"
-        magi_compounds = pd.read_csv(f"{magi2_dir}/{project_name}/output_{project_name}/magi_compound_results.csv")
-        fbmn_compounds = pd.read_csv(f"{mx_dir}/fbmn_compounds.csv")
-        mx_annotation = fbmn_compounds.merge(magi_compounds[['original_compound', mx_annotation_col, 'MAGI_score']],on='original_compound',how='left')
-        mx_annotation = mx_annotation.sort_values(by='MAGI_score', ascending=False).drop_duplicates(subset=[mx_id_col], keep='first')
-        mx_annotation = check_annotation_ids(mx_annotation, "mx", mx_id_col, mx_annotation_method)
-
-    else:
-        raise ValueError("Please select a valid mx_annotation_method: fbmn, custom, or magi2.")
-
-    log.info("Annotating features in integrated data...")
-    tx_annotation = tx_annotation.dropna(subset=[tx_id_col])
-    mx_annotation = mx_annotation.dropna(subset=[mx_id_col])
-    tx_annotation[tx_annotation_col] = tx_annotation[tx_annotation_col].replace("<NA>","Unassigned").fillna("Unassigned")
-    mx_annotation[mx_annotation_col] = mx_annotation[mx_annotation_col].replace("<NA>","Unassigned").fillna("Unassigned")
-
-    annotated_data = integrated_data[[]]
-    annotated_data['tx_annotation'] = integrated_data.index.map(tx_annotation[tx_annotation_col])
-    annotated_data['mx_annotation'] = integrated_data.index.map(mx_annotation[mx_annotation_col])
+        # No annotation found
+        mapping_data.append({
+            'metabolite_id': met_id,
+            'molecular_formula': None,
+            'Compound_Name': None,
+            'INCHI': None,
+            'InChiKey': None,
+            'superclass': None,
+            'class': None,
+            'subclass': None,
+            'npclassifier_superclass': None,
+            'npclassifier_class': None,
+            'npclassifier_pathway': None,
+            'library_usi': None
+        })
     
-    annotated_data['annotation'] = annotated_data['tx_annotation'].combine_first(annotated_data['mx_annotation'])
+    # Create and save annotation DataFrame
+    mapping_df = pd.DataFrame(mapping_data)
+    os.makedirs(output_dir, exist_ok=True)
+    write_integration_file(data=mapping_df, output_dir=output_dir, filename=output_filename, indexing=True)
     
-    result = annotated_data[['annotation']]
-    log.info("Writing annotated data to file...")
-    write_integration_file(data=result, output_dir=output_dir, filename=annotated_data_filename, indexing=True)
-    return result
+    # Summary statistics for annotation
+    total_rows = len(mapping_df)
+    annotated_count = mapping_df.dropna(subset=['INCHI', 'InChiKey'], how='all').shape[0]
+    log.info(f"Created annotation mapping with {total_rows} rows")
+    log.info(f"Metabolites with annotations: {annotated_count}")
+    log.info(f"Metabolites without annotations: {total_rows - annotated_count}")
+    
+    return mapping_df
+
+def annotate_integrated_features(
+    integrated_data: pd.DataFrame,
+    datasets: List = None,
+    output_dir: str = None,
+    output_filename: str = None
+) -> pd.DataFrame:
+    """
+    Build a combined annotation dataframe for integrated features from multiple datasets.
+    
+    Parameters
+    ----------
+    integrated_data : pd.DataFrame
+        Integrated feature matrix (features x samples)
+    datasets : List, optional
+        List of dataset objects with annotation_map attributes
+    output_dir : str, optional
+        Directory to save the annotation results
+    output_filename : str, default "integrated_features_annotated"
+        Filename for the output annotation table
+        
+    Returns
+    -------
+    pd.DataFrame
+        Combined annotation dataframe with columns for each annotation type
+        and multiple rows per feature if multiple annotations exist
+    """
+    
+    # Get all unique features from integrated data
+    all_features = integrated_data.index.tolist()
+    log.info(f"Annotating {len(all_features)} features from integrated data")
+    
+    # Build combined annotation dataframe from datasets if provided
+    combined_annotation_df = None
+    if datasets is not None:
+        annotation_dfs = []
+        all_annotation_columns = set()
+        
+        for dataset in datasets:
+            if hasattr(dataset, 'annotation_map') and dataset.annotation_map is not None:
+                log.info(f"Processing annotation map for {dataset.dataset_name}")
+                
+                # Get the annotation map and ensure it has the right structure
+                ann_map = dataset.annotation_map.copy()
+                
+                # Determine the feature ID column based on dataset type
+                feature_id_col = None
+                if hasattr(dataset, 'dataset_name'):
+                    if 'tx' in dataset.dataset_name.lower() or 'transcript' in dataset.dataset_name.lower():
+                        # For transcriptomics, use gene_id as the feature identifier
+                        if 'gene_id' in ann_map.columns:
+                            feature_id_col = 'gene_id'
+                    elif 'mx' in dataset.dataset_name.lower() or 'metabol' in dataset.dataset_name.lower():
+                        # For metabolomics, use metabolite_id as the feature identifier
+                        if 'metabolite_id' in ann_map.columns:
+                            feature_id_col = 'metabolite_id'
+                
+                if feature_id_col is None:
+                    log.warning(f"Could not determine feature ID column for {dataset.dataset_name}")
+                    continue
+                
+                # Set the feature ID as index if it's not already
+                if feature_id_col in ann_map.columns and ann_map.index.name != feature_id_col:
+                    ann_map = ann_map.set_index(feature_id_col)
+                
+                # Remove the feature ID columns that are now the index
+                annotation_columns = [col for col in ann_map.columns if col not in ['gene_id', 'metabolite_id']]
+                ann_map = ann_map[annotation_columns]
+                
+                # Add dataset prefix to annotation columns to avoid conflicts
+                ann_map.columns = [f"{dataset.dataset_name}_{col}" for col in ann_map.columns]
+                
+                # Track all annotation columns across datasets
+                all_annotation_columns.update(ann_map.columns)
+                annotation_dfs.append(ann_map)
+                
+                log.info(f"Added {ann_map.shape[0]} annotation rows with {len(annotation_columns)} columns from {dataset.dataset_name}")
+        
+        # Combine all annotation dataframes
+        if annotation_dfs:
+            # First, ensure all dataframes have the same columns filled with 'Unassigned'
+            for i, ann_df in enumerate(annotation_dfs):
+                for col in all_annotation_columns:
+                    if col not in ann_df.columns:
+                        ann_df[col] = 'Unassigned'
+                # Reorder columns consistently
+                annotation_dfs[i] = ann_df[sorted(all_annotation_columns)]
+            
+            # Concatenate all annotation dataframes, preserving multiple rows per feature
+            combined_annotation_df = pd.concat(annotation_dfs, axis=0, sort=False)
+            # Fill any remaining NaN values with 'Unassigned'
+            combined_annotation_df = combined_annotation_df.fillna('Unassigned')
+            
+            log.info(f"Combined annotation data from {len(annotation_dfs)} datasets")
+            log.info(f"Total annotation columns: {len(all_annotation_columns)}")
+            log.info(f"Total annotation rows: {combined_annotation_df.shape[0]}")
+    
+    # Use combined annotation if available, otherwise use provided annotation_df
+    final_annotation_df = combined_annotation_df if combined_annotation_df is not None else annotation_df
+    
+    if final_annotation_df is None:
+        log.warning("No annotation data provided. Creating empty annotation dataframe.")
+        # Create a minimal annotation dataframe with just feature IDs
+        final_annotation_df = pd.DataFrame(
+            {'feature_id': all_features, 'annotation_status': 'No annotation available'}
+        ).set_index('feature_id')
+    
+    # Filter annotations to only include features present in integrated data
+    features_with_annotations = final_annotation_df.index.intersection(all_features)
+    final_annotation_df = final_annotation_df.loc[features_with_annotations]
+    
+    # Add features that don't have annotations
+    missing_features = set(all_features) - set(features_with_annotations)
+    if missing_features:
+        log.info(f"Found {len(missing_features)} features without annotations")
+        
+        # Create rows for missing features
+        missing_rows = []
+        for feature in missing_features:
+            # Create a row with the same columns as the existing annotation dataframe
+            missing_row = pd.Series(index=final_annotation_df.columns, name=feature)
+            missing_row = missing_row.fillna('Unassigned')
+            missing_rows.append(missing_row)
+        
+        if missing_rows:
+            missing_df = pd.DataFrame(missing_rows)
+            final_annotation_df = pd.concat([final_annotation_df, missing_df], axis=0, sort=False)
+    
+    # Reset index to make feature_id a column for easier handling
+    final_annotation_df = final_annotation_df.reset_index()
+    if 'index' in final_annotation_df.columns:
+        final_annotation_df = final_annotation_df.rename(columns={'index': 'feature_id'})
+    elif final_annotation_df.index.name:
+        final_annotation_df = final_annotation_df.rename(columns={final_annotation_df.index.name: 'feature_id'})
+    
+    # Sort by feature_id for consistent output
+    final_annotation_df = final_annotation_df.sort_values('feature_id')
+    
+    # Summary statistics
+    n_annotated_features = len(final_annotation_df['feature_id'].unique())
+    n_total_annotations = len(final_annotation_df)
+    avg_annotations_per_feature = n_total_annotations / n_annotated_features if n_annotated_features > 0 else 0
+    
+    log.info(f"Annotation summary:")
+    log.info(f"  Features with annotations: {n_annotated_features}")
+    log.info(f"  Total annotation rows: {n_total_annotations}")
+    log.info(f"  Average annotations per feature: {avg_annotations_per_feature:.2f}")
+    
+    # Save results if output directory provided
+    if output_dir:
+        write_integration_file(
+            data=final_annotation_df,
+            output_dir=output_dir,
+            filename=output_filename,
+            indexing=False
+        )
+    
+    return final_annotation_df
+
+# def parse_gff3_proteinid_to_id(gff3_path: str) -> dict:
+#     """
+#     Parse a GFF3 file to map protein IDs to gene IDs.
+
+#     Args:
+#         gff3_path (str): Path to GFF3 file.
+
+#     Returns:
+#         dict: Mapping from proteinId to geneId.
+#     """
+
+#     open_func = gzip.open if gff3_path.endswith('.gz') else open
+#     proteinid_to_id = {}
+#     with open_func(gff3_path, 'rt') as f:
+#         for line in f:
+#             if line.startswith('#'):
+#                 continue
+#             fields = line.strip().split('\t')
+#             if len(fields) < 9 or fields[2] != 'gene':
+#                 continue
+#             attrs = {kv.split('=')[0]: kv.split('=')[1] for kv in fields[8].split(';') if '=' in kv}
+#             protein_id = attrs.get('proteinId')
+#             gene_id = attrs.get('ID')
+#             if protein_id and gene_id:
+#                 proteinid_to_id[protein_id.strip()] = gene_id.strip()
+#     return proteinid_to_id
+
+# def parse_annotation_file(annotation_path: str, tx_id_col: str, tx_annotation_col: str) -> dict:
+#     """
+#     Parse an annotation file to map IDs to annotation values.
+
+#     Args:
+#         annotation_path (str): Path to annotation file.
+#         tx_id_col (str): Column name for IDs.
+#         tx_annotation_col (str): Column name for annotation.
+
+#     Returns:
+#         dict: Mapping from ID to annotation.
+#     """
+    
+#     df = pd.read_csv(annotation_path)
+#     if tx_id_col not in df.columns or tx_annotation_col not in df.columns:
+#         raise ValueError(f"Required columns {tx_id_col} or {tx_annotation_col} not found in annotation file.")
+#     df = df.dropna(subset=[tx_id_col, tx_annotation_col])
+#     annotation_map = dict(zip(df[tx_id_col].astype(str).str.strip(), df[tx_annotation_col].astype(int).astype(str).str.strip()))
+#     return annotation_map
+
+# def map_ids_to_annotations(
+#     gff3_path: str,
+#     annotation_path: str,
+#     tx_id_col: str,
+#     tx_annotation_col: str
+# ) -> dict:
+#     """
+#     Map gene IDs from a GFF3 file to annotation values using an annotation file.
+
+#     Args:
+#         gff3_path (str): Path to GFF3 file.
+#         annotation_path (str): Path to annotation file.
+#         tx_id_col (str): ID column name.
+#         tx_annotation_col (str): Annotation column name.
+
+#     Returns:
+#         dict: Mapping from gene ID to annotation.
+#     """
+    
+#     proteinid_to_id = parse_gff3_proteinid_to_id(gff3_path)
+#     annotation_map = parse_annotation_file(annotation_path, tx_id_col, tx_annotation_col)
+#     id_to_annotation = {}
+#     for protein_id, gene_id in proteinid_to_id.items():
+#         for annot_key in annotation_map:
+#             if protein_id in annot_key:
+#                 id_to_annotation[gene_id] = annotation_map[annot_key]
+#                 break
+#     return id_to_annotation
+
+# def annotate_genes_to_rhea(
+#     gff3_path: str,
+#     annotation_path: str,
+#     tx_id_col: str,
+#     tx_annotation_col: str
+# ) -> pd.DataFrame:
+#     """
+#     Annotate gene IDs with Rhea IDs using GFF3 and annotation files.
+
+#     Args:
+#         gff3_path (str): Path to GFF3 file.
+#         annotation_path (str): Path to annotation file.
+#         tx_id_col (str): ID column name.
+#         tx_annotation_col (str): Annotation column name.
+
+#     Returns:
+#         pd.DataFrame: DataFrame mapping gene IDs to Rhea IDs.
+#     """
+
+#     id_to_annotation = map_ids_to_annotations(gff3_path, annotation_path, tx_id_col, tx_annotation_col)
+#     id_to_annotation = pd.DataFrame.from_dict(id_to_annotation, orient='index')
+#     id_to_annotation.index.name = tx_id_col
+#     id_to_annotation.rename(columns={0: tx_annotation_col}, inplace=True)
+#     id_to_annotation[tx_id_col] = id_to_annotation.index
+#     return id_to_annotation
+
+# def check_annotation_ids(
+#     annotated_data: pd.DataFrame,
+#     dtype: str,
+#     id_col: str,
+#     method: str
+# ) -> pd.DataFrame:
+#     """
+#     Ensure annotation DataFrame has correct index format and matches integrated data.
+
+#     Args:
+#         annotated_data (pd.DataFrame): Annotation DataFrame.
+#         dtype (str): Data type prefix ('tx' or 'mx').
+#         id_col (str): ID column name.
+#         method (str): Annotation method.
+
+#     Returns:
+#         pd.DataFrame: Checked annotation DataFrame.
+#     """
+
+#     if dtype+"_" in annotated_data[id_col].astype(str).values[0]:
+#         annotated_data.index = annotated_data[id_col].astype(str)
+#     else:
+#         annotated_data.index = dtype+"_" + annotated_data[id_col].astype(str)
+#     if len(annotated_data.index.intersection(annotated_data.index)) == 0:
+#         log.info(f"Warning! No matching indexes between integrated_data and annotation done with {method}. Please check the annotation file.")
+#         return None
+#     return annotated_data
+
+# def annotate_integrated_data(
+#     integrated_data: pd.DataFrame,
+#     output_dir: str,
+#     project_name: str,
+#     tx_dir: str,
+#     mx_dir: str,
+#     magi2_dir: str,
+#     tx_annotation_file: str,
+#     mx_annotation_file: str,
+#     tx_annotation_method: str,
+#     mx_annotation_method: str,
+#     tx_id_col: str,
+#     mx_id_col: str,
+#     tx_annotation_col: str,
+#     mx_annotation_col: str,
+#     overwrite: bool = False
+# ) -> pd.DataFrame:
+#     """
+#     Annotate integrated data features with functional information from transcriptomics and metabolomics.
+
+#     Args:
+#         integrated_data (pd.DataFrame): Integrated feature matrix.
+#         output_dir (str): Output directory.
+#         project_name (str): Project name.
+#         tx_dir (str): Transcriptomics data directory.
+#         mx_dir (str): Metabolomics data directory.
+#         magi2_dir (str): MAGI2 results directory.
+#         tx_annotation_file (str): Transcriptomics annotation file.
+#         mx_annotation_file (str): Metabolomics annotation file.
+#         tx_annotation_method (str): Annotation method for transcriptomics.
+#         mx_annotation_method (str): Annotation method for metabolomics.
+#         tx_id_col (str): Transcriptomics ID column.
+#         mx_id_col (str): Metabolomics ID column.
+#         tx_annotation_col (str): Transcriptomics annotation column.
+#         mx_annotation_col (str): Metabolomics annotation column.
+#         overwrite (bool): Overwrite existing results.
+
+#     Returns:
+#         pd.DataFrame: DataFrame with feature annotations.
+#     """
+    
+#     annotated_data_filename = f"integrated_data_annotated"
+#     if os.path.exists(f"{output_dir}/{annotated_data_filename}.csv") and overwrite is False:
+#         log.info(f"Integrated data already annotated: {output_dir}/{annotated_data_filename}.csv")
+#         annotated_data = pd.read_csv(f"{output_dir}/{annotated_data_filename}.csv", index_col=0)
+#         return annotated_data
+
+#     if tx_annotation_method == "custom":
+#         if tx_id_col is None or tx_annotation_col is None:
+#             raise ValueError("Please provide tx_id_col and tx_annotation_col for custom annotation.")
+#         sep = "\t" if tx_annotation_file.endswith((".txt", ".tsv", ".tab")) else ","
+#         tx_annotation = pd.read_csv(glob.glob(os.path.expanduser(tx_annotation_file))[0], sep=sep)
+#         tx_annotation = tx_annotation.drop_duplicates(subset=[tx_id_col])
+#         tx_annotation[tx_annotation_col] = tx_annotation[tx_annotation_col].astype(str)
+#         tx_annotation = check_annotation_ids(tx_annotation, "tx", tx_id_col, tx_annotation_method)
+
+#     elif tx_annotation_method == "jgi":
+#         log.info("JGI annotation method not yet implemented!!")
+#         return None
+
+#     elif tx_annotation_method == "magi2":
+#         tx_id_col = "gene_ID"
+#         tx_annotation_col = "rhea_ID_g2r"
+
+#         gff_filename = glob.glob(f"{tx_dir}/*gff3*")
+#         if len(gff_filename) == 0:
+#             raise ValueError(f"No GFF3 file found in {tx_dir}.")
+#         elif len(gff_filename) > 1:
+#             raise ValueError(f"Multiple GFF3 files found in the specified directory: {gff_filename}. \nPlease specify one.")
+#         elif len(gff_filename) == 1:
+#             gff_filename = gff_filename[0]
+
+#         magi_genes = f"{magi2_dir}/{project_name}/output_{project_name}/magi_gene_results.csv"
+        
+#         tx_annotation = annotate_genes_to_rhea(gff_filename, magi_genes, tx_id_col, tx_annotation_col)
+#         tx_annotation = check_annotation_ids(tx_annotation, "tx", tx_id_col, tx_annotation_method)
+
+#     else:
+#         raise ValueError("Please select a valid tx_annotation_method: custom, jgi, or magi2.")
+
+#     if mx_annotation_method == "fbmn":
+#         mx_id_col = "#Scan#"
+#         mx_annotation_col = "Compound_Name"
+#         mx_annotation = pd.read_csv(f"{mx_dir}/fbmn_compounds.csv")
+#         mx_annotation = mx_annotation.drop_duplicates(subset=[mx_id_col], keep='first')
+#         mx_annotation = check_annotation_ids(mx_annotation, "mx", mx_id_col, mx_annotation_method)
+
+#     elif mx_annotation_method == "custom":
+#         if mx_id_col is None or mx_annotation_col is None:
+#             raise ValueError("Please provide mx_id_col and mx_annotation_col for custom annotation.")
+#         sep = "\t" if mx_annotation_file.endswith((".txt", ".tsv", ".tab")) else ","
+#         mx_annotation = pd.read_csv(glob.glob(os.path.expanduser(mx_annotation_file))[0], sep=sep)
+#         mx_annotation = mx_annotation.drop_duplicates(subset=[mx_id_col])
+#         mx_annotation = check_annotation_ids(mx_annotation, "mx", mx_id_col, mx_annotation_method)
+        
+#     elif mx_annotation_method == "magi2":
+#         mx_id_col = "#Scan#"
+#         mx_annotation_col = "rhea_ID_r2g"
+#         magi_compounds = pd.read_csv(f"{magi2_dir}/{project_name}/output_{project_name}/magi_compound_results.csv")
+#         fbmn_compounds = pd.read_csv(f"{mx_dir}/fbmn_compounds.csv")
+#         mx_annotation = fbmn_compounds.merge(magi_compounds[['original_compound', mx_annotation_col, 'MAGI_score']],on='original_compound',how='left')
+#         mx_annotation = mx_annotation.sort_values(by='MAGI_score', ascending=False).drop_duplicates(subset=[mx_id_col], keep='first')
+#         mx_annotation = check_annotation_ids(mx_annotation, "mx", mx_id_col, mx_annotation_method)
+
+#     else:
+#         raise ValueError("Please select a valid mx_annotation_method: fbmn, custom, or magi2.")
+
+#     log.info("Annotating features in integrated data...")
+#     tx_annotation = tx_annotation.dropna(subset=[tx_id_col])
+#     mx_annotation = mx_annotation.dropna(subset=[mx_id_col])
+#     tx_annotation[tx_annotation_col] = tx_annotation[tx_annotation_col].replace("<NA>","Unassigned").fillna("Unassigned")
+#     mx_annotation[mx_annotation_col] = mx_annotation[mx_annotation_col].replace("<NA>","Unassigned").fillna("Unassigned")
+
+#     annotated_data = integrated_data[[]]
+#     annotated_data['tx_annotation'] = integrated_data.index.map(tx_annotation[tx_annotation_col])
+#     annotated_data['mx_annotation'] = integrated_data.index.map(mx_annotation[mx_annotation_col])
+    
+#     annotated_data['annotation'] = annotated_data['tx_annotation'].combine_first(annotated_data['mx_annotation'])
+    
+#     result = annotated_data[['annotation']]
+#     log.info("Writing annotated data to file...")
+#     write_integration_file(data=result, output_dir=output_dir, filename=annotated_data_filename, indexing=True)
+#     return result
 
 # ====================================
 # Data linking and integration functions
@@ -3726,334 +4286,412 @@ def plot_mofa2_feature_importance_per_factor(
 # MAGI functions
 # ====================================
 
-def run_magi2(
-    run_name: str,
-    sequence_file: str,
-    compound_file: str,
-    output_dir: str,
-    magi2_source_dir: str,
-    overwrite: bool = False
-) -> tuple[str, str]:
-    """
-    Run MAGI2 analysis by submitting a SLURM job on NERSC.
+# def run_magi2(
+#     run_name: str,
+#     sequence_file: str,
+#     compound_file: str,
+#     output_dir: str,
+#     magi2_source_dir: str,
+#     overwrite: bool = False
+# ) -> tuple[str, str]:
+#     """
+#     Run MAGI2 analysis by submitting a SLURM job on NERSC.
 
-    Args:
-        run_name (str): Name for the MAGI2 run.
-        sequence_file (str): Path to the protein FASTA file.
-        compound_file (str): Path to the compound input file.
-        output_dir (str): Output directory for MAGI2 results.
-        magi2_source_dir (str): Directory containing MAGI2 scripts.
-        overwrite (bool): Overwrite existing results if True.
+#     Args:
+#         run_name (str): Name for the MAGI2 run.
+#         sequence_file (str): Path to the protein FASTA file.
+#         compound_file (str): Path to the compound input file.
+#         output_dir (str): Output directory for MAGI2 results.
+#         magi2_source_dir (str): Directory containing MAGI2 scripts.
+#         overwrite (bool): Overwrite existing results if True.
 
-    Returns:
-        tuple: (compound_results_file, gene_results_file) paths to MAGI2 output files.
-    """
+#     Returns:
+#         tuple: (compound_results_file, gene_results_file) paths to MAGI2 output files.
+#     """
 
-    if os.path.exists(f"{output_dir}/{run_name}/output_{run_name}") and overwrite is False:
-        log.info(f"MAGI2 results directory already exists: {output_dir}/{run_name}/output_{run_name}. \nNot queueing new job.")
-        log.info("Returning path to existing results files.")
-        compound_results_file = f"{output_dir}/{run_name}/output_{run_name}/magi2_compounds.csv"
-        gene_results_file = f"{output_dir}/{run_name}/output_{run_name}/magi2_gene_results.csv"
-        return compound_results_file, gene_results_file
-    elif os.path.exists(f"{output_dir}/{run_name}/output_{run_name}/") and overwrite is True:
-        log.info(f"Overwriting existing submodule Sankey diagrams in {os.path.join(submodules_dir, 'submodule_sankeys')}.")
-        shutil.rmtree(os.path.join(output_dir, "magi2_sankeys"))
-        os.makedirs(os.path.join(output_dir, "magi2_sankeys"), exist_ok=True)
-    elif not os.path.exists(f"{output_dir}/{run_name}/output_{run_name}/"):
-        os.makedirs(f"{output_dir}/{run_name}/output_{run_name}/", exist_ok=True)
+#     if os.path.exists(f"{output_dir}/{run_name}/output_{run_name}") and overwrite is False:
+#         log.info(f"MAGI2 results directory already exists: {output_dir}/{run_name}/output_{run_name}. \nNot queueing new job.")
+#         log.info("Returning path to existing results files.")
+#         compound_results_file = f"{output_dir}/{run_name}/output_{run_name}/magi2_compounds.csv"
+#         gene_results_file = f"{output_dir}/{run_name}/output_{run_name}/magi2_gene_results.csv"
+#         return compound_results_file, gene_results_file
+#     elif os.path.exists(f"{output_dir}/{run_name}/output_{run_name}/") and overwrite is True:
+#         log.info(f"Overwriting existing submodule Sankey diagrams in {os.path.join(submodules_dir, 'submodule_sankeys')}.")
+#         shutil.rmtree(os.path.join(output_dir, "magi2_sankeys"))
+#         os.makedirs(os.path.join(output_dir, "magi2_sankeys"), exist_ok=True)
+#     elif not os.path.exists(f"{output_dir}/{run_name}/output_{run_name}/"):
+#         os.makedirs(f"{output_dir}/{run_name}/output_{run_name}/", exist_ok=True)
 
-    log.info("Queueing MAGI2 with sbatch...\n")
+#     log.info("Queueing MAGI2 with sbatch...\n")
 
-    SLURM_PERLMUTTER_HEADER = """#!/bin/bash
+#     SLURM_PERLMUTTER_HEADER = """#!/bin/bash
 
-#SBATCH -N 1
-#SBATCH --exclusive
-#SBATCH --error="slurm.err"
-#SBATCH --output="slurm.out"
-#SBATCH -A m2650
-#SBATCH -C cpu
-#SBATCH --qos=regular
-#SBATCH -t 6:00:00
+# #SBATCH -N 1
+# #SBATCH --exclusive
+# #SBATCH --error="slurm.err"
+# #SBATCH --output="slurm.out"
+# #SBATCH -A m2650
+# #SBATCH -C cpu
+# #SBATCH --qos=regular
+# #SBATCH -t 6:00:00
 
-    """
+#     """
 
-    magi2_sbatch_filename = f"{output_dir}/magi2_slurm.sbatch"
-    magi2_runner_filename = f"{output_dir}/magi2_kickoff.sh"
-    cmd = f"{magi2_source_dir}/run_magi2.sh {run_name} {sequence_file} {compound_file} {output_dir} {magi2_source_dir}\n\necho MAGI2 completed."
+#     magi2_sbatch_filename = f"{output_dir}/magi2_slurm.sbatch"
+#     magi2_runner_filename = f"{output_dir}/magi2_kickoff.sh"
+#     cmd = f"{magi2_source_dir}/run_magi2.sh {run_name} {sequence_file} {compound_file} {output_dir} {magi2_source_dir}\n\necho MAGI2 completed."
 
-    with open(magi2_sbatch_filename,'w') as fid:
-        fid.write(f"{SLURM_PERLMUTTER_HEADER.replace('slurm', f'{output_dir}/magi2_slurm')}\n{cmd}")
-    with open(magi2_runner_filename,'w') as fid:
-        fid.write(f"sbatch {magi2_sbatch_filename}")
+#     with open(magi2_sbatch_filename,'w') as fid:
+#         fid.write(f"{SLURM_PERLMUTTER_HEADER.replace('slurm', f'{output_dir}/magi2_slurm')}\n{cmd}")
+#     with open(magi2_runner_filename,'w') as fid:
+#         fid.write(f"sbatch {magi2_sbatch_filename}")
 
-    with open(magi2_runner_filename, 'r') as fid:
-        cmd = fid.read()
-        sbatch_output = subprocess.run(cmd, shell=True, executable='/bin/bash', stdout=subprocess.PIPE)
-        sbatch_output_str = sbatch_output.stdout.decode('utf-8').replace('\n', '')
-        job_id = sbatch_output_str.split()[-1]
+#     with open(magi2_runner_filename, 'r') as fid:
+#         cmd = fid.read()
+#         sbatch_output = subprocess.run(cmd, shell=True, executable='/bin/bash', stdout=subprocess.PIPE)
+#         sbatch_output_str = sbatch_output.stdout.decode('utf-8').replace('\n', '')
+#         job_id = sbatch_output_str.split()[-1]
 
-    user = os.getenv('USER')
-    log.info(f"MAGI2 job submitted with ID: {job_id}. Check status with 'squeue -u {user}'.")
-    return "",""
+#     user = os.getenv('USER')
+#     log.info(f"MAGI2 job submitted with ID: {job_id}. Check status with 'squeue -u {user}'.")
+#     return "",""
 
-def get_magi2_sequences_input(
-    sequence_dir: str,
-    output_dir: str,
-    fasta_filename: str = None,
-    overwrite: bool = False
-) -> str | None:
-    """
-    Prepare the protein FASTA file for MAGI2 input, converting nucleotides to amino acids if needed.
+# def summarize_fbmn_results(
+#     fbmn_results_dir: str,
+#     polarity: str,
+#     overwrite: bool = False
+# ) -> None:
+#     """
+#     Summarize FBMN results and export a cleaned compound table.
 
-    Args:
-        sequence_dir (str): Directory containing sequence files.
-        output_dir (str): Output directory for the MAGI2 FASTA file.
-        fasta_filename (str, optional): Specific FASTA file to use.
-        overwrite (bool): Overwrite existing output if True.
+#     Args:
+#         fbmn_results_dir (str): Directory with FBMN results.
+#         polarity (str): Polarity ('positive', 'negative', 'multipolarity').
+#         overwrite (bool): Overwrite existing output if True.
 
-    Returns:
-        str or None: Path to the protein FASTA file, or None if not found.
-    """
+#     Returns:
+#         None
+#     """
 
-    output_filename = f"{output_dir}/magi2_sequences.fasta"
-    if os.path.exists(output_filename) and overwrite is False:
-        log.info(f"MAGI2 sequences file already exists: {output_filename}. \nReturning this file.")
-        return output_filename
-
-    if fasta_filename is None:
-        fasta_files = [f for f in os.listdir(sequence_dir) if 
-                       '.fa' in f.lower() and
-                       not f.lower().startswith('aa_') and
-                       not 'scaffold' in f.lower()]
-        if len(fasta_files) == 0:
-            log.info("No fasta files found.")
-            return None
-        elif len(fasta_files) > 1:
-            log.info(f"Multiple fasta files found: {fasta_files}. \n\nPlease check {sequence_dir} to verify and use the fasta_filename argument.")
-            return None
-        elif len(fasta_files) == 1:
-            fasta_filename = fasta_files[0]
-            log.info(f"Using the single fasta file found in the sequence directory: {fasta_filename}")
-    else:
-        log.info(f"Using the provided fasta file: {fasta_filename}.")
+#     fbmn_output_filename = f"{fbmn_results_dir}/fbmn_compounds.csv"
+#     if os.path.exists(fbmn_output_filename) and overwrite is False:
+#         log.info(f"FBMN output summary already exists: {fbmn_output_filename}. Not overwriting.")
+#         return
     
-    input_fasta = f"{sequence_dir}/{fasta_filename}"
-    open_func = gzip.open if input_fasta.endswith('.gz') else open
-    protein_fasta = []
+#     log.info(f"Summarizing FBMN file {fbmn_output_filename}.")
+#     try:
+#         if polarity == "multipolarity":
+#             compound_files = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*library-results.tsv"))
+#             if compound_files:
+#                 if len(compound_files) > 1:
+#                     multipolarity_datasets = []
+#                     for mx_data_file in compound_files:
+#                         file_polarity = (
+#                             "positive" if "positive" in mx_data_file 
+#                             else "negative" if "negative" in mx_data_file 
+#                             else "NO_POLARITY"
+#                         )
+#                         mx_dataset = pd.read_csv(mx_data_file, sep='\t')
+#                         mx_data = mx_dataset.copy()
+#                         mx_data["#Scan#"] = "mx_" + mx_data["#Scan#"].astype(str) + "_" + file_polarity
+#                         multipolarity_datasets.append(mx_data)
+#                     fbmn_summary = pd.concat(multipolarity_datasets, axis=0)
+#                 elif len(compound_files) == 1:
+#                     log.info(f"Warning: Only single compound files found with polarity set to multipolarity.")
+#                     fbmn_summary = pd.read_csv(compound_files[0], sep='\t')
+#         elif polarity in ["positive", "negative"]:
+#             compound_file = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*{polarity}*library-results.tsv"))
+#             if len(compound_file) > 1:
+#                 log.info(f"Multiple compound files found: {compound_file}. \n\nPlease check {fbmn_results_dir} to verify and use the compound_filename argument.")
+#                 return None
+#             elif len(compound_file) == 0:
+#                 log.info(f"No compound files found for {polarity} polarity.")
+#                 return None
+#             elif len(compound_file) == 1:
+#                 fbmn_summary = pd.read_csv(compound_file[0], sep='\t')
+#                 fbmn_summary["#Scan#"] = "mx_" + fbmn_summary["#Scan#"].astype(str) + "_" + file_polarity
+#             log.info(f"\nUsing metabolomics compound file at {compound_file}")
+#     except Exception as e:
+#         log.info(f"Compound file could not be read due to {e}")
+#         return None
 
-    with open_func(input_fasta, 'rt') as handle:
-        for record in SeqIO.parse(handle, "fasta"):
-            if set(record.seq.upper()).issubset(set("ACGTN")):
-                log.info("Nucleotide sequence detected. Converting to amino acid sequence...")
-                protein_fasta = convert_nucleotides_to_amino_acids(input_fasta)
-                break
-            else:
-                protein_fasta.append(record)
-    
-    with open(output_filename, "w") as output_handle:
-        SeqIO.write(protein_fasta, output_handle, "fasta")
-    
-    return output_filename
+#     log.info("\tConverting FBMN outputs to summary format.")
+#     fbmn_data = fbmn_summary.rename(columns={"Smiles": 'original_compound'})
+#     fbmn_data['original_compound'] = fbmn_data['original_compound'].str.strip().replace(r'^\s*$', None, regex=True)
 
-def get_magi2_compound_input(
-    fbmn_results_dir: str,
-    polarity: str,
-    output_dir: str,
-    compound_filename: str = None,
-    overwrite: bool = False
-) -> str | None:
+#     # Check that smiles is valid to get mol object with rdkit
+#     keep_smiles = []
+#     for smiles in list(fbmn_data['original_compound']):
+#         if pd.isna(smiles):
+#             continue
+#         smiles_str = str(smiles)
+#         mol = Chem.MolFromSmiles(smiles_str)
+#         if mol is not None:
+#             keep_smiles.append(smiles_str)
+#     fbmn_data = fbmn_data[fbmn_data['original_compound'].isin(keep_smiles)]
+
+#     fbmn_data.to_csv(fbmn_output_filename, index=False)
+    
+#     return
+
+# def convert_nucleotides_to_amino_acids(
+#     input_fasta: str
+# ) -> list:
+#     """
+#     Convert nucleotide FASTA sequences to amino acid sequences.
+
+#     Args:
+#         input_fasta (str): Path to nucleotide FASTA file.
+
+#     Returns:
+#         list: List of SeqRecord objects with amino acid sequences.
+#     """
+
+#     amino_acid_sequences = []
+    
+#     if input_fasta.endswith('.gz'):
+#         open_func = gzip.open
+#     else:
+#         open_func = open
+    
+#     with open_func(input_fasta, 'rt') as in_handle:
+#         for record in SeqIO.parse(in_handle, "fasta"):
+#             amino_acid_seq = record.seq.translate()
+#             amino_acid_seq = amino_acid_seq.replace('*', '')
+#             new_record = record[:]
+#             new_record.seq = amino_acid_seq
+#             amino_acid_sequences.append(new_record)
+    
+#     log.info(f"\tConverted nucleotide -> amino acid sequences.")
+#     return amino_acid_sequences
+
+# ====================================
+# Functional Enrichment
+# ====================================
+
+def perform_functional_enrichment(
+    node_table: pd.DataFrame,
+    annotation_column: str,
+    p_value_threshold: float = 0.05,
+    correction_method : str = "fdr_bh",
+    min_annotation_count: int = 1,
+    output_dir: str = None,
+    output_filename: str = "submodule_enrichment_results"
+) -> pd.DataFrame:
     """
-    Prepare the compound input file for MAGI2 from FBMN results.
-
-    Args:
-        fbmn_results_dir (str): Directory with FBMN results.
-        polarity (str): Polarity ('positive', 'negative', 'multipolarity').
-        output_dir (str): Output directory for MAGI2 compound file.
-        compound_filename (str, optional): Specific compound file to use.
-        overwrite (bool): Overwrite existing output if True.
-
-    Returns:
-        str or None: Path to the MAGI2 compound file, or None if not found.
+    Perform functional enrichment analysis of annotation terms in network submodules 
+    using Fisher's exact test, handling multiple annotations per node stored as 
+    double semicolon-separated strings.
     """
-
-    magi_output_filename = f"{output_dir}/magi2_compounds.txt"
-    if os.path.exists(magi_output_filename) and overwrite is False:
-        log.info(f"MAGI2 compounds file already exists: {magi_output_filename}. \nReturning this file.")
-        return magi_output_filename
     
-    if compound_filename is None:
-        log.info(f"Using the compound file(s) from fbmn results directory: {fbmn_results_dir}.")
-        try:
-            if polarity == "multipolarity":
-                compound_files = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*library-results.tsv"))
-                if compound_files:
-                    if len(compound_files) > 1:
-                        multipolarity_datasets = []
-                        for mx_data_file in compound_files:
-                            file_polarity = (
-                                "positive" if "positive" in mx_data_file 
-                                else "negative" if "negative" in mx_data_file 
-                                else "NO_POLARITY"
-                            )
-                            mx_dataset = pd.read_csv(mx_data_file, sep='\t')
-                            mx_data = mx_dataset.copy()
-                            mx_data["#Scan#"] = "mx_" + mx_data["#Scan#"].astype(str) + "_" + file_polarity
-                            multipolarity_datasets.append(mx_data)
-                        compound_data = pd.concat(multipolarity_datasets, axis=0)
-                    elif len(compound_files) == 1:
-                        log.info(f"Warning: Only single compound files found with polarity set to multipolarity.")
-                        compound_data = pd.read_csv(compound_files[0], sep='\t')
-            elif polarity in ["positive", "negative"]:
-                compound_file = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*{polarity}*library-results.tsv"))
-                if len(compound_file) > 1:
-                    log.info(f"Multiple compound files found: {compound_file}. \n\nPlease check {fbmn_results_dir} to verify and use the compound_filename argument.")
-                    return None
-                elif len(compound_file) == 0:
-                    log.info(f"No compound files found for {polarity} polarity.")
-                    return None
-                elif len(compound_file) == 1:
-                    compound_data = pd.read_csv(compound_file[0], sep='\t')
-                    compound_data["#Scan#"] = "mx_" + compound_data["#Scan#"].astype(str) + "_" + file_polarity
-                log.info(f"\nUsing metabolomics compound file at {compound_file}")
-        except Exception as e:
-            log.info(f"Compound file could not be read due to {e}")
-            return None
-    elif compound_filename is not None:
-        log.info(f"Using the provided compound file: {compound_filename}.")
-        if "csv" in compound_filename:
-            compound_data = pd.read_csv(compound_filename)
+    # Input validation
+    if annotation_column not in node_table.columns:
+        raise ValueError(f"Annotation column '{annotation_column}' not found in node table")
+    
+    if 'submodule' not in node_table.columns:
+        raise ValueError("Node table must contain 'submodule' column")
+    
+    log.info(f"Performing enrichment analysis on annotation column: '{annotation_column}'")
+    
+    # Flatten annotations from semicolon-separated strings to individual rows
+    annotation_rows = []
+    for idx, row in node_table.iterrows():
+        node_id = row.name if row.name is not None else idx
+        submodule = row['submodule']
+        annotations_str = row[annotation_column]
+        
+        # Handle case where annotations are stored as semicolon-separated strings
+        if pd.isna(annotations_str) or annotations_str in ['Unassigned', 'NA', '']:
+            annotation_list = []
         else:
-            compound_data = pd.read_csv(compound_filename, sep='\t')
-
-    log.info("\tConverting to MAGI2 input format.")
-    fbmn_data = compound_data.rename(columns={"Smiles": 'original_compound'})
-    fbmn_data['original_compound'] = fbmn_data['original_compound'].str.strip().replace(r'^\s*$', None, regex=True)
-
-    # Check that smiles is valid to get mol object with rdkit
-    keep_smiles = []
-    for smiles in list(fbmn_data['original_compound']):
-        if pd.isna(smiles):
-            continue
-        smiles_str = str(smiles)
-        mol = Chem.MolFromSmiles(smiles_str)
-        if mol is not None:
-            keep_smiles.append(smiles_str)
+            # Split on double semicolons and clean up
+            annotation_list = [ann.strip() for ann in str(annotations_str).split(';;') 
+                             if ann.strip() and ann.strip() not in ['Unassigned', 'NA', '']]
+        
+        # Create a row for each annotation
+        if annotation_list:
+            for annotation in annotation_list:
+                annotation_rows.append({
+                    'node_id': node_id,
+                    'submodule': submodule,
+                    'annotation': annotation
+                })
+        else:
+            # Keep track of nodes without annotations for background calculation
+            annotation_rows.append({
+                'node_id': node_id,
+                'submodule': submodule,
+                'annotation': None
+            })
     
-    fbmn_data = fbmn_data[fbmn_data['original_compound'].isin(keep_smiles)]
-    magi2_output = fbmn_data[['original_compound']].dropna().drop_duplicates()
-
-    magi2_output.to_csv(magi_output_filename, index=False)
+    if not annotation_rows:
+        log.warning("No annotation data found for enrichment analysis")
+        return pd.DataFrame()
     
-    return magi_output_filename
-
-def summarize_fbmn_results(
-    fbmn_results_dir: str,
-    polarity: str,
-    overwrite: bool = False
-) -> None:
-    """
-    Summarize FBMN results and export a cleaned compound table.
-
-    Args:
-        fbmn_results_dir (str): Directory with FBMN results.
-        polarity (str): Polarity ('positive', 'negative', 'multipolarity').
-        overwrite (bool): Overwrite existing output if True.
-
-    Returns:
-        None
-    """
-
-    fbmn_output_filename = f"{fbmn_results_dir}/fbmn_compounds.csv"
-    if os.path.exists(fbmn_output_filename) and overwrite is False:
-        log.info(f"FBMN output summary already exists: {fbmn_output_filename}. Not overwriting.")
-        return
+    # Convert to DataFrame for easier manipulation
+    flat_annotations = pd.DataFrame(annotation_rows)
     
-    log.info(f"Summarizing FBMN file {fbmn_output_filename}.")
-    try:
-        if polarity == "multipolarity":
-            compound_files = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*library-results.tsv"))
-            if compound_files:
-                if len(compound_files) > 1:
-                    multipolarity_datasets = []
-                    for mx_data_file in compound_files:
-                        file_polarity = (
-                            "positive" if "positive" in mx_data_file 
-                            else "negative" if "negative" in mx_data_file 
-                            else "NO_POLARITY"
-                        )
-                        mx_dataset = pd.read_csv(mx_data_file, sep='\t')
-                        mx_data = mx_dataset.copy()
-                        mx_data["#Scan#"] = "mx_" + mx_data["#Scan#"].astype(str) + "_" + file_polarity
-                        multipolarity_datasets.append(mx_data)
-                    fbmn_summary = pd.concat(multipolarity_datasets, axis=0)
-                elif len(compound_files) == 1:
-                    log.info(f"Warning: Only single compound files found with polarity set to multipolarity.")
-                    fbmn_summary = pd.read_csv(compound_files[0], sep='\t')
-        elif polarity in ["positive", "negative"]:
-            compound_file = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*{polarity}*library-results.tsv"))
-            if len(compound_file) > 1:
-                log.info(f"Multiple compound files found: {compound_file}. \n\nPlease check {fbmn_results_dir} to verify and use the compound_filename argument.")
-                return None
-            elif len(compound_file) == 0:
-                log.info(f"No compound files found for {polarity} polarity.")
-                return None
-            elif len(compound_file) == 1:
-                fbmn_summary = pd.read_csv(compound_file[0], sep='\t')
-                fbmn_summary["#Scan#"] = "mx_" + fbmn_summary["#Scan#"].astype(str) + "_" + file_polarity
-            log.info(f"\nUsing metabolomics compound file at {compound_file}")
-    except Exception as e:
-        log.info(f"Compound file could not be read due to {e}")
-        return None
-
-    log.info("\tConverting FBMN outputs to summary format.")
-    fbmn_data = fbmn_summary.rename(columns={"Smiles": 'original_compound'})
-    fbmn_data['original_compound'] = fbmn_data['original_compound'].str.strip().replace(r'^\s*$', None, regex=True)
-
-    # Check that smiles is valid to get mol object with rdkit
-    keep_smiles = []
-    for smiles in list(fbmn_data['original_compound']):
-        if pd.isna(smiles):
-            continue
-        smiles_str = str(smiles)
-        mol = Chem.MolFromSmiles(smiles_str)
-        if mol is not None:
-            keep_smiles.append(smiles_str)
-    fbmn_data = fbmn_data[fbmn_data['original_compound'].isin(keep_smiles)]
-
-    fbmn_data.to_csv(fbmn_output_filename, index=False)
+    # Remove rows with no annotations for the enrichment test
+    valid_annotations = flat_annotations[flat_annotations['annotation'].notna()].copy()
     
-    return
-
-def convert_nucleotides_to_amino_acids(
-    input_fasta: str
-) -> list:
-    """
-    Convert nucleotide FASTA sequences to amino acid sequences.
-
-    Args:
-        input_fasta (str): Path to nucleotide FASTA file.
-
-    Returns:
-        list: List of SeqRecord objects with amino acid sequences.
-    """
-
-    amino_acid_sequences = []
+    if valid_annotations.empty:
+        log.warning("No valid annotations found after filtering")
+        return pd.DataFrame()
     
-    if input_fasta.endswith('.gz'):
-        open_func = gzip.open
+    # Filter annotations by minimum count AND require > 1 total occurrence
+    annotation_counts = valid_annotations['annotation'].value_counts()
+    valid_annotation_terms = annotation_counts[
+        (annotation_counts >= min_annotation_count) & (annotation_counts > 1)
+    ].index.tolist()
+    
+    if not valid_annotation_terms:
+        log.warning(f"No annotations meet minimum count threshold of {min_annotation_count} and >1 total occurrence")
+        return pd.DataFrame()
+    
+    valid_annotations = valid_annotations[valid_annotations['annotation'].isin(valid_annotation_terms)]
+    
+    log.info(f"Testing {len(valid_annotation_terms)} unique annotation terms")
+    log.info(f"Testing {len(valid_annotations['submodule'].unique())} submodules")
+    
+    # Get background: all nodes that have at least one valid annotation
+    background_nodes = set(valid_annotations['node_id'].unique())
+    total_nodes_in_network_with_annotations = len(background_nodes)
+    
+    # Also calculate total nodes in network (for reference)
+    total_nodes_in_network = len(node_table)
+    
+    # Store results
+    results = []
+    
+    # For each annotation term and each submodule, perform Fisher's exact test
+    for annotation in valid_annotation_terms:
+        # Get all nodes with this annotation (across all submodules)
+        nodes_with_annotation = set(
+            valid_annotations[valid_annotations['annotation'] == annotation]['node_id'].unique()
+        )
+        nodes_with_annotation_total = len(nodes_with_annotation)
+        
+        for submodule in valid_annotations['submodule'].unique():
+            # Get all nodes in this submodule (that have any valid annotation)
+            nodes_in_submodule_with_annotations = set(
+                valid_annotations[valid_annotations['submodule'] == submodule]['node_id'].unique()
+            )
+            total_nodes_in_submodule_with_annotations = len(nodes_in_submodule_with_annotations)
+            
+            # Also calculate total nodes in submodule (for reference)
+            total_nodes_in_submodule = len(node_table[node_table['submodule'] == submodule])
+            
+            # Create 2x2 contingency table
+            # Rows: [in_submodule, not_in_submodule] 
+            # Cols: [has_annotation, no_annotation]
+            
+            nodes_with_annotation_in_submodule = len(
+                nodes_with_annotation & nodes_in_submodule_with_annotations
+            )
+            
+            # Skip if this submodule has ≤1 nodes with this annotation
+            if nodes_with_annotation_in_submodule <= 1:
+                continue
+            
+            nodes_without_annotation_in_submodule = (
+                total_nodes_in_submodule_with_annotations - nodes_with_annotation_in_submodule
+            )
+            
+            nodes_with_annotation_not_in_submodule = (
+                nodes_with_annotation_total - nodes_with_annotation_in_submodule  
+            )
+            
+            nodes_without_annotation_not_in_submodule = (
+                total_nodes_in_network_with_annotations - total_nodes_in_submodule_with_annotations - nodes_with_annotation_not_in_submodule
+            )
+            
+            # Build contingency table
+            contingency_table = np.array([
+                [nodes_with_annotation_in_submodule, nodes_without_annotation_in_submodule],
+                [nodes_with_annotation_not_in_submodule, nodes_without_annotation_not_in_submodule]
+            ])
+            
+            # Calculate expected count under null hypothesis (using annotated nodes only)
+            expected_count = (total_nodes_in_submodule_with_annotations * nodes_with_annotation_total) / total_nodes_in_network_with_annotations
+            
+            # Calculate fold enrichment
+            if expected_count > 0:
+                fold_enrichment = nodes_with_annotation_in_submodule / expected_count
+            else:
+                fold_enrichment = np.inf if nodes_with_annotation_in_submodule > 0 else 0
+            
+            # Perform Fisher's exact test (one-tailed, testing for enrichment)
+            try:
+                odds_ratio, p_value = fisher_exact(contingency_table, alternative='greater')
+            except Exception as e:
+                log.warning(f"Fisher's exact test failed for {annotation} in {submodule}: {e}")
+                odds_ratio, p_value = np.nan, 1.0
+            
+            # Store results with both reference and actual test values
+            results.append({
+                'annotation_term': annotation,
+                'submodule': submodule,
+                'annotation_term_nodes_submodule': nodes_with_annotation_in_submodule,
+                'annotation_term_nodes_total': nodes_with_annotation_total,
+                # Reference values (total nodes including unannotated)
+                'all_nodes_submodule': total_nodes_in_submodule,
+                'all_nodes_total': total_nodes_in_network,
+                # Actual test values (annotated nodes only)
+                'annotated_nodes_submodule': total_nodes_in_submodule_with_annotations,
+                'annotated_nodes_total': total_nodes_in_network_with_annotations,
+                'expected_count': expected_count,
+                'fold_enrichment': fold_enrichment,
+                'odds_ratio': odds_ratio,
+                'p_value': p_value
+            })
+    
+    if not results:
+        log.warning("No enrichment tests were performed after filtering")
+        return pd.DataFrame()
+    
+    # Convert to DataFrame
+    results_df = pd.DataFrame(results)
+    
+    # Apply p-value correction
+    valid_pvals = ~(results_df['p_value'].isna() | np.isinf(results_df['p_value']))
+    
+    if valid_pvals.sum() > 0:
+        pval_results = multipletests(
+            results_df.loc[valid_pvals, 'p_value'], 
+            method=correction_method, 
+            alpha=p_value_threshold
+        )
+        
+        results_df['p_value_corr'] = np.nan
+        results_df.loc[valid_pvals, 'p_value_corr'] = pval_results[1]
+        results_df['significant'] = False
+        results_df.loc[valid_pvals, 'significant'] = pval_results[0]
     else:
-        open_func = open
+        results_df['p_value_corr'] = np.nan
+        results_df['significant'] = False
+
+    # Sort by corrected p-value, then by fold enrichment
+    results_df = results_df.sort_values(['p_value_corr', 'fold_enrichment'], ascending=[True, False])
+
+    # Summary statistics
+    n_significant = results_df['significant'].sum()
+    n_total_tests = len(results_df)
     
-    with open_func(input_fasta, 'rt') as in_handle:
-        for record in SeqIO.parse(in_handle, "fasta"):
-            amino_acid_seq = record.seq.translate()
-            amino_acid_seq = amino_acid_seq.replace('*', '')
-            new_record = record[:]
-            new_record.seq = amino_acid_seq
-            amino_acid_sequences.append(new_record)
+    log.info(f"Enrichment analysis complete:")
+    log.info(f"  Total tests performed: {n_total_tests}")
+    log.info(f"  Significant enrichments (< {p_value_threshold}): {n_significant}")
+    log.info(f"  Background: {total_nodes_in_network_with_annotations}/{total_nodes_in_network} nodes with annotations")
     
-    log.info(f"\tConverted nucleotide -> amino acid sequences.")
-    return amino_acid_sequences
+    # Save results if output directory provided
+    if output_dir:
+        write_integration_file(
+            data=results_df,
+            output_dir=output_dir, 
+            filename=output_filename,
+            indexing=False
+        )
+    
+    return results_df
 
 # ====================================
 # Output functions

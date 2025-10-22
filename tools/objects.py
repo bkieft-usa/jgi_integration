@@ -502,7 +502,8 @@ class Dataset(BaseDataHandler):
             'devarianced_data': 'devarianced_data.csv',
             'scaled_data': 'scaled_data.csv',
             'normalized_data': 'normalized_data.csv',
-            'pca_grid': 'pca_grid.pdf'
+            'pca_grid': 'pca_grid.pdf',
+            'annotation_map': 'annotation_map.csv'
         }
         for attr, filename in manual_file_storage.items():
             setattr(self, f"_{attr}_filename", filename)
@@ -557,6 +558,9 @@ class Dataset(BaseDataHandler):
             }
             call_params.update(kwargs)
             result = hlp.filter_data(**call_params)
+            if result.empty:
+                log.error(f"Filtering resulted in empty dataset for {self.dataset_name}. Please adjust filtering parameters.")
+                sys.exit(1)
             self.filtered_data = result
         
         if show_progress:
@@ -586,6 +590,9 @@ class Dataset(BaseDataHandler):
             call_params.update(kwargs)
 
             result = hlp.devariance_data(**call_params)
+            if result.empty:
+                log.error(f"Devariancing resulted in empty dataset for {self.dataset_name}. Please adjust devariancing parameters.")
+                sys.exit(1)
             self.devarianced_data = result
 
         if show_progress:
@@ -615,6 +622,9 @@ class Dataset(BaseDataHandler):
             call_params.update(kwargs)
             
             result = hlp.scale_data(**call_params)
+            if result.empty:
+                log.error(f"Scaling resulted in empty dataset for {self.dataset_name}. Please adjust scaling parameters.")
+                sys.exit(1)
             self.scaled_data = result
 
         if show_progress:
@@ -646,6 +656,9 @@ class Dataset(BaseDataHandler):
             call_params.update(kwargs)
             
             result = hlp.remove_low_replicable_features(**call_params)
+            if result.empty:
+                log.error(f"Replicability filtering resulted in empty dataset for {self.dataset_name}. Please adjust replicability parameters.")
+                sys.exit(1)
             self.normalized_data = result
 
         if show_progress:
@@ -702,7 +715,8 @@ manual_file_storage = {
     'devarianced_data': 'devarianced_data.csv',
     'scaled_data': 'scaled_data.csv',
     'normalized_data': 'normalized_data.csv',
-    'pca_grid': 'pca_grid.pdf'
+    'pca_grid': 'pca_grid.pdf',
+    'annotation_map': 'annotation_map.csv'
 }
 #for attr in config['datasets']['file_storage']:
 for attr, filename in manual_file_storage.items():
@@ -717,12 +731,13 @@ class MX(Dataset):
         self.polarity = self.dataset_config['polarity']
         self.mode = "untargeted" # Currently only untargeted supported, not configurable
         self.datatype = "peak-height" # Currently only peak-height supported, not configurable
-        self.get_raw_metadata(overwrite=overwrite, show_progress=False)
-        self.get_raw_data(overwrite=overwrite, show_progress=False)
+        self._get_raw_metadata(overwrite=overwrite, show_progress=False)
+        self._get_raw_data(overwrite=overwrite, show_progress=False)
+        self._generate_annotation_map(overwrite=overwrite, show_progress=False)
         if last:
             self._complete_tracking('create_datasets')
 
-    def get_raw_data(self, overwrite: bool = False, show_progress: bool = True) -> None:
+    def _get_raw_data(self, overwrite: bool = False, show_progress: bool = True) -> None:
         def _get_data_method():
             log.info("Getting Raw Data (MX)")
             if self.check_and_load_attribute('raw_data', self._raw_data_filename, overwrite):
@@ -738,6 +753,9 @@ class MX(Dataset):
                 datatype=self.datatype,
                 filtered_mx=False,
             )
+            if result.empty:
+                log.error(f"No data found for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
+                sys.exit(1)
             self.raw_data = result
             log.info(f"\tCreated raw data for MX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.\n")
         
@@ -750,7 +768,7 @@ class MX(Dataset):
             _get_data_method()
             return
 
-    def get_raw_metadata(self, overwrite: bool = False, show_progress: bool = True) -> None:
+    def _get_raw_metadata(self, overwrite: bool = False, show_progress: bool = True) -> None:
         def _get_metadata_method():
             log.info("Getting Raw Metadata (MX)")
             if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, overwrite):
@@ -789,6 +807,9 @@ class MX(Dataset):
                 chromatography=self.chromatography,
                 polarity=self.polarity
             )
+            if result.empty:
+                log.error(f"No metadata found for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
+                sys.exit(1)
             self.raw_metadata = result
             log.info(f"\tCreated raw metadata for MX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.\n")
         
@@ -801,6 +822,37 @@ class MX(Dataset):
             _get_metadata_method()
             return
 
+    def _generate_annotation_map(self, overwrite: bool = False, show_progress: bool = True) -> None:
+        """Generate metabolite ID to annotation mapping table for metabolomics data."""
+        def _generate_annotation_method():
+            log.info("Generating Metabolite Annotation Mapping")
+            if self.check_and_load_attribute('annotation_map', self._annotation_map_filename, overwrite):
+                log.info(f"\tAnnotation mapping with {self.annotation_map.shape[0]} rows and {self.annotation_map.shape[1]} columns.")
+                return
+            
+            call_params = {
+                'raw_data': self.raw_data,
+                'dataset_raw_dir': self.dataset_raw_dir,
+                'polarity': self.polarity,
+                'output_dir': self.output_dir,
+                'output_filename': self._annotation_map_filename
+            }
+
+            result = hlp.generate_mx_annotation_map(**call_params)
+            if result.empty:
+                log.error(f"No annotation mapping generated for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
+                sys.exit(1)
+            self.annotation_map = result
+
+        if show_progress:
+            self.workflow_tracker.set_current_step('generate_annotation_map')
+            _generate_annotation_method()
+            self._complete_tracking('generate_annotation_map')
+            return
+        else:
+            _generate_annotation_method()
+            return
+
 class TX(Dataset):
     """Transcriptomics dataset with specific configuration."""
     def __init__(self, project: Project, overwrite: bool = False, last: bool = False):
@@ -809,12 +861,13 @@ class TX(Dataset):
         self.index = 1 # Currently only index 1 supported, not configurable
         self.apid = None
         self.datatype = "counts" # Currently only counts supported, not configurable
-        self.get_raw_metadata(overwrite=overwrite, show_progress=False)
-        self.get_raw_data(overwrite=overwrite, show_progress=False)
+        self._get_raw_metadata(overwrite=overwrite, show_progress=False)
+        self._get_raw_data(overwrite=overwrite, show_progress=False)
+        self._generate_annotation_map(overwrite=overwrite, show_progress=False)
         if last:
             self._complete_tracking('create_datasets')
 
-    def get_raw_data(self, overwrite: bool = False, show_progress: bool = True) -> None:
+    def _get_raw_data(self, overwrite: bool = False, show_progress: bool = True) -> None:
         def _get_data_method():
             log.info("Getting Raw Data (TX)")
             if self.check_and_load_attribute('raw_data', self._raw_data_filename, overwrite):
@@ -828,6 +881,9 @@ class TX(Dataset):
                 type=self.datatype,
                 overwrite=overwrite
             )
+            if result.empty:
+                log.error(f"No data found for TX dataset. Please check your raw data files.")
+                sys.exit(1)
             self.raw_data = result
             log.info(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.\n")
 
@@ -840,7 +896,7 @@ class TX(Dataset):
             _get_data_method()
             return
 
-    def get_raw_metadata(self, overwrite: bool = False, show_progress: bool = True) -> None:
+    def _get_raw_metadata(self, overwrite: bool = False, show_progress: bool = True) -> None:
         def _get_metadata_method():
             log.info("Getting Raw Metadata (TX)")
             if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, overwrite):
@@ -880,6 +936,9 @@ class TX(Dataset):
                 apid=str(self.apid),
                 overwrite=overwrite
             )
+            if result.empty:
+                log.error(f"No metadata found for TX dataset. Please check your raw data files.")
+                sys.exit(1)
             self.raw_metadata = result
             log.info(f"\tCreated raw metadata for TX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.\n")
 
@@ -890,6 +949,36 @@ class TX(Dataset):
             return
         else:
             _get_metadata_method()
+            return
+
+    def _generate_annotation_map(self, overwrite: bool = False, show_progress: bool = True) -> None:
+        """Generate gene ID to GO annotation mapping table for transcriptomics data."""
+        def _generate_annotation_method():
+            log.info("Generating Gene-GO Annotation Mapping")
+            if self.check_and_load_attribute('annotation_map', self._annotation_map_filename, overwrite):
+                log.info(f"\tAnnotation mapping with {self.annotation_map.shape[0]} rows and {self.annotation_map.shape[1]} columns.")
+                return
+            
+            call_params = {
+                'raw_data': self.raw_data,
+                'dataset_raw_dir': self.dataset_raw_dir,
+                'output_dir': self.output_dir,
+                'output_filename': self._annotation_map_filename
+            }
+
+            result = hlp.generate_tx_annotation_map(**call_params)
+            if result.empty:
+                log.error(f"No annotation mapping generated for TX dataset. Please check your raw data files.")
+                sys.exit(1)
+            self.annotation_map = result
+
+        if show_progress:
+            self.workflow_tracker.set_current_step('generate_annotation_map')
+            _generate_annotation_method()
+            self._complete_tracking('generate_annotation_map')
+            return
+        else:
+            _generate_annotation_method()
             return
 
 class Analysis(BaseDataHandler):
@@ -905,7 +994,7 @@ class Analysis(BaseDataHandler):
         self.metadata_link_script = self.project.project_config['metadata_link']
 
         # Check if analysis directory exists
-        analysis_outdir = self.set_up_analysis_outdir(self.project, self.datasets_config, 
+        analysis_outdir = self._set_up_analysis_outdir(self.project, self.datasets_config, 
                                                       self.analysis_config, overwrite=overwrite)
         self.output_dir = analysis_outdir
         os.makedirs(self.output_dir, exist_ok=True)
@@ -923,7 +1012,7 @@ class Analysis(BaseDataHandler):
         self._complete_tracking('create_analysis')
 
     @staticmethod
-    def set_up_analysis_outdir(project: Project, datasets_config: dict, analysis_config: dict, overwrite: bool = False) -> str:
+    def _set_up_analysis_outdir(project: Project, datasets_config: dict, analysis_config: dict, overwrite: bool = False) -> str:
         """Check if the Analysis output directory already exists."""
         analysis_dir = os.path.join(
             project.project_dir,
@@ -955,6 +1044,7 @@ class Analysis(BaseDataHandler):
             'feature_network_graph': 'feature_network_graph.graphml',
             'feature_network_edge_table': 'feature_network_edge_table.csv',
             'feature_network_node_table': 'feature_network_node_table.csv',
+            'functional_enrichment_table': 'functional_enrichment_table.csv',
             'mofa_model': 'mofa_model.hdf5',
         }
         for attr, filename in manual_file_storage.items():
@@ -1094,6 +1184,9 @@ class Analysis(BaseDataHandler):
             
             # Set results back to datasets
             for ds in self.datasets:
+                if linked_metadata[ds.dataset_name].empty:
+                    log.error(f"Linking metadata resulted in empty table for {ds.dataset_name}. Please check your metadata linking script and input metadata files.")
+                    sys.exit(1)
                 ds.linked_metadata = linked_metadata[ds.dataset_name]
                 log.info(f"Created linked_metadata for {ds.dataset_name} with {ds.linked_metadata.shape[0]} samples and {ds.linked_metadata.shape[1]} metadata fields.\n")
 
@@ -1130,6 +1223,9 @@ class Analysis(BaseDataHandler):
 
             # Set results back to datasets
             for ds in self.datasets:
+                if linked_data[ds.dataset_name].empty:
+                    log.error(f"Linking data resulted in empty table for {ds.dataset_name}. Please check your datasets and linked metadata.")
+                    sys.exit(1)
                 ds.linked_data = linked_data[ds.dataset_name]
                 log.info(f"Created linked_data for {ds.dataset_name} with {ds.linked_data.shape[1]} samples and {ds.linked_data.shape[0]} features.\n")
 
@@ -1179,6 +1275,9 @@ class Analysis(BaseDataHandler):
                 output_filename=self._integrated_metadata_filename,
                 output_dir=self.output_dir
             )
+            if result.empty:
+                log.error(f"Integrating metadata resulted in empty table. Please check your datasets and linked metadata.")
+                sys.exit(1)
             self.integrated_metadata = result
             log.info(f"Created a single integrated metadata table with {self.integrated_metadata.shape[0]} samples and {self.integrated_metadata.shape[1]} metadata fields.\n")
 
@@ -1205,6 +1304,9 @@ class Analysis(BaseDataHandler):
                 output_filename=self._integrated_data_filename,
                 output_dir=self.output_dir
             )
+            if result.empty:
+                log.error(f"Integrating data resulted in empty table. Please check your datasets and linked data.")
+                sys.exit(1)
             self.integrated_data = result
             log.info(f"Created a single integrated data table with {self.integrated_data.shape[0]} samples and {self.integrated_data.shape[1]} features.\n")
 
@@ -1215,6 +1317,36 @@ class Analysis(BaseDataHandler):
             return
         else:
             _integrate_data_method()
+            return
+
+    def annotate_integrated_features(self, overlap_only: bool = True, overwrite: bool = False, show_progress: bool = False) -> pd.DataFrame:       
+        """Hybrid: Class orchestration + external annotate_integrated_features function."""
+        def _annotate_integrated_features_method():
+            log.info("Annotating integrated features")
+            if self.check_and_load_attribute('feature_annotation_table', self._feature_annotation_table_filename, overwrite):
+                log.info(f"\tAnnotated features object 'feature_annotation_table' with {self.feature_annotation_table.shape[0]} features and {self.feature_annotation_table.shape[1]} samples.")
+                return
+            
+            annotation_df = hlp.annotate_integrated_features(
+                integrated_data=self.integrated_data,
+                datasets=self.datasets,
+                output_dir=self.output_dir,
+                output_filename=self._feature_annotation_table_filename,
+            )
+
+            if annotation_df.empty:
+                log.error(f"Annotating integrated features resulted in empty table. Please check your datasets and annotation maps.")
+                sys.exit(1)
+            self.feature_annotation_table = annotation_df
+            log.info(f"Created an annotated integrated features table with {self.feature_annotation_table.shape[0]} entries ({len(self.feature_annotation_table['feature_id'].unique())} unique features) and {self.feature_annotation_table.shape[1]} samples.\n")
+
+        if show_progress:
+            self.workflow_tracker.set_current_step('annotate_integrated_features')
+            _annotate_integrated_features_method()
+            self._complete_tracking('annotate_integrated_features')
+            return
+        else:
+            _annotate_integrated_features_method()
             return
 
     def perform_feature_selection(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
@@ -1237,6 +1369,10 @@ class Analysis(BaseDataHandler):
             call_params.update(kwargs)
 
             result = hlp.perform_feature_selection(**call_params)
+
+            if result.empty:
+                log.error(f"Feature selection resulted in empty table. Please check your integrated data and feature selection parameters.")
+                sys.exit(1)
             self.integrated_data_selected = result
             log.info(f"Created a subset of the integrated data with {self.integrated_data_selected.shape[0]} samples and {self.integrated_data_selected.shape[1]} features for network analysis.\n")
 
@@ -1259,7 +1395,6 @@ class Analysis(BaseDataHandler):
             
             # Get parameters from config with defaults
             correlation_params = self.analysis_parameters.get('correlation', {})
-            networking_params = self.analysis_parameters.get('networking', {})        
             call_params = {
                 'data': self.integrated_data_selected,
                 'output_filename': self._feature_correlation_table_filename,
@@ -1270,11 +1405,15 @@ class Analysis(BaseDataHandler):
                 'keep_negative': correlation_params.get('keep_negative', False),
                 'block_size': correlation_params.get('block_size', 500),
                 'n_jobs': correlation_params.get('cores', -1),
-                'only_bipartite': networking_params.get('network_mode', 'bipartite') == 'bipartite'
+                'corr_mode': correlation_params.get('corr_mode', 'bipartite')
             }
             call_params.update(kwargs)
             
             result = hlp.calculate_correlated_features(**call_params)
+
+            if result.empty:
+                log.error(f"Calculating correlated features resulted in empty table. Please check your integrated data and correlation parameters.")
+                sys.exit(1)
             self.feature_correlation_table = result
             log.info(f"Created a feature correlation table with {self.feature_correlation_table.shape[0]} feature pairs.\n")
 
@@ -1304,7 +1443,6 @@ class Analysis(BaseDataHandler):
                 hlp.clear_directory(submodule_dir)
 
             networking_params = self.analysis_parameters.get('networking', {})
-            correlation_params = self.analysis_parameters.get('correlation', {})
             output_filenames = {
                 'graph': os.path.join(network_dir, self._feature_network_graph_filename),
                 'node_table': os.path.join(network_dir, self._feature_network_node_table_filename),
@@ -1314,22 +1452,27 @@ class Analysis(BaseDataHandler):
 
             call_params = {
                 'corr_table': self.feature_correlation_table,
-                'feature_prefixes': [ds.dataset_name + "_" for ds in self.datasets],
+                'datasets': self.datasets,
                 'integrated_data': self.integrated_data_selected,
                 'integrated_metadata': self.integrated_metadata,
                 'output_filenames': output_filenames,
-                'annotation_df': getattr(self, 'feature_annotation_table', None),
-                'network_mode': networking_params.get('network_mode', 'bipartite'),
+                'annotation_df': self.feature_annotation_table,
                 'submodule_mode': networking_params.get('submodule_mode', 'community'),
                 'show_plot': networking_params.get('interactive_plot', False),
                 'interactive_layout': networking_params.get('interactive_layout', None),
-                'corr_cutoff': correlation_params.get('corr_cutoff', 0.5),
                 'wgcna_params': networking_params.get('wgcna_params', {"beta": 5, "min_module_size": 10, "distance_cutoff": 0.25})
             }
             call_params.update(kwargs)
             
-            hlp.plot_correlation_network(**call_params)
-            log.info("Created correlation network graph and associated node/edge tables.\n")
+            node_table, edge_table = hlp.plot_correlation_network(**call_params)
+
+            if node_table.empty or edge_table.empty:
+                log.error(f"Plotting correlation network resulted in empty node/edge tables. Please check your correlation table and networking parameters.")
+                sys.exit(1)
+            else:
+                log.info("Created correlation network graph and associated node/edge tables.")
+            self.feature_network_node_table = node_table
+            self.feature_network_edge_table = edge_table
 
         if show_progress:
             self.workflow_tracker.set_current_step('plot_correlation_network')
@@ -1338,6 +1481,46 @@ class Analysis(BaseDataHandler):
             return
         else:
             _network_method()
+            return
+
+    def perform_functional_enrichment(self, overwrite: bool = False, show_progress: bool = False, **kwargs) -> None:
+        """Hybrid: Class parameter setup + external hlp.perform_functional_enrichment function."""
+        def _enrichment_method():
+            log.info("Performing functional enrichment test on network submodules")
+            if self.check_and_load_attribute('functional_enrichment_table', self._functional_enrichment_table_filename, overwrite):
+                log.info(f"\tFunctional enrichment table object 'functional_enrichment_table' with {self.functional_enrichment_table.shape[0]} functional categories.")
+                return
+
+            networking_params = self.analysis_parameters.get('networking', {})
+            if networking_params.get('submodule_mode', 'community') == 'none':
+                log.warning("Submodule mode is set to 'none'; skipping functional enrichment analysis.")
+                return
+            functional_enrichment_params = self.analysis_parameters.get('functional_enrichment', {})
+            call_params = {
+                'node_table': self.feature_network_node_table,
+                'annotation_column': functional_enrichment_params.get('annotation_column', None),
+                'p_value_threshold': functional_enrichment_params.get('pvalue_cutoff', 0.05),
+                'correction_method': functional_enrichment_params.get('correction_method', 'fdr_bh'),
+                'min_annotation_count': functional_enrichment_params.get('min_genes_per_term', 1),
+                'output_dir': os.path.join(self.output_dir, "feature_network"),
+                'output_filename': self._functional_enrichment_table_filename,
+            }
+            call_params.update(kwargs)
+            
+            enrichment_table = hlp.perform_functional_enrichment(**call_params)
+
+            if enrichment_table.empty:
+                log.error(f"Performing functional enrichment resulted in empty table. Please check your node table and enrichment parameters.")
+                sys.exit(1)
+            self.functional_enrichment_table = enrichment_table
+
+        if show_progress:
+            self.workflow_tracker.set_current_step('functional_enrichment')
+            _enrichment_method()
+            self._complete_tracking('functional_enrichment')
+            return
+        else:
+            _enrichment_method()
             return
 
     def run_mofa2_analysis(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
@@ -1387,6 +1570,7 @@ manual_file_storage = {
     'feature_network_graph': 'feature_network_graph.graphml',
     'feature_network_edge_table': 'feature_network_edge_table.csv',
     'feature_network_node_table': 'feature_network_node_table.csv',
+    'functional_enrichment_table': 'functional_enrichment_table.csv',
     'mofa_model': 'mofa_model.hdf5'
 }
 #for attr in config['analysis']['file_storage']:
