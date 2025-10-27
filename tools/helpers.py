@@ -1561,13 +1561,13 @@ def _annotate_and_save_submodules(
 def find_mx_parent_folder(
     pid: str,
     pi_name: str,
-    script_dir: str,
     mx_dir: str,
     polarity: str,
     datatype: str,
     chromatography: str,
     filtered_mx: bool = False,
-    overwrite: bool = False
+    overwrite: bool = False,
+    superuser: bool = False
 ) -> str:
     """
     Find the parent folder for metabolomics (MX) data on Google Drive using rclone.
@@ -1575,7 +1575,6 @@ def find_mx_parent_folder(
     Args:
         pid (str): Proposal ID.
         pi_name (str): PI name.
-        script_dir (str): Directory for scripts.
         mx_dir (str): Local MX data directory.
         polarity (str): Polarity ('positive', 'negative', 'multipolarity').
         datatype (str): Data type ('peak-height', 'peak-area', etc.).
@@ -1589,11 +1588,9 @@ def find_mx_parent_folder(
     
     if datatype == "peak-area":
         datatype = "quant"
-
     if filtered_mx and datatype == "quant":
         log.info("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
         return None
-    
     if polarity == "multipolarity":
         mx_data_pattern = f"{mx_dir}/*{chromatography}*/*_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*_{datatype}.csv"
     elif polarity in ["positive", "negative"]:
@@ -1601,14 +1598,19 @@ def find_mx_parent_folder(
     else:
         log.info(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
         return None
-
     if glob.glob(os.path.expanduser(mx_data_pattern)) and not overwrite:
         log.info("MX folder already downloaded and linked.")
         return None
     elif glob.glob(os.path.expanduser(mx_data_pattern)) and overwrite:
-        raise ValueError("You are not currently authorized to download or overwrite metabolomics data from source. Please contact your JGI project manager for access.")
+        if not superuser:
+            raise ValueError("You are not currently authorized to download or overwrite metabolomics data from source. Please contact your JGI project manager for access.")
+        elif superuser:
+            log.info("MX folder already downloaded and linked. Overwriting as per user request...")
     elif not glob.glob(os.path.expanduser(mx_data_pattern)):
-        raise ValueError("MX folder not found locally. Exiting...")
+        if not superuser:
+            raise ValueError("MX folder not found locally. Exiting...")
+        elif superuser:
+            log.info("MX folder not found locally. Proceeding to find and link MX data from Google Drive...")
 
     # Find project folder
     cmd = f"rclone lsd JGI_Metabolomics_Projects: | grep -E '{pid}|{pi_name}'"
@@ -1658,6 +1660,8 @@ def find_mx_parent_folder(
         else:
             final_results_folder = f"{untargeted_mx_final['parent_folder'].values[0]}/{untargeted_mx_final['folder'].values[0]}"
 
+        script_dir = f"{mx_dir}/scripts"
+        os.makedirs(script_dir, exist_ok=True)
         script_name = f"{script_dir}/find_mx_files.sh"
         with open(script_name, "w") as script_file:
             script_file.write(f"cd {script_dir}/\n")
@@ -1672,7 +1676,6 @@ def find_mx_parent_folder(
 
 def gather_mx_files(
     mx_untargeted_remote: str,
-    script_dir: str,
     mx_dir: str,
     polarity: str,
     datatype: str,
@@ -1686,7 +1689,6 @@ def gather_mx_files(
 
     Args:
         mx_untargeted_remote (str): Remote MX folder path.
-        script_dir (str): Directory for scripts.
         mx_dir (str): Local MX data directory.
         polarity (str): Polarity.
         datatype (str): Data type.
@@ -1701,11 +1703,9 @@ def gather_mx_files(
     
     if datatype == "peak-area":
         datatype = "quant"
-
     if filtered_mx and datatype == "quant":
         log.info("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
         return None
-
     if polarity == "multipolarity":
         mx_data_pattern = f"{mx_dir}/*{chromatography}*/*_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*_{datatype}.csv"
     elif polarity in ["positive", "negative"]:
@@ -1713,13 +1713,17 @@ def gather_mx_files(
     else:
         log.info(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
         return None
-
     if glob.glob(os.path.expanduser(mx_data_pattern)) and not overwrite:
         log.info("MX data already linked.")
         return "Archive already linked", "Archive already extracted"
     else:
-        raise ValueError("You are not currently authorized to download metabolomics data from source. Please contact your JGI project manager for access.")
+        if superuser:
+            log.info("You are a superuser. Proceeding with the download...")
+        else:
+            raise ValueError("You are not currently authorized to download metabolomics data from source. Please contact your JGI project manager for access.")
     
+    script_dir = f"{mx_dir}/scripts"
+    os.makedirs(script_dir, exist_ok=True)
     script_name = f"{script_dir}/gather_mx_files.sh"
     if chromatography == "C18":
         chromatography = "C18_" # This (hopefully) removes C18-Lipid
@@ -1775,17 +1779,16 @@ def extract_mx_archives(mx_dir: str, chromatography: str) -> pd.DataFrame:
 
 def find_tx_files(
     pid: str,
-    script_dir: str,
     tx_dir: str,
     tx_index: int,
-    overwrite: bool = False
+    overwrite: bool = False,
+    superuser: bool = False
 ) -> pd.DataFrame:
     """
     Find TX files for a project using JAMO report select.
 
     Args:
         pid (str): Proposal ID.
-        script_dir (str): Directory for scripts.
         tx_dir (str): TX data directory.
         tx_index (int): Index of analysis project to use.
         overwrite (bool): Overwrite existing results.
@@ -1794,13 +1797,18 @@ def find_tx_files(
         pd.DataFrame: DataFrame of TX file information.
     """
     
-    if os.path.exists(f"{tx_dir}/tx_files.txt") and overwrite is False:
+    if os.path.exists(f"{tx_dir}/all_tx_portal_files.txt") and overwrite is False:
         log.info("TX files already found.")
         return pd.DataFrame()
     else:
-        raise ValueError("You are not currently authorized to download transcriptomics data from source. Please contact your JGI project manager for access.")
+        if superuser:
+            log.info("You are a superuser. Proceeding with finding TX files...")
+        else:
+            raise ValueError("You are not currently authorized to download transcriptomics data from source. Please contact your JGI project manager for access.")
     
-    file_list = f"{tx_dir}/tx_files.txt"
+    file_list = f"{tx_dir}/all_tx_portal_files.txt"
+    script_dir = f"{tx_dir}/scripts"
+    os.makedirs(script_dir, exist_ok=True)
     script_name = f"{script_dir}/find_tx_files.sh"
 
     if not os.path.exists(os.path.dirname(file_list)):
@@ -1859,7 +1867,7 @@ def find_tx_files(
     
     if files.shape[0] > 0:
         log.info(f"Using the value of 'tx_index' ({tx_index}) from the config file to choose the correct 'ix' column (change if incorrect): \n")
-        files.to_csv(f"{tx_dir}/jamo_report_tx_files.txt", sep="\t", index=False)
+        files.to_csv(f"{tx_dir}/all_tx_portal_files.txt", sep="\t", index=False)
         display(files)
         return files
     else:
@@ -1869,7 +1877,6 @@ def find_tx_files(
 def gather_tx_files(
     file_list: pd.DataFrame,
     tx_index: int = None,
-    script_dir: str = None,
     tx_dir: str = None,
     overwrite: bool = False
 ) -> str:
@@ -1879,7 +1886,6 @@ def gather_tx_files(
     Args:
         file_list (pd.DataFrame): DataFrame of TX file information.
         tx_index (int): Index of analysis project to use.
-        script_dir (str): Directory for scripts.
         tx_dir (str): TX data directory.
         overwrite (bool): Overwrite existing results.
 
@@ -1887,13 +1893,16 @@ def gather_tx_files(
         str: Analysis project ID (APID).
     """
 
-    if glob.glob(f"{tx_dir}/*counts.txt") and os.path.exists(f"{tx_dir}/tx_files.txt") and overwrite is False:
+    if glob.glob(f"{tx_dir}/*counts.txt") and os.path.exists(f"{tx_dir}/all_tx_portal_files.txt") and overwrite is False:
         log.info("TX files already linked.")
-        tx_files = pd.read_csv(f"{tx_dir}/jamo_report_tx_files.txt", sep="\t")
+        tx_files = pd.read_csv(f"{tx_dir}/all_tx_portal_files.txt", sep="\t")
         apid = int(tx_files.iloc[tx_index-1:,2].values)
         return apid
     else:
-        raise ValueError("You are not currently authorized to download transcriptomics data from source. Please contact your JGI project manager for access.")
+        if superuser:
+            log.info("You are a superuser. Proceeding with linking TX files...")
+        else:
+            raise ValueError("You are not currently authorized to download transcriptomics data from source. Please contact your JGI project manager for access.")
 
 
     if tx_index is None:
@@ -1901,6 +1910,8 @@ def gather_tx_files(
         log.info("Please set 'tx_index' in the project config file by choosing the correct row from the table above.\n")
         sys.exit(1)
 
+    script_dir = f"{tx_dir}/scripts"
+    os.makedirs(script_dir, exist_ok=True)
     script_name = f"{script_dir}/gather_tx_files.sh"
     log.info("Linking TX files...\n")
 
@@ -1963,6 +1974,7 @@ def get_mx_data(
     polarity: str,
     datatype: str = "peak-height",
     filtered_mx: bool = False,
+    superuser: bool = False,
 ) -> pd.DataFrame:
     """
     Load MX data from extracted files, optionally filtered.
@@ -1995,7 +2007,6 @@ def get_mx_data(
         return None
 
     mx_data_files = glob.glob(os.path.expanduser(mx_data_pattern))
-    
     if mx_data_files:
         if len(mx_data_files) > 1:
             multipolarity_datasets = []
@@ -2046,7 +2057,8 @@ def get_mx_data(
             return None
 
     else:
-        log.info(f"MX data file matching pattern {mx_data_pattern} not found.")
+        log.warning(f"MX data file matching pattern {mx_data_pattern} not found.")
+        log.warning("Have you run _get_raw_metadata() to extract the MX data files?")
         return None
 
 def get_mx_metadata(
@@ -2076,7 +2088,7 @@ def get_mx_metadata(
     elif polarity in ["positive", "negative"]:
         mx_metadata_pattern = f"{input_dir}/*{chromatography}*/*{polarity}_metadata.tab"
         mx_metadata_files = glob.glob(os.path.expanduser(mx_metadata_pattern))
-    
+
     if mx_metadata_files:
         if len(mx_metadata_files) > 1:
             multiploarity_metadata = []
@@ -2150,7 +2162,8 @@ def get_tx_data(
         #display(tx_data.head())
         return tx_data
     else:
-        log.info(f"TX data file matching pattern {tx_data_pattern} not found.")
+        log.warning(f"TX data file matching pattern {tx_data_pattern} not found.")
+        log.warning("Have you run _get_raw_metadata() to link the TX data files?")
         return None
     
 def get_tx_metadata(
@@ -2158,7 +2171,8 @@ def get_tx_metadata(
     output_dir: str,
     proposal_ID: str,
     apid: str,
-    overwrite: bool = False
+    overwrite: bool = False,
+    superuser: bool = False
 ) -> pd.DataFrame:
     """
     Extract TX metadata using JAMO report select.
@@ -2179,8 +2193,11 @@ def get_tx_metadata(
         tx_metadata = pd.read_csv(f"{output_dir}/portal_metadata.csv")
         return tx_metadata
     else:
-        log.info(f"Source file {output_dir}/portal_metadata.csv does not exist.")
-        raise ValueError("You are not currently authorized to download transcriptomics metadata from source. Please contact your JGI project manager for access.")
+        if superuser:
+            log.info("You are a superuser. Proceeding with pulling TX metadata from source...")
+        else:
+            log.info(f"Source file {output_dir}/portal_metadata.csv does not exist.")
+            raise ValueError("You are not currently authorized to download transcriptomics metadata from source. Please contact your JGI project manager for access.")
 
     myfields = [
         "metadata.proposal_id",

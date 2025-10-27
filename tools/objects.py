@@ -724,15 +724,15 @@ for attr, filename in manual_file_storage.items():
 
 class MX(Dataset):
     """Metabolomics dataset with specific configuration."""
-    def __init__(self, project: Project, overwrite: bool = False, last: bool = False):
+    def __init__(self, project: Project, overwrite: bool = False, last: bool = False, superuser: bool = False):
         super().__init__("mx", project, overwrite)
         self.workflow_tracker = self.project.workflow_tracker
         self.chromatography = self.dataset_config['chromatography']
         self.polarity = self.dataset_config['polarity']
         self.mode = "untargeted" # Currently only untargeted supported, not configurable
         self.datatype = "peak-height" # Currently only peak-height supported, not configurable
-        self._get_raw_metadata(overwrite=overwrite, show_progress=False)
-        self._get_raw_data(overwrite=overwrite, show_progress=False)
+        self._get_raw_metadata(overwrite=overwrite, show_progress=False, superuser=superuser)
+        self._get_raw_data(overwrite=overwrite, show_progress=False, superuser=superuser)
         self._generate_annotation_map(overwrite=overwrite, show_progress=False)
         if last:
             self._complete_tracking('create_datasets')
@@ -768,7 +768,7 @@ class MX(Dataset):
             _get_data_method()
             return
 
-    def _get_raw_metadata(self, overwrite: bool = False, show_progress: bool = True) -> None:
+    def _get_raw_metadata(self, overwrite: bool = False, show_progress: bool = True, superuser: bool = False) -> None:
         def _get_metadata_method():
             log.info("Getting Raw Metadata (MX)")
             if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, overwrite):
@@ -780,25 +780,25 @@ class MX(Dataset):
                 mx_parent_folder = hlp.find_mx_parent_folder(
                     pid=self.project.proposal_ID,
                     pi_name=self.project.PI_name,
-                    script_dir=self.project.script_dir,
                     mx_dir=self.dataset_raw_dir,
                     polarity=self.polarity,
                     datatype=self.datatype,
                     chromatography=self.chromatography,
                     filtered_mx=False,
-                    overwrite=overwrite
+                    overwrite=overwrite,
+                    superuser=superuser
                 )
                 if mx_parent_folder:
-                    hlp.gather_mx_files(
+                    archives = hlp.gather_mx_files(
                         mx_untargeted_remote=mx_parent_folder,
-                        script_dir=self.project.script_dir,
                         mx_dir=self.dataset_raw_dir,
                         polarity=self.polarity,
                         datatype=self.datatype,
                         chromatography=self.chromatography,
                         filtered_mx=False,
                         extract=True,
-                        overwrite=overwrite
+                        overwrite=overwrite,
+                        superuser=superuser
                     )
             result = hlp.get_mx_metadata(
                 output_filename=self._raw_metadata_filename,
@@ -855,14 +855,14 @@ class MX(Dataset):
 
 class TX(Dataset):
     """Transcriptomics dataset with specific configuration."""
-    def __init__(self, project: Project, overwrite: bool = False, last: bool = False):
+    def __init__(self, project: Project, overwrite: bool = False, last: bool = False, superuser: bool = False):
         super().__init__("tx", project, overwrite)
         self.workflow_tracker = self.project.workflow_tracker
         self.index = 1 # Currently only index 1 supported, not configurable
         self.apid = None
         self.datatype = "counts" # Currently only counts supported, not configurable
-        self._get_raw_metadata(overwrite=overwrite, show_progress=False)
-        self._get_raw_data(overwrite=overwrite, show_progress=False)
+        self._get_raw_metadata(overwrite=overwrite, show_progress=False, superuser=superuser)
+        self._get_raw_data(overwrite=overwrite, show_progress=False, superuser=superuser)
         self._generate_annotation_map(overwrite=overwrite, show_progress=False)
         if last:
             self._complete_tracking('create_datasets')
@@ -908,17 +908,17 @@ class TX(Dataset):
             if not os.path.exists(tx_files_path):
                 tx_files = hlp.find_tx_files(
                     pid=self.project.proposal_ID,
-                    script_dir=self.project.script_dir,
                     tx_dir=self.dataset_raw_dir,
                     tx_index=self.dataset_config['index'],
-                    overwrite=overwrite
+                    overwrite=overwrite,
+                    superuser=superuser
                 )
                 self.apid = hlp.gather_tx_files(
                     file_list=tx_files,
                     tx_index=self.dataset_config['index'],
-                    script_dir=self.project.script_dir,
                     tx_dir=self.dataset_raw_dir,
-                    overwrite=overwrite
+                    overwrite=overwrite,
+                    superuser=superuser
                 )
             else:
                 tx_files = pd.read_csv(tx_files_path, sep='\t')
@@ -934,7 +934,8 @@ class TX(Dataset):
                 output_dir=self.dataset_raw_dir,
                 proposal_ID=self.project.proposal_ID,
                 apid=str(self.apid),
-                overwrite=overwrite
+                overwrite=overwrite,
+                superuser=superuser
             )
             if result.empty:
                 log.error(f"No metadata found for TX dataset. Please check your raw data files.")
