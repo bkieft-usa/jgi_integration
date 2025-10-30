@@ -436,7 +436,7 @@ class BaseDataHandler:
 class Dataset(BaseDataHandler):
     """Simplified Dataset class using hybrid approach."""
 
-    def __init__(self, dataset_name: str, project: Project, overwrite: bool = False):
+    def __init__(self, dataset_name: str, project: Project, overwrite: bool = False, superuser: bool = False):
         self.project = project
         self.workflow_tracker = self.project.workflow_tracker
         self.workflow_tracker.set_current_step('create_datasets')
@@ -459,7 +459,7 @@ class Dataset(BaseDataHandler):
 
         # Configuration
         self.normalization_params = self.dataset_config.get('normalization_parameters', {})
-        self.annotation = self.dataset_config.get('annotation', {})
+        self.superuser = superuser
 
     def _complete_tracking(self, step_id: str):
         """Helper method to track workflow steps with after visualization."""
@@ -503,7 +503,7 @@ class Dataset(BaseDataHandler):
             'scaled_data': 'scaled_data.csv',
             'normalized_data': 'normalized_data.csv',
             'pca_grid': 'pca_grid.pdf',
-            'annotation_map': 'annotation_map.csv'
+            'annotation_table': 'annotation_table.csv'
         }
         for attr, filename in manual_file_storage.items():
             setattr(self, f"_{attr}_filename", filename)
@@ -716,7 +716,7 @@ manual_file_storage = {
     'scaled_data': 'scaled_data.csv',
     'normalized_data': 'normalized_data.csv',
     'pca_grid': 'pca_grid.pdf',
-    'annotation_map': 'annotation_map.csv'
+    'annotation_table': 'annotation_table.csv'
 }
 #for attr in config['datasets']['file_storage']:
 for attr, filename in manual_file_storage.items():
@@ -725,15 +725,15 @@ for attr, filename in manual_file_storage.items():
 class MX(Dataset):
     """Metabolomics dataset with specific configuration."""
     def __init__(self, project: Project, overwrite: bool = False, last: bool = False, superuser: bool = False):
-        super().__init__("mx", project, overwrite)
+        super().__init__("mx", project, overwrite, superuser)
         self.workflow_tracker = self.project.workflow_tracker
         self.chromatography = self.dataset_config['chromatography']
         self.polarity = self.dataset_config['polarity']
         self.mode = "untargeted" # Currently only untargeted supported, not configurable
         self.datatype = "peak-height" # Currently only peak-height supported, not configurable
         self._get_raw_metadata(overwrite=overwrite, show_progress=False, superuser=superuser)
-        self._get_raw_data(overwrite=overwrite, show_progress=False, superuser=superuser)
-        self._generate_annotation_map(overwrite=overwrite, show_progress=False)
+        self._get_raw_data(overwrite=overwrite, show_progress=False)
+        self._generate_annotation_table(overwrite=overwrite, show_progress=False)
         if last:
             self._complete_tracking('create_datasets')
 
@@ -822,12 +822,12 @@ class MX(Dataset):
             _get_metadata_method()
             return
 
-    def _generate_annotation_map(self, overwrite: bool = False, show_progress: bool = True) -> None:
+    def _generate_annotation_table(self, overwrite: bool = False, show_progress: bool = True) -> None:
         """Generate metabolite ID to annotation mapping table for metabolomics data."""
         def _generate_annotation_method():
             log.info("Generating Metabolite Annotation Mapping")
-            if self.check_and_load_attribute('annotation_map', self._annotation_map_filename, overwrite):
-                log.info(f"\tAnnotation mapping with {self.annotation_map.shape[0]} rows and {self.annotation_map.shape[1]} columns.")
+            if self.check_and_load_attribute('annotation_table', self._annotation_table_filename, overwrite):
+                log.info(f"\tAnnotation mapping with {self.annotation_table.shape[0]} rows and {self.annotation_table.shape[1]} columns.")
                 return
             
             call_params = {
@@ -835,19 +835,19 @@ class MX(Dataset):
                 'dataset_raw_dir': self.dataset_raw_dir,
                 'polarity': self.polarity,
                 'output_dir': self.output_dir,
-                'output_filename': self._annotation_map_filename
+                'output_filename': self._annotation_table_filename
             }
 
-            result = hlp.generate_mx_annotation_map(**call_params)
+            result = hlp.generate_mx_annotation_table(**call_params)
             if result.empty:
                 log.error(f"No annotation mapping generated for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
                 sys.exit(1)
-            self.annotation_map = result
+            self.annotation_table = result
 
         if show_progress:
-            self.workflow_tracker.set_current_step('generate_annotation_map')
+            self.workflow_tracker.set_current_step('generate_annotation_table')
             _generate_annotation_method()
-            self._complete_tracking('generate_annotation_map')
+            self._complete_tracking('generate_annotation_table')
             return
         else:
             _generate_annotation_method()
@@ -856,14 +856,15 @@ class MX(Dataset):
 class TX(Dataset):
     """Transcriptomics dataset with specific configuration."""
     def __init__(self, project: Project, overwrite: bool = False, last: bool = False, superuser: bool = False):
-        super().__init__("tx", project, overwrite)
+        super().__init__("tx", project, overwrite, superuser)
         self.workflow_tracker = self.project.workflow_tracker
         self.index = 1 # Currently only index 1 supported, not configurable
         self.apid = None
+        self.genome_type = self.project.config['project']['genome_type']
         self.datatype = "counts" # Currently only counts supported, not configurable
         self._get_raw_metadata(overwrite=overwrite, show_progress=False, superuser=superuser)
-        self._get_raw_data(overwrite=overwrite, show_progress=False, superuser=superuser)
-        self._generate_annotation_map(overwrite=overwrite, show_progress=False)
+        self._get_raw_data(overwrite=overwrite, show_progress=False)
+        self._generate_annotation_table(overwrite=overwrite, show_progress=False)
         if last:
             self._complete_tracking('create_datasets')
 
@@ -896,7 +897,7 @@ class TX(Dataset):
             _get_data_method()
             return
 
-    def _get_raw_metadata(self, overwrite: bool = False, show_progress: bool = True) -> None:
+    def _get_raw_metadata(self, overwrite: bool = False, show_progress: bool = True, superuser: bool = False) -> None:
         def _get_metadata_method():
             log.info("Getting Raw Metadata (TX)")
             if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, overwrite):
@@ -952,31 +953,32 @@ class TX(Dataset):
             _get_metadata_method()
             return
 
-    def _generate_annotation_map(self, overwrite: bool = False, show_progress: bool = True) -> None:
-        """Generate gene ID to GO annotation mapping table for transcriptomics data."""
+    def _generate_annotation_table(self, overwrite: bool = False, show_progress: bool = True) -> None:
+        """Generate gene annotation table for transcriptomics data."""
         def _generate_annotation_method():
-            log.info("Generating Gene-GO Annotation Mapping")
-            if self.check_and_load_attribute('annotation_map', self._annotation_map_filename, overwrite):
-                log.info(f"\tAnnotation mapping with {self.annotation_map.shape[0]} rows and {self.annotation_map.shape[1]} columns.")
+            log.info("Generating Gene Annotation Table")
+            if self.check_and_load_attribute('annotation_table', self._annotation_table_filename, overwrite):
+                log.info(f"\tAnnotation table with {self.annotation_table.shape[0]} rows and {self.annotation_table.shape[1]} columns.")
                 return
             
             call_params = {
                 'raw_data': self.raw_data,
-                'dataset_raw_dir': self.dataset_raw_dir,
+                'raw_data_dir': self.dataset_raw_dir,
+                'genome_type': self.genome_type,
                 'output_dir': self.output_dir,
-                'output_filename': self._annotation_map_filename
+                'output_filename': self._annotation_table_filename
             }
 
-            result = hlp.generate_tx_annotation_map(**call_params)
+            result = hlp.generate_tx_annotation_table(**call_params)
             if result.empty:
-                log.error(f"No annotation mapping generated for TX dataset. Please check your raw data files.")
+                log.error(f"No annotation table generated for TX dataset. Please check your raw data files.")
                 sys.exit(1)
-            self.annotation_map = result
+            self.annotation_table = result
 
         if show_progress:
-            self.workflow_tracker.set_current_step('generate_annotation_map')
+            self.workflow_tracker.set_current_step('generate_annotation_table')
             _generate_annotation_method()
-            self._complete_tracking('generate_annotation_map')
+            self._complete_tracking('generate_annotation_table')
             return
         else:
             _generate_annotation_method()

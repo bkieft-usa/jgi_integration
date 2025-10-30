@@ -1235,7 +1235,7 @@ def plot_correlation_network(
     behavioural change is the expanded ``submodule_mode`` options.
     
     datasets : List, optional
-        List of dataset objects with annotation_map attributes
+        List of dataset objects with annotation_table attributes
     """
 
     # Get all unique features
@@ -2266,41 +2266,451 @@ def get_tx_metadata(
 # Feature annotation functions
 # ====================================
 
-def generate_tx_annotation_map(
-    raw_data: pd.DataFrame, 
-    dataset_raw_dir: str, 
-    output_dir: str, 
+def generate_tx_annotation_table(
+    raw_data: pd.DataFrame,
+    raw_data_dir: str,
+    genome_type: str,
+    output_dir: str,
     output_filename: str,
-    overwrite: bool = False
 ) -> pd.DataFrame:
     """
-    Generate gene ID to GO annotation mapping table AND MAGI2 sequence input for transcriptomics data.
+    Generate a merged gene annotation table from multiple annotation files.
     
     Args:
-        raw_data: Raw transcriptomics data DataFrame with GeneID column
-        dataset_raw_dir: Directory containing GO annotation, GFF files, and sequence files
-        output_dir: Output directory for saving annotation map
-        output_filename: Filename for saving the annotation map
-        overwrite: Overwrite existing output if True
+        raw_data (pd.DataFrame): Raw transcriptomics data with gene IDs as index
+        raw_data_dir (str): Directory containing annotation table files
+        genome_type (str): Type of genome - "microbe", "algal", "metagenome", or "plant"
+        output_dir (str): Output directory for saving the merged annotation table
+        output_filename (str): Filename for the output annotation table
     
     Returns:
-        pd.DataFrame: annotation_mapping_df
+        pd.DataFrame: Merged annotation table with gene_oid and annotation columns
     """
+    
+    if genome_type == "microbe":
+        annotation_df = _process_microbe_annotations(raw_data_dir, output_dir, output_filename)
+    elif genome_type == "algal":
+        annotation_df = _process_algal_annotations(raw_data_dir, output_dir, output_filename)
+    elif genome_type == "metagenome":
+        log.info(f"Annotation processing for '{genome_type}' genome type is not yet implemented.")
+        empty_df = pd.DataFrame(columns=['gene_oid'])
+        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
+        return empty_df
+    elif genome_type == "plant":
+        log.info(f"Annotation processing for '{genome_type}' genome type is not yet implemented.")
+        empty_df = pd.DataFrame(columns=['gene_oid'])
+        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
+        return empty_df
+    else:
+        raise ValueError(f"Invalid genome_type '{genome_type}'. Must be one of: 'microbe', 'algal', 'metagenome', 'plant'")
 
-    # Get file paths from configuration
-    go_annotation_file = os.path.join(dataset_raw_dir, "go_annotation_table.tsv")
-    gff_file = os.path.join(dataset_raw_dir, "genes.gff3")
+    if not raw_data.empty and not annotation_df.empty:
+        _validate_annotation_gene_ids(annotation_df, raw_data)
+    else:
+        raise ValueError("Either input raw_data or computed annotation_df is empty. Cannot validate gene IDs.")
+
+    return annotation_df
+
+def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.DataFrame) -> None:
+    """
+    Validate that gene IDs in annotation table match those in raw data.
     
-    if not os.path.exists(go_annotation_file) or not os.path.exists(gff_file):
-        raise ValueError("GO annotation file and GFF file paths must be valid and exist to generate annotation map.")
+    Args:
+        annotation_df (pd.DataFrame): Annotation table with gene_oid column
+        raw_data (pd.DataFrame): Raw transcriptomics data with gene IDs as index
+    """
     
-    # Get gene IDs from raw data
-    gene_ids = set(raw_data['GeneID'].unique())
-    log.info(f"Found {len(gene_ids)} genes in raw data")
+    # If "tx_" prefix is used in raw data, ensure annotation gene IDs also have it
+    if all(str(gid).startswith('tx_') for gid in raw_data.index):
+        if not all(str(gid).startswith('tx_') for gid in annotation_df['gene_oid']):
+            annotation_df['gene_oid'] = annotation_df['gene_oid'].apply(lambda x: f'tx_{x}')
+
+    # Get gene IDs from both datasets
+    raw_data_genes = set(raw_data.index.tolist())
+    annotation_genes = set(annotation_df['gene_oid'].tolist())
     
-    # Parse GFF3 file to create gene_id -> protein_id mapping
-    log.info("Parsing GFF3 file for gene-protein mappings...")
-    gene_to_protein = {}
+    # Calculate overlap statistics
+    common_genes = raw_data_genes.intersection(annotation_genes)
+    raw_only = raw_data_genes - annotation_genes
+    annotation_only = annotation_genes - raw_data_genes
+    
+    # Log validation results
+    log.info(f"Gene ID Validation Results:")
+    log.info(f"  Raw data genes: {len(raw_data_genes)}")
+    log.info(f"  Annotation genes: {len(annotation_genes)}")
+    log.info(f"  Common genes: {len(common_genes)} ({len(common_genes)/len(raw_data_genes)*100:.1f}% of raw data)")
+    log.info(f"  Raw data only: {len(raw_only)}")
+    log.info(f"  Annotation only: {len(annotation_only)}")
+    
+    # Warn if low overlap
+    overlap_pct = len(common_genes) / len(raw_data_genes) * 100
+    if overlap_pct < 50:
+        log.warning(f"Low gene ID overlap ({overlap_pct:.1f}%) between raw data and annotations")
+    
+    # Show examples of mismatched IDs if any
+    if raw_only:
+        log.info(f"  Example raw data genes without annotations: {list(raw_only)[:5]}")
+    if annotation_only:
+        log.info(f"  Example annotation genes not in raw data: {list(annotation_only)[:5]}")
+
+def _process_microbe_annotations(
+    raw_data_dir: str,
+    output_dir: str,
+    output_filename: str
+) -> pd.DataFrame:
+    """
+    Process microbe annotation files and merge into a single table.
+    
+    Args:
+        raw_data_dir (str): Directory containing annotation files
+        output_dir (str): Output directory
+        output_filename (str): Output filename
+        
+    Returns:
+        pd.DataFrame: Merged annotation table
+    """
+    
+    log.info(f"Processing microbe annotations from {raw_data_dir}")
+    
+    # Find all annotation table files
+    annotation_files = glob.glob(os.path.join(raw_data_dir, "*_annotation_table.tsv"))
+    
+    if not annotation_files:
+        log.warning(f"No *_annotation_table.tsv files found in {raw_data_dir}")
+        empty_df = pd.DataFrame(columns=['gene_oid'])
+        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
+        return empty_df
+    
+    log.info(f"Found {len(annotation_files)} annotation files:")
+    for file in annotation_files:
+        log.info(f"  {os.path.basename(file)}")
+    
+    # Process each annotation file
+    processed_dfs = []
+    for file_path in annotation_files:
+        df = _read_and_select_microbe_annotations(file_path)
+        if df is not None and not df.empty:
+            agg_df = _aggregate_gene_annotations(df)
+            processed_dfs.append(agg_df)
+            log.info(f"  Processed {os.path.basename(file_path)}: {len(agg_df)} genes")
+        else:
+            log.warning(f"  Skipped {os.path.basename(file_path)}: no valid data")
+    
+    if not processed_dfs:
+        log.warning("No valid annotation data found in any files")
+        empty_df = pd.DataFrame(columns=['gene_oid'])
+        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
+        return empty_df
+    
+    # Merge all annotation dataframes
+    from functools import reduce
+    merged_df = reduce(
+        lambda left, right: pd.merge(left, right, on='gene_oid', how='outer'), 
+        processed_dfs
+    )
+    
+    # Fill NaN values with empty strings for consistency
+    merged_df = merged_df.fillna('')
+    
+    # Add protein ID mapping from GFF3 file if available
+    merged_df = _add_protein_id_mapping(merged_df, raw_data_dir, "microbe")
+    
+    # Compress the dataframe to ensure one gene per row with semicolon-separated annotations
+    final_df = _compress_annotation_table(merged_df)
+    
+    log.info(f"Final annotation table: {len(final_df)} genes with {len(final_df.columns)} annotation columns")
+    
+    # Save the merged annotation table
+    write_integration_file(final_df, output_dir, output_filename, indexing=False)
+    
+    return final_df
+
+def _aggregate_gene_annotations(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate microbe annotations by gene_oid, handling multiple annotations per gene.
+    
+    Args:
+        df (pd.DataFrame): Annotation dataframe with gene_oid column
+        
+    Returns:
+        pd.DataFrame: Aggregated dataframe with one row per gene_oid
+    """
+    
+    def join_unique_values(series):
+        """Join unique non-empty values with double semicolon"""
+        unique_vals = sorted({
+            str(x).strip() for x in series.dropna() 
+            if str(x).strip() and str(x).strip().lower() not in ['nan', 'none', '']
+        })
+        return ';;'.join(unique_vals) if unique_vals else ''
+    
+    # Group by gene_oid and aggregate all other columns
+    annotation_columns = [col for col in df.columns if col != 'gene_oid']
+    
+    # Group by gene_oid and aggregate
+    aggregated_df = df.groupby('gene_oid')[annotation_columns].agg(join_unique_values).reset_index()
+    
+    return aggregated_df
+
+def _process_algal_annotations(
+    raw_data_dir: str,
+    output_dir: str,
+    output_filename: str
+) -> pd.DataFrame:
+    """
+    Process algal annotation files and merge into a single table.
+    
+    Args:
+        raw_data_dir (str): Directory containing annotation files
+        output_dir (str): Output directory
+        output_filename (str): Output filename
+        
+    Returns:
+        pd.DataFrame: Merged annotation table
+    """
+    
+    log.info(f"Processing algal annotations from {raw_data_dir}")
+    
+    # Find all annotation table files
+    annotation_files = glob.glob(os.path.join(raw_data_dir, "*_annotation_table.tsv"))
+    
+    if not annotation_files:
+        log.warning(f"No *_annotation_table.tsv files found in {raw_data_dir}")
+        empty_df = pd.DataFrame(columns=['gene_oid'])
+        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
+        return empty_df
+    
+    log.info(f"Found {len(annotation_files)} annotation files:")
+    for file in annotation_files:
+        log.info(f"  {os.path.basename(file)}")
+    
+    # Process each annotation file
+    processed_dfs = []
+    for file_path in annotation_files:
+        df = _read_and_select_algal_annotations(file_path)
+        if df is not None and not df.empty:
+            agg_df = _aggregate_algal_annotations(df)
+            processed_dfs.append(agg_df)
+            log.info(f"  Processed {os.path.basename(file_path)}: {len(agg_df)} proteins")
+        else:
+            log.warning(f"  Skipped {os.path.basename(file_path)}: no valid data")
+    
+    if not processed_dfs:
+        log.warning("No valid annotation data found in any files")
+        empty_df = pd.DataFrame(columns=['gene_oid'])
+        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
+        return empty_df
+    
+    # Merge all annotation dataframes based on protein_id
+    from functools import reduce
+    merged_df = reduce(
+        lambda left, right: pd.merge(left, right, on='protein_id', how='outer'), 
+        processed_dfs
+    )
+    
+    # Fill NaN values with empty strings for consistency
+    merged_df = merged_df.fillna('')
+    
+    # Add gene_oid mapping from GFF3 file (protein_id -> gene_oid)
+    merged_df = _add_gene_id_mapping(merged_df, raw_data_dir, "algal")
+    
+    # Compress the dataframe to ensure one gene per row with semicolon-separated annotations
+    final_df = _compress_annotation_table(merged_df)
+    
+    log.info(f"Final annotation table: {len(final_df)} genes with {len(final_df.columns)} annotation columns")
+    
+    # Save the merged annotation table
+    write_integration_file(final_df, output_dir, output_filename, indexing=False)
+    
+    return final_df
+
+def _read_and_select_microbe_annotations(file_path: str) -> pd.DataFrame:
+    """
+    Read and select relevant columns from microbe annotation files.
+    
+    Args:
+        file_path (str): Path to annotation file
+        
+    Returns:
+        pd.DataFrame: Processed annotation dataframe
+    """
+    
+    try:
+        df = pd.read_csv(file_path, sep='\t')
+        
+        # Determine annotation type based on filename
+        filename = os.path.basename(file_path)
+        
+        if 'cog_annotation_table' in filename:
+            # Select gene_oid and COG annotation columns
+            selected_cols = ['gene_oid', 'cog_id', 'cog_name']
+            df = df[selected_cols].copy()
+            df.rename(columns={'cog_id': 'cog_acc', 'cog_name': 'cog_desc'}, inplace=True)
+            
+        elif 'ipr_annotation_table' in filename:
+            # Select gene_oid and InterPro annotation columns
+            selected_cols = ['gene_oid', 'iprid', 'iprdesc']
+            df = df[selected_cols].copy()
+            df.rename(columns={'iprid': 'ipr_acc', 'iprdesc': 'ipr_desc'}, inplace=True)
+            
+        elif 'kegg_annotation_table' in filename:
+            # Select gene_oid and KEGG annotation columns
+            selected_cols = ['gene_oid', 'ko_id', 'ko_name']
+            df = df[selected_cols].copy()
+            df.rename(columns={'ko_id': 'kegg_acc', 'ko_name': 'kegg_desc'}, inplace=True)
+            
+        elif 'pfam_annotation_table' in filename:
+            # Select gene_oid and Pfam annotation columns
+            selected_cols = ['gene_oid', 'pfam_id', 'pfam_name']
+            df = df[selected_cols].copy()
+            df.rename(columns={'pfam_id': 'pfam_acc', 'pfam_name': 'pfam_desc'}, inplace=True)
+            
+        elif 'tigrfam_annotation_table' in filename:
+            # Select gene_oid and TIGRFam annotation columns
+            selected_cols = ['gene_oid', 'tigrfam_id', 'tigrfam_name']
+            df = df[selected_cols].copy()
+            df.rename(columns={'tigrfam_id': 'tigrfam_acc', 'tigrfam_name': 'tigrfam_desc'}, inplace=True)
+            
+        else:
+            log.warning(f"Unknown annotation file type: {filename}")
+            return None
+            
+        return df
+        
+    except Exception as e:
+        log.warning(f"Error reading file {file_path}: {e}")
+        return None
+
+def _read_and_select_algal_annotations(file_path: str) -> pd.DataFrame:
+    """
+    Read and select relevant columns from algal annotation files.
+    
+    Args:
+        file_path (str): Path to annotation file
+        
+    Returns:
+        pd.DataFrame: Processed annotation dataframe
+    """
+    
+    try:
+        df = pd.read_csv(file_path, sep='\t')
+        
+        # Determine annotation type based on filename
+        filename = os.path.basename(file_path)
+        
+        if 'go_annotation_table' in filename:
+            # Select proteinId and GO annotation columns
+            selected_cols = ['#proteinId', 'gotermId', 'goName', 'gotermType', 'goAcc']
+            df = df[selected_cols].copy()
+            df.rename(columns={
+                '#proteinId': 'protein_id',
+                'gotermId': 'go_id',
+                'goName': 'go_name',
+                'gotermType': 'go_type',
+                'goAcc': 'go_acc'
+            }, inplace=True)
+            
+        elif 'ipr_annotation_table' in filename:
+            # Select proteinId and InterPro annotation columns
+            selected_cols = ['#proteinId', 'iprId', 'iprDesc']
+            df = df[selected_cols].copy()
+            df.rename(columns={
+                '#proteinId': 'protein_id',
+                'iprId': 'ipr_acc',
+                'iprDesc': 'ipr_desc'
+            }, inplace=True)
+            
+        elif 'kegg_annotation_table' in filename:
+            # Select proteinId and KEGG annotation columns
+            selected_cols = ['#proteinId', 'ecNum', 'definition']
+            df = df[selected_cols].copy()
+            df.rename(columns={
+                '#proteinId': 'protein_id',
+                'ecNum': 'kegg_acc',
+                'definition': 'kegg_desc'
+            }, inplace=True)
+            
+        elif 'kog_annotation_table' in filename:
+            # Select proteinId and KOG annotation columns
+            selected_cols = ['proteinId', 'kogid', 'kogdefline']
+            df = df[selected_cols].copy()
+            df.rename(columns={
+                'proteinId': 'protein_id',
+                'kogid': 'kog_acc',
+                'kogdefline': 'kog_desc'
+            }, inplace=True)
+            
+        else:
+            log.warning(f"Unknown annotation file type: {filename}")
+            return None
+            
+        return df
+        
+    except Exception as e:
+        log.warning(f"Error reading file {file_path}: {e}")
+        return None
+
+def _aggregate_algal_annotations(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate algal annotations by protein_id, handling multiple annotations per protein.
+    
+    Args:
+        df (pd.DataFrame): Annotation dataframe with protein_id column
+        
+    Returns:
+        pd.DataFrame: Aggregated dataframe with one row per protein_id
+    """
+    
+    def join_unique_values(series):
+        """Join unique non-empty values with double semicolon"""
+        unique_vals = sorted({
+            str(x).strip() for x in series.dropna() 
+            if str(x).strip() and str(x).strip().lower() not in ['nan', 'none', '']
+        })
+        return ';;'.join(unique_vals) if unique_vals else ''
+    
+    # Group by protein_id and aggregate all other columns
+    annotation_columns = [col for col in df.columns if col != 'protein_id']
+    
+    # Group by protein_id and aggregate
+    aggregated_df = df.groupby('protein_id')[annotation_columns].agg(join_unique_values).reset_index()
+    
+    return aggregated_df
+
+def _add_gene_id_mapping(
+    merged_df: pd.DataFrame,
+    raw_data_dir: str,
+    genome_type: str
+) -> pd.DataFrame:
+    """
+    Add gene_oid mapping from GFF3 file to the merged annotation table for algal genomes.
+    Maps protein_id to gene_oid.
+    
+    Args:
+        merged_df (pd.DataFrame): Merged annotation dataframe with protein_id
+        raw_data_dir (str): Directory containing GFF3 file
+        genome_type (str): Genome type
+        
+    Returns:
+        pd.DataFrame: Annotation dataframe with gene_oid column added
+    """
+    
+    # Look for GFF3 file in the raw data directory
+    gff_files = glob.glob(os.path.join(raw_data_dir, "*.gff3"))
+    if not gff_files:
+        gff_files = glob.glob(os.path.join(raw_data_dir, "genes.gff3"))
+    
+    if not gff_files:
+        log.warning("No GFF3 file found for gene ID mapping")
+        # Create gene_oid from protein_id if no GFF3 found
+        merged_df['gene_oid'] = merged_df['protein_id']
+        return merged_df
+    
+    gff_file = gff_files[0]  # Use first GFF3 file found
+    log.info(f"Adding gene ID mapping from {os.path.basename(gff_file)}")
+    
+    # Parse GFF3 file to create protein_id -> gene_id mapping
+    protein_to_gene = {}
     
     with open(gff_file, 'r') as f:
         for line in f:
@@ -2316,79 +2726,132 @@ def generate_tx_annotation_map(
                 if not gene_match:
                     continue
                 gene_id = gene_match.group(1)
-                if not gene_id.startswith('tx_'):
-                    gene_id = f"tx_{gene_id}"
                 
                 # Extract protein ID
                 protein_match = re.search(r'proteinId=([^;]+)', attributes)
                 if protein_match:
-                    protein_id = int(protein_match.group(1))
+                    protein_id = protein_match.group(1)
+                    protein_to_gene[protein_id] = gene_id
+    
+    log.info(f"Found {len(protein_to_gene)} protein-to-gene mappings")
+    
+    # Add gene_oid column to merged_df
+    merged_df['gene_oid'] = merged_df['protein_id'].map(protein_to_gene).fillna(merged_df['protein_id'])
+    
+    return merged_df
+
+def _add_protein_id_mapping(
+    merged_df: pd.DataFrame,
+    raw_data_dir: str,
+    genome_type: str
+) -> pd.DataFrame:
+    """
+    Add protein ID mapping from GFF3 file to the merged annotation table.
+    
+    Args:
+        merged_df (pd.DataFrame): Merged annotation dataframe
+        raw_data_dir (str): Directory containing GFF3 file
+        genome_type (str): Genome type ("microbe", "algal", etc.)
+        
+    Returns:
+        pd.DataFrame: Annotation dataframe with protein ID column added
+    """
+    
+    # Look for GFF3 file in the raw data directory
+    gff_files = glob.glob(os.path.join(raw_data_dir, "*.gff3"))
+    if not gff_files:
+        gff_files = glob.glob(os.path.join(raw_data_dir, "genes.gff3"))
+    
+    if not gff_files:
+        log.warning("No GFF3 file found for protein ID mapping")
+        merged_df['protein_id'] = ''
+        return merged_df
+    
+    gff_file = gff_files[0]  # Use first GFF3 file found
+    log.info(f"Adding protein ID mapping from {os.path.basename(gff_file)}")
+    
+    # Parse GFF3 file to create gene_id -> protein_id mapping
+    gene_to_protein = {}
+    
+    with open(gff_file, 'r') as f:
+        for line in f:
+            if line.startswith('#') or line.strip() == '':
+                continue
+                
+            fields = line.strip().split('\t')
+            if len(fields) < 9:
+                continue
+            
+            # Set feature type and protein attribute based on genome type
+            if genome_type == "algal":
+                feature_type = 'gene'
+                protein_attribute = 'proteinId'
+            elif genome_type == "microbe":
+                feature_type = 'CDS'
+                protein_attribute = 'locus_tag'
+            else:
+                # For other genome types, try gene first, then CDS
+                feature_type = 'gene'
+                protein_attribute = 'proteinId'
+            
+            if fields[2] == feature_type:
+                attributes = fields[8]
+                
+                # Extract gene ID
+                gene_match = re.search(r'ID=([^;]+)', attributes)
+                if not gene_match:
+                    continue
+                gene_id = gene_match.group(1)
+                
+                # Extract protein ID using the appropriate attribute
+                protein_id = None
+                pattern = rf"{re.escape(protein_attribute)}=([^;]+)"
+                protein_match = re.search(pattern, attributes)
+                if protein_match:
+                    protein_id = protein_match.group(1)
+                
+                if protein_id:
                     gene_to_protein[gene_id] = protein_id
     
     log.info(f"Found {len(gene_to_protein)} gene-to-protein mappings")
     
-    # Load GO annotations
-    log.info("Loading GO annotations...")
-    go_df = pd.read_csv(go_annotation_file, sep='\t')
-    if '#proteinId' in go_df.columns:
-        go_df.rename(columns={'#proteinId': 'proteinId'}, inplace=True)
-    log.info(f"Found {len(go_df)} GO annotations for {go_df['proteinId'].nunique()} proteins")
+    # Add protein_id column to merged_df
+    merged_df['protein_id'] = merged_df['gene_oid'].map(gene_to_protein).fillna('')
     
-    # Create the mapping table
-    log.info("Creating gene-GO mapping table...")
-    mapping_records = []
-    
-    for gene_id in gene_ids:
-        if gene_id in gene_to_protein:
-            protein_id = gene_to_protein[gene_id]
-            
-            # Get all GO annotations for this protein
-            protein_annotations = go_df[go_df['proteinId'] == protein_id]
-            
-            if len(protein_annotations) > 0:
-                for _, annotation in protein_annotations.iterrows():
-                    mapping_records.append({
-                        'gene_id': str(gene_id),
-                        'protein_id': str(protein_id),
-                        'goterm_id': int(annotation['gotermId']),
-                        'goterm_name': str(annotation['goName']),
-                        'goterm_type': str(annotation['gotermType']),
-                        'goterm_acc': str(annotation['goAcc'])
-                    })
-            else:
-                # Gene has protein mapping but no GO annotations
-                mapping_records.append({
-                    'gene_id': gene_id,
-                    'protein_id': protein_id,
-                    'goterm_id': None,
-                    'goterm_name': None,
-                    'goterm_type': None,
-                    'goterm_acc': None
-                })
-        else:
-            # Gene has no protein mapping
-            mapping_records.append({
-                'gene_id': gene_id,
-                'protein_id': None,
-                'goterm_id': None,
-                'goterm_name': None,
-                'goterm_type': None,
-                'goterm_acc': None
-            })
-    
-    # Convert to DataFrame and save annotation map
-    mapping_df = pd.DataFrame(mapping_records)
-    os.makedirs(output_dir, exist_ok=True)
-    write_integration_file(data=mapping_df, output_dir=output_dir, filename=output_filename, indexing=True)
-    
-    # Summary statistics for annotation
-    log.info(f"Created gene-GO mapping table with {len(mapping_df)} rows")
-    log.info(f"Genes with protein mappings: {mapping_df['protein_id'].notna().sum()}")
-    log.info(f"Genes with GO annotations: {mapping_df['goterm_id'].notna().sum()}")
-    
-    return mapping_df
+    return merged_df
 
-def generate_mx_annotation_map(
+def _compress_annotation_table(
+    merged_df: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Compress annotation table to ensure one gene per row with semicolon-separated annotations.
+    
+    Args:
+        merged_df (pd.DataFrame): Merged annotation dataframe potentially with duplicate genes
+        
+    Returns:
+        pd.DataFrame: Compressed dataframe with one row per gene
+    """
+    
+    def join_unique_values(series):
+        """Join unique non-empty values with double semicolon"""
+        unique_vals = sorted({
+            str(x).strip() for x in series.dropna() 
+            if str(x).strip() and str(x).strip().lower() not in ['nan', 'none', '']
+        })
+        return ';;'.join(unique_vals) if unique_vals else ''
+    
+    # Group by gene_oid and aggregate all other columns
+    annotation_columns = [col for col in merged_df.columns if col != 'gene_oid']
+    
+    # Group by gene_oid and aggregate
+    compressed_df = merged_df.groupby('gene_oid')[annotation_columns].agg(join_unique_values).reset_index()
+    
+    log.info(f"Compressed annotations from {len(merged_df)} rows to {len(compressed_df)} unique genes")
+    
+    return compressed_df
+
+def generate_mx_annotation_table(
     raw_data: pd.DataFrame, 
     dataset_raw_dir: str, 
     polarity: str, 
@@ -2397,7 +2860,7 @@ def generate_mx_annotation_map(
     overwrite: bool = False
 ) -> pd.DataFrame:
     """
-    Generate metabolite ID to annotation mapping table AND MAGI2 compound input for metabolomics data.
+    Generate metabolite ID to annotation mapping table for metabolomics data.
     
     Args:
         raw_data: Raw metabolomics data DataFrame
@@ -2405,11 +2868,10 @@ def generate_mx_annotation_map(
         polarity: Polarity setting ('positive', 'negative', 'multipolarity')
         output_dir: Output directory for saving annotation map
         output_filename: Filename for saving the annotation map
-        magi2_output_dir: Output directory for MAGI2 files (if None, uses output_dir)
         overwrite: Overwrite existing output if True
     
     Returns:
-        pd.DataFrame: annotation_mapping_df
+        pd.DataFrame: annotation_table DataFrame
     """
     
     # Get metabolite IDs from raw data
@@ -2467,31 +2929,41 @@ def generate_mx_annotation_map(
     # Create annotation mapping for all metabolites
     log.info("Creating metabolite annotation mapping...")
     mapping_data = []
+    
     for met_id in metabolite_ids:
         if not fbmn_data.empty:
-            # Find matching annotation
-            match = fbmn_data[fbmn_data['metabolite_id'] == met_id]
-            if len(match) > 0:
-                row = match.iloc[0]
-                # Handle InChiKey variations
-                inchikey_value = (row.get('InChiKey') or 
-                                row.get('InChIKey') or 
-                                row.get('inchikey') or 
-                                row.get('INCHIKEY'))
+            # Find ALL matching annotations for this metabolite ID
+            matches = fbmn_data[fbmn_data['metabolite_id'] == met_id]
+            if len(matches) > 0:
+                # Helper function to concatenate unique values
+                def concat_unique_values(series):
+                    """Concatenate unique non-null values with ;;"""
+                    unique_vals = sorted({
+                        str(val).strip() for val in series.dropna() 
+                        if str(val).strip() and str(val).strip().lower() not in ['nan', 'none', '']
+                    })
+                    return ';;'.join(unique_vals) if unique_vals else None
+                
+                # Handle InChiKey variations and concatenate all values
+                inchikey_cols = ['InChiKey', 'InChIKey', 'inchikey', 'INCHIKEY']
+                inchikey_values = []
+                for col in inchikey_cols:
+                    if col in matches.columns:
+                        inchikey_values.extend(matches[col].dropna().tolist())
                 
                 mapping_data.append({
                     'metabolite_id': met_id,
-                    'molecular_formula': row.get('molecular_formula'),
-                    'Compound_Name': row.get('Compound_Name'),
-                    'INCHI': row.get('INCHI'),
-                    'InChiKey': inchikey_value,
-                    'superclass': row.get('superclass'),
-                    'class': row.get('class'),
-                    'subclass': row.get('subclass'),
-                    'npclassifier_superclass': row.get('npclassifier_superclass'),
-                    'npclassifier_class': row.get('npclassifier_class'),
-                    'npclassifier_pathway': row.get('npclassifier_pathway'),
-                    'library_usi': row.get('library_usi')
+                    'molecular_formula': concat_unique_values(matches.get('molecular_formula', pd.Series())),
+                    'Compound_Name': concat_unique_values(matches.get('Compound_Name', pd.Series())),
+                    'INCHI': concat_unique_values(matches.get('INCHI', pd.Series())),
+                    'InChiKey': concat_unique_values(pd.Series(inchikey_values)),
+                    'superclass': concat_unique_values(matches.get('superclass', pd.Series())),
+                    'class': concat_unique_values(matches.get('class', pd.Series())),
+                    'subclass': concat_unique_values(matches.get('subclass', pd.Series())),
+                    'npclassifier_superclass': concat_unique_values(matches.get('npclassifier_superclass', pd.Series())),
+                    'npclassifier_class': concat_unique_values(matches.get('npclassifier_class', pd.Series())),
+                    'npclassifier_pathway': concat_unique_values(matches.get('npclassifier_pathway', pd.Series())),
+                    'library_usi': concat_unique_values(matches.get('library_usi', pd.Series()))
                 })
                 continue
         
@@ -2519,9 +2991,20 @@ def generate_mx_annotation_map(
     # Summary statistics for annotation
     total_rows = len(mapping_df)
     annotated_count = mapping_df.dropna(subset=['INCHI', 'InChiKey'], how='all').shape[0]
+    
+    # Count metabolites with multiple annotations
+    multi_annotation_count = 0
+    for col in ['Compound_Name', 'superclass', 'class', 'subclass']:
+        if col in mapping_df.columns:
+            multi_count = mapping_df[col].str.contains(';;', na=False).sum()
+            if multi_count > 0:
+                log.info(f"Metabolites with multiple {col} annotations: {multi_count}")
+                multi_annotation_count = max(multi_annotation_count, multi_count)
+    
     log.info(f"Created annotation mapping with {total_rows} rows")
     log.info(f"Metabolites with annotations: {annotated_count}")
     log.info(f"Metabolites without annotations: {total_rows - annotated_count}")
+    log.info(f"Metabolites with multiple annotations: {multi_annotation_count}")
     
     return mapping_df
 
@@ -2539,7 +3022,7 @@ def annotate_integrated_features(
     integrated_data : pd.DataFrame
         Integrated feature matrix (features x samples)
     datasets : List, optional
-        List of dataset objects with annotation_map attributes
+        List of dataset objects with annotation_table attributes
     output_dir : str, optional
         Directory to save the annotation results
     output_filename : str, default "integrated_features_annotated"
@@ -2549,128 +3032,99 @@ def annotate_integrated_features(
     -------
     pd.DataFrame
         Combined annotation dataframe with columns for each annotation type
-        and multiple rows per feature if multiple annotations exist
+        and one row per feature from integrated_data
     """
     
     # Get all unique features from integrated data
     all_features = integrated_data.index.tolist()
     log.info(f"Annotating {len(all_features)} features from integrated data")
     
+    # Start with a base dataframe containing all features
+    final_annotation_df = pd.DataFrame(index=all_features)
+    final_annotation_df.index.name = 'feature_id'
+    
     # Build combined annotation dataframe from datasets if provided
-    combined_annotation_df = None
     if datasets is not None:
-        annotation_dfs = []
-        all_annotation_columns = set()
-        
         for dataset in datasets:
-            if hasattr(dataset, 'annotation_map') and dataset.annotation_map is not None:
-                log.info(f"Processing annotation map for {dataset.dataset_name}")
+            if hasattr(dataset, 'annotation_table') and dataset.annotation_table is not None:
+                log.info(f"Processing annotation table for {dataset.dataset_name}")
                 
-                # Get the annotation map and ensure it has the right structure
-                ann_map = dataset.annotation_map.copy()
+                ann_table = dataset.annotation_table.copy()
                 
-                # Determine the feature ID column based on dataset type
-                feature_id_col = None
-                if hasattr(dataset, 'dataset_name'):
-                    if 'tx' in dataset.dataset_name.lower() or 'transcript' in dataset.dataset_name.lower():
-                        # For transcriptomics, use gene_id as the feature identifier
-                        if 'gene_id' in ann_map.columns:
-                            feature_id_col = 'gene_id'
-                    elif 'mx' in dataset.dataset_name.lower() or 'metabol' in dataset.dataset_name.lower():
-                        # For metabolomics, use metabolite_id as the feature identifier
-                        if 'metabolite_id' in ann_map.columns:
-                            feature_id_col = 'metabolite_id'
+                # Find potential ID columns in the annotation table
+                potential_id_cols = []
+                for col in ann_table.columns:
+                    if 'id' in col.lower() or col == ann_table.index.name:
+                        potential_id_cols.append(col)
+                
+                # If index looks like feature IDs, use that
+                if ann_table.index.name and any(feat in ann_table.index for feat in all_features[:5]):
+                    feature_id_col = ann_table.index.name
+                    ann_table = ann_table.reset_index()
+                elif potential_id_cols:
+                    # Try each potential ID column to find matches
+                    feature_id_col = None
+                    for col in potential_id_cols:
+                        if any(feat in ann_table[col].astype(str).values for feat in all_features[:5]):
+                            feature_id_col = col
+                            break
+                else:
+                    # Fallback: look for any column that has overlapping values with our features
+                    feature_id_col = None
+                    for col in ann_table.columns:
+                        if ann_table[col].dtype == 'object' or 'int' in str(ann_table[col].dtype):
+                            overlap = set(ann_table[col].astype(str)) & set(all_features)
+                            if len(overlap) > 0:
+                                feature_id_col = col
+                                break
                 
                 if feature_id_col is None:
-                    log.warning(f"Could not determine feature ID column for {dataset.dataset_name}")
+                    log.warning(f"Could not find matching ID column for {dataset.dataset_name}")
                     continue
                 
-                # Set the feature ID as index if it's not already
-                if feature_id_col in ann_map.columns and ann_map.index.name != feature_id_col:
-                    ann_map = ann_map.set_index(feature_id_col)
+                log.info(f"Using '{feature_id_col}' as feature ID column for {dataset.dataset_name}")
                 
-                # Remove the feature ID columns that are now the index
-                annotation_columns = [col for col in ann_map.columns if col not in ['gene_id', 'metabolite_id']]
-                ann_map = ann_map[annotation_columns]
+                # Set the feature ID as index
+                if feature_id_col != ann_table.index.name:
+                    ann_table = ann_table.set_index(feature_id_col)
+                
+                # Remove any remaining ID columns from the data
+                id_cols_to_remove = [col for col in ann_table.columns 
+                                   if 'id' in col.lower() and col != feature_id_col]
+                if id_cols_to_remove:
+                    ann_table = ann_table.drop(columns=id_cols_to_remove)
                 
                 # Add dataset prefix to annotation columns to avoid conflicts
-                ann_map.columns = [f"{dataset.dataset_name}_{col}" for col in ann_map.columns]
+                ann_table.columns = [f"{dataset.dataset_name}_{col}" for col in ann_table.columns]
                 
-                # Track all annotation columns across datasets
-                all_annotation_columns.update(ann_map.columns)
-                annotation_dfs.append(ann_map)
+                # Merge with the main annotation dataframe
+                # Use left join to keep all features from integrated_data
+                final_annotation_df = final_annotation_df.join(ann_table, how='left')
                 
-                log.info(f"Added {ann_map.shape[0]} annotation rows with {len(annotation_columns)} columns from {dataset.dataset_name}")
-        
-        # Combine all annotation dataframes
-        if annotation_dfs:
-            # First, ensure all dataframes have the same columns filled with 'Unassigned'
-            for i, ann_df in enumerate(annotation_dfs):
-                for col in all_annotation_columns:
-                    if col not in ann_df.columns:
-                        ann_df[col] = 'Unassigned'
-                # Reorder columns consistently
-                annotation_dfs[i] = ann_df[sorted(all_annotation_columns)]
-            
-            # Concatenate all annotation dataframes, preserving multiple rows per feature
-            combined_annotation_df = pd.concat(annotation_dfs, axis=0, sort=False)
-            # Fill any remaining NaN values with 'Unassigned'
-            combined_annotation_df = combined_annotation_df.fillna('Unassigned')
-            
-            log.info(f"Combined annotation data from {len(annotation_dfs)} datasets")
-            log.info(f"Total annotation columns: {len(all_annotation_columns)}")
-            log.info(f"Total annotation rows: {combined_annotation_df.shape[0]}")
+                # Count matches
+                matches = ann_table.index.intersection(all_features)
+                log.info(f"Matched {len(matches)} features from {dataset.dataset_name} "
+                        f"(out of {len(ann_table)} in annotation table)")
     
-    # Use combined annotation if available, otherwise use provided annotation_df
-    final_annotation_df = combined_annotation_df if combined_annotation_df is not None else annotation_df
-    
-    if final_annotation_df is None:
-        log.warning("No annotation data provided. Creating empty annotation dataframe.")
-        # Create a minimal annotation dataframe with just feature IDs
-        final_annotation_df = pd.DataFrame(
-            {'feature_id': all_features, 'annotation_status': 'No annotation available'}
-        ).set_index('feature_id')
-    
-    # Filter annotations to only include features present in integrated data
-    features_with_annotations = final_annotation_df.index.intersection(all_features)
-    final_annotation_df = final_annotation_df.loc[features_with_annotations]
-    
-    # Add features that don't have annotations
-    missing_features = set(all_features) - set(features_with_annotations)
-    if missing_features:
-        log.info(f"Found {len(missing_features)} features without annotations")
-        
-        # Create rows for missing features
-        missing_rows = []
-        for feature in missing_features:
-            # Create a row with the same columns as the existing annotation dataframe
-            missing_row = pd.Series(index=final_annotation_df.columns, name=feature)
-            missing_row = missing_row.fillna('Unassigned')
-            missing_rows.append(missing_row)
-        
-        if missing_rows:
-            missing_df = pd.DataFrame(missing_rows)
-            final_annotation_df = pd.concat([final_annotation_df, missing_df], axis=0, sort=False)
+    # Fill NaN values with 'Unassigned'
+    final_annotation_df = final_annotation_df.fillna('Unassigned')
     
     # Reset index to make feature_id a column for easier handling
     final_annotation_df = final_annotation_df.reset_index()
-    if 'index' in final_annotation_df.columns:
-        final_annotation_df = final_annotation_df.rename(columns={'index': 'feature_id'})
-    elif final_annotation_df.index.name:
-        final_annotation_df = final_annotation_df.rename(columns={final_annotation_df.index.name: 'feature_id'})
-    
-    # Sort by feature_id for consistent output
-    final_annotation_df = final_annotation_df.sort_values('feature_id')
     
     # Summary statistics
-    n_annotated_features = len(final_annotation_df['feature_id'].unique())
-    n_total_annotations = len(final_annotation_df)
-    avg_annotations_per_feature = n_total_annotations / n_annotated_features if n_annotated_features > 0 else 0
+    n_features = len(final_annotation_df)
+    n_annotation_cols = len(final_annotation_df.columns) - 1  # Exclude feature_id column
+    
+    # Count features with at least one non-"Unassigned" annotation
+    non_unassigned_mask = (final_annotation_df.iloc[:, 1:] != 'Unassigned').any(axis=1)
+    n_annotated_features = non_unassigned_mask.sum()
     
     log.info(f"Annotation summary:")
+    log.info(f"  Total features: {n_features}")
     log.info(f"  Features with annotations: {n_annotated_features}")
-    log.info(f"  Total annotation rows: {n_total_annotations}")
-    log.info(f"  Average annotations per feature: {avg_annotations_per_feature:.2f}")
+    log.info(f"  Features without annotations: {n_features - n_annotated_features}")
+    log.info(f"  Total annotation columns: {n_annotation_cols}")
     
     # Save results if output directory provided
     if output_dir:
@@ -2727,8 +3181,8 @@ def annotate_integrated_features(
 #     if tx_id_col not in df.columns or tx_annotation_col not in df.columns:
 #         raise ValueError(f"Required columns {tx_id_col} or {tx_annotation_col} not found in annotation file.")
 #     df = df.dropna(subset=[tx_id_col, tx_annotation_col])
-#     annotation_map = dict(zip(df[tx_id_col].astype(str).str.strip(), df[tx_annotation_col].astype(int).astype(str).str.strip()))
-#     return annotation_map
+#     annotation_table = dict(zip(df[tx_id_col].astype(str).str.strip(), df[tx_annotation_col].astype(int).astype(str).str.strip()))
+#     return annotation_table
 
 # def map_ids_to_annotations(
 #     gff3_path: str,
@@ -2750,12 +3204,12 @@ def annotate_integrated_features(
 #     """
     
 #     proteinid_to_id = parse_gff3_proteinid_to_id(gff3_path)
-#     annotation_map = parse_annotation_file(annotation_path, tx_id_col, tx_annotation_col)
+#     annotation_table = parse_annotation_file(annotation_path, tx_id_col, tx_annotation_col)
 #     id_to_annotation = {}
 #     for protein_id, gene_id in proteinid_to_id.items():
-#         for annot_key in annotation_map:
+#         for annot_key in annotation_table:
 #             if protein_id in annot_key:
-#                 id_to_annotation[gene_id] = annotation_map[annot_key]
+#                 id_to_annotation[gene_id] = annotation_table[annot_key]
 #                 break
 #     return id_to_annotation
 
