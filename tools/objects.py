@@ -483,7 +483,7 @@ class Dataset(BaseDataHandler):
             #     #shutil.rmtree(processing_dir)
             #     return processing_dir
             # else:
-            #     error_msg = f"Dataset processing directory already exists for {dataset_name} at {processing_dir}\n" \
+            #     error_msg = f"Dataset processing directory already exists for {dataset_name} at {processing_dir}" \
             #                 "Please choose a different data processing tag, delete the existing directory, or use the overwrite=True flag before proceeding."
             #     log.error(error_msg)
             #     sys.exit(1)
@@ -757,7 +757,7 @@ class MX(Dataset):
                 log.error(f"No data found for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
                 sys.exit(1)
             self.raw_data = result
-            log.info(f"\tCreated raw data for MX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.\n")
+            log.info(f"\tCreated raw data for MX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
         
         if show_progress:
             self.workflow_tracker.set_current_step('load_data')
@@ -811,7 +811,7 @@ class MX(Dataset):
                 log.error(f"No metadata found for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
                 sys.exit(1)
             self.raw_metadata = result
-            log.info(f"\tCreated raw metadata for MX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.\n")
+            log.info(f"\tCreated raw metadata for MX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
         
         if show_progress:
             self.workflow_tracker.set_current_step('load_metadata')
@@ -886,7 +886,7 @@ class TX(Dataset):
                 log.error(f"No data found for TX dataset. Please check your raw data files.")
                 sys.exit(1)
             self.raw_data = result
-            log.info(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.\n")
+            log.info(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
 
         if show_progress:
             self.workflow_tracker.set_current_step('load_data')
@@ -942,7 +942,7 @@ class TX(Dataset):
                 log.error(f"No metadata found for TX dataset. Please check your raw data files.")
                 sys.exit(1)
             self.raw_metadata = result
-            log.info(f"\tCreated raw metadata for TX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.\n")
+            log.info(f"\tCreated raw metadata for TX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
 
         if show_progress:
             self.workflow_tracker.set_current_step('load_metadata')
@@ -1028,7 +1028,7 @@ class Analysis(BaseDataHandler):
                 #shutil.rmtree(analysis_dir)
                 return analysis_dir
             else:
-                error_msg = f"Analysis directory already exists at {analysis_dir}\n" \
+                error_msg = f"Analysis directory already exists at {analysis_dir}" \
                             "Please choose a different analysis tag, delete the existing directory, or use the overwrite=True flag before proceeding."
                 log.error(error_msg)
                 sys.exit(1)
@@ -1191,7 +1191,7 @@ class Analysis(BaseDataHandler):
                     log.error(f"Linking metadata resulted in empty table for {ds.dataset_name}. Please check your metadata linking script and input metadata files.")
                     sys.exit(1)
                 ds.linked_metadata = linked_metadata[ds.dataset_name]
-                log.info(f"Created linked_metadata for {ds.dataset_name} with {ds.linked_metadata.shape[0]} samples and {ds.linked_metadata.shape[1]} metadata fields.\n")
+                log.info(f"Created linked_metadata for {ds.dataset_name} with {ds.linked_metadata.shape[0]} samples and {ds.linked_metadata.shape[1]} metadata fields.")
 
         if show_progress:
             self.workflow_tracker.set_current_step('link_metadata')
@@ -1230,7 +1230,7 @@ class Analysis(BaseDataHandler):
                     log.error(f"Linking data resulted in empty table for {ds.dataset_name}. Please check your datasets and linked metadata.")
                     sys.exit(1)
                 ds.linked_data = linked_data[ds.dataset_name]
-                log.info(f"Created linked_data for {ds.dataset_name} with {ds.linked_data.shape[1]} samples and {ds.linked_data.shape[0]} features.\n")
+                log.info(f"Created linked_data for {ds.dataset_name} with {ds.linked_data.shape[1]} samples and {ds.linked_data.shape[0]} features.")
 
         if show_progress:
             self.workflow_tracker.set_current_step('link_data')
@@ -1282,7 +1282,7 @@ class Analysis(BaseDataHandler):
                 log.error(f"Integrating metadata resulted in empty table. Please check your datasets and linked metadata.")
                 sys.exit(1)
             self.integrated_metadata = result
-            log.info(f"Created a single integrated metadata table with {self.integrated_metadata.shape[0]} samples and {self.integrated_metadata.shape[1]} metadata fields.\n")
+            log.info(f"Created a single integrated metadata table with {self.integrated_metadata.shape[0]} samples and {self.integrated_metadata.shape[1]} metadata fields.")
 
         if show_progress:
             self.workflow_tracker.set_current_step('integrate_metadata')
@@ -1311,7 +1311,7 @@ class Analysis(BaseDataHandler):
                 log.error(f"Integrating data resulted in empty table. Please check your datasets and linked data.")
                 sys.exit(1)
             self.integrated_data = result
-            log.info(f"Created a single integrated data table with {self.integrated_data.shape[0]} samples and {self.integrated_data.shape[1]} features.\n")
+            log.info(f"Created a single integrated data table with {self.integrated_data.shape[0]} samples and {self.integrated_data.shape[1]} features.")
 
         if show_progress:
             self.workflow_tracker.set_current_step('integrate_data')
@@ -1341,7 +1341,7 @@ class Analysis(BaseDataHandler):
                 log.error(f"Annotating integrated features resulted in empty table. Please check your datasets and annotation maps.")
                 sys.exit(1)
             self.feature_annotation_table = annotation_df
-            log.info(f"Created an annotated integrated features table with {self.feature_annotation_table.shape[0]} entries ({len(self.feature_annotation_table['feature_id'].unique())} unique features) and {self.feature_annotation_table.shape[1]} samples.\n")
+            log.info(f"Created an annotated integrated features table with {self.feature_annotation_table.shape[0]} entries ({len(self.feature_annotation_table['feature_id'].unique())} unique features) and {self.feature_annotation_table.shape[1]} samples.")
 
         if show_progress:
             self.workflow_tracker.set_current_step('annotate_integrated_features')
@@ -1377,7 +1377,7 @@ class Analysis(BaseDataHandler):
                 log.error(f"Feature selection resulted in empty table. Please check your integrated data and feature selection parameters.")
                 sys.exit(1)
             self.integrated_data_selected = result
-            log.info(f"Created a subset of the integrated data with {self.integrated_data_selected.shape[0]} samples and {self.integrated_data_selected.shape[1]} features for network analysis.\n")
+            log.info(f"Created a subset of the integrated data with {self.integrated_data_selected.shape[0]} samples and {self.integrated_data_selected.shape[1]} features for network analysis.")
 
         if show_progress:
             self.workflow_tracker.set_current_step('feature_selection')
@@ -1418,7 +1418,7 @@ class Analysis(BaseDataHandler):
                 log.error(f"Calculating correlated features resulted in empty table. Please check your integrated data and correlation parameters.")
                 sys.exit(1)
             self.feature_correlation_table = result
-            log.info(f"Created a feature correlation table with {self.feature_correlation_table.shape[0]} feature pairs.\n")
+            log.info(f"Created a feature correlation table with {self.feature_correlation_table.shape[0]} feature pairs.")
 
         if show_progress:
             self.workflow_tracker.set_current_step('calculate_correlations')

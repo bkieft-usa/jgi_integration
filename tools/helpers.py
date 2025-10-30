@@ -140,7 +140,7 @@ def write_integration_file(
         if index_label is not None:
             data.index.name = index_label
         data.to_csv(fname, index=indexing)
-        log.info(f"\tData saved to {fname}\n")
+        log.info(f"\tData saved to {fname}")
     else:
         log.info("Not saving data to disk.")
 
@@ -148,7 +148,7 @@ def list_project_configs() -> None:
     """
     List all saved configuration files for a project and print to standard output.
     """
-    config_pattern = os.path.join("/home/jovyan/work/output_data", "**/configs/*.yml")
+    config_pattern = "/home/jovyan/work/output_data/*/*/configs/*.yml"
     config_files = glob.glob(config_pattern, recursive=True)
     default_config = "/home/jovyan/work/input_data/config/project_config.yml"
     config_files.append(default_config)
@@ -1424,19 +1424,13 @@ def _nx_to_plotly_widget(
         # Check for metabolomics compound name
         mx_compound = data.get("mx_Compound_Name", "Unassigned")
         if isinstance(mx_compound, str) and mx_compound not in ["Unassigned", "", "NA"]:
-            # Split on double semicolons and take the first annotation
-            compound_names = [name.strip() for name in mx_compound.split(";;") if name.strip()]
-            if compound_names:
-                annotation_text = compound_names[0]  # Show first compound name
+            annotation_text = mx_compound
         
         # Check for transcriptomics GO term if metabolomics annotation not found
         elif annotation_text == "Unassigned":
             tx_goterm = data.get("tx_goterm_acc", "Unassigned")
             if isinstance(tx_goterm, str) and tx_goterm not in ["Unassigned", "", "NA"]:
-                # Split on double semicolons and take the first annotation
-                go_terms = [term.strip() for term in tx_goterm.split(";;") if term.strip()]
-                if go_terms:
-                    annotation_text = go_terms[0]  # Show first GO term
+                annotation_text = tx_goterm
         
         # Add annotation to hover text
         if annotation_text != "Unassigned":
@@ -1614,7 +1608,7 @@ def find_mx_parent_folder(
 
     # Find project folder
     cmd = f"rclone lsd JGI_Metabolomics_Projects: | grep -E '{pid}|{pi_name}'"
-    log.info("Finding MX parent folders...\n")
+    log.info("Finding MX parent folders...")
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     
     if result.stdout:
@@ -1625,7 +1619,7 @@ def find_mx_parent_folder(
         mx_parent = mx_parent[["ix", "date", "time", "folder"]]
         mx_final_folders = []
         # For each possible project folder (some will not be the right "final" folder)
-        log.info("Finding MX final folders...\n")
+        log.info("Finding MX final folders...")
         for project_folder in mx_parent["folder"].values:
             cmd = f"rclone lsd --max-depth 2 JGI_Metabolomics_Projects:{project_folder}"
             try:
@@ -1667,7 +1661,7 @@ def find_mx_parent_folder(
             script_file.write(f"cd {script_dir}/\n")
             script_file.write(f"rclone lsd --max-depth 2 JGI_Metabolomics_Projects:{untargeted_mx_final['parent_folder'].values[0]}")
         
-        log.info("Using the following metabolomics final results folder for further analysis:\n")
+        log.info("Using the following metabolomics final results folder for further analysis:")
         log.info(untargeted_mx_final)
         return final_results_folder
     else:
@@ -1733,7 +1727,7 @@ def gather_mx_files(
         script_file.write(f"cd {script_dir}/\n")
         script_file.write(f"rclone copy --include '*{chromatography}*.zip' --stats-one-line -v --max-depth 1 JGI_Metabolomics_Projects:{mx_untargeted_remote} {mx_dir};")
     
-    log.info("Linking MX files...\n")
+    log.info("Linking MX files...")
     result = subprocess.run(f"chmod +x {script_name} && {script_name}", shell=True, check=True, capture_output=True, text=True)
 
     if result.stdout or result.stderr:
@@ -1763,7 +1757,7 @@ def extract_mx_archives(mx_dir: str, chromatography: str) -> pd.DataFrame:
     """
     
     cmd = f"for archive in {mx_dir}/*{chromatography}*zip; do newdir={mx_dir}/$(basename $archive .zip); rm -rf $newdir; mkdir -p $newdir; unzip -j $archive -d $newdir; done"
-    log.info("Extracting the following archive to be used for MX data input:\n")
+    log.info("Extracting the following archive to be used for MX data input:")
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     
     if result.stdout:
@@ -1816,14 +1810,14 @@ def find_tx_files(
     if not os.path.exists(os.path.dirname(script_name)):
         os.makedirs(os.path.dirname(script_name))
     
-    log.info("Creating script to find TX files...\n")
+    log.info("Creating script to find TX files...")
     script_content = (
         f"jamo report select _id,metadata.analysis_project.analysis_project_id,metadata.library_name,metadata.analysis_project.status_name where "
         f"metadata.proposal_id={pid} file_name=counts.txt "
         f"| sed 's/\\[//g' | sed 's/\\]//g' | sed 's/u'\\''//g' | sed 's/'\\''//g' | sed 's/ //g' > {file_list}"
     )
 
-    log.info("Finding TX files...\n")
+    log.info("Finding TX files...")
     subprocess.run(
         f"echo \"{script_content}\" > {script_name} && chmod +x {script_name} && module load jamo && source {script_name}",
         shell=True, check=True
@@ -1866,7 +1860,7 @@ def find_tx_files(
     files.reset_index(drop=True)
     
     if files.shape[0] > 0:
-        log.info(f"Using the value of 'tx_index' ({tx_index}) from the config file to choose the correct 'ix' column (change if incorrect): \n")
+        log.info(f"Using the value of 'tx_index' ({tx_index}) from the config file to choose the correct 'ix' column (change if incorrect): ")
         files.to_csv(f"{tx_dir}/all_tx_portal_files.txt", sep="\t", index=False)
         display(files)
         return files
@@ -1907,13 +1901,13 @@ def gather_tx_files(
 
     if tx_index is None:
         log.info("There may be multiple APIDS or analyses for a given PI/Proposal ID and you have not specified which one to use!")
-        log.info("Please set 'tx_index' in the project config file by choosing the correct row from the table above.\n")
+        log.info("Please set 'tx_index' in the project config file by choosing the correct row from the table above.")
         sys.exit(1)
 
     script_dir = f"{tx_dir}/scripts"
     os.makedirs(script_dir, exist_ok=True)
     script_name = f"{script_dir}/gather_tx_files.sh"
-    log.info("Linking TX files...\n")
+    log.info("Linking TX files...")
 
     with open(script_name, "w") as script_file:
         script_file.write(f"cd {script_dir}/\n")
@@ -1960,7 +1954,7 @@ def gather_tx_files(
     if apid:
         with open(f"{tx_dir}/apid.txt", "w") as f:
             f.write(str(apid))
-        log.info(f"\nWorking with APID: {apid} from tx_index {tx_index}.\n")
+        log.info(f"Working with APID: {apid} from tx_index {tx_index}.")
         return apid
     else:
         log.info("Warning: Did not find APID. Check the index you selected from the tx_files object.")
@@ -2030,7 +2024,7 @@ def get_mx_data(
                     mx_data['CompoundID'] = 'mx_' + mx_data['CompoundID'].astype(str) + "_" + str(file_polarity)
                 multipolarity_datasets.append(mx_data)
             multipolarity_data = pd.concat(multipolarity_datasets, axis=0)
-            log.info(f"MX data loaded from {mx_data_files}:\n")
+            log.info(f"MX data loaded from {mx_data_files}:")
             #display(multipolarity_data.head())
             write_integration_file(data=multipolarity_data, output_dir=output_dir, filename=output_filename, indexing=False)
             return multipolarity_data
@@ -2048,7 +2042,7 @@ def get_mx_data(
             mx_data = mx_data.drop(columns=[col for col in mx_data.columns if "Unnamed" in col])
             if pd.api.types.is_numeric_dtype(mx_data['CompoundID']):
                 mx_data['CompoundID'] = 'mx_' + mx_data['CompoundID'].astype(str)
-            log.info(f"MX data loaded from {mx_data_filename}:\n")
+            log.info(f"MX data loaded from {mx_data_filename}:")
             write_integration_file(data=mx_data, output_dir=output_dir, filename=output_filename, indexing=False)
             #display(mx_data.head())
             return mx_data
@@ -2102,7 +2096,7 @@ def get_mx_metadata(
                 multiploarity_metadata.append(mx_metadata)
             multiploarity_metadatum = pd.concat(multiploarity_metadata, axis=0)
             multiploarity_metadatum.drop_duplicates(inplace=True)
-            log.info(f"MX metadata loaded from {mx_metadata_files}\n")
+            log.info(f"MX metadata loaded from {mx_metadata_files}")
             write_integration_file(data=multiploarity_metadatum, output_dir=output_dir, filename=output_filename, indexing=False)
             #display(multiploarity_metadatum.head())
             return multiploarity_metadatum
@@ -2113,7 +2107,7 @@ def get_mx_metadata(
             mx_metadata['filename'] = mx_metadata['filename'].str.replace('.mzML', '', regex=False)
             mx_metadata = mx_metadata.rename(columns={mx_metadata.columns[0]: 'file'})
             mx_metadata.insert(0, 'ix', mx_metadata.index + 1)
-            log.info(f"MX metadata loaded from {mx_metadata_filename}\n")
+            log.info(f"MX metadata loaded from {mx_metadata_filename}")
             log.info("Writing MX metadata to file...")
             write_integration_file(data=mx_metadata, output_dir=output_dir, filename=output_filename, indexing=False)
             #display(mx_metadata.head())
@@ -2157,7 +2151,7 @@ def get_tx_data(
         # Add prefix 'tx_' if not already present
         tx_data['GeneID'] = tx_data['GeneID'].apply(lambda x: x if str(x).startswith('tx_') else f'tx_{x}')
         
-        log.info(f"TX data loaded from {tx_data_filename} and processing...\n")
+        log.info(f"TX data loaded from {tx_data_filename} and processing...")
         write_integration_file(data=tx_data, output_dir=output_dir, filename=output_filename, indexing=False)
         #display(tx_data.head())
         return tx_data
@@ -2284,7 +2278,7 @@ def generate_tx_annotation_table(
         output_filename (str): Filename for the output annotation table
     
     Returns:
-        pd.DataFrame: Merged annotation table with gene_oid and annotation columns
+        pd.DataFrame: Merged annotation table with transcriptome_id and annotation columns
     """
     
     if genome_type == "microbe":
@@ -2293,12 +2287,12 @@ def generate_tx_annotation_table(
         annotation_df = _process_algal_annotations(raw_data_dir, output_dir, output_filename)
     elif genome_type == "metagenome":
         log.info(f"Annotation processing for '{genome_type}' genome type is not yet implemented.")
-        empty_df = pd.DataFrame(columns=['gene_oid'])
+        empty_df = pd.DataFrame(columns=['transcriptome_id'])
         write_integration_file(empty_df, output_dir, output_filename, indexing=False)
         return empty_df
     elif genome_type == "plant":
         log.info(f"Annotation processing for '{genome_type}' genome type is not yet implemented.")
-        empty_df = pd.DataFrame(columns=['gene_oid'])
+        empty_df = pd.DataFrame(columns=['transcriptome_id'])
         write_integration_file(empty_df, output_dir, output_filename, indexing=False)
         return empty_df
     else:
@@ -2309,6 +2303,10 @@ def generate_tx_annotation_table(
     else:
         raise ValueError("Either input raw_data or computed annotation_df is empty. Cannot validate gene IDs.")
 
+    annotation_df = annotation_df.set_index('transcriptome_id')
+    annotation_df = annotation_df.applymap(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
+    write_integration_file(annotation_df, output_dir, output_filename, indexing=True)
+
     return annotation_df
 
 def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.DataFrame) -> None:
@@ -2316,18 +2314,18 @@ def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.Data
     Validate that gene IDs in annotation table match those in raw data.
     
     Args:
-        annotation_df (pd.DataFrame): Annotation table with gene_oid column
-        raw_data (pd.DataFrame): Raw transcriptomics data with gene IDs as index
+        annotation_df (pd.DataFrame): Annotation table with transcriptome_id column
+        raw_data (pd.DataFrame): Raw transcriptomics data with gene IDs as GeneID column
     """
     
     # If "tx_" prefix is used in raw data, ensure annotation gene IDs also have it
-    if all(str(gid).startswith('tx_') for gid in raw_data.index):
-        if not all(str(gid).startswith('tx_') for gid in annotation_df['gene_oid']):
-            annotation_df['gene_oid'] = annotation_df['gene_oid'].apply(lambda x: f'tx_{x}')
+    if all(str(gid).startswith('tx_') for gid in raw_data['GeneID']):
+        if not all(str(gid).startswith('tx_') for gid in annotation_df['transcriptome_id']):
+            annotation_df['transcriptome_id'] = annotation_df['transcriptome_id'].apply(lambda x: f'tx_{x}')
 
     # Get gene IDs from both datasets
-    raw_data_genes = set(raw_data.index.tolist())
-    annotation_genes = set(annotation_df['gene_oid'].tolist())
+    raw_data_genes = set(raw_data['GeneID'].tolist())
+    annotation_genes = set(annotation_df['transcriptome_id'].tolist())
     
     # Calculate overlap statistics
     common_genes = raw_data_genes.intersection(annotation_genes)
@@ -2346,12 +2344,8 @@ def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.Data
     overlap_pct = len(common_genes) / len(raw_data_genes) * 100
     if overlap_pct < 50:
         log.warning(f"Low gene ID overlap ({overlap_pct:.1f}%) between raw data and annotations")
-    
-    # Show examples of mismatched IDs if any
-    if raw_only:
-        log.info(f"  Example raw data genes without annotations: {list(raw_only)[:5]}")
-    if annotation_only:
-        log.info(f"  Example annotation genes not in raw data: {list(annotation_only)[:5]}")
+    if overlap_pct == 0:
+        raise ValueError("No matching gene IDs found between raw data and annotations, something is wrong.")
 
 def _process_microbe_annotations(
     raw_data_dir: str,
@@ -2377,8 +2371,7 @@ def _process_microbe_annotations(
     
     if not annotation_files:
         log.warning(f"No *_annotation_table.tsv files found in {raw_data_dir}")
-        empty_df = pd.DataFrame(columns=['gene_oid'])
-        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
+        empty_df = pd.DataFrame(columns=['transcriptome_id'])
         return empty_df
     
     log.info(f"Found {len(annotation_files)} annotation files:")
@@ -2398,14 +2391,13 @@ def _process_microbe_annotations(
     
     if not processed_dfs:
         log.warning("No valid annotation data found in any files")
-        empty_df = pd.DataFrame(columns=['gene_oid'])
-        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
+        empty_df = pd.DataFrame(columns=['transcriptome_id'])
         return empty_df
     
     # Merge all annotation dataframes
     from functools import reduce
     merged_df = reduce(
-        lambda left, right: pd.merge(left, right, on='gene_oid', how='outer'), 
+        lambda left, right: pd.merge(left, right, on='transcriptome_id', how='outer'), 
         processed_dfs
     )
     
@@ -2418,22 +2410,19 @@ def _process_microbe_annotations(
     # Compress the dataframe to ensure one gene per row with semicolon-separated annotations
     final_df = _compress_annotation_table(merged_df)
     
-    log.info(f"Final annotation table: {len(final_df)} genes with {len(final_df.columns)} annotation columns")
-    
-    # Save the merged annotation table
-    write_integration_file(final_df, output_dir, output_filename, indexing=False)
+    log.info(f"Final annotation table: {len(final_df)} genes with {len(final_df.columns)} annotation columns")    
     
     return final_df
 
 def _aggregate_gene_annotations(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Aggregate microbe annotations by gene_oid, handling multiple annotations per gene.
+    Aggregate microbe annotations by transcriptome_id, handling multiple annotations per gene.
     
     Args:
-        df (pd.DataFrame): Annotation dataframe with gene_oid column
+        df (pd.DataFrame): Annotation dataframe with transcriptome_id column
         
     Returns:
-        pd.DataFrame: Aggregated dataframe with one row per gene_oid
+        pd.DataFrame: Aggregated dataframe with one row per transcriptome_id
     """
     
     def join_unique_values(series):
@@ -2444,11 +2433,11 @@ def _aggregate_gene_annotations(df: pd.DataFrame) -> pd.DataFrame:
         })
         return ';;'.join(unique_vals) if unique_vals else ''
     
-    # Group by gene_oid and aggregate all other columns
-    annotation_columns = [col for col in df.columns if col != 'gene_oid']
+    # Group by transcriptome_id and aggregate all other columns
+    annotation_columns = [col for col in df.columns if col != 'transcriptome_id']
     
-    # Group by gene_oid and aggregate
-    aggregated_df = df.groupby('gene_oid')[annotation_columns].agg(join_unique_values).reset_index()
+    # Group by transcriptome_id and aggregate
+    aggregated_df = df.groupby('transcriptome_id')[annotation_columns].agg(join_unique_values).reset_index()
     
     return aggregated_df
 
@@ -2476,7 +2465,7 @@ def _process_algal_annotations(
     
     if not annotation_files:
         log.warning(f"No *_annotation_table.tsv files found in {raw_data_dir}")
-        empty_df = pd.DataFrame(columns=['gene_oid'])
+        empty_df = pd.DataFrame(columns=['transcriptome_id'])
         write_integration_file(empty_df, output_dir, output_filename, indexing=False)
         return empty_df
     
@@ -2497,7 +2486,7 @@ def _process_algal_annotations(
     
     if not processed_dfs:
         log.warning("No valid annotation data found in any files")
-        empty_df = pd.DataFrame(columns=['gene_oid'])
+        empty_df = pd.DataFrame(columns=['transcriptome_id'])
         write_integration_file(empty_df, output_dir, output_filename, indexing=False)
         return empty_df
     
@@ -2511,7 +2500,7 @@ def _process_algal_annotations(
     # Fill NaN values with empty strings for consistency
     merged_df = merged_df.fillna('')
     
-    # Add gene_oid mapping from GFF3 file (protein_id -> gene_oid)
+    # Add transcriptome_id mapping from GFF3 file (protein_id -> transcriptome_id)
     merged_df = _add_gene_id_mapping(merged_df, raw_data_dir, "algal")
     
     # Compress the dataframe to ensure one gene per row with semicolon-separated annotations
@@ -2542,34 +2531,29 @@ def _read_and_select_microbe_annotations(file_path: str) -> pd.DataFrame:
         filename = os.path.basename(file_path)
         
         if 'cog_annotation_table' in filename:
-            # Select gene_oid and COG annotation columns
             selected_cols = ['gene_oid', 'cog_id', 'cog_name']
             df = df[selected_cols].copy()
-            df.rename(columns={'cog_id': 'cog_acc', 'cog_name': 'cog_desc'}, inplace=True)
+            df.rename(columns={'gene_oid': 'transcriptome_id', 'cog_id': 'cog_acc', 'cog_name': 'cog_desc'}, inplace=True)
             
         elif 'ipr_annotation_table' in filename:
-            # Select gene_oid and InterPro annotation columns
-            selected_cols = ['gene_oid', 'iprid', 'iprdesc']
+            selected_cols = ['gene_oid', 'iprid', 'iprdesc', 'go_info']
             df = df[selected_cols].copy()
-            df.rename(columns={'iprid': 'ipr_acc', 'iprdesc': 'ipr_desc'}, inplace=True)
+            df.rename(columns={'gene_oid': 'transcriptome_id', 'iprid': 'ipr_acc', 'iprdesc': 'ipr_desc', 'go_info': 'go_acc'}, inplace=True)
             
         elif 'kegg_annotation_table' in filename:
-            # Select gene_oid and KEGG annotation columns
             selected_cols = ['gene_oid', 'ko_id', 'ko_name']
             df = df[selected_cols].copy()
-            df.rename(columns={'ko_id': 'kegg_acc', 'ko_name': 'kegg_desc'}, inplace=True)
+            df.rename(columns={'gene_oid': 'transcriptome_id', 'ko_id': 'kegg_acc', 'ko_name': 'kegg_desc'}, inplace=True)
             
         elif 'pfam_annotation_table' in filename:
-            # Select gene_oid and Pfam annotation columns
             selected_cols = ['gene_oid', 'pfam_id', 'pfam_name']
             df = df[selected_cols].copy()
-            df.rename(columns={'pfam_id': 'pfam_acc', 'pfam_name': 'pfam_desc'}, inplace=True)
+            df.rename(columns={'gene_oid': 'transcriptome_id', 'pfam_id': 'pfam_acc', 'pfam_name': 'pfam_desc'}, inplace=True)
             
         elif 'tigrfam_annotation_table' in filename:
-            # Select gene_oid and TIGRFam annotation columns
             selected_cols = ['gene_oid', 'tigrfam_id', 'tigrfam_name']
             df = df[selected_cols].copy()
-            df.rename(columns={'tigrfam_id': 'tigrfam_acc', 'tigrfam_name': 'tigrfam_desc'}, inplace=True)
+            df.rename(columns={'gene_oid': 'transcriptome_id', 'tigrfam_id': 'tigrfam_acc', 'tigrfam_name': 'tigrfam_desc'}, inplace=True)
             
         else:
             log.warning(f"Unknown annotation file type: {filename}")
@@ -2617,7 +2601,8 @@ def _read_and_select_algal_annotations(file_path: str) -> pd.DataFrame:
             df.rename(columns={
                 '#proteinId': 'protein_id',
                 'iprId': 'ipr_acc',
-                'iprDesc': 'ipr_desc'
+                'iprDesc': 'ipr_desc',
+                'goAcc': 'go_acc'
             }, inplace=True)
             
         elif 'kegg_annotation_table' in filename:
@@ -2683,8 +2668,8 @@ def _add_gene_id_mapping(
     genome_type: str
 ) -> pd.DataFrame:
     """
-    Add gene_oid mapping from GFF3 file to the merged annotation table for algal genomes.
-    Maps protein_id to gene_oid.
+    Add transcriptome_id mapping from GFF3 file to the merged annotation table for algal genomes.
+    Maps protein_id to transcriptome_id.
     
     Args:
         merged_df (pd.DataFrame): Merged annotation dataframe with protein_id
@@ -2692,7 +2677,7 @@ def _add_gene_id_mapping(
         genome_type (str): Genome type
         
     Returns:
-        pd.DataFrame: Annotation dataframe with gene_oid column added
+        pd.DataFrame: Annotation dataframe with transcriptome_id column added
     """
     
     # Look for GFF3 file in the raw data directory
@@ -2702,8 +2687,8 @@ def _add_gene_id_mapping(
     
     if not gff_files:
         log.warning("No GFF3 file found for gene ID mapping")
-        # Create gene_oid from protein_id if no GFF3 found
-        merged_df['gene_oid'] = merged_df['protein_id']
+        # Create transcriptome_id from protein_id if no GFF3 found
+        merged_df['transcriptome_id'] = merged_df['protein_id']
         return merged_df
     
     gff_file = gff_files[0]  # Use first GFF3 file found
@@ -2735,8 +2720,8 @@ def _add_gene_id_mapping(
     
     log.info(f"Found {len(protein_to_gene)} protein-to-gene mappings")
     
-    # Add gene_oid column to merged_df
-    merged_df['gene_oid'] = merged_df['protein_id'].map(protein_to_gene).fillna(merged_df['protein_id'])
+    # Add transcriptome_id column to merged_df
+    merged_df['transcriptome_id'] = merged_df['protein_id'].map(protein_to_gene).fillna(merged_df['protein_id'])
     
     return merged_df
 
@@ -2816,7 +2801,7 @@ def _add_protein_id_mapping(
     log.info(f"Found {len(gene_to_protein)} gene-to-protein mappings")
     
     # Add protein_id column to merged_df
-    merged_df['protein_id'] = merged_df['gene_oid'].map(gene_to_protein).fillna('')
+    merged_df['protein_id'] = merged_df['transcriptome_id'].map(gene_to_protein).fillna('')
     
     return merged_df
 
@@ -2841,11 +2826,11 @@ def _compress_annotation_table(
         })
         return ';;'.join(unique_vals) if unique_vals else ''
     
-    # Group by gene_oid and aggregate all other columns
-    annotation_columns = [col for col in merged_df.columns if col != 'gene_oid']
+    # Group by transcriptome_id and aggregate all other columns
+    annotation_columns = [col for col in merged_df.columns if col != 'transcriptome_id']
     
-    # Group by gene_oid and aggregate
-    compressed_df = merged_df.groupby('gene_oid')[annotation_columns].agg(join_unique_values).reset_index()
+    # Group by transcriptome_id and aggregate
+    compressed_df = merged_df.groupby('transcriptome_id')[annotation_columns].agg(join_unique_values).reset_index()
     
     log.info(f"Compressed annotations from {len(merged_df)} rows to {len(compressed_df)} unique genes")
     
@@ -2985,6 +2970,8 @@ def generate_mx_annotation_table(
     
     # Create and save annotation DataFrame
     mapping_df = pd.DataFrame(mapping_data)
+    mapping_df.rename(columns={'metabolite_id': 'metabolome_id'}, inplace=True)
+    mapping_df = mapping_df.set_index('metabolome_id')
     os.makedirs(output_dir, exist_ok=True)
     write_integration_file(data=mapping_df, output_dir=output_dir, filename=output_filename, indexing=True)
     
@@ -2998,7 +2985,7 @@ def generate_mx_annotation_table(
         if col in mapping_df.columns:
             multi_count = mapping_df[col].str.contains(';;', na=False).sum()
             if multi_count > 0:
-                log.info(f"Metabolites with multiple {col} annotations: {multi_count}")
+                #log.info(f"Metabolites with multiple {col} annotations: {multi_count}")
                 multi_annotation_count = max(multi_annotation_count, multi_count)
     
     log.info(f"Created annotation mapping with {total_rows} rows")
@@ -3043,6 +3030,9 @@ def annotate_integrated_features(
     final_annotation_df = pd.DataFrame(index=all_features)
     final_annotation_df.index.name = 'feature_id'
     
+    # Track dataset-specific statistics
+    dataset_stats = {}
+    
     # Build combined annotation dataframe from datasets if provided
     if datasets is not None:
         for dataset in datasets:
@@ -3057,54 +3047,31 @@ def annotate_integrated_features(
                     if 'id' in col.lower() or col == ann_table.index.name:
                         potential_id_cols.append(col)
                 
-                # If index looks like feature IDs, use that
-                if ann_table.index.name and any(feat in ann_table.index for feat in all_features[:5]):
-                    feature_id_col = ann_table.index.name
-                    ann_table = ann_table.reset_index()
-                elif potential_id_cols:
-                    # Try each potential ID column to find matches
-                    feature_id_col = None
-                    for col in potential_id_cols:
-                        if any(feat in ann_table[col].astype(str).values for feat in all_features[:5]):
-                            feature_id_col = col
-                            break
-                else:
-                    # Fallback: look for any column that has overlapping values with our features
-                    feature_id_col = None
-                    for col in ann_table.columns:
-                        if ann_table[col].dtype == 'object' or 'int' in str(ann_table[col].dtype):
-                            overlap = set(ann_table[col].astype(str)) & set(all_features)
-                            if len(overlap) > 0:
-                                feature_id_col = col
-                                break
-                
-                if feature_id_col is None:
-                    log.warning(f"Could not find matching ID column for {dataset.dataset_name}")
-                    continue
-                
-                log.info(f"Using '{feature_id_col}' as feature ID column for {dataset.dataset_name}")
-                
-                # Set the feature ID as index
-                if feature_id_col != ann_table.index.name:
-                    ann_table = ann_table.set_index(feature_id_col)
-                
-                # Remove any remaining ID columns from the data
-                id_cols_to_remove = [col for col in ann_table.columns 
-                                   if 'id' in col.lower() and col != feature_id_col]
-                if id_cols_to_remove:
-                    ann_table = ann_table.drop(columns=id_cols_to_remove)
-                
                 # Add dataset prefix to annotation columns to avoid conflicts
                 ann_table.columns = [f"{dataset.dataset_name}_{col}" for col in ann_table.columns]
+                
+                # Count matches for this dataset
+                matches = ann_table.index.intersection(all_features)
+                
+                # Count features from this dataset in integrated data
+                dataset_features = [f for f in all_features if f.startswith(f"{dataset.dataset_name}_")]
+                
+                # Store dataset statistics
+                dataset_stats[dataset.dataset_name] = {
+                    'total_features_in_integrated': len(dataset_features),
+                    'total_annotations_available': len(ann_table),
+                    'features_with_annotations': len(matches),
+                    'annotation_columns': len(ann_table.columns)
+                }
                 
                 # Merge with the main annotation dataframe
                 # Use left join to keep all features from integrated_data
                 final_annotation_df = final_annotation_df.join(ann_table, how='left')
                 
-                # Count matches
-                matches = ann_table.index.intersection(all_features)
-                log.info(f"Matched {len(matches)} features from {dataset.dataset_name} "
-                        f"(out of {len(ann_table)} in annotation table)")
+                log.info(f"  Dataset features in integrated data: {len(dataset_features)}")
+                log.info(f"  Annotation records available: {len(ann_table)}")
+                log.info(f"  Features with annotations: {len(matches)}")
+                log.info(f"  Annotation columns added: {len(ann_table.columns)}")
     
     # Fill NaN values with 'Unassigned'
     final_annotation_df = final_annotation_df.fillna('Unassigned')
@@ -3112,7 +3079,7 @@ def annotate_integrated_features(
     # Reset index to make feature_id a column for easier handling
     final_annotation_df = final_annotation_df.reset_index()
     
-    # Summary statistics
+    # Overall summary statistics
     n_features = len(final_annotation_df)
     n_annotation_cols = len(final_annotation_df.columns) - 1  # Exclude feature_id column
     
@@ -3120,11 +3087,50 @@ def annotate_integrated_features(
     non_unassigned_mask = (final_annotation_df.iloc[:, 1:] != 'Unassigned').any(axis=1)
     n_annotated_features = non_unassigned_mask.sum()
     
-    log.info(f"Annotation summary:")
+    log.info(f"Overall annotation summary:")
     log.info(f"  Total features: {n_features}")
     log.info(f"  Features with annotations: {n_annotated_features}")
     log.info(f"  Features without annotations: {n_features - n_annotated_features}")
     log.info(f"  Total annotation columns: {n_annotation_cols}")
+    
+    # Dataset-specific annotation summaries
+    if dataset_stats:
+        log.info(f"Dataset-specific annotation summaries:")
+        for dataset_name, stats in dataset_stats.items():
+            # Count features from this dataset that have annotations
+            dataset_features = [f for f in all_features if f.startswith(f"{dataset_name}_")]
+            if dataset_features:
+                dataset_feature_indices = final_annotation_df[
+                    final_annotation_df['feature_id'].isin(dataset_features)
+                ].index
+                
+                # Check which of these features have annotations from any source
+                dataset_annotation_cols = [col for col in final_annotation_df.columns 
+                                         if col.startswith(f"{dataset_name}_")]
+                
+                if dataset_annotation_cols:
+                    # Count features with dataset-specific annotations
+                    dataset_annotated_mask = (
+                        final_annotation_df.loc[dataset_feature_indices, dataset_annotation_cols] != 'Unassigned'
+                    ).any(axis=1)
+                    dataset_annotated_count = dataset_annotated_mask.sum()
+                else:
+                    dataset_annotated_count = 0
+                
+                # Count features with any annotations (from any dataset)
+                any_annotation_mask = (
+                    final_annotation_df.loc[dataset_feature_indices, 
+                                          final_annotation_df.columns[1:]] != 'Unassigned'
+                ).any(axis=1)
+                any_annotated_count = any_annotation_mask.sum()
+                
+                annotation_rate = (dataset_annotated_count / len(dataset_features)) * 100 if dataset_features else 0
+                
+                log.info(f"  {dataset_name}:")
+                log.info(f"    Features in integrated data: {len(dataset_features)}")
+                log.info(f"    Features with {dataset_name} annotations: {dataset_annotated_count} ({annotation_rate:.1f}%)")
+                log.info(f"    Features with any annotations: {any_annotated_count}")
+                log.info(f"    Annotation columns for {dataset_name}: {len(dataset_annotation_cols)}")
     
     # Save results if output directory provided
     if output_dir:
@@ -3464,7 +3470,7 @@ def link_data_across_datasets(
     sample_sets = {}
     # Process each dataset
     for ds in datasets:
-        log.info(f"\nProcessing {ds.dataset_name} metadata and data...")
+        log.info(f"Processing {ds.dataset_name} metadata and data...")
 
         # Find the column that maps data columns to unified sample names
         unifying_col = 'unique_group'
@@ -3987,8 +3993,6 @@ def plot_pdf_grids(
     Returns the path to the grid PDF.
     """
     pdf_metadata_vars = metadata_variables.copy()
-    if "group" in pdf_metadata_vars:
-        pdf_metadata_vars.remove("group")
     data_types = list(pca_frames.keys())
     n_rows, n_cols = len(data_types), len(pdf_metadata_vars)
 
@@ -4498,7 +4502,7 @@ def run_full_mofa2_analysis(
     mofa_data = mofa_data[['sample', 'group', 'features', 'view', 'value']]
     mofa_data = mofa_data.rename(columns={'features': 'feature'})
 
-    log.info("Converted omics data to mofa2 format:\n")
+    log.info("Converted omics data to mofa2 format:")
 
     # Run the model and load to memory
     model_file = run_mofa2_model(data=mofa_data, output_dir=output_dir, output_filename=output_filename,
@@ -4586,7 +4590,7 @@ def run_mofa2_model(
 
     ent.run()
 
-    log.info(f"Exporting model to disk as {outfile}...\n")
+    log.info(f"Exporting model to disk as {outfile}...")
     ent.save(outfile=outfile,save_data=True)
     return outfile
 
@@ -4628,7 +4632,7 @@ def calculate_mofa2_feature_weights_and_r2(
 
     r2_table = model.get_r2(factors=list(range(num_factors))).sort_values("R2", ascending=False)
 
-    log.info(f"Saving mofa2 factor weights and R2 tables...\n")
+    log.info(f"Saving mofa2 factor weights and R2 tables...")
     write_integration_file(feature_weight_per_factor, output_dir, f"mofa2_feature_weight_per_factor", index_label='Feature')
     write_integration_file(r2_table, output_dir, f"mofa2_r2_per_factor", indexing=False)
 
@@ -4651,7 +4655,7 @@ def plot_mofa2_factor_r2(
 
     r2_plot = mofax.plot_r2(model, factors=list(range(num_factors)), cmap="Blues")
 
-    log.info(f"Printing and saving mofa2 factor R2 plot...\n")
+    log.info(f"Printing and saving mofa2 factor R2 plot...")
     r2_plot.figure.savefig(f'{output_dir}/mofa2_r2_per_factor.pdf')
 
     return r2_plot
@@ -4676,7 +4680,7 @@ def plot_mofa2_feature_weights_linear(
     feature_plot = mofax.plot_weights(model, n_features=num_features, label_size=7)
     feature_plot.figure.set_size_inches(16, 8)
 
-    log.info(f"Printing and saving mofa2 feature weights linear plot...\n")
+    log.info(f"Printing and saving mofa2 feature weights linear plot...")
     feature_plot.figure.savefig(f'{output_dir}/mofa2_feature_weights_linear_plot_combined_data.pdf')
 
     return feature_plot
@@ -4718,7 +4722,7 @@ def plot_mofa2_feature_weights_scatter(
     )
     feature_plot.figure.set_size_inches(10, 10)
 
-    log.info(f"Printing and saving {data_type} mofa2 feature weights scatter plot...\n")
+    log.info(f"Printing and saving {data_type} mofa2 feature weights scatter plot...")
     feature_plot.figure.savefig(f'{output_dir}/mofa2_feature_weights_scatter_plot_{data_type}_data.pdf')
 
     return feature_plot
@@ -4748,7 +4752,7 @@ def plot_mofa2_feature_importance_per_factor(
                                         w_abs=True, 
                                         yticklabels_size=8)
 
-    log.info(f"Printing and saving {data_type} mofa2 feature importance per factor plot...\n")
+    log.info(f"Printing and saving {data_type} mofa2 feature importance per factor plot...")
     plot.figure.savefig(f'{output_dir}/mofa2_feature_importance_per_factor_for_{data_type}_data.pdf')
 
     return plot
@@ -5152,6 +5156,8 @@ def perform_functional_enrichment(
     log.info(f"  Total tests performed: {n_total_tests}")
     log.info(f"  Significant enrichments (< {p_value_threshold}): {n_significant}")
     log.info(f"  Background: {total_nodes_in_network_with_annotations}/{total_nodes_in_network} nodes with annotations")
+    log.info("Results preview:")
+    display(results_df.head())
     
     # Save results if output directory provided
     if output_dir:
@@ -5188,7 +5194,7 @@ def create_excel_metadata_sheet(
     """
 
     # Create the data for the "Instructions" tab
-    log.info("Creating metadata Excel file...\n")
+    log.info("Creating metadata Excel file...")
     instructions_text = (
         "Placeholder\n\n"
     )
@@ -5438,7 +5444,7 @@ def create_user_output_directory(
             intermediate_dir = os.path.join(dst, project_name, f"output_{project_name}", "intermediate_files")
             shutil.rmtree(intermediate_dir)
 
-    log.info(f"User output directory structure created at {final_dir}\n")
+    log.info(f"User output directory structure created at {final_dir}")
 
     return
 
@@ -5467,10 +5473,10 @@ def upload_to_google_drive(
             f'"{orig_folder}/" "{dest_folder}"'
         )
     try:
-        log.info(f"Uploading to Google Drive with command:\n\t{upload_command}")
+        log.info(f"Uploading to Google Drive with command:\t{upload_command}")
         subprocess.check_output(upload_command, shell=True)
     except Exception as e:
-        log.info(f"Warning! Google Drive upload failed with exception: {e}\nCommand: {upload_command}")
+        log.info(f"Warning! Google Drive upload failed with exception: {e}. Command: {upload_command}")
         return
 
     # Check that upload worked
@@ -5480,11 +5486,11 @@ def upload_to_google_drive(
     try:
         check_upload_out = subprocess.check_output(check_upload_command, shell=True)
         if check_upload_out.decode('utf-8').strip():
-            log.info(f"\nGoogle Drive upload confirmed!")
+            log.info(f"Google Drive upload confirmed!")
             return
         else:
-            log.info(f"Warning! Google Drive upload check failed because no data was returned with command:\n{check_upload_command}.\nUpload may not have been successful.")
+            log.info(f"Warning! Google Drive upload check failed because no data was returned with command: {check_upload_command}. Upload may not have been successful.")
             return
     except Exception as e:
-        log.info(f"Warning! Google Drive upload failed on upload check with exception: {e}\nCommand: {check_upload_command}")
+        log.info(f"Warning! Google Drive upload failed on upload check with exception: {e}. Command: {check_upload_command}")
         return
