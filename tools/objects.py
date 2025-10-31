@@ -5,7 +5,7 @@ import glob
 import pandas as pd
 import numpy as np
 import shutil
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from IPython.display import display, Javascript
 from IPython import get_ipython
 import tools.helpers as hlp
@@ -17,6 +17,8 @@ import inspect
 import re
 import time
 import hashlib
+import duckdb
+import openai
 
 log = logging.getLogger(__name__)
 if not log.handlers:
@@ -25,6 +27,153 @@ if not log.handlers:
     handler.setFormatter(logging.Formatter(fmt))
     log.addHandler(handler)
     log.setLevel(logging.INFO)
+
+class DataRegistry:
+    """Registry that automatically syncs DataFrames to DuckDB for AI querying."""
+    
+    def __init__(self, db_path: str = ":memory:"):
+        self.conn = duckdb.connect(db_path)
+        self.table_metadata = {}
+        self._setup_schema()
+    
+    def _setup_schema(self):
+        """Create metadata tables for tracking datasets and analyses."""
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS data_catalog (
+                table_name VARCHAR PRIMARY KEY,
+                object_type VARCHAR,  -- 'dataset' or 'analysis'
+                object_name VARCHAR,  -- dataset_name or analysis identifier
+                attribute_name VARCHAR,
+                description VARCHAR,
+                shape_rows INTEGER,
+                shape_cols INTEGER,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    
+    def register_dataframe(self, df: pd.DataFrame, table_name: str, 
+                          object_type: str, object_name: str, 
+                          attribute_name: str, description: str = ""):
+        """Register a DataFrame in DuckDB with metadata."""
+        if df.empty:
+            return
+        
+        # Store the DataFrame
+        self.conn.register(table_name, df)
+        
+        # Update catalog
+        self.conn.execute("""
+            INSERT OR REPLACE INTO data_catalog 
+            (table_name, object_type, object_name, attribute_name, description, shape_rows, shape_cols)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (table_name, object_type, object_name, attribute_name, description, len(df), len(df.columns)))
+        
+        self.table_metadata[table_name] = {
+            'object_type': object_type,
+            'object_name': object_name,
+            'attribute_name': attribute_name,
+            'columns': list(df.columns),
+            'dtypes': {col: str(dtype) for col, dtype in df.dtypes.items()}
+        }
+    
+    def get_schema_info(self) -> str:
+        """Get human-readable schema information for the AI agent."""
+        catalog_df = self.conn.execute("SELECT * FROM data_catalog ORDER BY object_type, object_name").df()
+        
+        schema_info = "Available Tables:\n\n"
+        for _, row in catalog_df.iterrows():
+            table_name = row['table_name']
+            metadata = self.table_metadata.get(table_name, {})
+            
+            schema_info += f"Table: {table_name}\n"
+            schema_info += f"  - Type: {row['object_type']} ({row['object_name']})\n"
+            schema_info += f"  - Attribute: {row['attribute_name']}\n"
+            schema_info += f"  - Shape: {row['shape_rows']} rows by {row['shape_cols']} columns\n"
+            schema_info += f"  - Description: {row['description']}\n"
+            
+            if 'columns' in metadata:
+                schema_info += f"  - Columns: {', '.join(metadata['columns'])}\n"
+            schema_info += "\n"
+        
+        return schema_info
+
+class AIQueryAgent:
+    """AI agent that converts natural language to SQL queries."""
+    
+    def __init__(self, data_registry: DataRegistry, openai_api_key: str = None):
+        self.data_registry = data_registry
+        if openai_api_key:
+            openai.api_key = openai_api_key
+    
+    def query(self, natural_language_query: str, limit: int = 100) -> pd.DataFrame:
+        """Convert natural language to SQL and execute."""
+        try:
+            sql_query = self._generate_sql(natural_language_query)
+            print(f"Generated SQL: {sql_query}")
+            
+            # Add safety limit
+            if "LIMIT" not in sql_query.upper():
+                sql_query += f" LIMIT {limit}"
+            
+            result = self.data_registry.conn.execute(sql_query).df()
+            return result
+            
+        except Exception as e:
+            print(f"Query failed: {e}")
+            return pd.DataFrame()
+    
+    def _generate_sql(self, query: str) -> str:
+        """Generate SQL from natural language using AI."""
+        schema_info = self.data_registry.get_schema_info()
+        
+        prompt = f"""
+You are a SQL expert. Convert the following natural language query to SQL using DuckDB syntax.
+
+Database Schema:
+{schema_info}
+
+User Query: "{query}"
+
+Rules:
+1. Use exact table and column names from the schema
+2. Return only the SQL query, no explanations
+3. Use proper DuckDB syntax
+4. Handle common variations (e.g., "submodule" might refer to columns like "module", "cluster", "community")
+5. If filtering by numeric values, use appropriate comparison operators
+
+SQL Query:
+"""
+        
+        # If using OpenAI
+        if hasattr(openai, 'api_key') and openai.api_key:
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
+            )
+            return response.choices[0].message.content.strip()
+        
+        # Fallback: Rule-based parsing for common patterns
+        return self._rule_based_sql_generation(query)
+    
+    def _rule_based_sql_generation(self, query: str) -> str:
+        """Fallback rule-based SQL generation for common patterns."""
+        query_lower = query.lower()
+        
+        # Pattern: "show/view all rows from X where Y"
+        if "feature_network_node_table" in query_lower or "node table" in query_lower:
+            table_name = "analysis_analysis_feature_network_node_table"  # Adjust based on your naming
+            
+            # Look for submodule filters
+            submodule_match = re.search(r'submodule\s+(\d+)', query_lower)
+            if submodule_match:
+                submodule_num = submodule_match.group(1)
+                return f"SELECT * FROM {table_name} WHERE submodule = {submodule_num}"
+            
+            return f"SELECT * FROM {table_name}"
+        
+        # Add more patterns as needed
+        return "SELECT 'Query pattern not recognized' as error"
 
 class WorkflowProgressTracker:
     """Class to track and visualize workflow progress."""
@@ -432,6 +581,57 @@ class BaseDataHandler:
         """Clear specific cache entry."""
         if key in self._cache:
             del self._cache[key]
+
+
+class DataAwareBaseHandler(BaseDataHandler):
+    """Enhanced base class with automatic data registry integration."""
+    
+    def __init__(self, output_dir: str, data_registry: Optional['DataRegistry'] = None):
+        super().__init__(output_dir)
+        self.data_registry = data_registry
+        self._auto_register_enabled = data_registry is not None
+    
+    def _set_df(self, key, filename, df):
+        """Enhanced setter that also registers with data registry."""
+        super()._set_df(key, filename, df)
+        
+        if self._auto_register_enabled and not df.empty:
+            self._register_dataframe(key, df)
+    
+    def _register_dataframe(self, attribute_name: str, df: pd.DataFrame):
+        """Register DataFrame with the data registry."""
+        if not self.data_registry:
+            return
+        
+        object_type = "dataset" if hasattr(self, 'dataset_name') else "analysis"
+        object_name = getattr(self, 'dataset_name', 'analysis')
+        table_name = f"{object_type}_{object_name}_{attribute_name}"
+        
+        # Get description from attribute docstring or config
+        description = self._get_attribute_description(attribute_name)
+        
+        self.data_registry.register_dataframe(
+            df=df,
+            table_name=table_name,
+            object_type=object_type,
+            object_name=object_name,
+            attribute_name=attribute_name,
+            description=description
+        )
+    
+    def _get_attribute_description(self, attribute_name: str) -> str:
+        """Get human-readable description for the attribute."""
+        descriptions = {
+            'raw_data': 'Raw unprocessed data matrix',
+            'filtered_data': 'Data after filtering rare features',
+            'normalized_data': 'Final processed data ready for analysis',
+            'linked_metadata': 'Metadata linked across samples',
+            'feature_network_node_table': 'Network nodes with submodule assignments',
+            'feature_correlation_table': 'Pairwise feature correlations',
+            'integrated_data': 'Combined data from multiple datasets',
+            # Add more as needed
+        }
+        return descriptions.get(attribute_name, f"Data attribute: {attribute_name}")
 
 class Dataset(BaseDataHandler):
     """Simplified Dataset class using hybrid approach."""
@@ -984,9 +1184,9 @@ class TX(Dataset):
             _generate_annotation_method()
             return
 
-class Analysis(BaseDataHandler):
-    """Simplified Analysis class using consistent hybrid approach."""
-
+class Analysis(DataAwareBaseHandler):
+    """Enhanced Analysis class with AI query capabilities."""
+    
     def __init__(self, project: Project, datasets: list = None, overwrite: bool = False):
         self.project = project
         self.workflow_tracker = self.project.workflow_tracker
@@ -1001,7 +1201,14 @@ class Analysis(BaseDataHandler):
                                                       self.analysis_config, overwrite=overwrite)
         self.output_dir = analysis_outdir
         os.makedirs(self.output_dir, exist_ok=True)
-        super().__init__(self.output_dir)
+
+        # Initialize data registry
+        self.data_registry = DataRegistry(db_path=os.path.join(self.output_dir, "analysis_data.db"))
+        super().__init__(self.output_dir, self.data_registry)
+        
+        # Initialize AI agent
+        api_key = hlp.load_openai_api_key()
+        self.ai_agent = AIQueryAgent(self.data_registry, openai_api_key=api_key)
 
         self._setup_analysis_filenames()
 
@@ -1562,6 +1769,29 @@ class Analysis(BaseDataHandler):
         else:
             _mofa_method()
             return
+
+    def query(self, text_query: str, limit: int = 100) -> pd.DataFrame:
+        """Natural language interface to query analysis data."""
+        return self.ai_agent.query(text_query, limit)
+    
+    def register_all_existing_data(self):
+        """Register all existing DataFrames with the registry."""
+        for attr_name in ['integrated_data', 'integrated_metadata', 'feature_network_node_table', 
+                         'feature_correlation_table', 'feature_annotation_table']:
+            if hasattr(self, attr_name):
+                df = getattr(self, attr_name)
+                if not df.empty:
+                    self._register_dataframe(attr_name, df)
+        
+        # Register dataset data too
+        for dataset in self.datasets:
+            dataset.data_registry = self.data_registry
+            dataset._auto_register_enabled = True
+            for attr_name in ['raw_data', 'normalized_data', 'linked_metadata']:
+                if hasattr(dataset, attr_name):
+                    df = getattr(dataset, attr_name)
+                    if not df.empty:
+                        dataset._register_dataframe(attr_name, df)
 
 # Create properties for Analysis class
 manual_file_storage = {

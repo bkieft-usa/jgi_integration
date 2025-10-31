@@ -18,6 +18,7 @@ import warnings
 import logging
 import json
 import tempfile
+from functools import reduce
 
 # --- Display and plotting ---
 from IPython.display import display, Image
@@ -37,7 +38,6 @@ import scipy.sparse as sp
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 from scipy.stats import fisher_exact
-from statsmodels.stats.multitest import multipletests
 
 # --- Plotting ---
 import matplotlib.pyplot as plt
@@ -51,6 +51,7 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LassoCV
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.feature_selection import mutual_info_regression, mutual_info_classif
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import multipletests
@@ -210,6 +211,38 @@ def load_project_config(config_path: str = None) -> dict:
     
     return config
 
+def load_openai_api_key(key_file_path: str = "/home/jovyan/work/input_data/dev/.openai_api_key") -> Optional[str]:
+    """
+    Load OpenAI API key from a hidden file.
+    
+    Args:
+        key_file_path (str): Path to the API key file
+        
+    Returns:
+        str or None: The API key if found and valid, None otherwise
+    """
+    try:
+        if not os.path.exists(key_file_path):
+            log.warning(f"OpenAI API key file not found at {key_file_path}")
+            return None
+            
+        with open(key_file_path, 'r') as f:
+            api_key = f.read().strip()
+            
+        if not api_key:
+            log.warning("API key file is empty")
+            return None
+            
+        log.info("OpenAI API key loaded successfully")
+        return api_key
+        
+    except PermissionError:
+        log.error(f"Permission denied reading API key file: {key_file_path}")
+        return None
+    except Exception as e:
+        log.error(f"Error loading API key: {e}")
+        return None
+
 # ====================================
 # Analysis step functions
 # ====================================
@@ -334,7 +367,6 @@ def glm_selection(
                     continue
                 
                 # Fit GLM using statsmodels
-                import statsmodels.api as sm
                 y = feature_df['response']
                 X_feature = pd.get_dummies(feature_df[category], drop_first=True)
                 X_feature = sm.add_constant(X_feature)
@@ -580,10 +612,6 @@ def mutual_info_selection(
     """
     if category not in metadata.columns:
         raise ValueError(f"Target column '{category}' missing.")
-    try:
-        from sklearn.feature_selection import mutual_info_regression, mutual_info_classif
-    except Exception as exc:
-        raise ValueError("scikit-learn is required for mutual information.") from exc
 
     y_raw = metadata[category]
     is_numeric = pd.api.types.is_numeric_dtype(y_raw)
@@ -1150,8 +1178,6 @@ def _detect_submodules(
                 for i, (comm, nodes) in enumerate(sorted(modules.items()))]
 
     elif method == "leiden":
-        if ig is None or leidenalg is None:
-            raise ImportError("igraph + leidenalg not installed -  `pip install igraph leidenalg`")
         # Convert to igraph (preserves node names)
         ig_g = ig.Graph.from_networkx(G)
         partition = leidenalg.find_partition(
@@ -2395,7 +2421,6 @@ def _process_microbe_annotations(
         return empty_df
     
     # Merge all annotation dataframes
-    from functools import reduce
     merged_df = reduce(
         lambda left, right: pd.merge(left, right, on='transcriptome_id', how='outer'), 
         processed_dfs
@@ -2491,7 +2516,6 @@ def _process_algal_annotations(
         return empty_df
     
     # Merge all annotation dataframes based on protein_id
-    from functools import reduce
     merged_df = reduce(
         lambda left, right: pd.merge(left, right, on='protein_id', how='outer'), 
         processed_dfs
