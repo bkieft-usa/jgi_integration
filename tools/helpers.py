@@ -2972,6 +2972,7 @@ def generate_mx_annotation_table(
     mapping_df = pd.DataFrame(mapping_data)
     mapping_df.rename(columns={'metabolite_id': 'metabolome_id'}, inplace=True)
     mapping_df = mapping_df.set_index('metabolome_id')
+    mapping_df = mapping_df.applymap(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
     os.makedirs(output_dir, exist_ok=True)
     write_integration_file(data=mapping_df, output_dir=output_dir, filename=output_filename, indexing=True)
     
