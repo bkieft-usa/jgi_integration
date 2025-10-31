@@ -102,8 +102,10 @@ class AIQueryAgent:
     
     def __init__(self, data_registry: DataRegistry, openai_api_key: str = None):
         self.data_registry = data_registry
+        self.client = None
         if openai_api_key:
-            openai.api_key = openai_api_key
+            # Initialize the OpenAI client for CBorg with the new API
+            self.client = openai.OpenAI(api_key=openai_api_key, base_url="https://api.cborg.lbl.gov")
     
     def query(self, natural_language_query: str, limit: int = 100) -> pd.DataFrame:
         """Convert natural language to SQL and execute."""
@@ -140,40 +142,103 @@ Rules:
 3. Use proper DuckDB syntax
 4. Handle common variations (e.g., "submodule" might refer to columns like "module", "cluster", "community")
 5. If filtering by numeric values, use appropriate comparison operators
+6. IMPORTANT: Submodule values are stored as strings like 'submodule_1', 'submodule_15', etc. When filtering by submodule number, use the format 'submodule_X' where X is the number
+7. Do NOT wrap the response in markdown code blocks or backticks
 
 SQL Query:
 """
         
-        # If using OpenAI
-        if hasattr(openai, 'api_key') and openai.api_key:
-            response = openai.ChatCompletion.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0
-            )
-            return response.choices[0].message.content.strip()
+        # If using OpenAI with new API
+        if self.client:
+            try:
+                response = self.client.chat.completions.create(
+                    model="gpt-4.1",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0
+                )
+                sql_query = response.choices[0].message.content.strip()
+                
+                # Clean up any markdown formatting that might still appear
+                sql_query = self._clean_sql_response(sql_query)
+                
+                return sql_query
+            except Exception as e:
+                print(f"OpenAI API call failed: {e}")
+                # Fall back to rule-based generation
+                return self._rule_based_sql_generation(query)
         
         # Fallback: Rule-based parsing for common patterns
         return self._rule_based_sql_generation(query)
+    
+    def _clean_sql_response(self, sql_response: str) -> str:
+        """Clean up SQL response from AI to remove markdown formatting."""
+        # Remove markdown code blocks
+        if sql_response.startswith('```sql'):
+            sql_response = sql_response[6:]
+        elif sql_response.startswith('```'):
+            sql_response = sql_response[3:]
+        
+        if sql_response.endswith('```'):
+            sql_response = sql_response[:-3]
+        
+        # Remove any remaining backticks
+        sql_response = sql_response.replace('`', '')
+        
+        # Clean up whitespace
+        sql_response = sql_response.strip()
+        
+        return sql_response
     
     def _rule_based_sql_generation(self, query: str) -> str:
         """Fallback rule-based SQL generation for common patterns."""
         query_lower = query.lower()
         
-        # Pattern: "show/view all rows from X where Y"
-        if "feature_network_node_table" in query_lower or "node table" in query_lower:
-            table_name = "analysis_analysis_feature_network_node_table"  # Adjust based on your naming
+        # Get available tables from the registry
+        try:
+            catalog_df = self.data_registry.conn.execute("SELECT * FROM data_catalog").df()
             
-            # Look for submodule filters
-            submodule_match = re.search(r'submodule\s+(\d+)', query_lower)
-            if submodule_match:
-                submodule_num = submodule_match.group(1)
-                return f"SELECT * FROM {table_name} WHERE submodule = {submodule_num}"
+            # Pattern: "show/view all rows from X where Y"
+            if "feature_network_node_table" in query_lower or "node table" in query_lower:
+                # Find the correct table name
+                node_tables = catalog_df[catalog_df['attribute_name'] == 'feature_network_node_table']
+                if not node_tables.empty:
+                    table_name = node_tables.iloc[0]['table_name']
+                    
+                    # Look for submodule filters
+                    submodule_match = re.search(r'submodule\s+(\d+)', query_lower)
+                    if submodule_match:
+                        submodule_num = submodule_match.group(1)
+                        # Check what columns are available
+                        try:
+                            columns_info = self.data_registry.conn.execute(f"DESCRIBE {table_name}").df()
+                            column_names = columns_info['column_name'].str.lower().tolist()
+                            
+                            # Try different possible column names for submodule
+                            if 'submodule' in column_names:
+                                # Handle string format like 'submodule_15'
+                                return f"SELECT * FROM {table_name} WHERE submodule = 'submodule_{submodule_num}'"
+                            elif 'module' in column_names:
+                                return f"SELECT * FROM {table_name} WHERE module = 'module_{submodule_num}'"
+                            elif 'cluster' in column_names:
+                                return f"SELECT * FROM {table_name} WHERE cluster = 'cluster_{submodule_num}'"
+                            elif 'community' in column_names:
+                                return f"SELECT * FROM {table_name} WHERE community = 'community_{submodule_num}'"
+                            else:
+                                return f"SELECT * FROM {table_name}"
+                        except:
+                            return f"SELECT * FROM {table_name} WHERE submodule = 'submodule_{submodule_num}'"
+                    
+                    return f"SELECT * FROM {table_name}"
             
-            return f"SELECT * FROM {table_name}"
-        
-        # Add more patterns as needed
-        return "SELECT 'Query pattern not recognized' as error"
+            # Pattern: show all tables
+            if "show tables" in query_lower or "list tables" in query_lower:
+                return "SELECT table_name, object_type, object_name, attribute_name, description FROM data_catalog"
+            
+            # Add more patterns as needed
+            return "SELECT 'Query pattern not recognized. Try: show tables, or describe a specific table' as message"
+            
+        except Exception as e:
+            return f"SELECT 'Error processing query: {str(e)}' as error"
 
 class WorkflowProgressTracker:
     """Class to track and visualize workflow progress."""
@@ -604,7 +669,7 @@ class DataAwareBaseHandler(BaseDataHandler):
             return
         
         object_type = "dataset" if hasattr(self, 'dataset_name') else "analysis"
-        object_name = getattr(self, 'dataset_name', 'analysis')
+        object_name = getattr(self, 'dataset_name', '')
         table_name = f"{object_type}_{object_name}_{attribute_name}"
         
         # Get description from attribute docstring or config
@@ -633,7 +698,7 @@ class DataAwareBaseHandler(BaseDataHandler):
         }
         return descriptions.get(attribute_name, f"Data attribute: {attribute_name}")
 
-class Dataset(BaseDataHandler):
+class Dataset(DataAwareBaseHandler):  # Changed from BaseDataHandler to DataAwareBaseHandler
     """Simplified Dataset class using hybrid approach."""
 
     def __init__(self, dataset_name: str, project: Project, overwrite: bool = False, superuser: bool = False):
@@ -652,7 +717,9 @@ class Dataset(BaseDataHandler):
         self.output_dir = dataset_outdir
         self.dataset_raw_dir = os.path.join(self.project.raw_data_dir, self.dataset_config['dataset_dir'])
         os.makedirs(self.output_dir, exist_ok=True)
-        super().__init__(self.output_dir)
+        
+        # Initialize with data registry support (will be set later by Analysis)
+        super().__init__(self.output_dir, data_registry=None)
 
         # Set up filename attributes
         self._setup_dataset_filenames()
@@ -1776,22 +1843,53 @@ class Analysis(DataAwareBaseHandler):
     
     def register_all_existing_data(self):
         """Register all existing DataFrames with the registry."""
+        # Register analysis data
         for attr_name in ['integrated_data', 'integrated_metadata', 'feature_network_node_table', 
-                         'feature_correlation_table', 'feature_annotation_table']:
+                         'feature_correlation_table', 'feature_annotation_table', 'functional_enrichment_table']:
             if hasattr(self, attr_name):
                 df = getattr(self, attr_name)
                 if not df.empty:
                     self._register_dataframe(attr_name, df)
         
-        # Register dataset data too
+        # Register dataset data
         for dataset in self.datasets:
+            log.info(f"Registering data for dataset: {dataset.dataset_name}")
+            # Enable data registry for datasets
             dataset.data_registry = self.data_registry
             dataset._auto_register_enabled = True
-            for attr_name in ['raw_data', 'normalized_data', 'linked_metadata']:
+            
+            # Register dataset attributes
+            for attr_name in ['raw_data', 'normalized_data', 'linked_metadata', 'linked_data', 
+                             'filtered_data', 'scaled_data', 'annotation_table']:
                 if hasattr(dataset, attr_name):
                     df = getattr(dataset, attr_name)
                     if not df.empty:
-                        dataset._register_dataframe(attr_name, df)
+                        # Check if method exists before calling
+                        if hasattr(dataset, '_register_dataframe'):
+                            log.info(f"Registering dataset attribute '{attr_name}'...")
+                            dataset._register_dataframe(attr_name, df)
+                        else:
+                            # Fallback: register directly through analysis
+                            self._register_dataset_dataframe(dataset, attr_name, df)
+        
+        log.info("Completed registering all existing data.")
+    
+    def _register_dataset_dataframe(self, dataset, attribute_name: str, df: pd.DataFrame):
+        """Helper method to register dataset DataFrames when dataset doesn't have the method."""
+        if not self.data_registry or df.empty:
+            return
+        
+        table_name = f"dataset_{dataset.dataset_name}_{attribute_name}"
+        description = self._get_attribute_description(attribute_name)
+        
+        self.data_registry.register_dataframe(
+            df=df,
+            table_name=table_name,
+            object_type="dataset",
+            object_name=dataset.dataset_name,
+            attribute_name=attribute_name,
+            description=description
+        )
 
 # Create properties for Analysis class
 manual_file_storage = {
