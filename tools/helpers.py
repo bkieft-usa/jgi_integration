@@ -3002,6 +3002,16 @@ def generate_mx_annotation_table(
     mapping_df.rename(columns={'metabolite_id': 'metabolome_id'}, inplace=True)
     mapping_df = mapping_df.set_index('metabolome_id')
     mapping_df = mapping_df.applymap(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
+    
+    # Validate annotation IDs against raw data before saving
+    if not raw_data.empty and not mapping_df.empty:
+        _validate_annotation_metabolite_ids(mapping_df, raw_data)
+    else:
+        if raw_data.empty:
+            log.warning("Raw data is empty, skipping validation")
+        if mapping_df.empty:
+            log.warning("Annotation table is empty, skipping validation")
+    
     os.makedirs(output_dir, exist_ok=True)
     write_integration_file(data=mapping_df, output_dir=output_dir, filename=output_filename, indexing=True)
     
@@ -3024,6 +3034,57 @@ def generate_mx_annotation_table(
     log.info(f"Metabolites with multiple annotations: {multi_annotation_count}")
     
     return mapping_df
+
+def _validate_annotation_metabolite_ids(annotation_df: pd.DataFrame, raw_data: pd.DataFrame) -> None:
+    """
+    Validate that metabolite IDs in annotation table match those in raw data.
+    
+    Args:
+        annotation_df (pd.DataFrame): Annotation table with metabolome_id as index
+        raw_data (pd.DataFrame): Raw metabolomics data with CompoundID column or metabolite IDs as index
+    """
+    
+    # Get metabolite IDs from raw data
+    if not raw_data.empty:
+        if 'CompoundID' in raw_data.columns:
+            raw_data_metabolites = set(raw_data['CompoundID'].tolist())
+        else:
+            raw_data_metabolites = set(raw_data.index.tolist())
+    else:
+        raw_data_metabolites = set()
+    
+    # Get metabolite IDs from annotation table (should be in index as metabolome_id)
+    if hasattr(annotation_df.index, 'name') and annotation_df.index.name == 'metabolome_id':
+        annotation_metabolites = set(annotation_df.index.tolist())
+    elif 'metabolome_id' in annotation_df.columns:
+        annotation_metabolites = set(annotation_df['metabolome_id'].tolist())
+    else:
+        # Fallback to index if no metabolome_id column
+        annotation_metabolites = set(annotation_df.index.tolist())
+    
+    # Calculate overlap statistics
+    common_metabolites = raw_data_metabolites.intersection(annotation_metabolites)
+    raw_only = raw_data_metabolites - annotation_metabolites
+    annotation_only = annotation_metabolites - raw_data_metabolites
+    
+    # Log validation results
+    log.info(f"Metabolite ID Validation Results:")
+    log.info(f"  Raw data metabolites: {len(raw_data_metabolites)}")
+    log.info(f"  Annotation metabolites: {len(annotation_metabolites)}")
+    log.info(f"  Common metabolites: {len(common_metabolites)} ({len(common_metabolites)/len(raw_data_metabolites)*100:.1f}% of raw data)")
+    log.info(f"  Raw data only: {len(raw_only)}")
+    log.info(f"  Annotation only: {len(annotation_only)}")
+    
+    # Warn if low overlap
+    overlap_pct = len(common_metabolites) / len(raw_data_metabolites) * 100 if len(raw_data_metabolites) > 0 else 0
+    if overlap_pct < 50:
+        log.warning(f"Low metabolite ID overlap ({overlap_pct:.1f}%) between raw data and annotations")
+    if overlap_pct == 0:
+        log.info("Raw data metabolite IDs (first 10):")
+        log.info(list(raw_data_metabolites)[:10])
+        log.info("Annotation metabolite IDs (first 10):")
+        log.info(list(annotation_metabolites)[:10])
+        raise ValueError("No matching metabolite IDs found between raw data and annotations, something is wrong.")
 
 def annotate_integrated_features(
     integrated_data: pd.DataFrame,
@@ -4043,6 +4104,8 @@ def plot_pdf_grids(
         pca_df = pca_frames[d_type]
         for j, meta_var in enumerate(pdf_metadata_vars):
             ax = axes[i, j]
+            if d_type == "linked":
+                d_type = "non-normalized"
             title = f"{d_type} - {meta_var}"
             _draw_pca(ax, pca_df, hue_col=meta_var, title=title, alpha=alpha)
 
