@@ -107,7 +107,7 @@ class AIQueryAgent:
             # Initialize the OpenAI client for CBorg with the new API
             self.client = openai.OpenAI(api_key=openai_api_key, base_url="https://api.cborg.lbl.gov")
     
-    def query(self, natural_language_query: str, limit: int = 100) -> pd.DataFrame:
+    def query(self, natural_language_query: str, limit: int = 500) -> pd.DataFrame:
         """Convert natural language to SQL and execute."""
         try:
             sql_query = self._generate_sql(natural_language_query)
@@ -140,19 +140,32 @@ Rules:
 1. Use exact table and column names from the schema
 2. Return only the SQL query, no explanations
 3. Use proper DuckDB syntax
-4. Handle common variations (e.g., "submodule" might refer to columns like "module", "cluster", "community")
+4. Handle common variations in natural language input appropriately
 5. If filtering by numeric values, use appropriate comparison operators
 6. IMPORTANT: Submodule values are stored as strings like 'submodule_1', 'submodule_15', etc. When filtering by submodule number, use the format 'submodule_X' where X is the number
 7. Do NOT wrap the response in markdown code blocks or backticks
+8. For p-value or statistical significance queries, look for columns containing 'pvalue', 'p_value', 'corrected_pvalue', or similar
+9. When filtering by text content "containing" or "with phrase", use LIKE operator with wildcards (e.g., column LIKE '%text%')
+10. For "not equal" conditions like "not 'Unassigned'", use != or <> operator
+11. When querying correlation data, look for columns like 'correlation', 'corr_score', or similar numerical correlation measures
+12. For network/node queries, prioritize tables with 'node' in the name over 'edge' tables
+13. When filtering by annotation classes or categories, look for columns ending in '_class', '_category', '_annotation', or '_superclass'
+14. Handle case-insensitive text matching when appropriate using UPPER() or LOWER() functions
+
+Common Query Patterns:
+- "submodule X" → WHERE submodule = 'submodule_X'
+- "correlation > 0.7" → WHERE correlation > 0.7 (or similar correlation column)
+- "p value < 0.05" → WHERE pvalue < 0.05 (or corrected_pvalue, etc.)
+- "contains 'text'" → WHERE column LIKE '%text%'
+- "not 'value'" → WHERE column != 'value'
 
 SQL Query:
 """
-        
-        # If using OpenAI with new API
+
         if self.client:
             try:
                 response = self.client.chat.completions.create(
-                    model="gpt-4.1",
+                    model="openai/chatgpt:latest",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0
                 )
@@ -163,12 +176,7 @@ SQL Query:
                 
                 return sql_query
             except Exception as e:
-                print(f"OpenAI API call failed: {e}")
-                # Fall back to rule-based generation
-                return self._rule_based_sql_generation(query)
-        
-        # Fallback: Rule-based parsing for common patterns
-        return self._rule_based_sql_generation(query)
+                raise ValueError(f"OpenAI API call failed: {e}")
     
     def _clean_sql_response(self, sql_response: str) -> str:
         """Clean up SQL response from AI to remove markdown formatting."""
@@ -187,58 +195,11 @@ SQL Query:
         # Clean up whitespace
         sql_response = sql_response.strip()
         
-        return sql_response
-    
-    def _rule_based_sql_generation(self, query: str) -> str:
-        """Fallback rule-based SQL generation for common patterns."""
-        query_lower = query.lower()
+        # Remove trailing semicolon to prevent syntax errors when adding LIMIT
+        if sql_response.endswith(';'):
+            sql_response = sql_response[:-1]
         
-        # Get available tables from the registry
-        try:
-            catalog_df = self.data_registry.conn.execute("SELECT * FROM data_catalog").df()
-            
-            # Pattern: "show/view all rows from X where Y"
-            if "feature_network_node_table" in query_lower or "node table" in query_lower:
-                # Find the correct table name
-                node_tables = catalog_df[catalog_df['attribute_name'] == 'feature_network_node_table']
-                if not node_tables.empty:
-                    table_name = node_tables.iloc[0]['table_name']
-                    
-                    # Look for submodule filters
-                    submodule_match = re.search(r'submodule\s+(\d+)', query_lower)
-                    if submodule_match:
-                        submodule_num = submodule_match.group(1)
-                        # Check what columns are available
-                        try:
-                            columns_info = self.data_registry.conn.execute(f"DESCRIBE {table_name}").df()
-                            column_names = columns_info['column_name'].str.lower().tolist()
-                            
-                            # Try different possible column names for submodule
-                            if 'submodule' in column_names:
-                                # Handle string format like 'submodule_15'
-                                return f"SELECT * FROM {table_name} WHERE submodule = 'submodule_{submodule_num}'"
-                            elif 'module' in column_names:
-                                return f"SELECT * FROM {table_name} WHERE module = 'module_{submodule_num}'"
-                            elif 'cluster' in column_names:
-                                return f"SELECT * FROM {table_name} WHERE cluster = 'cluster_{submodule_num}'"
-                            elif 'community' in column_names:
-                                return f"SELECT * FROM {table_name} WHERE community = 'community_{submodule_num}'"
-                            else:
-                                return f"SELECT * FROM {table_name}"
-                        except:
-                            return f"SELECT * FROM {table_name} WHERE submodule = 'submodule_{submodule_num}'"
-                    
-                    return f"SELECT * FROM {table_name}"
-            
-            # Pattern: show all tables
-            if "show tables" in query_lower or "list tables" in query_lower:
-                return "SELECT table_name, object_type, object_name, attribute_name, description FROM data_catalog"
-            
-            # Add more patterns as needed
-            return "SELECT 'Query pattern not recognized. Try: show tables, or describe a specific table' as message"
-            
-        except Exception as e:
-            return f"SELECT 'Error processing query: {str(e)}' as error"
+        return sql_response
 
 class WorkflowProgressTracker:
     """Class to track and visualize workflow progress."""
@@ -1626,6 +1587,15 @@ class Analysis(DataAwareBaseHandler):
             _annotate_integrated_features_method()
             return
 
+    def plot_individual_feature(self, feature_id: str, metadata_column: str = 'group') -> None:
+        """Plot individual feature abundance by metadata."""
+        hlp.plot_feature_abundance_by_metadata(
+            data=self.integrated_data,
+            metadata=self.integrated_metadata,
+            feature=feature_id,
+            metadata_group=metadata_column
+        )
+
     def perform_feature_selection(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
         """Hybrid: Class parameter setup + external hlp.perform_feature_selection function."""
         def _feature_selection_method():
@@ -1837,7 +1807,7 @@ class Analysis(DataAwareBaseHandler):
             _mofa_method()
             return
 
-    def query(self, text_query: str, limit: int = 100) -> pd.DataFrame:
+    def query(self, text_query: str, limit: int = 500) -> pd.DataFrame:
         """Natural language interface to query analysis data."""
         return self.ai_agent.query(text_query, limit)
     

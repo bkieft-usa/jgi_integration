@@ -2371,6 +2371,10 @@ def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.Data
     if overlap_pct < 50:
         log.warning(f"Low gene ID overlap ({overlap_pct:.1f}%) between raw data and annotations")
     if overlap_pct == 0:
+        log.info("Raw data GeneIDs:")
+        log.info(raw_data['GeneID'].tolist()[:10])
+        log.info("Annotation transcriptome_ids:")
+        log.info(annotation_df['transcriptome_id'].tolist()[:10])
         raise ValueError("No matching gene IDs found between raw data and annotations, something is wrong.")
 
 def _process_microbe_annotations(
@@ -2730,23 +2734,24 @@ def _add_gene_id_mapping(
             if len(fields) >= 9 and fields[2] == 'gene':
                 attributes = fields[8]
                 
-                # Extract gene ID
+                # Extract gene ID from ID= field
                 gene_match = re.search(r'ID=([^;]+)', attributes)
                 if not gene_match:
                     continue
                 gene_id = gene_match.group(1)
                 
-                # Extract protein ID
+                # Extract protein ID from proteinId= field
                 protein_match = re.search(r'proteinId=([^;]+)', attributes)
                 if protein_match:
                     protein_id = protein_match.group(1)
-                    protein_to_gene[protein_id] = gene_id
+                    protein_to_gene[str(protein_id)] = str(gene_id)
     
     log.info(f"Found {len(protein_to_gene)} protein-to-gene mappings")
     
-    # Add transcriptome_id column to merged_df
+    # Add transcriptome_id column to merged_df by mapping protein_id to gene_id
+    merged_df['protein_id'] = merged_df['protein_id'].astype(str)
     merged_df['transcriptome_id'] = merged_df['protein_id'].map(protein_to_gene).fillna(merged_df['protein_id'])
-    
+
     return merged_df
 
 def _add_protein_id_mapping(
@@ -4173,6 +4178,8 @@ def plot_feature_abundance_by_metadata(
     """
 
     # Select the row data
+    if feature not in data.index:
+        raise ValueError(f"Feature '{feature}' not found in data.")
     row_data = data.loc[feature]
     
     # Merge row data with metadata
