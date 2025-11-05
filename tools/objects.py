@@ -19,6 +19,8 @@ import time
 import hashlib
 import duckdb
 import openai
+import json
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 if not log.handlers:
@@ -27,6 +29,149 @@ if not log.handlers:
     handler.setFormatter(logging.Formatter(fmt))
     log.addHandler(handler)
     log.setLevel(logging.INFO)
+
+class ConfigManager:
+    """Manages configuration files with automatic hash-based tagging."""
+    
+    def __init__(self, config_dir: str, data_processing_hash: str = None, analysis_hash: str = None):
+        self.config_dir = Path(glob.glob(config_dir)[0])
+        self.target_data_hash = data_processing_hash
+        self.target_analysis_hash = analysis_hash
+        
+        # Set up config file paths
+        self.project_config_file = self.config_dir / "project.yml"
+        self.data_processing_config_file = self.config_dir / "data_processing.yml"
+        self.analysis_config_file = self.config_dir / "analysis.yml"
+        
+        # If hashes are specified, try to load from persistent configs
+        if self.target_data_hash and self.target_analysis_hash:
+            self._load_from_persistent_configs()
+        elif not self._standard_configs_exist():
+            log.warning("Standard config files not found and no hashes specified.")
+    
+    def _standard_configs_exist(self) -> bool:
+        """Check if standard config files exist."""
+        return all([
+            self.project_config_file.exists(),
+            self.data_processing_config_file.exists(),
+            self.analysis_config_file.exists()
+        ])
+    
+    def _load_from_persistent_configs(self):
+        """Load from persistent config files with specified hashes."""
+        log.info(f"Loading persistent configs for hashes: {self.target_data_hash}, {self.target_analysis_hash}")
+        
+        # Look for persistent config files with the exact hash pattern
+        pattern = f"Dataset_Processing--{self.target_data_hash}_Analysis--{self.target_analysis_hash}_*_config.yml"
+        config_files = list(self.config_dir.glob(pattern))
+        
+        if not config_files:
+            log.error(f"No persistent config files found for pattern: {pattern}")
+            raise FileNotFoundError(f"Cannot find configs for the specified hashes in {self.config_dir}")
+        
+        # Group by config type
+        config_mapping = {
+            'project': self.project_config_file,
+            'data': self.data_processing_config_file,
+            'analysis': self.analysis_config_file
+        }
+        
+        found_configs = {}
+        for config_file in config_files:
+            name_parts = config_file.stem.split('_')
+            if len(name_parts) >= 3:
+                config_type = name_parts[-2]  # e.g., 'project', 'data', 'analysis'
+                
+                # Handle both 'data' and 'data_processing' naming
+                if config_type == 'data':
+                    config_type = 'data'
+                elif config_type == 'processing':
+                    config_type = 'data'
+                
+                if config_type in config_mapping:
+                    found_configs[config_type] = config_file
+        
+        # Check if we have all required configs
+        required_types = ['project', 'data', 'analysis']
+        missing_types = [t for t in required_types if t not in found_configs]
+        
+        if missing_types:
+            log.error(f"Missing config types: {missing_types}")
+            raise FileNotFoundError(f"Cannot find all required config types for specified hashes")
+        
+        # Copy persistent configs to standard names
+        for config_type, target_file in config_mapping.items():
+            if config_type in found_configs:
+                source_file = found_configs[config_type]
+                shutil.copy2(source_file, target_file)
+                log.info(f"Loaded {config_type} config from: {source_file.name}")
+    
+    def load_configs(self) -> Tuple[Dict[str, Any], str, str]:
+        """Load all config files and generate hashes."""
+        
+        # Load project config
+        with open(self.project_config_file, 'r') as f:
+            project_config = yaml.safe_load(f)
+        
+        # Load data processing config and generate hash
+        with open(self.data_processing_config_file, 'r') as f:
+            data_processing_config = yaml.safe_load(f)
+        data_processing_hash = self._generate_config_hash(data_processing_config)
+        
+        # Load analysis config and generate hash
+        with open(self.analysis_config_file, 'r') as f:
+            analysis_config = yaml.safe_load(f)
+        analysis_hash = self._generate_config_hash(analysis_config)
+        
+        # Verify hashes match if they were specified
+        if self.target_data_hash and data_processing_hash != self.target_data_hash:
+            log.warning(f"Data processing hash mismatch! Expected: {self.target_data_hash}, Got: {data_processing_hash}")
+
+        if self.target_analysis_hash and analysis_hash != self.target_analysis_hash:
+            log.warning(f"Analysis hash mismatch! Expected: {self.target_analysis_hash}, Got: {analysis_hash}")
+        
+        # Combine all configs for backward compatibility
+        combined_config = {
+            **project_config,
+            **data_processing_config,
+            **analysis_config
+        }
+        
+        return combined_config, data_processing_hash, analysis_hash
+    
+    def _generate_config_hash(self, config: Dict[str, Any], length: int = 8) -> str:
+        """Generate a deterministic hash from config parameters."""
+        # Convert to JSON string with sorted keys for deterministic hashing
+        config_str = json.dumps(config, sort_keys=True, separators=(',', ':'))
+        
+        # Generate SHA-256 hash
+        hash_obj = hashlib.sha256(config_str.encode('utf-8'))
+        full_hash = hash_obj.hexdigest()
+        
+        # Return truncated hash
+        return full_hash[:length]
+    
+    def check_config_changes(self, previous_data_hash: Optional[str] = None, 
+                           previous_analysis_hash: Optional[str] = None) -> Dict[str, bool]:
+        """Check if configs have changed compared to previous hashes."""
+        _, current_data_hash, current_analysis_hash = self.load_configs()
+        
+        changes = {
+            'data_processing_changed': previous_data_hash != current_data_hash,
+            'analysis_changed': previous_analysis_hash != current_analysis_hash,
+            'current_data_hash': current_data_hash,
+            'current_analysis_hash': current_analysis_hash
+        }
+        
+        return changes
+    
+    def get_hash_info(self) -> Dict[str, str]:
+        """Get current hash information for both configs."""
+        _, data_hash, analysis_hash = self.load_configs()
+        return {
+            'data_processing_hash': data_hash,
+            'analysis_hash': analysis_hash
+        }
 
 class DataRegistry:
     """Registry that automatically syncs DataFrames to DuckDB for AI querying."""
@@ -429,15 +574,56 @@ class WorkflowProgressTracker:
         return fig
 
 class Project:
-    """Project configuration and directory management."""
+    """Project configuration and directory management with hash-based tagging."""
 
-    def __init__(self, config):
+    def __init__(self, data_processing_hash: str = None, analysis_hash: str = None):
         self.workflow_tracker = WorkflowProgressTracker()
         self.workflow_tracker.set_current_step('init_project')
         log.info("Initializing Project")
-        self.config = config
-        self.project_config = config['project']
-        self.user_settings = config['user_settings']
+        
+        # Handle default config directory
+        config_dir = None
+        self.default_config_dir = "/home/jovyan/work/input_data/config"
+        self.custom_config_dir = "/home/jovyan/work/output_data/*/configs"
+        
+        if data_processing_hash is None and analysis_hash is None:
+            if os.path.isdir(self.default_config_dir):
+                config_dir = self.default_config_dir
+            else:
+                log.error("No configuration directory specified or default path is invalid.")
+                raise FileNotFoundError("Configuration directory not found.")
+        elif data_processing_hash is not None and analysis_hash is not None:
+            matching_dirs = glob.glob(self.custom_config_dir)
+            if matching_dirs and os.path.isdir(matching_dirs[0]):
+                config_dir = matching_dirs[0]
+            else:
+                log.error("No configuration directory found for the specified hashes.")
+                raise FileNotFoundError("Configuration directory not found for specified hashes.")
+        elif data_processing_hash is None and analysis_hash is not None:
+            log.error("Both data processing hash and analysis hash must be provided together.")
+            raise ValueError("Both data processing hash and analysis hash are required.")
+        elif data_processing_hash is not None and analysis_hash is None:
+            log.error("Both data processing hash and analysis hash must be provided together.")
+            raise ValueError("Both data processing hash and analysis hash are required.")
+        
+        # Initialize config manager
+        self.config_manager = ConfigManager(config_dir, data_processing_hash, analysis_hash)
+        self.config, self.data_processing_hash, self.analysis_hash = self.config_manager.load_configs()
+        
+        # Log configuration info
+        if data_processing_hash and analysis_hash:
+            log.info(f"Loading existing configuration:")
+            log.info(f"  Requested data processing hash: {data_processing_hash}")
+            log.info(f"  Requested analysis hash: {analysis_hash}")
+        else:
+            log.info(f"Using current configuration:")
+        
+        log.info(f"  Data processing tag: {self.data_processing_hash}")
+        log.info(f"  Analysis tag: {self.analysis_hash}")
+        
+        # Set up project attributes
+        self.project_config = self.config['project']
+        self.user_settings = self.config['user_settings']
         self.PI_name = self.project_config['PI_name']
         self.proposal_ID = self.project_config['proposal_ID']
         self.data_types = self.project_config['dataset_list']
@@ -448,6 +634,7 @@ class Project:
         self.project_dir = f"{self.output_dir}/{self.project_name}"
         os.makedirs(self.project_dir, exist_ok=True)
         log.info(f"Project directory: {self.project_dir}")
+        self._validate_directory_structure()
         self._complete_tracking('init_project')
 
     def _complete_tracking(self, step_id: str):
@@ -460,72 +647,63 @@ class Project:
         """Save the current configuration and notebook with timestamp and tags for this run."""
         
         try:
-            # Get tags for naming
-            data_processing_tag = self.config['datasets']['data_processing_tag']
-            data_analysis_tag = self.config['analysis']['data_analysis_tag']
-            
-            # Create base filename pattern
-            base_filename = f"Dataset_Processing--{data_processing_tag}_Analysis--{data_analysis_tag}"
+            # Use hash-based tags for naming
+            base_filename = f"Dataset_Processing--{self.data_processing_hash}_Analysis--{self.analysis_hash}"
             
             # Setup directories
             config_dir = os.path.join(self.project_dir, "configs")
             notebooks_dir = os.path.join(self.project_dir, "notebooks")
             os.makedirs(config_dir, exist_ok=True)
             os.makedirs(notebooks_dir, exist_ok=True)
+            self._cleanup_orphaned_analysis_directories()
             
-            # Define new configuration filename
-            config_filename = f"{base_filename}_config.yml"
-            config_path = os.path.join(config_dir, config_filename)
-            if os.path.exists(config_path):
-                log.warning(f"Configuration file already exists at {config_path}. It will be updated.")
-            
-            # Add metadata to config
-            config_with_metadata = self.config.copy()
-            config_with_metadata['_metadata'] = {
-                'created_at': pd.Timestamp.now().isoformat(),
-                'data_processing_tag': data_processing_tag,
-                'data_analysis_tag': data_analysis_tag
+            # Save all three config files with hash-based naming
+            config_files = {
+                'project': self.config_manager.project_config_file,
+                'data_processing': self.config_manager.data_processing_config_file,
+                'analysis': self.config_manager.analysis_config_file
             }
+            
+            for config_type, source_path in config_files.items():
+                dest_filename = f"{base_filename}_{config_type}_config.yml"
+                dest_path = os.path.join(config_dir, dest_filename)
+                
+                if os.path.exists(dest_path):
+                    log.warning(f"Configuration file already exists at {dest_path}. It will be updated.")
+                
+                # Copy config file to timestamped location
+                shutil.copy2(source_path, dest_path)
+                log.info(f"Configuration saved to: {dest_path}")
 
-            # Save config to disk
-            with open(config_path, 'w') as f:
-                yaml.dump(config_with_metadata, f, default_flow_style=False, sort_keys=False)
-            log.info(f"Configuration saved to: {config_path}")
-
+            # Handle notebook saving (existing logic)
             this_notebook_path = None
-            # Try using IPython's get_ipython() for notebook name
-            if this_notebook_path is None:
-                ipython = get_ipython()
-                if ipython and hasattr(ipython, 'kernel'):
-                    # Try to get the connection file
-                    connection_file = ipython.kernel.config['IPKernelApp']['connection_file']
-                    kernel_id = connection_file.split('-', 1)[1].split('.')[0]
-                    # Look for notebook files in common locations
-                    possible_paths = [
-                        f"/notebooks/*.ipynb",
-                        f"/work/*.ipynb", 
-                        f"*.ipynb",
-                        f"/home/jovyan/*.ipynb"
-                    ]
-                    for pattern in possible_paths:
-                        notebooks = glob.glob(pattern)
-                        if notebooks:
-                            # Use the most recently modified notebook
-                            this_notebook_path = max(notebooks, key=os.path.getmtime)
-                            log.info(f"Notebook path identified: {this_notebook_path}")
-                            break
+            ipython = get_ipython()
+            if ipython and hasattr(ipython, 'kernel'):
+                connection_file = ipython.kernel.config['IPKernelApp']['connection_file']
+                kernel_id = connection_file.split('-', 1)[1].split('.')[0]
+                possible_paths = [
+                    f"/notebooks/*.ipynb",
+                    f"/work/*.ipynb", 
+                    f"*.ipynb",
+                    f"/home/jovyan/*.ipynb"
+                ]
+                for pattern in possible_paths:
+                    notebooks = glob.glob(pattern)
+                    if notebooks:
+                        this_notebook_path = max(notebooks, key=os.path.getmtime)
+                        log.info(f"Notebook path identified: {this_notebook_path}")
+                        break
 
             if this_notebook_path and os.path.exists(this_notebook_path):
-                # Define new notebook filename
                 notebook_filename = f"{base_filename}_notebook.ipynb"
                 new_notebook_path = os.path.join(notebooks_dir, notebook_filename)
                 if os.path.exists(new_notebook_path):
                     log.warning(f"Notebook file already exists at {new_notebook_path}. It will be updated.")
                 
-                # Get initial hash
+                # Wait for notebook to save and copy
                 start_md5 = hashlib.md5(open(this_notebook_path,'rb').read()).hexdigest()
                 current_md5 = start_md5
-                max_wait_time = 30  # seconds
+                max_wait_time = 30
                 wait_time = 0
                 while start_md5 == current_md5 and wait_time < max_wait_time:
                     time.sleep(2)
@@ -533,7 +711,6 @@ class Project:
                     if os.path.exists(this_notebook_path):
                         current_md5 = hashlib.md5(open(this_notebook_path,'rb').read()).hexdigest()
 
-                # Copy to output directory
                 shutil.copy2(this_notebook_path, new_notebook_path)
                 log.info(f"Notebook saved to: {new_notebook_path}")
             else:
@@ -543,6 +720,178 @@ class Project:
         
         except Exception as e:
             log.error(f"Failed to save configuration and notebook: {e}")
+
+    def _cleanup_orphaned_analysis_directories(self):
+        """Clean up analysis directories with the same hash under different data processing hashes."""
+        current_data_hash = self.data_processing_hash
+        current_analysis_hash = self.analysis_hash
+        
+        # Find all existing data processing directories
+        data_processing_pattern = os.path.join(self.project_dir, "Dataset_Processing--*")
+        existing_data_dirs = glob.glob(data_processing_pattern)
+        
+        orphaned_analysis_dirs = []
+        
+        for data_dir in existing_data_dirs:
+            # Extract data processing hash from directory name
+            data_hash = os.path.basename(data_dir).split('--')[1]
+            
+            # Skip current data processing directory
+            if data_hash == current_data_hash:
+                continue
+            
+            # Look for analysis directories with the same analysis hash
+            analysis_pattern = os.path.join(data_dir, f"Analysis--{current_analysis_hash}")
+            if os.path.exists(analysis_pattern):
+                orphaned_analysis_dirs.append({
+                    'old_data_hash': data_hash,
+                    'analysis_hash': current_analysis_hash,
+                    'path': analysis_pattern,
+                    'parent_dir': data_dir
+                })
+        
+        if orphaned_analysis_dirs:
+            log.info(f"Found {len(orphaned_analysis_dirs)} orphaned analysis directories with hash {current_analysis_hash}")
+            
+            for orphaned in orphaned_analysis_dirs:
+                old_data_hash = orphaned['old_data_hash']
+                analysis_path = orphaned['path']
+                parent_dir = orphaned['parent_dir']
+                
+                log.info(f"Cleaning up orphaned analysis: {analysis_path}")
+                log.info(f"  (Analysis hash {current_analysis_hash} under old data processing hash {old_data_hash})")
+                
+                try:
+                    # Remove the analysis directory
+                    shutil.rmtree(analysis_path)
+                    log.info(f"Successfully removed: {analysis_path}")
+                    
+                    # Check if parent data processing directory is now empty
+                    remaining_items = [item for item in os.listdir(parent_dir) 
+                                    if not item.startswith('.')]
+                    
+                    if not remaining_items:
+                        log.info(f"Data processing directory {parent_dir} is now empty. Removing it.")
+                        shutil.rmtree(parent_dir)
+                        log.info(f"Successfully removed empty data processing directory: {parent_dir}")
+                    else:
+                        log.info(f"Data processing directory {parent_dir} still contains other analyses.")
+                        
+                except Exception as e:
+                    log.error(f"Failed to clean up {analysis_path}: {e}")
+        else:
+            log.info(f"No orphaned analysis directories found for hash {current_analysis_hash}")
+
+    def _validate_directory_structure(self) -> Dict[str, Any]:
+        """Validate the overall directory structure for consistency."""
+        validation_info = {
+            'data_processing_dirs': [],
+            'analysis_dirs_by_data_hash': {},
+            'duplicate_analysis_hashes': {},
+            'orphaned_dirs': [],
+            'issues': [],
+            'current_config_valid': True
+        }
+        
+        # Only validate if project directory exists
+        if not os.path.exists(self.project_dir):
+            log.info("Project directory doesn't exist yet - skipping validation.")
+            return validation_info
+        
+        # Find all data processing directories
+        data_processing_pattern = os.path.join(self.project_dir, "Dataset_Processing--*")
+        data_dirs = glob.glob(data_processing_pattern)
+        
+        if not data_dirs:
+            log.info("No existing data processing directories found.")
+            return validation_info
+        
+        log.info(f"Validating directory structure with {len(data_dirs)} data processing directories...")
+        
+        for data_dir in data_dirs:
+            try:
+                data_hash = os.path.basename(data_dir).split('--')[1]
+                validation_info['data_processing_dirs'].append(data_hash)
+                
+                # Find analysis directories under this data processing directory
+                analysis_pattern = os.path.join(data_dir, "Analysis--*")
+                analysis_dirs = glob.glob(analysis_pattern)
+                
+                analysis_hashes = []
+                for analysis_dir in analysis_dirs:
+                    try:
+                        analysis_hash = os.path.basename(analysis_dir).split('--')[1]
+                        analysis_hashes.append(analysis_hash)
+                        
+                        # Track where each analysis hash appears
+                        if analysis_hash not in validation_info['duplicate_analysis_hashes']:
+                            validation_info['duplicate_analysis_hashes'][analysis_hash] = []
+                        validation_info['duplicate_analysis_hashes'][analysis_hash].append(data_hash)
+                        
+                        # Check if this is an orphaned directory (same analysis hash under different data processing)
+                        if (hasattr(self, 'analysis_hash') and 
+                            analysis_hash == self.analysis_hash and 
+                            data_hash != self.data_processing_hash):
+                            validation_info['orphaned_dirs'].append({
+                                'type': 'analysis',
+                                'path': analysis_dir,
+                                'old_data_hash': data_hash,
+                                'analysis_hash': analysis_hash,
+                                'should_be_under': self.data_processing_hash
+                            })
+                            validation_info['issues'].append(
+                                f"Orphaned analysis directory: {analysis_dir} (should be under {self.data_processing_hash})"
+                            )
+                            
+                    except Exception as e:
+                        log.warning(f"Could not parse analysis directory {analysis_dir}: {e}")
+                        validation_info['issues'].append(f"Invalid analysis directory format: {analysis_dir}")
+                
+                validation_info['analysis_dirs_by_data_hash'][data_hash] = analysis_hashes
+                
+            except Exception as e:
+                log.warning(f"Could not parse data processing directory {data_dir}: {e}")
+                validation_info['issues'].append(f"Invalid data processing directory format: {data_dir}")
+        
+        # Check for legitimate duplicate analysis hashes (same analysis under different data processing)
+        duplicates = {ah: data_hashes for ah, data_hashes in validation_info['duplicate_analysis_hashes'].items() 
+                    if len(data_hashes) > 1}
+        
+        if duplicates:
+            log.info("Directory structure analysis:")
+            for analysis_hash, data_hashes in duplicates.items():
+                if len(data_hashes) > 1:
+                    log.info(f"  Analysis hash {analysis_hash} exists under data processing hashes: {data_hashes}")
+                    # This is normal behavior, not an issue
+        
+        # Check current configuration validity
+        if hasattr(self, 'data_processing_hash') and hasattr(self, 'analysis_hash'):
+            expected_dir = os.path.join(
+                self.project_dir,
+                f"Dataset_Processing--{self.data_processing_hash}",
+                f"Analysis--{self.analysis_hash}"
+            )
+            
+            if not os.path.exists(os.path.dirname(expected_dir)):
+                log.info(f"Current data processing directory will be created: Dataset_Processing--{self.data_processing_hash}")
+            
+            if not os.path.exists(expected_dir):
+                log.info(f"Current analysis directory will be created: Analysis--{self.analysis_hash}")
+        
+        # Report validation results
+        if validation_info['issues']:
+            log.warning(f"Found {len(validation_info['issues'])} directory structure issues:")
+            for issue in validation_info['issues']:
+                log.warning(f"  - {issue}")
+            validation_info['current_config_valid'] = False
+        else:
+            log.info("Directory structure validation passed - no issues found.")
+        
+        # Report orphaned directories that will be cleaned up
+        if validation_info['orphaned_dirs']:
+            log.info(f"Found {len(validation_info['orphaned_dirs'])} orphaned directories that will be cleaned up during save.")
+        
+        return validation_info
 
 class BaseDataHandler:
     """Base class with common data handling functionality."""
@@ -659,8 +1008,8 @@ class DataAwareBaseHandler(BaseDataHandler):
         }
         return descriptions.get(attribute_name, f"Data attribute: {attribute_name}")
 
-class Dataset(DataAwareBaseHandler):  # Changed from BaseDataHandler to DataAwareBaseHandler
-    """Simplified Dataset class using hybrid approach."""
+class Dataset(DataAwareBaseHandler):
+    """Simplified Dataset class using hash-based tagging."""
 
     def __init__(self, dataset_name: str, project: Project, overwrite: bool = False, superuser: bool = False):
         self.project = project
@@ -671,13 +1020,18 @@ class Dataset(DataAwareBaseHandler):  # Changed from BaseDataHandler to DataAwar
         self.datasets_config = self.project.config['datasets']
         self.dataset_config = self.datasets_config[self.dataset_name]
 
-        # Set up output directories
-        dataset_outdir = self.set_up_dataset_outdir(self.project, self.datasets_config,
+        # Use hash-based tag for output directory
+        self.data_processing_tag = project.data_processing_hash
+        dataset_outdir = self.set_up_dataset_outdir(self.project, self.data_processing_tag,
                                                     self.dataset_config, self.dataset_name,
                                                     overwrite=overwrite)
         self.output_dir = dataset_outdir
         self.dataset_raw_dir = os.path.join(self.project.raw_data_dir, self.dataset_config['dataset_dir'])
         os.makedirs(self.output_dir, exist_ok=True)
+        
+        log.info(f"Dataset: {self.dataset_name}")
+        log.info(f"Processing tag: {self.data_processing_tag}")
+        log.info(f"Output directory: {self.output_dir}")
         
         # Initialize with data registry support (will be set later by Analysis)
         super().__init__(self.output_dir, data_registry=None)
@@ -696,25 +1050,16 @@ class Dataset(DataAwareBaseHandler):  # Changed from BaseDataHandler to DataAwar
         self.workflow_tracker.plot(show_plot=True)
 
     @staticmethod
-    def set_up_dataset_outdir(project: Project, datasets_config: dict, dataset_config: dict, dataset_name: str, overwrite: bool = False) -> bool:
-        """Check if the Dataset_Processing--[tag] directory already exists."""
+    def set_up_dataset_outdir(project: Project, data_processing_tag: str, dataset_config: dict, dataset_name: str, overwrite: bool = False) -> str:
+        """Check if the Dataset_Processing--[hash] directory already exists."""
         processing_dir = os.path.join(
             project.project_dir,
-            f"Dataset_Processing--{datasets_config['data_processing_tag']}",
+            f"Dataset_Processing--{data_processing_tag}",
             dataset_config['dataset_dir']
         )
         if os.path.exists(processing_dir):
             log.info(f"Dataset processing directory already exists. Proceeding with output directory as {processing_dir}")
             return processing_dir
-            # if overwrite:
-            #     log.info(f"Overwriting existing dataset processing directory for {dataset_name} at {processing_dir}.")
-            #     #shutil.rmtree(processing_dir)
-            #     return processing_dir
-            # else:
-            #     error_msg = f"Dataset processing directory already exists for {dataset_name} at {processing_dir}" \
-            #                 "Please choose a different data processing tag, delete the existing directory, or use the overwrite=True flag before proceeding."
-            #     log.error(error_msg)
-            #     sys.exit(1)
         else:
             log.info(f"Set up {dataset_name} dataset output directory: {processing_dir}")
             return processing_dir
@@ -1213,7 +1558,7 @@ class TX(Dataset):
             return
 
 class Analysis(DataAwareBaseHandler):
-    """Enhanced Analysis class with AI query capabilities."""
+    """Enhanced Analysis class with hash-based tagging and AI query capabilities."""
     
     def __init__(self, project: Project, datasets: list = None, overwrite: bool = False):
         self.project = project
@@ -1224,11 +1569,18 @@ class Analysis(DataAwareBaseHandler):
         self.analysis_config = self.project.config['analysis']
         self.metadata_link_script = self.project.project_config['metadata_link']
 
-        # Check if analysis directory exists
-        analysis_outdir = self._set_up_analysis_outdir(self.project, self.datasets_config, 
-                                                      self.analysis_config, overwrite=overwrite)
+        # Use hash-based tags for output directory
+        self.data_processing_tag = project.data_processing_hash
+        self.analysis_tag = project.analysis_hash
+        analysis_outdir = self._set_up_analysis_outdir(self.project, self.data_processing_tag, 
+                                                      self.analysis_tag, overwrite=overwrite)
         self.output_dir = analysis_outdir
         os.makedirs(self.output_dir, exist_ok=True)
+
+        log.info(f"Analysis object created")
+        log.info(f"Data processing tag: {self.data_processing_tag}")
+        log.info(f"Analysis tag: {self.analysis_tag}")
+        log.info(f"Output directory: {self.output_dir}")
 
         # Initialize data registry
         self.data_registry = DataRegistry(db_path=os.path.join(self.output_dir, "analysis_data.db"))
@@ -1250,23 +1602,16 @@ class Analysis(DataAwareBaseHandler):
         self._complete_tracking('create_analysis')
 
     @staticmethod
-    def _set_up_analysis_outdir(project: Project, datasets_config: dict, analysis_config: dict, overwrite: bool = False) -> str:
+    def _set_up_analysis_outdir(project: Project, data_processing_tag: str, analysis_tag: str, overwrite: bool = False) -> str:
         """Check if the Analysis output directory already exists."""
         analysis_dir = os.path.join(
             project.project_dir,
-            f"Dataset_Processing--{datasets_config['data_processing_tag']}",
-            f"Analysis--{analysis_config['data_analysis_tag']}"
+            f"Dataset_Processing--{data_processing_tag}",
+            f"Analysis--{analysis_tag}"
         )
         if os.path.exists(analysis_dir):
-            if overwrite:
-                log.info(f"Overwriting existing analysis directory {analysis_dir}.")
-                #shutil.rmtree(analysis_dir)
-                return analysis_dir
-            else:
-                error_msg = f"Analysis directory already exists at {analysis_dir}" \
-                            "Please choose a different analysis tag, delete the existing directory, or use the overwrite=True flag before proceeding."
-                log.error(error_msg)
-                sys.exit(1)
+            log.info(f"Analysis directory already exists. Proceeding with output directory as {analysis_dir}")
+            return analysis_dir
         else:
             log.info(f"Set up analysis output directory: {analysis_dir}")
             return analysis_dir

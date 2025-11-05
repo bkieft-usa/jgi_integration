@@ -38,6 +38,7 @@ import scipy.sparse as sp
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 from scipy.stats import fisher_exact
+from scipy.stats import gmean
 
 # --- Plotting ---
 import matplotlib.pyplot as plt
@@ -144,6 +145,42 @@ def write_integration_file(
         log.info(f"\tData saved to {fname}")
     else:
         log.info("Not saving data to disk.")
+
+def list_persistent_configs():
+    """List available persistent configuration sets in a directory."""
+    config_pattern = "/home/jovyan/work/output_data/*/configs/*.yml"
+    config_files = glob.glob(config_pattern, recursive=True)
+    
+    # Group by hash combination
+    config_sets = {}
+    for config_file in config_files:
+        name_parts = config_file.stem.split('_')
+        if len(name_parts) >= 5:
+            # Extract hashes from filename
+            data_hash = name_parts[1].split('--')[1]
+            analysis_hash = name_parts[3].split('--')[1]
+            hash_combo = (data_hash, analysis_hash)
+            
+            if hash_combo not in config_sets:
+                config_sets[hash_combo] = []
+            config_sets[hash_combo].append(config_file)
+    
+    print("Available persistent configuration sets:")
+    print("-" * 50)
+    for (data_hash, analysis_hash), files in config_sets.items():
+        config_types = [f.stem.split('_')[-2] for f in files]
+        complete = len(config_types) >= 3
+        status = "✓ Complete" if complete else f"✗ Missing ({3-len(config_types)} files)"
+        
+        print(f"Data Hash: {data_hash}")
+        print(f"Analysis Hash: {analysis_hash}")
+        print(f"Status: {status}")
+        print(f"Files: {len(files)}")
+        
+        if complete:
+            print(f"Usage:")
+            print(f'  project = objs.Project("{config_dir}", "{data_hash}", "{analysis_hash}")')
+        print()
 
 def list_project_configs() -> None:
     """
@@ -2697,7 +2734,7 @@ def _add_gene_id_mapping(
 ) -> pd.DataFrame:
     """
     Add transcriptome_id mapping from GFF3 file to the merged annotation table for algal genomes.
-    Maps protein_id to transcriptome_id.
+    Maps protein_id to transcriptome_id and adds display_name from product field.
     
     Args:
         merged_df (pd.DataFrame): Merged annotation dataframe with protein_id
@@ -2705,7 +2742,7 @@ def _add_gene_id_mapping(
         genome_type (str): Genome type
         
     Returns:
-        pd.DataFrame: Annotation dataframe with transcriptome_id column added
+        pd.DataFrame: Annotation dataframe with transcriptome_id and display_name columns added
     """
     
     # Look for GFF3 file in the raw data directory
@@ -2717,13 +2754,15 @@ def _add_gene_id_mapping(
         log.warning("No GFF3 file found for gene ID mapping")
         # Create transcriptome_id from protein_id if no GFF3 found
         merged_df['transcriptome_id'] = merged_df['protein_id']
+        merged_df['display_name'] = ''
         return merged_df
     
     gff_file = gff_files[0]  # Use first GFF3 file found
     log.info(f"Adding gene ID mapping from {os.path.basename(gff_file)}")
     
-    # Parse GFF3 file to create protein_id -> gene_id mapping
+    # Parse GFF3 file to create protein_id -> gene_id mapping and product mapping
     protein_to_gene = {}
+    protein_to_product = {}
     
     with open(gff_file, 'r') as f:
         for line in f:
@@ -2745,12 +2784,22 @@ def _add_gene_id_mapping(
                 if protein_match:
                     protein_id = protein_match.group(1)
                     protein_to_gene[str(protein_id)] = str(gene_id)
+                    
+                    # Extract product information from product= field
+                    product_match = re.search(r'product=([^;]+)', attributes)
+                    if product_match:
+                        product = product_match.group(1).strip()
+                        protein_to_product[str(protein_id)] = product
+                    else:
+                        protein_to_product[str(protein_id)] = ''
     
     log.info(f"Found {len(protein_to_gene)} protein-to-gene mappings")
+    log.info(f"Found {len(protein_to_product)} protein-to-product mappings")
     
-    # Add transcriptome_id column to merged_df by mapping protein_id to gene_id
+    # Add extracted columns to merged_df
     merged_df['protein_id'] = merged_df['protein_id'].astype(str)
     merged_df['transcriptome_id'] = merged_df['protein_id'].map(protein_to_gene).fillna(merged_df['protein_id'])
+    merged_df['display_name'] = merged_df['protein_id'].map(protein_to_product).fillna('')
 
     return merged_df
 
@@ -3860,14 +3909,14 @@ def scale_data(
     norm_method: str = "modified_zscore"
 ) -> pd.DataFrame:
     """
-    Normalize and scale a feature matrix using log2 and z-score or modified z-score.
+    Normalize and scale a feature matrix using log2 and z-score, modified z-score, or log-fold-change methods.
 
     Args:
         df (pd.DataFrame): Feature matrix.
         output_dir (str): Output directory.
         dataset_name (str): Dataset name (for stdout)
         log2 (bool): Apply log2 transformation.
-        norm_method (str): Normalization method ('zscore', 'modified_zscore').
+        norm_method (str): Normalization method ('zscore', 'modified_zscore', 'logfc_mean', 'logfc_median', 'logfc_geometric_mean').
 
     Returns:
         pd.DataFrame: Scaled feature matrix.
@@ -3877,19 +3926,39 @@ def scale_data(
         log.info("Not scaling data.")
         scaled_df = df
     else:
-        if log2 is True:
-            log.info(f"Transforming {dataset_name} data by log2 before z-scoring...")
+        if log2 is True and norm_method not in ["logfc_mean", "logfc_median", "logfc_geometric_mean"]:
+            log.info(f"Transforming {dataset_name} data by log2 before scaling...")
             unscaled_df = df.copy()
             df = unscaled_df.apply(pd.to_numeric, errors='coerce')
             df = np.log2(df + 1)
+        elif log2 is True and norm_method in ["logfc_mean", "logfc_median", "logfc_geometric_mean"]:
+            log.warning(f"Note: Not applying log2 transformation before {norm_method} scaling, as it is included in the method.")
+        
         if norm_method == "zscore":
             log.info(f"Scaling {dataset_name} data to z-scores...")
             scaled_df = df.apply(lambda x: (x - x.mean()) / x.std(), axis=0)
         elif norm_method == "modified_zscore":
             log.info(f"Scaling {dataset_name} data to modified z-scores...")
             scaled_df = df.apply(lambda x: ((x - x.median()) * 0.6745) / (x - x.median()).abs().median(), axis=0)
+        elif norm_method == "logfc_mean":
+            log.info(f"Scaling {dataset_name} data using log2 fold-change relative to mean...")
+            df_pseudocount = df + 1
+            log_values = np.log2(df_pseudocount)
+            mean_log = log_values.mean(axis=1, skipna=True)
+            scaled_df = log_values.subtract(mean_log, axis=0)
+        elif norm_method == "logfc_median":
+            log.info(f"Scaling {dataset_name} data using log2 fold-change relative to median...")
+            df_pseudocount = df + 1
+            log_values = np.log2(df_pseudocount)
+            median_log = log_values.median(axis=1, skipna=True)
+            scaled_df = log_values.subtract(median_log, axis=0)
+        elif norm_method == "logfc_geometric_mean":
+            log.info(f"Scaling {dataset_name} data using log2 fold-change relative to geometric mean...")
+            df_pseudocount = df + 1
+            geometric_means = df_pseudocount.apply(lambda row: gmean(row.dropna()), axis=1)
+            scaled_df = np.log2(df_pseudocount.divide(geometric_means, axis=0))
         else:
-            raise ValueError("Please select a valid norm_method: 'zscore' or 'modified_zscore'.")
+            raise ValueError("Please select a valid norm_method: 'zscore', 'modified_zscore', 'logfc_mean', 'logfc_median', or 'logfc_geometric_mean'.")
 
     # Ensure output is float, and replace NA/inf/-inf with 0
     scaled_df = scaled_df.astype(float)
@@ -3899,7 +3968,6 @@ def scale_data(
     log.info(f"Saving scaled data for {dataset_name}...")
     write_integration_file(scaled_df, output_dir, output_filename, indexing=True)
     return scaled_df
-
 
 def remove_low_replicable_features(
     data: pd.DataFrame,
