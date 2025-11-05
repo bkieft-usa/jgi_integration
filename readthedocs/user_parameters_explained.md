@@ -1,6 +1,6 @@
 # User Settings Parameters Explained
 
-This document describes the practical effect of each option in the **user_settings** section of the integration workflow configuration file (`/input_data/config/project_config.yml`).  
+This document describes the practical effect of each option in the **user_settings** section of the integration workflow configuration file (`/input_data/config/project.yml`).  
 These settings define the project name and the metadata variables that will be used throughout the analysis.
 
 ---
@@ -40,3 +40,17 @@ user_settings:
     - treatment
     - timepoint
     - group
+
+project:
+  dataset_list:
+    - tx
+    - mx
+  genome_type: microbe
+  PI_name: Smith
+  proposal_ID: 123456
+  results_path: /home/jovyan/work/output_data
+  raw_data_path: /home/jovyan/work/input_data/raw_data
+  metadata_link: /home/jovyan/work/input_data/link_script/metadata_link_script.py
+```
+
+---

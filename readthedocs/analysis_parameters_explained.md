@@ -4,30 +4,34 @@
 
 ## Overview
 
-This document describes the practical effect of each option in the **analysis** section of the integration workflow configuration file (`/input_data/config/project_config.yml`), including the analysis tag, feature selection, network analysis, and MOFA modeling. Each section lists available methods, their options, and default values, and at the end there is an example of a full analysis workflow.
+This document describes the practical effect of each option in the **analysis** configuration file (`/input_data/config/analysis.yml`). This file contains parameters for feature selection, correlation analysis, network analysis, functional enrichment, and MOFA modeling. Changes to any parameter in this file will generate a new analysis hash, ensuring results are never accidentally mixed between different analysis configurations.
 
 ---  
 
 ## Table of Contents
-1. [Tagging](#tagging)  
-2. [Feature Selection](#feature-selection)  
+- [Configuration](#configuration)
+- [Feature Selection](#feature-selection)  
    - [Shared options](#feature-selection-shared-options)  
    - [Methods](#feature-selection-methods)  
-3. [Feature Correlation](#feature-correlation)  
-4. [Network Analysis](#network-analysis)  
-5. [Functional Enrichment](#functional-enrichment)
-6. [MOFA Modeling](#mofa-modeling)  
-7. [Configuration Example](#configuration-example)  
+- [Feature Correlation](#feature-correlation)  
+- [Network Analysis](#network-analysis)  
+- [Functional Enrichment](#functional-enrichment)
+- [MOFA Modeling](#mofa-modeling)  
+- [Configuration Example](#configuration-example)  
 
 ---
 
-## Tagging <a id="tagging"></a>
+## Configuration <a id="configuration"></a>
 
-| Config key | Type | Default | Description |
-|------------|------|---------|-------------|
-| `analysis.data_analysis_tag` | string | `"0"` | Tag used to create a sub‑folder `Analysis--<TAG>` under the data‑processing output. Helps keep runs with different settings separate. **Note**: if the folder already exists and overwriting is disabled the workflow aborts. |
+The workflow automatically generates an **analysis hash** from all parameters in this file. When you change any analysis parameter (correlation thresholds, feature selection methods, etc.), a new hash is generated, ensuring:
 
----  
+- Only analysis steps are re-run (data processing results are reused)
+- Previous analysis results are preserved
+- Clear tracking of which parameters produced which results
+
+Example: Changing correlation cutoff from `0.65` to `0.7` will generate a new analysis hash like `f1g2h3i4`, creating a new directory `Dataset_Processing--a1b2c3d4/Analysis--f1g2h3i4/`. All results generated with the new parameter set are saved in their own analysis folder. To re-produce the exact results of an analysis again, use the configuration file path that was produced during the previous run.
+
+---
 
 ## Feature Selection <a id="feature-selection"></a>
 
@@ -117,20 +121,33 @@ Configuration path: `analysis.analysis_parameters.mofa`
 
 ## Configuration Example <a id="configuration-example"></a>
 
-Below is a **minimal, valid** `analysis` block that exercises each major option.  
-Only parameters that differ from defaults are shown; omitted fields assume their defaults.
+Below is a complete `analysis.yml` file that exercises each major option:
 
 ```yaml
 analysis:
-  data_analysis_tag: KW-FS
   analysis_parameters:
     feature_selection:
       selected_method: kruskalwallis
       max_features: 5000
+      variance:
+        top_n: 5000
+      glm:
+        category:
+        reference:
+        significance_level: 0.05
+        log2fc_cutoff: 0.25
       kruskalwallis:
         category: temperature
         significance_level: 0.01
         lfc_cutoff: 0.5
+      feature_list:
+        feature_list_file:
+      lasso:
+        category:
+      random_forest:
+        category:
+      mutual_info:
+        category:
     correlation:
       corr_method: pearson
       corr_cutoff: 0.75
@@ -140,6 +157,10 @@ analysis:
       corr_mode: bipartite
     networking:
       submodule_mode: louvain
+      wgcna_params:
+        beta:
+        min_module_size:
+        distance_cutoff:
       interactive_plot: true
       interactive_layout: spring
     functional_enrichment:

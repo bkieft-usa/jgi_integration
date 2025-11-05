@@ -1,15 +1,15 @@
-# Datasets Parameters Explained
+# Data Processing Configuration Reference
 
 ---  
 
 ## Overview
 
-This document describes the practical effect of each option in the **datasets** section of the integration workflow configuration file (`/input_data/config/project_config.yml`). It covers the data‑processing tag, the dataset directory, and the four normalization steps applied to each omics dataset (filtering, devariancing, scaling, and replicate handling). Each option lists available methods, their parameters, default values, and a short description. An example configuration and a brief walk‑through are provided at the end.
+This document describes the practical effect of each option in the **data processing** configuration file (`/input_data/config/data_processing.yml`). This file contains parameters that affect the four normalization steps applied to each omics dataset: filtering, devariancing, scaling, and replicate handling. Each option lists available methods, their parameters, default values, and a short description.
 
 ---
 
 ## Table of Contents
-- [Tagging](#tagging)  
+- [Configuration](#configuration)  
 - [Normalization Parameters](#normalization-parameters)  
   - [2.1 Filtering](#filtering)  
   - [2.2 Devariancing](#devariancing)  
@@ -19,12 +19,15 @@ This document describes the practical effect of each option in the **datasets** 
 
 ---
 
-## Tagging <a id="tagging"></a>
+## Configuration <a id="configuration"></a>
 
-| Config key | Type | Default | Description |
-|------------|------|---------|-------------|
-| `data_processing_tag` | string | `"0"` | Tag used to create a sub‑folder `Data_Processing--<TAG>` under the data‑processing output. Changing the tag creates a fresh output directory and prevents overwriting previous runs. |
-| `dataset_dir` | string | *fixed* (e.g., `transcriptomics`, `metabolomics`) | Directory name for the omics type. **Do not modify**; it is currently tied to the workflow structure. |
+The workflow automatically generates a **data processing hash** based on the parameters in the config file. When you change any parameter (filtering thresholds, scaling methods, etc.), a new hash is generated, ensuring:
+
+- Fresh calculations with new parameters
+- Preservation of previous results
+- No accidental mixing of results from different parameter sets
+
+Example: Changing the filtering method (see below) from `minimum` to `proportion` will generate a new hash like `x9y8z7w6`, creating a new directory `Dataset_Processing--x9y8z7w6/`. All results generated with the new parameter set are saved in their own folder. To re-produce the exact results of the data processing steps again, use the configuration file path that was produced during the previous run.
 
 ---
 
@@ -50,8 +53,8 @@ All normalization sub‑sections share the same path pattern: `datasets.<dataset
 
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `log2` | boolean | `true` | If `true`, apply `log2(x + 1)` to all values before scaling. |
-| `method` | string | `"modified_zscore"` | Scaling method. Options: `modified_zscore`, `zscore`, `none`. <br>• **modified_zscore** – median‑MAD based standardization (robust to outliers). <br>• **zscore** – mean‑std standardization. <br>• **none** – raw values (not recommended for integration). |
+| `log2` | boolean | `true` | If `true`, apply `log2(x + 1)` to all values before scaling. Note: Not applied for log-fold-change methods as they include log2 transformation. |
+| `method` | string | `"modified_zscore"` | Scaling method. Options: `modified_zscore`, `zscore`, `logfc_mean`, `logfc_median`, `logfc_geometric_mean`, `none`. <br>• **modified_zscore** – Median‑MAD based standardization: `(x - median) * 0.6745 / MAD` (robust to outliers). <br>• **zscore** – Mean‑std standardization: `(x - mean) / std`. <br>• **logfc_mean** – Log2 fold-change relative to row mean: `log2((x+1) / mean(row+1))`. <br>• **logfc_median** – Log2 fold-change relative to row median: `log2((x+1) / median(row+1))`. <br>• **logfc_geometric_mean** – Log2 fold-change relative to geometric mean: `log2((x+1) / geometric_mean(row+1))`. <br>• **none** – Raw values (not recommended for integration). |
 
 ### Replicate Handling <a id="replicate-handling"></a>
 
@@ -69,7 +72,6 @@ Below is a minimal yet complete `datasets` block for a transcriptomics dataset (
 
 ```yaml
 datasets:
-  data_processing_tag: 0
   tx:
     dataset_dir: transcriptomics
     normalization_parameters:
@@ -188,4 +190,4 @@ And the following transcriptomics dataset (features as rows, samples as columns)
 
 **Final Output:**
 
-After all normalization steps, the dataset contains 7 features and all 10 samples, with all values log2-transformed and modified z-score standardized. This dataset now has a quality-controlled and standardized quantitative distribution and can be integrated with other datasets that have undergone the same treatment.
+After all normalization steps, the dataset contains 7 features and all 10 samples, with all values log2-transformed and modified z-score standardized. This dataset now has a quality-controlled and standardized quantitative distribution and can be integrated with other datasets that have undergone the same treatment. Any changes made to the example config above will generate a new set of results that are saved in a new output folder.
