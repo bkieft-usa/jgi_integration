@@ -714,7 +714,7 @@ class Project:
                 # Wait for notebook to save and copy
                 start_md5 = hashlib.md5(open(this_notebook_path,'rb').read()).hexdigest()
                 current_md5 = start_md5
-                max_wait_time = 20
+                max_wait_time = 10
                 wait_time = 0
                 while start_md5 == current_md5 and wait_time < max_wait_time:
                     time.sleep(2)
@@ -1982,42 +1982,33 @@ class Analysis(DataAwareBaseHandler):
     def plot_correlation_network(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
         def _network_method():
             log.info("Plotting Correlation Network")
-            network_subdir = "feature_network"
             submodule_subdir = "submodules"
-            network_dir = os.path.join(self.output_dir, network_subdir)
-            submodule_dir = os.path.join(network_dir, submodule_subdir)
-            os.makedirs(network_dir, exist_ok=True)
+            submodule_dir = os.path.join(self.output_dir, submodule_subdir)
             os.makedirs(submodule_dir, exist_ok=True)
             
-            # Update filename attributes to include subdirectory
-            node_table_path = os.path.join(network_subdir, self._feature_network_node_table_filename)
-            edge_table_path = os.path.join(network_subdir, self._feature_network_edge_table_filename)
-            
             # Check if tables already exist
-            if self.check_and_load_attribute('feature_network_node_table', node_table_path, self.overwrite) or \
-                self.check_and_load_attribute('feature_network_edge_table', edge_table_path, self.overwrite):
+            if self.check_and_load_attribute('feature_network_node_table', self._feature_network_node_table_filename, self.overwrite) or \
+                self.check_and_load_attribute('feature_network_edge_table', self._feature_network_edge_table_filename, self.overwrite):
                 networking_params = self.analysis_parameters.get('networking', {})
                 if networking_params.get('interactive_plot', False):
                     # Display existing network if interactive plot is enabled
-                    graph_file = os.path.join(network_dir, self._feature_network_graph_filename)
-                    if os.path.exists(graph_file):
+                    if os.path.exists(self._feature_network_graph_filename):
                         log.info("Displaying existing network visualization...")
                         hlp.display_existing_network(
-                            graph_file=graph_file,
+                            graph_file=self._feature_network_graph_filename,
                             node_table=self.feature_network_node_table,
                             edge_table=self.feature_network_edge_table,
                             interactive_layout=networking_params.get('interactive_layout', None)
                         )
                 return
             else: # necessary to clear carryover from previous analyses
-                hlp.clear_directory(network_dir)
                 hlp.clear_directory(submodule_dir)
 
             networking_params = self.analysis_parameters.get('networking', {})
             output_filenames = {
-                'graph': os.path.join(network_dir, self._feature_network_graph_filename),
-                'node_table': os.path.join(network_dir, self._feature_network_node_table_filename),
-                'edge_table': os.path.join(network_dir, self._feature_network_edge_table_filename),
+                'graph': os.path.join(self.output_dir, self._feature_network_graph_filename),
+                'node_table': os.path.join(self.output_dir, self._feature_network_node_table_filename),
+                'edge_table': os.path.join(self.output_dir, self._feature_network_edge_table_filename),
                 'submodule_path': submodule_dir
             }
 
@@ -2026,6 +2017,7 @@ class Analysis(DataAwareBaseHandler):
                 'datasets': self.datasets,
                 'integrated_data': self.integrated_data_selected,
                 'integrated_metadata': self.integrated_metadata,
+                'output_dir': self.output_dir,
                 'output_filenames': output_filenames,
                 'annotation_df': self.feature_annotation_table,
                 'submodule_mode': networking_params.get('submodule_mode', 'community'),
@@ -2042,21 +2034,9 @@ class Analysis(DataAwareBaseHandler):
                 sys.exit(1)
             else:
                 log.info("Created correlation network graph and associated node/edge tables.")
-            
-            # Temporarily update the filename attributes to save to subdirectory
-            original_node_filename = self._feature_network_node_table_filename
-            original_edge_filename = self._feature_network_edge_table_filename
-            
-            self._feature_network_node_table_filename = node_table_path
-            self._feature_network_edge_table_filename = edge_table_path
-            
-            # Set the attributes (this will save to the subdirectory)
+
             self.feature_network_node_table = node_table
             self.feature_network_edge_table = edge_table
-            
-            # Restore original filenames
-            self._feature_network_node_table_filename = original_node_filename
-            self._feature_network_edge_table_filename = original_edge_filename
 
             log.info(f"Created table: {self._feature_network_node_table_filename}")
             log.info("Created attribute: feature_network_node_table")
