@@ -197,16 +197,25 @@ class DataRegistry:
         """)
     
     def register_dataframe(self, df: pd.DataFrame, table_name: str, 
-                          object_type: str, object_name: str, 
-                          attribute_name: str, description: str = ""):
+                        object_type: str, object_name: str, 
+                        attribute_name: str, description: str = ""):
         """Register a DataFrame in DuckDB with metadata."""
         if df.empty:
             return
         
-        # Store the DataFrame
-        self.conn.register(table_name, df)
+        # Check if the index contains meaningful data (not just default numeric index)
+        has_meaningful_index = not df.index.equals(pd.RangeIndex(len(df)))
         
-        # Update catalog
+        # Store the DataFrame with index preserved if meaningful
+        if has_meaningful_index:
+            # Reset index to make it a column, then register
+            df_with_index = df.reset_index()
+            self.conn.register(table_name, df_with_index)
+        else:
+            # Store DataFrame as-is
+            self.conn.register(table_name, df)
+        
+        # Update catalog with index information
         self.conn.execute("""
             INSERT OR REPLACE INTO data_catalog 
             (table_name, object_type, object_name, attribute_name, description, shape_rows, shape_cols)
@@ -217,8 +226,10 @@ class DataRegistry:
             'object_type': object_type,
             'object_name': object_name,
             'attribute_name': attribute_name,
-            'columns': list(df.columns),
-            'dtypes': {col: str(dtype) for col, dtype in df.dtypes.items()}
+            'columns': list(df_with_index.columns if has_meaningful_index else df.columns),
+            'dtypes': {col: str(dtype) for col, dtype in (df_with_index.dtypes if has_meaningful_index else df.dtypes).items()},
+            'has_meaningful_index': has_meaningful_index,
+            'index_name': df.index.name if has_meaningful_index else None
         }
     
     def get_schema_info(self) -> str:

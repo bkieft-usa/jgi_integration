@@ -208,7 +208,7 @@ def list_persistent_configs():
         log.info("Available persistent configuration sets:")
         display(df)
     else:
-        log.info("No persistent configuration sets found.")
+        log.info("No persistent configuration sets found yet.")
     
     return
 
@@ -3109,7 +3109,7 @@ def generate_mx_annotation_table(
     log.info("Creating metabolite annotation mapping...")
     mapping_data = []
     
-    for met_id in metabolite_ids:
+    for met_id in tqdm(sorted(metabolite_ids), desc="Processing metabolites", unit="metabolite"):
         if not fbmn_data.empty:
             # Find ALL matching annotations for this metabolite ID
             matches = fbmn_data[fbmn_data['metabolite_id'] == met_id]
