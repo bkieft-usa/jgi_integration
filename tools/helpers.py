@@ -1359,7 +1359,7 @@ def plot_correlation_network(
         log.info(f"\tRemoved {len(tiny)} tiny components (<3 nodes).")
 
     # Export the raw graph (before submodule annotation)
-    nx.write_graphml(G, output_filenames["graph"])
+    nx.write_graphml(G, os.path.join(output_dir, output_filenames["graph"]))
     edge_table = nx.to_pandas_edgelist(G)
     node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient="index")
     write_integration_file(data=node_table, output_dir=output_dir, filename=output_filenames["node_table"], indexing=True, index_label="node_id")
@@ -1474,9 +1474,6 @@ def display_existing_network(
         if index_like_cols:
             edge_df = edge_df.drop(columns=index_like_cols)
             log.info(f"Removed meaningless index columns: {index_like_cols}")
-        
-        log.info(f"Cleaned edge table columns: {edge_df.columns.tolist()}")
-        log.info(f"Edge table shape: {edge_df.shape}")
         
         # Now the edge table should have exactly the columns we expect: source, target, weight
         expected_cols = ['source', 'target', 'weight']

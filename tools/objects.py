@@ -2006,9 +2006,9 @@ class Analysis(DataAwareBaseHandler):
 
             networking_params = self.analysis_parameters.get('networking', {})
             output_filenames = {
-                'graph': os.path.join(self.output_dir, self._feature_network_graph_filename),
-                'node_table': os.path.join(self.output_dir, self._feature_network_node_table_filename),
-                'edge_table': os.path.join(self.output_dir, self._feature_network_edge_table_filename),
+                'graph': self._feature_network_graph_filename,
+                'node_table': self._feature_network_node_table_filename,
+                'edge_table': self._feature_network_edge_table_filename,
                 'submodule_path': submodule_dir
             }
 
@@ -2071,7 +2071,7 @@ class Analysis(DataAwareBaseHandler):
                 'p_value_threshold': functional_enrichment_params.get('pvalue_cutoff', 0.05),
                 'correction_method': functional_enrichment_params.get('correction_method', 'fdr_bh'),
                 'min_annotation_count': functional_enrichment_params.get('min_genes_per_term', 1),
-                'output_dir': os.path.join(self.output_dir, "feature_network"),
+                'output_dir': self.output_dir,
                 'output_filename': self._functional_enrichment_table_filename,
             }
             call_params.update(kwargs)
