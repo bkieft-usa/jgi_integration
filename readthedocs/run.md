@@ -133,6 +133,8 @@ Re-runs are useful for reproducing results, continuing interrupted analyses, or 
 
 *   You will not be able to delete directories on the JupyterLab file browser (the left navigation panel), so if you need to remove a directory for any reason you can do so from your local file browser (for the directories mounted to your system) or via the built-in JupyterLab terminal with `rm -rf <directory>`.
 
+* If you notice odd visualization behavior in the JupyterLab notebook (i.e., "jumping" around when trying to scroll), go to Settings -> Settings Editor -> search for "windowing" -> change "Windowing Mode" to None. Wait for the setting to save and then close the editor window.
+
 *   The default working directory for JupyterLab is `/home/joyvan/work`, which throughout these instructions is referred to as the root directory `/` – this is set by the docker image and should not be changed for security purposes.
 
 *   Details about how to navigate the JupyterLab interface can be found on the [Jupyter documentation page](https://docs.jupyter.org/en/latest/).
