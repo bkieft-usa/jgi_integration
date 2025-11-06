@@ -386,7 +386,7 @@ class WorkflowProgressTracker:
             {'id': 'feature_selection', 'label': 'Feature Selection', 'category': 'analysis'},
             {'id': 'calculate_correlations', 'label': 'Calculate Correlations', 'category': 'analysis'},
             {'id': 'plot_correlation_network', 'label': 'Plot Correlation Network', 'category': 'analysis'},
-            {'id': 'run_mofa2', 'label': 'Run MOFA2 Analysis', 'category': 'analysis'}
+            #{'id': 'run_mofa2', 'label': 'Run MOFA2 Analysis', 'category': 'analysis'}
         ]
         
         # Add step numbers and status
@@ -1987,19 +1987,17 @@ class Analysis(DataAwareBaseHandler):
             os.makedirs(submodule_dir, exist_ok=True)
             
             # Check if tables already exist
-            if self.check_and_load_attribute('feature_network_node_table', self._feature_network_node_table_filename, self.overwrite) or \
+            if self.check_and_load_attribute('feature_network_node_table', self._feature_network_node_table_filename, self.overwrite) and \
                 self.check_and_load_attribute('feature_network_edge_table', self._feature_network_edge_table_filename, self.overwrite):
                 networking_params = self.analysis_parameters.get('networking', {})
                 if networking_params.get('interactive_plot', False):
-                    # Display existing network if interactive plot is enabled
-                    if os.path.exists(self._feature_network_graph_filename):
-                        log.info("Displaying existing network visualization...")
-                        hlp.display_existing_network(
-                            graph_file=self._feature_network_graph_filename,
-                            node_table=self.feature_network_node_table,
-                            edge_table=self.feature_network_edge_table,
-                            interactive_layout=networking_params.get('interactive_layout', None)
-                        )
+                    log.info("Displaying existing network visualization...")
+                    hlp.display_existing_network(
+                        graph_file=self._feature_network_graph_filename,
+                        node_table=self.feature_network_node_table,
+                        edge_table=self.feature_network_edge_table,
+                        interactive_layout=networking_params.get('interactive_layout', None)
+                    )
                 return
             else: # necessary to clear carryover from previous analyses
                 hlp.clear_directory(submodule_dir)
