@@ -1708,7 +1708,7 @@ class Analysis(DataAwareBaseHandler):
                     sys.exit(1)
                 ds.linked_metadata = linked_metadata[ds.dataset_name]
                 log.info(f"Created linked_metadata for {ds.dataset_name} with {ds.linked_metadata.shape[0]} samples and {ds.linked_metadata.shape[1]} metadata fields.")
-                log.info(f"Created table: {self._linked_metadata_filename}")
+                log.info(f"Created table: {ds._linked_metadata_filename}")
                 log.info("Created attribute: linked_metadata")
 
         if show_progress:
@@ -1749,7 +1749,7 @@ class Analysis(DataAwareBaseHandler):
                     sys.exit(1)
                 ds.linked_data = linked_data[ds.dataset_name]
                 log.info(f"Created linked_data for {ds.dataset_name} with {ds.linked_data.shape[1]} samples and {ds.linked_data.shape[0]} features.")
-                log.info(f"Created table: {self._linked_data_filename}")
+                log.info(f"Created table: {ds._linked_data_filename}")
                 log.info("Created attribute: linked_data")
 
         if show_progress:
