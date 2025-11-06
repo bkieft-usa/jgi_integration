@@ -1311,6 +1311,7 @@ def plot_correlation_network(
     corr_table: pd.DataFrame,
     integrated_data: pd.DataFrame,
     integrated_metadata: pd.DataFrame,
+    output_dir: str,
     output_filenames: Dict[str, str],
     datasets: List = None,
     annotation_df: Optional[pd.DataFrame] = None,
@@ -1361,8 +1362,8 @@ def plot_correlation_network(
     nx.write_graphml(G, output_filenames["graph"])
     edge_table = nx.to_pandas_edgelist(G)
     node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient="index")
-    node_table.to_csv(output_filenames["node_table"], index_label="node_id")
-    edge_table.to_csv(output_filenames["edge_table"], index_label="edge_index")
+    write_integration_file(data=node_table, output_dir=output_dir, filename=output_filenames["node_table"], indexing=True, index_label="node_id")
+    write_integration_file(data=edge_table, output_dir=output_dir, filename=output_filenames["edge_table"], indexing=True, index_label="edge_index")
     log.info("\tRaw graph, node table and edge table written to disk.")
 
     # submodule detection
@@ -1402,8 +1403,8 @@ def plot_correlation_network(
         nx.write_graphml(G, output_filenames["graph"])
         edge_table = nx.to_pandas_edgelist(G)
         node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient="index")
-        node_table.to_csv(output_filenames["node_table"], index_label="node_id")
-        edge_table.to_csv(output_filenames["edge_table"], index_label="edge_index")
+        write_integration_file(data=node_table, output_dir=output_dir, filename=output_filenames["node_table"], indexing=True, index_label="node_id")
+        write_integration_file(data=edge_table, output_dir=output_dir, filename=output_filenames["edge_table"], indexing=True, index_label="edge_index")
         log.info("\tMain graph updated with submodule annotations and written to disk.")
 
     # interactive plot
@@ -1444,13 +1445,64 @@ def display_existing_network(
     """
     
     try:
-        # Recreate graph from tables instead of loading GraphML
-        G = nx.from_pandas_edgelist(
-            edge_table, 
-            source='source', 
-            target='target', 
-            edge_attr=True  # Include all edge attributes
-        )
+        # Clean up the edge table - remove any unnamed or meaningless index columns
+        edge_df = edge_table.copy()
+        
+        # Remove unnamed index columns (columns that start with 'Unnamed:')
+        unnamed_cols = [col for col in edge_df.columns if str(col).startswith('Unnamed:')]
+        if unnamed_cols:
+            edge_df = edge_df.drop(columns=unnamed_cols)
+            log.info(f"Removed unnamed index columns: {unnamed_cols}")
+        
+        # Check for and remove meaningless index columns (integer sequences starting from 0)
+        index_like_cols = []
+        for col in edge_df.columns:
+            # Check if column name suggests it's an index
+            if any(keyword in str(col).lower() for keyword in ['index', 'idx', '_id']) and col not in ['source', 'target']:
+                # Check if it's just a sequence of integers starting from 0
+                try:
+                    col_values = edge_df[col].dropna()
+                    if (col_values.dtype in ['int64', 'int32'] and 
+                        len(col_values) > 0 and 
+                        col_values.min() == 0 and 
+                        col_values.max() == len(col_values) - 1 and
+                        len(col_values.unique()) == len(col_values)):  # All unique values
+                        index_like_cols.append(col)
+                except:
+                    continue
+        
+        if index_like_cols:
+            edge_df = edge_df.drop(columns=index_like_cols)
+            log.info(f"Removed meaningless index columns: {index_like_cols}")
+        
+        log.info(f"Cleaned edge table columns: {edge_df.columns.tolist()}")
+        log.info(f"Edge table shape: {edge_df.shape}")
+        
+        # Now the edge table should have exactly the columns we expect: source, target, weight
+        expected_cols = ['source', 'target', 'weight']
+        if not all(col in edge_df.columns for col in expected_cols[:2]):  # at least source and target
+            log.error(f"Edge table missing required columns. Expected at least 'source' and 'target', got: {edge_df.columns.tolist()}")
+            raise ValueError("Edge table must have 'source' and 'target' columns")
+        
+        # Get edge attribute columns (everything except source and target)
+        edge_attr_cols = [col for col in edge_df.columns if col not in ['source', 'target']]
+        
+        # Create graph from edge list
+        if edge_attr_cols:
+            G = nx.from_pandas_edgelist(
+                edge_df, 
+                source='source', 
+                target='target', 
+                edge_attr=edge_attr_cols
+            )
+        else:
+            G = nx.from_pandas_edgelist(
+                edge_df, 
+                source='source', 
+                target='target'
+            )
+        
+        log.info(f"Created graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
         
         # Add all node attributes from node_table
         for node_id, row in node_table.iterrows():
@@ -1483,6 +1535,11 @@ def display_existing_network(
     except Exception as e:
         log.error(f"Error displaying existing network: {e}")
         log.info("Network files exist but could not be displayed. You may need to regenerate the network.")
+        # Print debug info
+        log.info(f"Original edge table columns: {edge_table.columns.tolist()}")
+        log.info(f"Node table columns: {node_table.columns.tolist()}")
+        log.info(f"Edge table head:\n{edge_table.head()}")
+        raise e
 
 def _nx_to_plotly_widget(
     G,
@@ -4393,11 +4450,9 @@ def plot_data_variance_histogram(
     plt.legend()
 
     # Save the plot if output_dir is specified
-    output_subdir = f"{output_dir}/dataset_distributions"
-    os.makedirs(output_subdir, exist_ok=True)
     filename = f"distribution_of_{datatype}_datasets.pdf"
-    log.info(f"Saving plot to {output_subdir}/{filename}...")
-    plt.savefig(f"{output_subdir}/{filename}")
+    log.info(f"Saving plot to {output_dir}/{filename}...")
+    plt.savefig(f"{output_dir}/{filename}")
     if show_plot is True:
         log.info("Datasets should follow similar distributions, while quantitative values can be slightly shifted:")
         plt.show()
