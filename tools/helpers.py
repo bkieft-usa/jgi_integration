@@ -147,40 +147,70 @@ def write_integration_file(
         log.info("Not saving data to disk.")
 
 def list_persistent_configs():
-    """List available persistent configuration sets in a directory."""
+    """List available persistent configuration sets in a directory with last write dates."""
     config_pattern = "/home/jovyan/work/output_data/*/configs/*.yml"
     config_files = glob.glob(config_pattern, recursive=True)
     
     # Group by hash combination
     config_sets = {}
     for config_file in config_files:
+        config_file = Path(config_file)
         name_parts = config_file.stem.split('_')
+        
         if len(name_parts) >= 5:
-            # Extract hashes from filename
-            data_hash = name_parts[1].split('--')[1]
-            analysis_hash = name_parts[3].split('--')[1]
-            hash_combo = (data_hash, analysis_hash)
+            data_hash = None
+            analysis_hash = None
             
-            if hash_combo not in config_sets:
-                config_sets[hash_combo] = []
-            config_sets[hash_combo].append(config_file)
+            for part in name_parts:
+                if 'Processing--' in part:
+                    data_hash = part.split('--')[1]
+                elif 'Analysis--' in part:
+                    analysis_hash = part.split('--')[1]
+            
+            if data_hash and analysis_hash:
+                hash_combo = (data_hash, analysis_hash)
+                
+                if hash_combo not in config_sets:
+                    config_sets[hash_combo] = []
+                
+                # Get file modification time
+                mod_time = config_file.stat().st_mtime
+                config_sets[hash_combo].append({
+                    'file': config_file,
+                    'mod_time': mod_time,
+                    'timestamp': datetime.fromtimestamp(mod_time)
+                })
     
-    print("Available persistent configuration sets:")
-    print("-" * 50)
+    # Find most recent file for each hash combination and prepare table data
+    table_data = []
     for (data_hash, analysis_hash), files in config_sets.items():
-        config_types = [f.stem.split('_')[-2] for f in files]
+        # Sort by modification time and get the most recent
+        most_recent = max(files, key=lambda x: x['mod_time'])
+        
+        config_types = [f['file'].stem.split('_')[-2] for f in files]
         complete = len(config_types) >= 3
-        status = "✓ Complete" if complete else f"✗ Missing ({3-len(config_types)} files)"
+        status = "Complete" if complete else f"Missing ({3-len(config_types)} files)"
         
-        print(f"Data Hash: {data_hash}")
-        print(f"Analysis Hash: {analysis_hash}")
-        print(f"Status: {status}")
-        print(f"Files: {len(files)}")
-        
-        if complete:
-            print(f"Usage:")
-            print(f'  project = objs.Project("{config_dir}", "{data_hash}", "{analysis_hash}")')
-        print()
+        table_data.append({
+            'Data Hash': data_hash,
+            'Analysis Hash': analysis_hash,
+            'Last Modified': most_recent['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+            'Status': status,
+            'File Count': len(files)
+        })
+    
+    # Sort by last modified date (most recent first)
+    table_data.sort(key=lambda x: x['Last Modified'], reverse=True)
+    
+    # Create and display DataFrame
+    if table_data:
+        df = pd.DataFrame(table_data)
+        log.info("Available persistent configuration sets:")
+        display(df)
+    else:
+        log.info("No persistent configuration sets found.")
+    
+    return
 
 def list_project_configs() -> None:
     """
@@ -1392,6 +1422,68 @@ def plot_correlation_network(
 
     return node_table, edge_table
 
+def display_existing_network(
+    graph_file: str,
+    node_table: pd.DataFrame,
+    edge_table: pd.DataFrame,
+    interactive_layout: str = None
+) -> None:
+    """
+    Display an existing network visualization from saved files.
+    
+    Parameters
+    ----------
+    graph_file : str
+        Path to the saved GraphML file (not used, kept for compatibility)
+    node_table : pd.DataFrame
+        Node table DataFrame with node attributes
+    edge_table : pd.DataFrame
+        Edge table DataFrame with edge information
+    interactive_layout : str, optional
+        Layout algorithm for the interactive plot
+    """
+    
+    try:
+        # Recreate graph from tables instead of loading GraphML
+        G = nx.from_pandas_edgelist(
+            edge_table, 
+            source='source', 
+            target='target', 
+            edge_attr=True  # Include all edge attributes
+        )
+        
+        # Add all node attributes from node_table
+        for node_id, row in node_table.iterrows():
+            if node_id in G.nodes():
+                # Add all attributes from the row to the node
+                for col, value in row.items():
+                    G.nodes[node_id][col] = value
+        
+        # Determine color attribute based on whether submodule info exists
+        if 'submodule_color' in node_table.columns and not node_table['submodule_color'].isna().all():
+            color_attr = "submodule_color"
+        else:
+            color_attr = "datatype_color"
+        
+        log.info("Rendering existing network visualization...")
+        log.info("Pre-computing network layout...")
+        
+        # Create the interactive widget
+        widget = _nx_to_plotly_widget(
+            G,
+            node_color_attr=color_attr,
+            node_size_attr="node_size",
+            layout=interactive_layout,
+            seed=42,
+        )
+        
+        # Display the widget
+        display(widget)
+        
+    except Exception as e:
+        log.error(f"Error displaying existing network: {e}")
+        log.info("Network files exist but could not be displayed. You may need to regenerate the network.")
+
 def _nx_to_plotly_widget(
     G,
     node_color_attr="submodule_color",
@@ -1481,26 +1573,31 @@ def _nx_to_plotly_widget(
         if submodule:
             hover_parts.append(f"{submodule.replace('_','')}")
         
-        # Determine which annotation to show
-        annotation_text = "Unassigned"
+        # Determine which annotation to show based on node prefix
+        annotation_text = "Unassigned_Annotation"
+        display_text = "Unassigned_Name"
         
-        # Check for metabolomics compound name
-        mx_compound = data.get("mx_Compound_Name", "Unassigned")
-        if isinstance(mx_compound, str) and mx_compound not in ["Unassigned", "", "NA"]:
-            annotation_text = mx_compound
-        
-        # Check for transcriptomics GO term if metabolomics annotation not found
-        elif annotation_text == "Unassigned":
-            tx_goterm = data.get("tx_goterm_acc", "Unassigned")
-            if isinstance(tx_goterm, str) and tx_goterm not in ["Unassigned", "", "NA"]:
-                annotation_text = tx_goterm
+        # Check for metabolomics compound annotation and name
+        if str(n).startswith('mx_'):
+            mx_compound_name = data.get("mx_Compound_Name", "Unassigned")
+            mx_display_name = data.get('mx_display_name', "Unassigned")
+            if mx_compound_name != "Unassigned":
+                annotation_text = mx_compound_name
+            if mx_display_name != "Unassigned":
+                display_text = mx_display_name
+
+        # Check for transcriptomics annotation and name
+        elif str(n).startswith('tx_'):
+            tx_go_acc = data.get("tx_go_acc", "Unassigned")
+            tx_display_name = data.get('tx_display_name', "Unassigned")
+            if tx_go_acc != "Unassigned":
+                annotation_text = tx_go_acc
+            if tx_display_name != "Unassigned":
+                display_text = tx_display_name
         
         # Add annotation to hover text
-        if annotation_text != "Unassigned":
-            hover_parts.append(f"{annotation_text}")
-        else:
-            hover_parts.append("Unassigned")
-        
+        hover_parts.append(f"{annotation_text}")
+        hover_parts.append(f"{display_text}")
         hover_txt.append("<br>".join(hover_parts))
     
     node_trace = go.Scatter(
@@ -2566,7 +2663,7 @@ def _process_algal_annotations(
     merged_df = merged_df.fillna('')
     
     # Add transcriptome_id mapping from GFF3 file (protein_id -> transcriptome_id)
-    merged_df = _add_gene_id_mapping(merged_df, raw_data_dir, "algal")
+    merged_df = _add_protein_id_mapping(merged_df, raw_data_dir, "algal")
     
     # Compress the dataframe to ensure one gene per row with semicolon-separated annotations
     final_df = _compress_annotation_table(merged_df)
@@ -2809,7 +2906,7 @@ def _add_protein_id_mapping(
     genome_type: str
 ) -> pd.DataFrame:
     """
-    Add protein ID mapping from GFF3 file to the merged annotation table.
+    Add protein ID mapping and display name from GFF3 file to the merged annotation table.
     
     Args:
         merged_df (pd.DataFrame): Merged annotation dataframe
@@ -2817,7 +2914,7 @@ def _add_protein_id_mapping(
         genome_type (str): Genome type ("microbe", "algal", etc.)
         
     Returns:
-        pd.DataFrame: Annotation dataframe with protein ID column added
+        pd.DataFrame: Annotation dataframe with protein ID and display_name columns added
     """
     
     # Look for GFF3 file in the raw data directory
@@ -2828,13 +2925,16 @@ def _add_protein_id_mapping(
     if not gff_files:
         log.warning("No GFF3 file found for protein ID mapping")
         merged_df['protein_id'] = ''
+        merged_df['transcriptome_id'] = ''
+        merged_df['display_name'] = ''
         return merged_df
     
     gff_file = gff_files[0]  # Use first GFF3 file found
-    log.info(f"Adding protein ID mapping from {os.path.basename(gff_file)}")
+    log.info(f"Adding protein ID mapping and display names from {os.path.basename(gff_file)}")
     
-    # Parse GFF3 file to create gene_id -> protein_id mapping
+    # Parse GFF3 file to create gene_id -> protein_id mapping and product mapping
     gene_to_protein = {}
+    gene_to_product = {}
     
     with open(gff_file, 'r') as f:
         for line in f:
@@ -2845,17 +2945,20 @@ def _add_protein_id_mapping(
             if len(fields) < 9:
                 continue
             
-            # Set feature type and protein attribute based on genome type
+            # Set feature type, protein attribute, and display attribute based on genome type
             if genome_type == "algal":
                 feature_type = 'gene'
                 protein_attribute = 'proteinId'
+                display_attribute = 'product_name'
             elif genome_type == "microbe":
                 feature_type = 'CDS'
                 protein_attribute = 'locus_tag'
+                display_attribute = 'product'
             else:
                 # For other genome types, try gene first, then CDS
                 feature_type = 'gene'
                 protein_attribute = 'proteinId'
+                display_attribute = 'product'
             
             if fields[2] == feature_type:
                 attributes = fields[8]
@@ -2873,14 +2976,27 @@ def _add_protein_id_mapping(
                 if protein_match:
                     protein_id = protein_match.group(1)
                 
+                # Extract product information from the appropriate display attribute
+                product = ''
+                display_pattern = rf"{re.escape(display_attribute)}=([^;]+)"
+                product_match = re.search(display_pattern, attributes)
+                if product_match:
+                    product = product_match.group(1).strip()
+                
                 if protein_id:
                     gene_to_protein[gene_id] = protein_id
+                
+                # Store product information regardless of whether protein_id exists
+                if product:
+                    gene_to_product[gene_id] = product
     
     log.info(f"Found {len(gene_to_protein)} gene-to-protein mappings")
-    
-    # Add protein_id column to merged_df
+    log.info(f"Found {len(gene_to_product)} gene-to-product mappings")
+
+    merged_df['transcriptome_id'] = merged_df['transcriptome_id'].astype(str)
     merged_df['protein_id'] = merged_df['transcriptome_id'].map(gene_to_protein).fillna('')
-    
+    merged_df['display_name'] = merged_df['transcriptome_id'].map(gene_to_product).fillna('')
+
     return merged_df
 
 def _compress_annotation_table(
@@ -3051,6 +3167,7 @@ def generate_mx_annotation_table(
     mapping_df.rename(columns={'metabolite_id': 'metabolome_id'}, inplace=True)
     mapping_df = mapping_df.set_index('metabolome_id')
     mapping_df = mapping_df.applymap(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
+    mapping_df['display_name'] = mapping_df['Compound_Name']
     
     # Validate annotation IDs against raw data before saving
     if not raw_data.empty and not mapping_df.empty:
@@ -3921,11 +4038,11 @@ def scale_data(
     Returns:
         pd.DataFrame: Scaled feature matrix.
     """
-
     if norm_method == "none":
         log.info("Not scaling data.")
         scaled_df = df
     else:
+        df = df.apply(pd.to_numeric, errors='coerce')
         if log2 is True and norm_method not in ["logfc_mean", "logfc_median", "logfc_geometric_mean"]:
             log.info(f"Transforming {dataset_name} data by log2 before scaling...")
             unscaled_df = df.copy()
@@ -3933,7 +4050,7 @@ def scale_data(
             df = np.log2(df + 1)
         elif log2 is True and norm_method in ["logfc_mean", "logfc_median", "logfc_geometric_mean"]:
             log.warning(f"Note: Not applying log2 transformation before {norm_method} scaling, as it is included in the method.")
-        
+
         if norm_method == "zscore":
             log.info(f"Scaling {dataset_name} data to z-scores...")
             scaled_df = df.apply(lambda x: (x - x.mean()) / x.std(), axis=0)
@@ -4701,7 +4818,7 @@ def run_full_mofa2_analysis(
     # for dataset in mofa2_views:
     #     plot_mofa2_feature_importance_per_factor(model=model, num_features=num_features,
     #                                              data_type=dataset, output_dir=output_dir)
-    return
+    return mofa_data
 
 def run_mofa2_model(
     data: pd.DataFrame,

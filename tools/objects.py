@@ -576,7 +576,7 @@ class WorkflowProgressTracker:
 class Project:
     """Project configuration and directory management with hash-based tagging."""
 
-    def __init__(self, data_processing_hash: str = None, analysis_hash: str = None):
+    def __init__(self, data_processing_hash: str = None, analysis_hash: str = None, overwrite: bool = False):
         self.workflow_tracker = WorkflowProgressTracker()
         self.workflow_tracker.set_current_step('init_project')
         log.info("Initializing Project")
@@ -622,6 +622,7 @@ class Project:
         log.info(f"  Analysis tag: {self.analysis_hash}")
         
         # Set up project attributes
+        self.overwrite = overwrite
         self.project_config = self.config['project']
         self.user_settings = self.config['user_settings']
         self.PI_name = self.project_config['PI_name']
@@ -655,7 +656,6 @@ class Project:
             notebooks_dir = os.path.join(self.project_dir, "notebooks")
             os.makedirs(config_dir, exist_ok=True)
             os.makedirs(notebooks_dir, exist_ok=True)
-            self._cleanup_orphaned_analysis_directories()
             
             # Save all three config files with hash-based naming
             config_files = {
@@ -703,7 +703,7 @@ class Project:
                 # Wait for notebook to save and copy
                 start_md5 = hashlib.md5(open(this_notebook_path,'rb').read()).hexdigest()
                 current_md5 = start_md5
-                max_wait_time = 30
+                max_wait_time = 20
                 wait_time = 0
                 while start_md5 == current_md5 and wait_time < max_wait_time:
                     time.sleep(2)
@@ -721,74 +721,12 @@ class Project:
         except Exception as e:
             log.error(f"Failed to save configuration and notebook: {e}")
 
-    def _cleanup_orphaned_analysis_directories(self):
-        """Clean up analysis directories with the same hash under different data processing hashes."""
-        current_data_hash = self.data_processing_hash
-        current_analysis_hash = self.analysis_hash
-        
-        # Find all existing data processing directories
-        data_processing_pattern = os.path.join(self.project_dir, "Dataset_Processing--*")
-        existing_data_dirs = glob.glob(data_processing_pattern)
-        
-        orphaned_analysis_dirs = []
-        
-        for data_dir in existing_data_dirs:
-            # Extract data processing hash from directory name
-            data_hash = os.path.basename(data_dir).split('--')[1]
-            
-            # Skip current data processing directory
-            if data_hash == current_data_hash:
-                continue
-            
-            # Look for analysis directories with the same analysis hash
-            analysis_pattern = os.path.join(data_dir, f"Analysis--{current_analysis_hash}")
-            if os.path.exists(analysis_pattern):
-                orphaned_analysis_dirs.append({
-                    'old_data_hash': data_hash,
-                    'analysis_hash': current_analysis_hash,
-                    'path': analysis_pattern,
-                    'parent_dir': data_dir
-                })
-        
-        if orphaned_analysis_dirs:
-            log.info(f"Found {len(orphaned_analysis_dirs)} orphaned analysis directories with hash {current_analysis_hash}")
-            
-            for orphaned in orphaned_analysis_dirs:
-                old_data_hash = orphaned['old_data_hash']
-                analysis_path = orphaned['path']
-                parent_dir = orphaned['parent_dir']
-                
-                log.info(f"Cleaning up orphaned analysis: {analysis_path}")
-                log.info(f"  (Analysis hash {current_analysis_hash} under old data processing hash {old_data_hash})")
-                
-                try:
-                    # Remove the analysis directory
-                    shutil.rmtree(analysis_path)
-                    log.info(f"Successfully removed: {analysis_path}")
-                    
-                    # Check if parent data processing directory is now empty
-                    remaining_items = [item for item in os.listdir(parent_dir) 
-                                    if not item.startswith('.')]
-                    
-                    if not remaining_items:
-                        log.info(f"Data processing directory {parent_dir} is now empty. Removing it.")
-                        shutil.rmtree(parent_dir)
-                        log.info(f"Successfully removed empty data processing directory: {parent_dir}")
-                    else:
-                        log.info(f"Data processing directory {parent_dir} still contains other analyses.")
-                        
-                except Exception as e:
-                    log.error(f"Failed to clean up {analysis_path}: {e}")
-        else:
-            log.info(f"No orphaned analysis directories found for hash {current_analysis_hash}")
-
     def _validate_directory_structure(self) -> Dict[str, Any]:
         """Validate the overall directory structure for consistency."""
         validation_info = {
             'data_processing_dirs': [],
             'analysis_dirs_by_data_hash': {},
             'duplicate_analysis_hashes': {},
-            'orphaned_dirs': [],
             'issues': [],
             'current_config_valid': True
         }
@@ -827,21 +765,6 @@ class Project:
                         if analysis_hash not in validation_info['duplicate_analysis_hashes']:
                             validation_info['duplicate_analysis_hashes'][analysis_hash] = []
                         validation_info['duplicate_analysis_hashes'][analysis_hash].append(data_hash)
-                        
-                        # Check if this is an orphaned directory (same analysis hash under different data processing)
-                        if (hasattr(self, 'analysis_hash') and 
-                            analysis_hash == self.analysis_hash and 
-                            data_hash != self.data_processing_hash):
-                            validation_info['orphaned_dirs'].append({
-                                'type': 'analysis',
-                                'path': analysis_dir,
-                                'old_data_hash': data_hash,
-                                'analysis_hash': analysis_hash,
-                                'should_be_under': self.data_processing_hash
-                            })
-                            validation_info['issues'].append(
-                                f"Orphaned analysis directory: {analysis_dir} (should be under {self.data_processing_hash})"
-                            )
                             
                     except Exception as e:
                         log.warning(f"Could not parse analysis directory {analysis_dir}: {e}")
@@ -886,11 +809,7 @@ class Project:
             validation_info['current_config_valid'] = False
         else:
             log.info("Directory structure validation passed - no issues found.")
-        
-        # Report orphaned directories that will be cleaned up
-        if validation_info['orphaned_dirs']:
-            log.info(f"Found {len(validation_info['orphaned_dirs'])} orphaned directories that will be cleaned up during save.")
-        
+
         return validation_info
 
 class BaseDataHandler:
@@ -1019,12 +938,13 @@ class Dataset(DataAwareBaseHandler):
         self.dataset_name = dataset_name
         self.datasets_config = self.project.config['datasets']
         self.dataset_config = self.datasets_config[self.dataset_name]
+        self.overwrite = self.project.overwrite
 
         # Use hash-based tag for output directory
         self.data_processing_tag = project.data_processing_hash
         dataset_outdir = self.set_up_dataset_outdir(self.project, self.data_processing_tag,
                                                     self.dataset_config, self.dataset_name,
-                                                    overwrite=overwrite)
+                                                    overwrite=self.overwrite)
         self.output_dir = dataset_outdir
         self.dataset_raw_dir = os.path.join(self.project.raw_data_dir, self.dataset_config['dataset_dir'])
         os.makedirs(self.output_dir, exist_ok=True)
@@ -1116,7 +1036,7 @@ class Dataset(DataAwareBaseHandler):
     def filter_data(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
         """Hybrid: Class validation + external hlp.filter_data function."""
         def _filter_method():
-            if self.check_and_load_attribute('filtered_data', self._filtered_data_filename, overwrite):
+            if self.check_and_load_attribute('filtered_data', self._filtered_data_filename, self.overwrite):
                 return
             
             params = self.normalization_params.get('filtering', {})
@@ -1148,7 +1068,7 @@ class Dataset(DataAwareBaseHandler):
     def devariance_data(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
         """Remove low-variance features using external helper function with class integration."""
         def _devariance_method():
-            if self.check_and_load_attribute('devarianced_data', self._devarianced_data_filename, overwrite):
+            if self.check_and_load_attribute('devarianced_data', self._devarianced_data_filename, self.overwrite):
                 return
             
             params = self.normalization_params.get('devariancing', {})
@@ -1180,7 +1100,7 @@ class Dataset(DataAwareBaseHandler):
     def scale_data(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
         """Hybrid: Class validation + external hlp.scale_data function."""
         def _scale_method():
-            if self.check_and_load_attribute('scaled_data', self._scaled_data_filename, overwrite):
+            if self.check_and_load_attribute('scaled_data', self._scaled_data_filename, self.overwrite):
                 return
             
             params = self.normalization_params.get('scaling', {})
@@ -1212,7 +1132,7 @@ class Dataset(DataAwareBaseHandler):
     def remove_low_replicable_features(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
         """Hybrid: Class validation + external hlp.remove_low_replicable_features function."""
         def _replicate_method():
-            if self.check_and_load_attribute('normalized_data', self._normalized_data_filename, overwrite):
+            if self.check_and_load_attribute('normalized_data', self._normalized_data_filename, self.overwrite):
                 return
             
             params = self.normalization_params.get('replicate_handling', {})
@@ -1250,11 +1170,6 @@ class Dataset(DataAwareBaseHandler):
             plot_subdir = "pca_plots"
             plot_dir = os.path.join(self.output_dir, plot_subdir)
             os.makedirs(plot_dir, exist_ok=True)
-            if os.path.exists(os.path.join(plot_dir, self._pca_grid_filename)) and not overwrite:
-                log.info(f"PCA grid plot already exists at {plot_dir}. Skipping.")
-                return
-            else: # necessary to clear carryover from previous analyses
-                hlp.clear_directory(plot_dir)
             
             call_params = {
                 'data': {"linked": self.linked_data, "normalized": self.normalized_data},
@@ -1304,16 +1219,16 @@ class MX(Dataset):
         self.polarity = self.dataset_config['polarity']
         self.mode = "untargeted" # Currently only untargeted supported, not configurable
         self.datatype = "peak-height" # Currently only peak-height supported, not configurable
-        self._get_raw_metadata(overwrite=overwrite, show_progress=False, superuser=superuser)
-        self._get_raw_data(overwrite=overwrite, show_progress=False)
-        self._generate_annotation_table(overwrite=overwrite, show_progress=False)
+        self._get_raw_metadata(overwrite=self.overwrite, show_progress=False, superuser=superuser)
+        self._get_raw_data(overwrite=self.overwrite, show_progress=False)
+        self._generate_annotation_table(overwrite=self.overwrite, show_progress=False)
         if last:
             self._complete_tracking('create_datasets')
 
     def _get_raw_data(self, overwrite: bool = False, show_progress: bool = True) -> None:
         def _get_data_method():
             log.info("Getting Raw Data (MX)")
-            if self.check_and_load_attribute('raw_data', self._raw_data_filename, overwrite):
+            if self.check_and_load_attribute('raw_data', self._raw_data_filename, self.overwrite):
                 log.info(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.")
                 return
 
@@ -1344,7 +1259,7 @@ class MX(Dataset):
     def _get_raw_metadata(self, overwrite: bool = False, show_progress: bool = True, superuser: bool = False) -> None:
         def _get_metadata_method():
             log.info("Getting Raw Metadata (MX)")
-            if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, overwrite):
+            if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, self.overwrite):
                 log.info(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
                 return
 
@@ -1399,7 +1314,7 @@ class MX(Dataset):
         """Generate metabolite ID to annotation mapping table for metabolomics data."""
         def _generate_annotation_method():
             log.info("Generating Metabolite Annotation Mapping")
-            if self.check_and_load_attribute('annotation_table', self._annotation_table_filename, overwrite):
+            if self.check_and_load_attribute('annotation_table', self._annotation_table_filename, self.overwrite):
                 log.info(f"\tAnnotation mapping with {self.annotation_table.shape[0]} rows and {self.annotation_table.shape[1]} columns.")
                 return
             
@@ -1435,16 +1350,16 @@ class TX(Dataset):
         self.apid = None
         self.genome_type = self.project.config['project']['genome_type']
         self.datatype = "counts" # Currently only counts supported, not configurable
-        self._get_raw_metadata(overwrite=overwrite, show_progress=False, superuser=superuser)
-        self._get_raw_data(overwrite=overwrite, show_progress=False)
-        self._generate_annotation_table(overwrite=overwrite, show_progress=False)
+        self._get_raw_metadata(overwrite=self.overwrite, show_progress=False, superuser=superuser)
+        self._get_raw_data(overwrite=self.overwrite, show_progress=False)
+        self._generate_annotation_table(overwrite=self.overwrite, show_progress=False)
         if last:
             self._complete_tracking('create_datasets')
 
     def _get_raw_data(self, overwrite: bool = False, show_progress: bool = True) -> None:
         def _get_data_method():
             log.info("Getting Raw Data (TX)")
-            if self.check_and_load_attribute('raw_data', self._raw_data_filename, overwrite):
+            if self.check_and_load_attribute('raw_data', self._raw_data_filename, self.overwrite):
                 log.info(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.")
                 return
             
@@ -1473,7 +1388,7 @@ class TX(Dataset):
     def _get_raw_metadata(self, overwrite: bool = False, show_progress: bool = True, superuser: bool = False) -> None:
         def _get_metadata_method():
             log.info("Getting Raw Metadata (TX)")
-            if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, overwrite):
+            if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, self.overwrite):
                 self.apid = self.raw_metadata['APID'].iloc[0] if 'APID' in self.raw_metadata.columns else None
                 log.info(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
                 return
@@ -1484,14 +1399,14 @@ class TX(Dataset):
                     pid=self.project.proposal_ID,
                     tx_dir=self.dataset_raw_dir,
                     tx_index=self.dataset_config['index'],
-                    overwrite=overwrite,
+                    overwrite=self.overwrite,
                     superuser=superuser
                 )
                 self.apid = hlp.gather_tx_files(
                     file_list=tx_files,
                     tx_index=self.dataset_config['index'],
                     tx_dir=self.dataset_raw_dir,
-                    overwrite=overwrite,
+                    overwrite=self.overwrite,
                     superuser=superuser
                 )
             else:
@@ -1508,7 +1423,7 @@ class TX(Dataset):
                 output_dir=self.dataset_raw_dir,
                 proposal_ID=self.project.proposal_ID,
                 apid=str(self.apid),
-                overwrite=overwrite,
+                overwrite=self.overwrite,
                 superuser=superuser
             )
             if result.empty:
@@ -1530,7 +1445,7 @@ class TX(Dataset):
         """Generate gene annotation table for transcriptomics data."""
         def _generate_annotation_method():
             log.info("Generating Gene Annotation Table")
-            if self.check_and_load_attribute('annotation_table', self._annotation_table_filename, overwrite):
+            if self.check_and_load_attribute('annotation_table', self._annotation_table_filename, self.overwrite):
                 log.info(f"\tAnnotation table with {self.annotation_table.shape[0]} rows and {self.annotation_table.shape[1]} columns.")
                 return
             
@@ -1568,12 +1483,13 @@ class Analysis(DataAwareBaseHandler):
         self.datasets_config = self.project.config['datasets']
         self.analysis_config = self.project.config['analysis']
         self.metadata_link_script = self.project.project_config['metadata_link']
+        self.overwrite = self.project.overwrite
 
         # Use hash-based tags for output directory
         self.data_processing_tag = project.data_processing_hash
         self.analysis_tag = project.analysis_hash
         analysis_outdir = self._set_up_analysis_outdir(self.project, self.data_processing_tag, 
-                                                      self.analysis_tag, overwrite=overwrite)
+                                                      self.analysis_tag, overwrite=self.overwrite)
         self.output_dir = analysis_outdir
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -1628,7 +1544,7 @@ class Analysis(DataAwareBaseHandler):
             'feature_network_edge_table': 'feature_network_edge_table.csv',
             'feature_network_node_table': 'feature_network_node_table.csv',
             'functional_enrichment_table': 'functional_enrichment_table.csv',
-            'mofa_model': 'mofa_model.hdf5',
+            'mofa_data': 'mofa_data.csv',
         }
         for attr, filename in manual_file_storage.items():
             setattr(self, f"_{attr}_filename", filename)
@@ -1669,9 +1585,9 @@ class Analysis(DataAwareBaseHandler):
         """Apply filtering to all datasets in the analysis."""
         def _filter_method():
             log.info("Filtering Data")
-            for ds in tqdm(self.datasets, desc=f"Filtering {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green"):
+            for ds in self.datasets:
                 log.info(f"Filtering {ds.dataset_name} dataset...")
-                ds.filter_data(overwrite=overwrite, show_progress=False, **kwargs)
+                ds.filter_data(overwrite=self.overwrite, show_progress=False, **kwargs)
 
         if show_progress:
             self.workflow_tracker.set_current_step('filter_dataset_features')
@@ -1686,9 +1602,9 @@ class Analysis(DataAwareBaseHandler):
         """Apply devariancing to all datasets in the analysis."""
         def _devariance_method():
             log.info("Devariancing Data")
-            for ds in tqdm(self.datasets, desc=f"Devariancing {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green"):
+            for ds in self.datasets:
                 log.info(f"Devariancing {ds.dataset_name} dataset...")
-                ds.devariance_data(overwrite=overwrite, show_progress=False, **kwargs)
+                ds.devariance_data(overwrite=self.overwrite, show_progress=False, **kwargs)
 
         if show_progress:
             self.workflow_tracker.set_current_step('devariance_dataset_features')
@@ -1703,9 +1619,9 @@ class Analysis(DataAwareBaseHandler):
         """Apply scaling to all datasets in the analysis."""
         def _scale_method():
             log.info("Scaling Data")
-            for ds in tqdm(self.datasets, desc=f"Scaling {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green"):
+            for ds in self.datasets:
                 log.info(f"Scaling {ds.dataset_name} dataset...")
-                ds.scale_data(overwrite=overwrite, show_progress=False, **kwargs)
+                ds.scale_data(overwrite=self.overwrite, show_progress=False, **kwargs)
 
         if show_progress:
             self.workflow_tracker.set_current_step('scale_dataset_features')
@@ -1720,9 +1636,9 @@ class Analysis(DataAwareBaseHandler):
         """Remove low replicable features from all datasets in the analysis."""
         def _replicate_method():
             log.info("Removing Unreplicable Features")
-            for ds in tqdm(self.datasets, desc=f"Removing low replicable features from {len(self.datasets)} Datasets", unit="dataset", leave=True, colour="green"):
+            for ds in self.datasets:
                 log.info(f"Removing low replicable features from {ds.dataset_name} dataset...")
-                ds.remove_low_replicable_features(overwrite=overwrite, show_progress=False, **kwargs)
+                ds.remove_low_replicable_features(overwrite=self.overwrite, show_progress=False, **kwargs)
 
         if show_progress:
             self.workflow_tracker.set_current_step('replicability_test_dataset_features')
@@ -1739,7 +1655,7 @@ class Analysis(DataAwareBaseHandler):
             log.info("Plotting Individual PCAs and Grid")
             for ds in self.datasets:
                 log.info(f"Plotting PCA for {ds.dataset_name} dataset...")
-                ds.plot_pca(overwrite=overwrite, 
+                ds.plot_pca(overwrite=self.overwrite, 
                             analysis_outdir=self.output_dir, 
                             show_plot=show_plot,
                             show_progress=False,
@@ -1756,7 +1672,7 @@ class Analysis(DataAwareBaseHandler):
             # Check if datasets already have linked metadata
             datasets_to_process = [
                 ds for ds in self.datasets 
-                if not ds.check_and_load_attribute('linked_metadata', ds._linked_metadata_filename, overwrite)
+                if not ds.check_and_load_attribute('linked_metadata', ds._linked_metadata_filename, self.overwrite)
             ]
             if not datasets_to_process:
                 return
@@ -1790,7 +1706,7 @@ class Analysis(DataAwareBaseHandler):
             # Check if all datasets already have linked data
             datasets_to_process = [
                 ds for ds in self.datasets 
-                if not ds.check_and_load_attribute('linked_data', ds._linked_data_filename, overwrite)
+                if not ds.check_and_load_attribute('linked_data', ds._linked_data_filename, self.overwrite)
             ]
             if not datasets_to_process:
                 return
@@ -1847,7 +1763,7 @@ class Analysis(DataAwareBaseHandler):
         """Hybrid: Class validation + external hlp.integrate_metadata function."""
         def _integrate_metadata_method():
             log.info("Integrating metadata across data types")
-            if self.check_and_load_attribute('integrated_metadata', self._integrated_metadata_filename, overwrite):
+            if self.check_and_load_attribute('integrated_metadata', self._integrated_metadata_filename, self.overwrite):
                 log.info(f"\tIntegrated metadata object 'integrated_metadata' with {self.integrated_metadata.shape[0]} samples and {self.integrated_metadata.shape[1]} metadata fields.")
                 return
             
@@ -1877,7 +1793,7 @@ class Analysis(DataAwareBaseHandler):
         """Hybrid: Class validation + external hlp.integrate_data function."""
         def _integrate_data_method():
             log.info("Integrating data matrices across data types")
-            if self.check_and_load_attribute('integrated_data', self._integrated_data_filename, overwrite):
+            if self.check_and_load_attribute('integrated_data', self._integrated_data_filename, self.overwrite):
                 log.info(f"\tIntegrated data object 'integrated_data' with {self.integrated_data.shape[0]} features and {self.integrated_data.shape[1]} samples.")
                 return
             
@@ -1906,7 +1822,7 @@ class Analysis(DataAwareBaseHandler):
         """Hybrid: Class orchestration + external annotate_integrated_features function."""
         def _annotate_integrated_features_method():
             log.info("Annotating integrated features")
-            if self.check_and_load_attribute('feature_annotation_table', self._feature_annotation_table_filename, overwrite):
+            if self.check_and_load_attribute('feature_annotation_table', self._feature_annotation_table_filename, self.overwrite):
                 log.info(f"\tAnnotated features object 'feature_annotation_table' with {self.feature_annotation_table.shape[0]} features and {self.feature_annotation_table.shape[1]} samples.")
                 return
             
@@ -1945,7 +1861,7 @@ class Analysis(DataAwareBaseHandler):
         """Hybrid: Class parameter setup + external hlp.perform_feature_selection function."""
         def _feature_selection_method():
             log.info("Subsetting Features before Network Analysis")
-            if self.check_and_load_attribute('integrated_data_selected', self._integrated_data_selected_filename, overwrite):
+            if self.check_and_load_attribute('integrated_data_selected', self._integrated_data_selected_filename, self.overwrite):
                 log.info(f"\tFeature selection data object 'integrated_data_selected' with {self.integrated_data_selected.shape[0]} features and {self.integrated_data_selected.shape[1]} samples.")
                 return
             
@@ -1981,7 +1897,7 @@ class Analysis(DataAwareBaseHandler):
         """Hybrid: Class validation + external hlp.calculate_correlated_features function."""
         def _correlation_method():
             log.info("Calculating Correlated Features")
-            if self.check_and_load_attribute('feature_correlation_table', self._feature_correlation_table_filename, overwrite):
+            if self.check_and_load_attribute('feature_correlation_table', self._feature_correlation_table_filename, self.overwrite):
                 log.info(f"\tFeature correlation table object 'feature_correlation_table' with {self.feature_correlation_table.shape[0]} feature pairs.")
                 return
             
@@ -2027,8 +1943,26 @@ class Analysis(DataAwareBaseHandler):
             submodule_dir = os.path.join(network_dir, submodule_subdir)
             os.makedirs(network_dir, exist_ok=True)
             os.makedirs(submodule_dir, exist_ok=True)
-            if self.check_and_load_attribute('feature_network_node_table', os.path.join(network_subdir, self._feature_network_node_table_filename), overwrite) or \
-                self.check_and_load_attribute('feature_network_edge_table', os.path.join(network_subdir, self._feature_network_edge_table_filename), overwrite):
+            
+            # Update filename attributes to include subdirectory
+            node_table_path = os.path.join(network_subdir, self._feature_network_node_table_filename)
+            edge_table_path = os.path.join(network_subdir, self._feature_network_edge_table_filename)
+            
+            # Check if tables already exist
+            if self.check_and_load_attribute('feature_network_node_table', node_table_path, self.overwrite) or \
+                self.check_and_load_attribute('feature_network_edge_table', edge_table_path, self.overwrite):
+                networking_params = self.analysis_parameters.get('networking', {})
+                if networking_params.get('interactive_plot', False):
+                    # Display existing network if interactive plot is enabled
+                    graph_file = os.path.join(network_dir, self._feature_network_graph_filename)
+                    if os.path.exists(graph_file):
+                        log.info("Displaying existing network visualization...")
+                        hlp.display_existing_network(
+                            graph_file=graph_file,
+                            node_table=self.feature_network_node_table,
+                            edge_table=self.feature_network_edge_table,
+                            interactive_layout=networking_params.get('interactive_layout', None)
+                        )
                 return
             else: # necessary to clear carryover from previous analyses
                 hlp.clear_directory(network_dir)
@@ -2063,8 +1997,21 @@ class Analysis(DataAwareBaseHandler):
                 sys.exit(1)
             else:
                 log.info("Created correlation network graph and associated node/edge tables.")
+            
+            # Temporarily update the filename attributes to save to subdirectory
+            original_node_filename = self._feature_network_node_table_filename
+            original_edge_filename = self._feature_network_edge_table_filename
+            
+            self._feature_network_node_table_filename = node_table_path
+            self._feature_network_edge_table_filename = edge_table_path
+            
+            # Set the attributes (this will save to the subdirectory)
             self.feature_network_node_table = node_table
             self.feature_network_edge_table = edge_table
+            
+            # Restore original filenames
+            self._feature_network_node_table_filename = original_node_filename
+            self._feature_network_edge_table_filename = original_edge_filename
 
         if show_progress:
             self.workflow_tracker.set_current_step('plot_correlation_network')
@@ -2079,7 +2026,7 @@ class Analysis(DataAwareBaseHandler):
         """Hybrid: Class parameter setup + external hlp.perform_functional_enrichment function."""
         def _enrichment_method():
             log.info("Performing functional enrichment test on network submodules")
-            if self.check_and_load_attribute('functional_enrichment_table', self._functional_enrichment_table_filename, overwrite):
+            if self.check_and_load_attribute('functional_enrichment_table', self._functional_enrichment_table_filename, self.overwrite):
                 log.info(f"\tFunctional enrichment table object 'functional_enrichment_table' with {self.functional_enrichment_table.shape[0]} functional categories.")
                 return
 
@@ -2122,8 +2069,11 @@ class Analysis(DataAwareBaseHandler):
             mofa_dir = os.path.join(self.output_dir, mofa_subdir)
             os.makedirs(mofa_dir, exist_ok=True)
             log.info("Running MOFA2 Analysis")
-            if os.path.exists(os.path.join(mofa_subdir, self._mofa_model_filename)) and not overwrite:
-                log.info(f"MOFA2 model already exists in {mofa_dir}. Skipping.")
+            
+            # Check with subdirectory path
+            mofa_data_path = os.path.join(mofa_subdir, self._mofa_data_filename)
+            if self.check_and_load_attribute('mofa_data', mofa_data_path, self.overwrite):
+                log.info(f"MOFA2 model already exists. Using existing data.")
                 return
 
             mofa2_params = self.analysis_parameters.get('mofa', {})
@@ -2132,16 +2082,30 @@ class Analysis(DataAwareBaseHandler):
                 'mofa2_views': [ds.dataset_name for ds in self.datasets],
                 'metadata': self.integrated_metadata,
                 'output_dir': mofa_dir,
-                'output_filename': self._mofa_model_filename,
+                'output_filename': self._mofa_data_filename,
                 'num_factors': mofa2_params.get('num_mofa_factors', 5),
                 'num_features': 10,
                 'num_iterations': mofa2_params.get('num_mofa_iterations', 100),
                 'training_seed': mofa2_params.get('seed_for_training', 555),
-                'overwrite': overwrite
+                'overwrite': self.overwrite
             }
             call_params.update(kwargs)
             
-            hlp.run_full_mofa2_analysis(**call_params)
+            mofa_data = hlp.run_full_mofa2_analysis(**call_params)
+
+            if mofa_data.empty:
+                log.error(f"Running MOFA2 analysis resulted in empty model. Please check your integrated data and MOFA2 parameters.")
+                sys.exit(1)
+            
+            # Temporarily update filename to include subdirectory
+            original_filename = self._mofa_data_filename
+            self._mofa_data_filename = mofa_data_path
+            
+            # Set the attribute (saves to subdirectory)
+            self.mofa_data = mofa_data
+            
+            # Restore original filename
+            self._mofa_data_filename = original_filename
 
         if show_progress:
             self.workflow_tracker.set_current_step('run_mofa2')
@@ -2217,7 +2181,7 @@ manual_file_storage = {
     'feature_network_edge_table': 'feature_network_edge_table.csv',
     'feature_network_node_table': 'feature_network_node_table.csv',
     'functional_enrichment_table': 'functional_enrichment_table.csv',
-    'mofa_model': 'mofa_model.hdf5'
+    'mofa_data': 'mofa_data.csv'
 }
 #for attr in config['analysis']['file_storage']:
 for attr, filename in manual_file_storage.items():
