@@ -34,7 +34,7 @@ The configuration is split into three separate files:
 2. **`data_processing.yml`** - Parameters affecting data processing steps
 3. **`analysis.yml`** - Parameters affecting analysis steps
 
-When you initialize a project, hashes are automatically generated. Your results will be organized in hash-tagged directories:
+When you initialize a project, hashes are automatically generated. Your results will be organized in hash-tagged directories. For example, running the workflow with default parameter would produce an output like this:
 
 ```
 my_jgi_project/
@@ -52,15 +52,18 @@ my_jgi_project/
 ### Running Fresh vs. Existing Analysis
 
 **Fresh Analysis (new parameters):**
-For a new analysis, you can update the default configuration file at `/input_data/config`, which will create a new set of results in unique output folders.
+For a new analysis, you can update the configuration files in the JupyterLab interface or your local directory at `input_data/config/*yml`, which will create a new set of results in unique output folders.
 
 **Re-run Existing Analysis (exact reproduction):**
 ```python
 # Optionally, see what existing analyses are available in the previously saved configuration files
 hlp.list_persistent_configs()
 
-# Use hashes to load specific saved configuration
+# Use hashes to load specific saved configuration (replace the default None)
 project = objs.Project(data_processing_hash="a1b2c3d4", analysis_hash="e5f6g7h8")
+
+# If, for some reason, you want to overwrite existing workflow results
+project = objs.Project(data_processing_hash="a1b2c3d4", analysis_hash="e5f6g7h8", overwrite=True)
 ```
 
 When re-running existing analysis, the workflow automatically:
@@ -76,7 +79,7 @@ Re-runs are useful for reproducing results, continuing interrupted analyses, or 
 
 2.  Double-click the workflow notebook `/integration_workflow.ipynb` in the left menu navigator to bring it into the workspace.
 
-3.  Double-click the configuration files in `/input_data/config/*.yml` to bring them into the workspace. The JupyterLab interface will open the files in a text editor for you to change parameters during analyses.
+3.  Double-click the data processing and analysis configuration files in `/input_data/config/*.yml` to bring them into the workspace. The JupyterLab interface will open the files in a text editor for you to change parameters during analyses.
 
 4.  Run a workflow with all default parameters:
     
@@ -104,23 +107,23 @@ Re-runs are useful for reproducing results, continuing interrupted analyses, or 
 
     - To view the outputs within the notebook itself, you can access and view attributes of a dataset or analysis by creating a new cell and executing the command `<object>.<attribute>`. For example, running a cell with `tx_dataset.normalized_data` will show the transcriptomics count table (a dataframe) after all dataset normalization steps, or `mx_dataset.linked`_metadata will show the metabolomics metadata table after it has been linked to the other datasets.
 
-    _Note_: to see the names of all possible attributes that you can view for each object (dataset or analysis), run a cell with the command `vars(<object>).keys()`. For example, `vars(analysis).keys()` or `vars(mx_dataset).keys()`.
+    _Note_: Each cell that produces viewable output will print the name of the `attribute` to the notebook standard output for your reference.. But to see the names of all possible attributes that you can view for each object (dataset or analysis), run a cell with the command `vars(<object>).keys()`. For example, `vars(analysis).keys()` or `vars(mx_dataset).keys()`.
 
     - To view the outputs on your system (which is mounted to the docker container), navigate to `$INTEGRATION_DIR/project_data/output_data` directory (see _setup.md_ if you do not have this directory) and view output files as you would normally on your local filesystem.
 
 ## **Persistent Configuration and Motebook Files**
 
-*   The default config files will contain a set of parameters that can be used right from the outset, but these can be changed during your analysis and exploration of the data. Each time the config parameters are changed and the workflow is run, the last cell of the notebook will save the configuration file to a persistent directory in `/output_data/<your_project_name>/configs`. This configuration file can then be accessed in the future if you want to recreate the results from that particular run.
+*   The default config files will contain a set of parameters that can be used right from the outset, but these can be changed during your analysis and exploration of the data. Each time the config parameters are changed and the workflow is run, a cell in the notebook will save the configuration file to a persistent directory in `/output_data/<your_project_name>/configs`. This configuration file can then be accessed in the future using the hashes if you want to recreate the results from that particular run (see the section above).
 
 *   Similarly, the notebook itself (which includes some logging/error printouts, plots, a configuration file path, and other cells you may have added) will be saved to a persistent directory in `/output_data/<your_project_name>/notebooks` to revisit.
 
 ## **Exiting the Workflow Container**
 
-1.  When you are finished running the workflow and producing outputs, it is best to close it down gracefully rather than simply close your browser window and exit the Docker Desktop app. There are three methods to properly close down the docker container, any of which will work equally well:
+1.  When you are finished running the workflow and producing outputs, it is best to close it down gracefully rather than simply close your browser window. There are several methods to properly close down the docker container, any of which will work equally well:
+
+    - Recommended: To close with the running terminal/console, open the window that is running the container (where you ran the `… docker compose …` command during instructions in _setup.md_) and press ctrl/cmd-C on your keyboard.
 
     - To close with the Docker Desktop app, open the app and click on the Containers tab in the top left menu bar. Find the container named “jgi-integration” in the main panel and click the Stop button (black square) in the Actions column.
-
-    - To close with the running terminal/console, open the window that is running the container (where you ran the `… docker compose …` command during instructions in _setup.md_) and press ctrl/cmd-C on your keyboard.
 
     - To close with another terminal/console, open a new window and stop the container with a single command:
 
