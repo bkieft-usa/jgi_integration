@@ -85,6 +85,8 @@ Configuration path: `analysis.analysis_parameters.correlation`
 
 Configuration path: `analysis.analysis_parameters.networking`
 
+**Background**: A datatype-specific or bipartite network is constructed from the integrated data. Before conducting network analysis, it is advisable to drop some un-important or non-relevant features (e.g., those without significant variation across groups in your experimental design) from the analysis because they are not meaningful to correlation analysis; large graphs are very difficult to interpret without sub-setting the data in a biologically or technically meaningful way (see feature selection above). Submodules (discrete sets of connected nodes) can also be extracted from the network, which represent tightly correlated clusters of features that had similar observed abundance across experimental samples. The networks are provided in .graphml format for uploading to CytoScape or a similar tool or are viewed by deafult in the Jupyterlab interface, and the node and edge files of each graph are provided for custom analysis.
+
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
 | `submodule_mode` | string | `"louvain"` | Sub‑module extraction method. Options: `none`, `subgraphs`, `louvain`, `leiden`, `wgcna`. |
@@ -98,6 +100,8 @@ Configuration path: `analysis.analysis_parameters.networking`
 
 Configuration path: `analysis.analysis_parameters.functional_enrichment`
 
+**Background**: Functional enrichment tests in correlation or coexpression networks are used to identify biological processes or pathways that are overrepresented among genes with highly correlated expression profiles. In the case of this workflow, the enrichment tests are performed on network submodules (if generated, see above), and the biological process can be any of the annotation categories from the feature annotation table. By testing for enriched functions, such as Gene Ontology terms, KEGG pathways, or metabolite classes, the "role" of the submodule and its relationship to your experimental design can be inferred. This approach can reveal insights into the biological functions of genes, metabolites, or their interactions, and the results of functional enrichment tests can be used to prioritize features for further investigation and to inform the development of new hypotheses.
+
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
 | `annotation_column` | string | `"tx_goterm_acc"` | Column containing functional annotations. Options: `tx_goterm_acc` (Gene Ontology terms), `mx_subclass` (metabolite subclasses). |
@@ -110,6 +114,8 @@ Configuration path: `analysis.analysis_parameters.functional_enrichment`
 ## MOFA Modeling <a id="mofa-modeling"></a>  
 
 Configuration path: `analysis.analysis_parameters.mofa`
+
+**Background**: MOFA (Multi-omics Factor Analysis). MOFA2 is a modelling tool that helps integrate and interpret ‘omics datasets in an unsupervised fashion. The software produces factors that are analogous to principal component analysis (PCA) axes but tailored for use on multi-omics datasets. It takes two or more data matrices with differing structure (e.g., RNA counts and metabolite peak heights) that have the same or at least overlapping samples and infers “interpretable low-dimensional representation in terms of a few latent factors”. More details on interpreting MOFA2 results can be found below. The source code for MOFA2 can be found here [https://github.com/bioFAM/MOFA2] and the publication describing the MOFA2 algorithm can be found here [doi:10.1101/2020.11.03.366674].
 
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
