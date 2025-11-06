@@ -1055,6 +1055,8 @@ class Dataset(DataAwareBaseHandler):
                 log.error(f"Filtering resulted in empty dataset for {self.dataset_name}. Please adjust filtering parameters.")
                 sys.exit(1)
             self.filtered_data = result
+            log.info(f"Created table: {self._filtered_data_filename}")
+            log.info("Created attribute: filtered_data")
         
         if show_progress:
             self.workflow_tracker.set_current_step('filter_dataset_features')
@@ -1087,6 +1089,8 @@ class Dataset(DataAwareBaseHandler):
                 log.error(f"Devariancing resulted in empty dataset for {self.dataset_name}. Please adjust devariancing parameters.")
                 sys.exit(1)
             self.devarianced_data = result
+            log.info(f"Created table: {self._devarianced_data_filename}")
+            log.info("Created attribute: devarianced_data")
 
         if show_progress:
             self.workflow_tracker.set_current_step('devariance_dataset_features')
@@ -1119,6 +1123,8 @@ class Dataset(DataAwareBaseHandler):
                 log.error(f"Scaling resulted in empty dataset for {self.dataset_name}. Please adjust scaling parameters.")
                 sys.exit(1)
             self.scaled_data = result
+            log.info(f"Created table: {self._scaled_data_filename}")
+            log.info("Created attribute: scaled_data")
 
         if show_progress:
             self.workflow_tracker.set_current_step('scale_dataset_features')
@@ -1153,6 +1159,8 @@ class Dataset(DataAwareBaseHandler):
                 log.error(f"Replicability filtering resulted in empty dataset for {self.dataset_name}. Please adjust replicability parameters.")
                 sys.exit(1)
             self.normalized_data = result
+            log.info(f"Created table: {self._normalized_data_filename}")
+            log.info("Created attribute: normalized_data")
 
         if show_progress:
             self.workflow_tracker.set_current_step('replicability_test_dataset_features')
@@ -1246,6 +1254,8 @@ class MX(Dataset):
                 sys.exit(1)
             self.raw_data = result
             log.info(f"\tCreated raw data for MX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
+            log.info(f"Created table: {self._raw_data_filename}")
+            log.info("Created attribute: raw_data")
         
         if show_progress:
             self.workflow_tracker.set_current_step('load_data')
@@ -1300,7 +1310,9 @@ class MX(Dataset):
                 sys.exit(1)
             self.raw_metadata = result
             log.info(f"\tCreated raw metadata for MX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
-        
+            log.info(f"Created table: {self._raw_metadata_filename}")
+            log.info("Created attribute: raw_metadata")
+
         if show_progress:
             self.workflow_tracker.set_current_step('load_metadata')
             _get_metadata_method()
@@ -1331,6 +1343,8 @@ class MX(Dataset):
                 log.error(f"No annotation mapping generated for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
                 sys.exit(1)
             self.annotation_table = result
+            log.info(f"Created table: {self._annotation_table_filename}")
+            log.info("Created attribute: annotation_table")
 
         if show_progress:
             self.workflow_tracker.set_current_step('generate_annotation_table')
@@ -1375,6 +1389,8 @@ class TX(Dataset):
                 sys.exit(1)
             self.raw_data = result
             log.info(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
+            log.info(f"Created table: {self._raw_data_filename}")
+            log.info("Created attribute: raw_data")
 
         if show_progress:
             self.workflow_tracker.set_current_step('load_data')
@@ -1431,6 +1447,8 @@ class TX(Dataset):
                 sys.exit(1)
             self.raw_metadata = result
             log.info(f"\tCreated raw metadata for TX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
+            log.info(f"Created table: {self._raw_metadata_filename}")
+            log.info("Created attribute: raw_metadata")
 
         if show_progress:
             self.workflow_tracker.set_current_step('load_metadata')
@@ -1462,6 +1480,8 @@ class TX(Dataset):
                 log.error(f"No annotation table generated for TX dataset. Please check your raw data files.")
                 sys.exit(1)
             self.annotation_table = result
+            log.info(f"Created table: {self._annotation_table_filename}")
+            log.info("Created attribute: annotation_table")
 
         if show_progress:
             self.workflow_tracker.set_current_step('generate_annotation_table')
@@ -1679,7 +1699,7 @@ class Analysis(DataAwareBaseHandler):
             
             # Call external function
             linked_metadata = hlp.link_metadata_with_custom_script(datasets=self.datasets,
-                                                                      custom_script_path=self.metadata_link_script)
+                                                                    custom_script_path=self.metadata_link_script)
             
             # Set results back to datasets
             for ds in self.datasets:
@@ -1688,6 +1708,8 @@ class Analysis(DataAwareBaseHandler):
                     sys.exit(1)
                 ds.linked_metadata = linked_metadata[ds.dataset_name]
                 log.info(f"Created linked_metadata for {ds.dataset_name} with {ds.linked_metadata.shape[0]} samples and {ds.linked_metadata.shape[1]} metadata fields.")
+                log.info(f"Created table: {self._linked_metadata_filename}")
+                log.info("Created attribute: linked_metadata")
 
         if show_progress:
             self.workflow_tracker.set_current_step('link_metadata')
@@ -1727,6 +1749,8 @@ class Analysis(DataAwareBaseHandler):
                     sys.exit(1)
                 ds.linked_data = linked_data[ds.dataset_name]
                 log.info(f"Created linked_data for {ds.dataset_name} with {ds.linked_data.shape[1]} samples and {ds.linked_data.shape[0]} features.")
+                log.info(f"Created table: {self._linked_data_filename}")
+                log.info("Created attribute: linked_data")
 
         if show_progress:
             self.workflow_tracker.set_current_step('link_data')
@@ -1779,6 +1803,8 @@ class Analysis(DataAwareBaseHandler):
                 sys.exit(1)
             self.integrated_metadata = result
             log.info(f"Created a single integrated metadata table with {self.integrated_metadata.shape[0]} samples and {self.integrated_metadata.shape[1]} metadata fields.")
+            log.info(f"Created table: {self._integrated_metadata_filename}")
+            log.info("Created attribute: integrated_metadata")
 
         if show_progress:
             self.workflow_tracker.set_current_step('integrate_metadata')
@@ -1808,6 +1834,8 @@ class Analysis(DataAwareBaseHandler):
                 sys.exit(1)
             self.integrated_data = result
             log.info(f"Created a single integrated data table with {self.integrated_data.shape[0]} samples and {self.integrated_data.shape[1]} features.")
+            log.info(f"Created table: {self._integrated_data_filename}")
+            log.info("Created attribute: integrated_data")
 
         if show_progress:
             self.workflow_tracker.set_current_step('integrate_data')
@@ -1838,6 +1866,8 @@ class Analysis(DataAwareBaseHandler):
                 sys.exit(1)
             self.feature_annotation_table = annotation_df
             log.info(f"Created an annotated integrated features table with {self.feature_annotation_table.shape[0]} entries ({len(self.feature_annotation_table['feature_id'].unique())} unique features) and {self.feature_annotation_table.shape[1]} samples.")
+            log.info(f"Created table: {self._feature_annotation_table_filename}")
+            log.info("Created attribute: feature_annotation_table")
 
         if show_progress:
             self.workflow_tracker.set_current_step('annotate_integrated_features')
@@ -1883,6 +1913,8 @@ class Analysis(DataAwareBaseHandler):
                 sys.exit(1)
             self.integrated_data_selected = result
             log.info(f"Created a subset of the integrated data with {self.integrated_data_selected.shape[0]} samples and {self.integrated_data_selected.shape[1]} features for network analysis.")
+            log.info(f"Created table: {self._integrated_data_selected_filename}")
+            log.info("Created attribute: integrated_data_selected")
 
         if show_progress:
             self.workflow_tracker.set_current_step('feature_selection')
@@ -1924,6 +1956,8 @@ class Analysis(DataAwareBaseHandler):
                 sys.exit(1)
             self.feature_correlation_table = result
             log.info(f"Created a feature correlation table with {self.feature_correlation_table.shape[0]} feature pairs.")
+            log.info(f"Created table: {self._feature_correlation_table_filename}")
+            log.info("Created attribute: feature_correlation_table")
 
         if show_progress:
             self.workflow_tracker.set_current_step('calculate_correlations')
@@ -2013,6 +2047,11 @@ class Analysis(DataAwareBaseHandler):
             self._feature_network_node_table_filename = original_node_filename
             self._feature_network_edge_table_filename = original_edge_filename
 
+            log.info(f"Created table: {self._feature_network_node_table_filename}")
+            log.info("Created attribute: feature_network_node_table")
+            log.info(f"Created table: {self._feature_network_edge_table_filename}")
+            log.info("Created attribute: feature_network_edge_table")
+
         if show_progress:
             self.workflow_tracker.set_current_step('plot_correlation_network')
             _network_method()
@@ -2052,6 +2091,8 @@ class Analysis(DataAwareBaseHandler):
                 log.error(f"Performing functional enrichment resulted in empty table. Please check your node table and enrichment parameters.")
                 sys.exit(1)
             self.functional_enrichment_table = enrichment_table
+            log.info(f"Created table: {self._functional_enrichment_table_filename}")
+            log.info("Created attribute: functional_enrichment_table")
 
         if show_progress:
             self.workflow_tracker.set_current_step('functional_enrichment')
@@ -2106,6 +2147,9 @@ class Analysis(DataAwareBaseHandler):
             
             # Restore original filename
             self._mofa_data_filename = original_filename
+
+            log.info(f"Created table: {self._mofa_data_filename}")
+            log.info("Created attribute: mofa_data")
 
         if show_progress:
             self.workflow_tracker.set_current_step('run_mofa2')
