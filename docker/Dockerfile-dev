@@ -21,7 +21,7 @@ WORKDIR ${WORK}
 
 ######## Copy local files into the container for development
 COPY venv/pyproject.toml venv/uv.lock ${WORK}
-COPY notebooks/integration_workflow.ipynb ${WORK}
+#COPY notebooks/integration_workflow.ipynb ${WORK}
 COPY docker/jupyter_server_config.py ${HOME}/.jupyter/jupyter_server_config.py
 
 ######## Install uv
