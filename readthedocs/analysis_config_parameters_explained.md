@@ -37,6 +37,22 @@ Example: Changing correlation cutoff from `0.65` to `0.7` will generate a new an
 
 Configuration path: `analysis.analysis_parameters.feature_selection`
 
+**Background**:
+
+*Variance*: Selects the top features with highest variance across samples, identifying the most variable features in the dataset.
+
+*GLM*: Fits a Gaussian generalized linear model for each feature against a categorical metadata variable, selecting features that show significant differential expression (based on FDR-corrected p-values) and meet a log2-fold-change threshold.
+
+*Kruskal-Wallis*: Performs non-parametric Kruskal-Wallis tests to compare feature distributions across multiple groups, selecting features with significant differences and sufficient effect size (median difference).
+
+*Feature List*: Simply subsets features based on a user-provided list of feature names from a text file.
+
+*Lasso*: Uses L1-regularized linear regression (LassoCV) to predict a continuous target variable, selecting features with the largest absolute coefficient magnitudes after regularization.
+
+*Random Forest*: Trains either a regression or classification random forest model to predict the target variable, selecting features with the highest Gini importance scores.
+
+*Mutual Information*: Estimates the non-linear mutual information between each feature and the target variable, selecting features that share the most information with the target variable.
+
 ### Shared options <a id="feature-selection-shared-options"></a>
 
 | Config key | Type | Default | Description |
