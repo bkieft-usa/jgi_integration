@@ -484,7 +484,7 @@ def kruskal_selection(
     and an absolute median-difference (as a proxy for effect size) >= `lfc_cutoff`.
     """
     if category not in metadata.columns:
-        raise ValueError(f"Metadata column '{category}' missing.")
+        raise ValueError(f"Metadata column '{category}' missing. Set it in your analysis config file.")
     
     groups = metadata[category].dropna().unique()
     if len(groups) < 2:
@@ -619,7 +619,7 @@ def lasso_selection(
     Returns the top-`max_features` features by absolute coefficient magnitude.
     """
     if category not in metadata.columns:
-        raise ValueError(f"Target column '{category}' missing.")
+        raise ValueError(f"Target column '{category}' missing. Set it in your analysis config file.")
 
     # Check if category can be coerced to float
     try:
@@ -645,7 +645,7 @@ def random_forest_selection(
     and return the top-`max_features` features by Gini importance.
     """
     if category not in metadata.columns:
-        raise ValueError(f"Target column '{category}' missing.")
+        raise ValueError(f"Target column '{category}' missing. Set it in your analysis config file.")
 
     y_raw = metadata[category]
     is_numeric = pd.api.types.is_numeric_dtype(y_raw)
@@ -678,7 +678,7 @@ def mutual_info_selection(
     `mutual_info_classif`. Returns the top-`max_features` features.
     """
     if category not in metadata.columns:
-        raise ValueError(f"Target column '{category}' missing.")
+        raise ValueError(f"Target column '{category}' missing. Set it in your analysis config file.")
 
     y_raw = metadata[category]
     is_numeric = pd.api.types.is_numeric_dtype(y_raw)

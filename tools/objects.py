@@ -2167,16 +2167,18 @@ class Analysis(DataAwareBaseHandler):
     def register_all_existing_data(self):
         """Register all existing DataFrames with the registry."""
         # Register analysis data
+        log.info("Registering data for the analysis object:")
         for attr_name in ['integrated_data', 'integrated_metadata', 'feature_network_node_table', 
                          'feature_correlation_table', 'feature_annotation_table', 'functional_enrichment_table']:
             if hasattr(self, attr_name):
                 df = getattr(self, attr_name)
                 if not df.empty:
+                    log.info(f"Registering analysis attribute '{attr_name}'...")
                     self._register_dataframe(attr_name, df)
         
         # Register dataset data
         for dataset in self.datasets:
-            log.info(f"Registering data for dataset: {dataset.dataset_name}")
+            log.info(f"Registering data for the dataset object {dataset.dataset_name}:")
             # Enable data registry for datasets
             dataset.data_registry = self.data_registry
             dataset._auto_register_enabled = True
