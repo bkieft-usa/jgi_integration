@@ -54,7 +54,7 @@ _Note:_ The tutorial examples provided are for setup via a Unix-style command li
 
     `> cd $INTEGRATION_DIR/project_data/input_data`
 
-3.  Run the docker compose file to pull and run the container. In the command below, substitute `tag=<arch>` for the following architecture depending on your operating system: Windows, `tag=windows-amd64`; MacOS Apple, `tag=mac-arm64`; MacOS Intel, `tag=mac-amd64`; Linux, `tag=linux-amd64`. The `--build` flag is optional, but it will always build the container from the updated image regardless of whether it is already pulled into your local docker images repository, so it is recommended. 
+3.  Run the docker compose file to pull and run the container. In the command below, substitute `tag=<arch>` for the following architecture depending on your operating system: Windows, `tag=windows-amd64`; MacOS Apple, `tag=mac-arm64`; MacOS Intel, `tag=mac-amd64`; Linux, `tag=linux-amd64`. NOTE: the windows architecture using `tag=windows-amd64` is currently unstable and not recommended.
 
     `> tag=<arch> docker-compose -p jgi-integration up -d --force-recreate --pull`
 
