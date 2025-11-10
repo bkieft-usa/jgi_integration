@@ -1889,13 +1889,27 @@ class Analysis(DataAwareBaseHandler):
             _annotate_integrated_features_method()
             return
 
-    def plot_individual_feature(self, feature_id: str, metadata_column: str = 'group') -> None:
+    def plot_individual_feature(self, feature_id: str, metadata_cat: str = 'group', save_plot: bool = True) -> None:
         """Plot individual feature abundance by metadata."""
         hlp.plot_feature_abundance_by_metadata(
             data=self.integrated_data,
             metadata=self.integrated_metadata,
             feature=feature_id,
-            metadata_group=metadata_column
+            metadata_group=metadata_cat,
+            output_dir=self.output_dir,
+            save_plot=save_plot
+        )
+
+    def plot_submodule_avg_abundance(self, submodule_name: str, metadata_cat: str = 'group', save_plot: bool = True) -> None:
+        """Plot average abundance of features in submodules across metadata groups."""
+        hlp.plot_submodule_abundance_by_metadata(
+            data=self.integrated_data,
+            metadata=self.integrated_metadata,
+            node_table=self.feature_network_node_table,
+            submodule_name=submodule_name,
+            metadata_group=metadata_cat,
+            output_dir=self.output_dir,
+            save_plot=save_plot
         )
 
     def perform_feature_selection(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:

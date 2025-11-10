@@ -1400,7 +1400,7 @@ def plot_correlation_network(
                 G.nodes[node]["submodule_color"] = "#440154"  # First viridis color
 
         # Re-write the *main* graph (now enriched with submodule attributes)
-        nx.write_graphml(G, output_filenames["graph"])
+        nx.write_graphml(G, os.path.join(output_dir, output_filenames["graph"]))
         edge_table = nx.to_pandas_edgelist(G)
         node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient="index")
         write_integration_file(data=node_table, output_dir=output_dir, filename=output_filenames["node_table"], indexing=True, index_label="node_id")
@@ -4459,7 +4459,9 @@ def plot_feature_abundance_by_metadata(
     data: pd.DataFrame,
     metadata: pd.DataFrame,
     feature: str,
-    metadata_group: str | List[str]
+    metadata_group: str | List[str],
+    output_dir: str = None,
+    save_plot: bool = False
 ) -> None:
     """
     Plot the abundance of a single feature across metadata groups.
@@ -4484,6 +4486,7 @@ def plot_feature_abundance_by_metadata(
     
     # Merge row data with metadata
     linked_data = pd.merge(row_data.to_frame(name='abundance'), metadata, left_index=True, right_index=True)
+    linked_data.sort_values(by=metadata_group if isinstance(metadata_group, str) else metadata_group[0], inplace=True)
     
     # Check if metadata_group is a list
     if isinstance(metadata_group, list) and len(metadata_group) == 2:
@@ -4509,6 +4512,162 @@ def plot_feature_abundance_by_metadata(
         plt.xticks(rotation=90)
         plt.show()
 
+    if save_plot and output_dir:
+        output_subdir = f"{output_dir}/boxplots"
+        os.makedirs(output_subdir, exist_ok=True)
+        filename = f"abundance_of_{feature}_by_{metadata_group}.pdf"
+        log.info(f"Saving plot to {output_subdir}/{filename}")
+        plt.savefig(f"{output_subdir}/{filename}")
+
+def plot_submodule_abundance_by_metadata(
+    data: pd.DataFrame,
+    metadata: pd.DataFrame,
+    node_table: pd.DataFrame,
+    submodule_name: str,
+    metadata_group: str | List[str],
+    output_dir: str = None,
+    save_plot: bool = False
+) -> None:
+    """
+    Plot the average abundance of all features in a network submodule across metadata groups.
+
+    Args:
+        data (pd.DataFrame): Feature matrix (features x samples).
+        metadata (pd.DataFrame): Metadata DataFrame (samples x variables).
+        node_table (pd.DataFrame): Network node table with 'submodule' column and feature names as index or in a column.
+        submodule_name (str): Name of the submodule to extract features from (matches values in 'submodule' column).
+        metadata_group (str or list of str): Metadata variable(s) to group by (can be one or two for color/shape).
+
+    Returns:
+        None
+
+    Example:
+        # Load network node table and plot a specific submodule
+        node_table = pd.read_csv("network_node_table.csv", index_col=0)
+        plot_submodule_abundance_by_metadata(
+            integrated_data, 
+            integrated_metadata, 
+            node_table,
+            "submodule_1", 
+            "location"
+        )
+    """
+
+    # Check if node_table has required 'submodule' column
+    if 'submodule' not in node_table.columns:
+        raise ValueError("Node table must contain a 'submodule' column")
+    
+    # Extract features for the specified submodule
+    # Try to get feature names from index first, then from a potential node_id/feature column
+    if node_table.index.name in ['node_id', 'feature_id', 'features'] or 'node_id' in str(node_table.index.name).lower():
+        # Feature names are in the index
+        submodule_mask = node_table['submodule'] == submodule_name
+        submodule_features = node_table.index[submodule_mask].tolist()
+    elif 'node_id' in node_table.columns:
+        # Feature names are in a 'node_id' column
+        submodule_mask = node_table['submodule'] == submodule_name
+        submodule_features = node_table.loc[submodule_mask, 'node_id'].tolist()
+    elif 'feature_id' in node_table.columns:
+        # Feature names are in a 'feature_id' column
+        submodule_mask = node_table['submodule'] == submodule_name
+        submodule_features = node_table.loc[submodule_mask, 'feature_id'].tolist()
+    else:
+        # Default to using the index
+        submodule_mask = node_table['submodule'] == submodule_name
+        submodule_features = node_table.index[submodule_mask].tolist()
+    
+    # Check if submodule exists
+    if submodule_name not in node_table['submodule'].values:
+        available_submodules = node_table['submodule'].unique().tolist()
+        raise ValueError(f"Submodule '{submodule_name}' not found in node table. Available submodules: {available_submodules}")
+    
+    # Check if any features were found
+    if not submodule_features:
+        raise ValueError(f"No features found for submodule '{submodule_name}' in node table")
+    
+    log.info(f"Found {len(submodule_features)} features in submodule '{submodule_name}'")
+    
+    # Filter features that are present in the data
+    available_features = [f for f in submodule_features if f in data.index]
+    
+    if not available_features:
+        raise ValueError(f"None of the submodule features found in data. Available features: {data.index.tolist()[:10]}...")
+    
+    if len(available_features) < len(submodule_features):
+        missing_features = set(submodule_features) - set(available_features)
+        log.info(f"Warning: {len(missing_features)} features from submodule not found in data")
+    
+    # Calculate mean abundance across all features in the submodule for each sample
+    submodule_data = data.loc[available_features]
+    mean_abundance = submodule_data.mean(axis=0)  # Mean across features for each sample
+    
+    # Merge mean abundance with metadata
+    linked_data = pd.merge(
+        mean_abundance.to_frame(name='mean_abundance'), 
+        metadata, 
+        left_index=True, 
+        right_index=True
+    )
+    linked_data.sort_values(by=metadata_group if isinstance(metadata_group, str) else metadata_group[0], inplace=True)
+
+    # Check if metadata_group is a list for two-variable grouping
+    if isinstance(metadata_group, list) and len(metadata_group) == 2:
+        color_group, shape_group = metadata_group
+        linked_data['color_shape_group'] = (
+            linked_data[color_group].astype(str) + "_" + linked_data[shape_group].astype(str)
+        )
+        
+        plt.figure(figsize=(12, 8))
+        sns.violinplot(
+            x='color_shape_group', 
+            y='mean_abundance', 
+            data=linked_data, 
+            palette='viridis'
+        )
+        sns.stripplot(
+            x='color_shape_group', 
+            y='mean_abundance', 
+            data=linked_data, 
+            color='k', 
+            alpha=0.5, 
+            jitter=True
+        )
+        plt.xlabel(f'{color_group} and {shape_group}')
+        plt.ylabel('Mean abundance (Z-scored)')
+        plt.title(f'Mean abundance of {submodule_name} ({len(available_features)} features) by {color_group} and {shape_group}')
+        plt.xticks(rotation=90)
+        plt.tight_layout()
+        plt.show()
+    else:
+        # Single metadata variable
+        plt.figure(figsize=(12, 8))
+        sns.violinplot(
+            x=metadata_group, 
+            y='mean_abundance', 
+            data=linked_data, 
+            palette='viridis'
+        )
+        sns.stripplot(
+            x=metadata_group, 
+            y='mean_abundance', 
+            data=linked_data, 
+            color='k', 
+            alpha=0.5, 
+            jitter=True
+        )
+        plt.xlabel(metadata_group)
+        plt.ylabel('Mean abundance (Z-scored)')
+        plt.title(f'Mean abundance of {submodule_name} ({len(available_features)} features) by {metadata_group}')
+        plt.xticks(rotation=90)
+        plt.tight_layout()
+        plt.show()
+
+    if save_plot and output_dir:
+        output_subdir = f"{output_dir}/boxplots"
+        os.makedirs(output_subdir, exist_ok=True)
+        filename = f"avg_abundance_of_{submodule_name}_nodes_by_{metadata_group}.pdf"
+        log.info(f"Saving plot to {output_subdir}/{filename}")
+        plt.savefig(f"{output_subdir}/{filename}")
 
 def plot_replicate_correlation(
     data: pd.DataFrame,
