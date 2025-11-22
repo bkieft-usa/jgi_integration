@@ -4,6 +4,7 @@ import gzip
 import importlib.util
 import io
 import itertools
+from itertools import combinations
 import os
 import re
 import random
@@ -24,12 +25,13 @@ from functools import reduce
 from IPython.display import display, Image
 
 # --- Typing ---
-from typing import List, Tuple, Union, Optional, Dict, Any, Callable
+from typing import List, Tuple, Union, Optional, Dict, Any, Callable, Literal
 
 # --- Scientific computing & data analysis ---
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
+from scipy.stats import norm
 from scipy.stats import rankdata
 from scipy.stats import kruskal
 from scipy import linalg
@@ -39,6 +41,9 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 from scipy.stats import fisher_exact
 from scipy.stats import gmean
+import dcor
+from scipy.optimize import minimize_scalar
+from sklearn.preprocessing import quantile_transform
 
 # --- Plotting ---
 import matplotlib.pyplot as plt
@@ -53,13 +58,16 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LassoCV
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.feature_selection import mutual_info_regression, mutual_info_classif
+from sklearn.metrics import adjusted_rand_score
+from sklearn.covariance import GraphicalLasso
+from sklearn.preprocessing import StandardScaler
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import multipletests
 
 # --- MOFA2 & related ---
-import mofax
-from mofapy2.run.entry_point import entry_point
+# import mofax
+# from mofapy2.run.entry_point import entry_point
 
 # --- Bioinformatics ---
 import gff3_parser
@@ -627,7 +635,7 @@ def lasso_selection(
     except Exception:
         raise ValueError(f"Target column '{category}' is probably not continuous and cannot be coerced to float. Choose a different category or selection method.")
 
-    X = data.T.values  # samples × features
+    X = data.T.values  # samples x features
     lasso = LassoCV(cv=5, n_jobs=-1, random_state=0).fit(X, y)
     coef = pd.Series(np.abs(lasso.coef_), index=data.index, name="lasso_importance")
     top = _subset_by_rank(coef.to_frame(), "lasso_importance", max_features, ascending=False)
@@ -773,80 +781,6 @@ def perform_feature_selection(
     write_integration_file(subset, output_dir, output_filename, indexing=True)
     return subset
 
-def _set_up_matrix(
-    X: np.ndarray,
-    method: str,
-) -> Tuple[np.ndarray, float]:
-    """
-    Parameters
-    ------
-    X : (n_samples, n_features) ndarray
-        Raw (already log-scaled / z-scored) data.
-    method : str
-        One of  {'pearson', 'spearman', 'cosine',
-                  'centered_cosine', 'bicor'}.
-
-    Returns
-    ---
-    Z : ndarray, same shape as X
-        Transformed matrix.
-    scale : float
-        Multiplicative factor that must be applied to the dot-product
-        `Z_i.T @ Z_j` to obtain the final similarity.
-        For Pearson / Spearman / bicor   → 1/(n_samples-1)
-        For Cosine / Centered-Cosine   → 1
-    """
-    n = X.shape[0]                     # number of samples
-    if method == "pearson":
-        mu = X.mean(axis=0, keepdims=True)
-        sigma = X.std(axis=0, ddof=1, keepdims=True)
-        sigma[sigma == 0] = 1.0
-        Z = (X - mu) / sigma
-        scale = 1.0 / (n - 1)
-
-    elif method == "spearman":
-        # rank each column, then treat the ranks as ordinary data
-        R = np.apply_along_axis(rankdata, 0, X)
-        mu = R.mean(axis=0, keepdims=True)
-        sigma = R.std(axis=0, ddof=1, keepdims=True)
-        sigma[sigma == 0] = 1.0
-        Z = (R - mu) / sigma
-        scale = 1.0 / (n - 1)
-
-    elif method == "cosine":
-        norm = np.linalg.norm(X, axis=0, keepdims=True)
-        norm[norm == 0] = 1.0
-        Z = X / norm
-        scale = 1.0                           # dot = cosine directly
-
-    elif method == "centered_cosine":
-        mu = X.mean(axis=0, keepdims=True)
-        Xc = X - mu
-        norm = np.linalg.norm(Xc, axis=0, keepdims=True)
-        norm[norm == 0] = 1.0
-        Z = Xc / norm
-        scale = 1.0
-
-    elif method == "bicor":
-        # Robust “biweight-mid-correlation” approximated by
-        # median-centre + MAD-scale → then Pearson on the robust z-scores
-        med = np.median(X, axis=0, keepdims=True)
-        mad = np.median(np.abs(X - med), axis=0, keepdims=True)
-        # Convert MAD to a sigma estimator (the 1.4826 factor makes it unbiased
-        # for a normal distribution)
-        sigma = mad * 1.4826
-        sigma[sigma == 0] = 1.0
-        Z = (X - med) / sigma
-        scale = 1.0 / (n - 1)
-
-    else:
-        raise ValueError(
-            f"Method '{method}' not recognised. Choose "
-            "'pearson', 'spearman', 'cosine', 'centered_cosine' or 'bicor'."
-        )
-    return Z, scale
-
-
 def _block_pair(
     Z_i: np.ndarray,
     Z_j: np.ndarray,
@@ -902,7 +836,8 @@ def calculate_correlated_features(
         Example: ["tx_", "mx_", "px_"]
     method : str, default 'pearson'
         Similarity to compute - ``'pearson'``, ``'spearman'``,
-        ``'cosine'``, ``'centered_cosine'`` or ``'bicor'``.
+        ``'cosine'``, ``'centered_cosine'``, ``'bicor'``,
+        ``'dcor'``, or ``'sparse_partial'``.
     cutoff : float, default 0.75
         Minimum absolute similarity (or minimum similarity if
         ``keep_negative=False``) for a pair to be kept.
@@ -910,15 +845,14 @@ def calculate_correlated_features(
         If True, also keep negative correlations whose absolute value
         exceeds ``cutoff``.
     block_size : int, default 500
-        Number of features processed per block (memory ~= 4 x block_size x n_samples bytes).
+        Number of features processed per block.
     n_jobs : int, default 1
         Parallelism over transcript blocks.  ``-1`` uses all cores.
     corr_mode : str, default "bipartite"
         Correlation mode:
         - "bipartite": Only compute correlations between different datatypes
         - "full": Compute all pairwise correlations
-        - Any other string: Should match a feature prefix; only compute correlations
-          between features with that prefix (intra-datatype)
+        - Any other string: Should match a feature prefix
 
     Returns
     ---
@@ -927,6 +861,34 @@ def calculate_correlated_features(
     """
 
     log.info("Starting feature correlation computation...")
+    
+    # Validate method
+    valid_methods = {"pearson", "spearman", "cosine", "centered_cosine", "bicor", "dcor", "sparse_partial"}
+    if method not in valid_methods:
+        raise ValueError(f"Unsupported method '{method}'. Valid: {valid_methods}")
+    
+    if method in ["dcor"]:
+        log.info(f"Using advanced correlation method: {method}")
+        return _calculate_dcor_correlation(
+            data=data,
+            output_filename=output_filename,
+            output_dir=output_dir,
+            feature_prefixes=feature_prefixes,
+            method=method,
+            cutoff=cutoff,
+            keep_negative=keep_negative,
+            corr_mode=corr_mode,
+        )
+
+    if method == "sparse_partial":
+        return _calculate_sparse_partial_correlations(
+            data=data,
+            feature_prefixes=feature_prefixes,
+            alpha=0.01,
+            cutoff=cutoff,
+            corr_mode=corr_mode,
+            max_iter=100
+        )
     
     # Create feature type designation based on prefixes
     ftype = pd.Series(index=data.index, dtype=object)
@@ -1056,7 +1018,7 @@ def calculate_correlated_features(
         log.info(f"Processing {len(i_idx)} source features in blocks of {block_size}...")
         block_ranges = list(range(0, len(i_idx), block_size))
         if n_jobs == 1:
-            for t_start in tqdm(block_ranges, desc="Blocks", unit="block"):
+            for t_start in block_ranges:
                 t_end = min(t_start + block_size, len(i_idx))
                 all_pairs.extend(_process_block(i_idx, j_idx, t_start, t_end))
         else:
@@ -1065,7 +1027,7 @@ def calculate_correlated_features(
             parallel = Parallel(n_jobs=n_jobs_eff, backend="loky", verbose=0)
             chunks = parallel(
                 delayed(_process_block)(i_idx, j_idx, t_start, min(t_start + block_size, len(i_idx)))
-                for t_start in tqdm(block_ranges, desc="Blocks", unit="block")
+                for t_start in block_ranges
             )
             log.info("Parallel block processing complete.")
             all_pairs.extend([pair for sublist in chunks for pair in sublist])
@@ -1092,6 +1054,371 @@ def calculate_correlated_features(
     write_integration_file(data=df, output_dir=output_dir, filename=output_filename, indexing=True)
     log.info("Correlation computation complete.")
     return df
+
+def _set_up_matrix(
+    X: np.ndarray,
+    method: str,
+    data_is_normalized: bool = False,
+) -> Tuple[np.ndarray, float]:
+    """
+    Parameters
+    ------
+    X : (n_samples, n_features) ndarray
+        Data matrix (already log2-scaled and z-scored).
+    method : str
+        One of  {'pearson', 'spearman', 'cosine',
+                  'centered_cosine', 'bicor'}.
+    data_is_normalized : bool, default False
+        If True, assumes X is already log2-scaled and z-scored.
+        For Pearson correlation, will still re-normalize after centering.
+
+    Returns
+    -------
+    Z : ndarray, same shape as X
+        Transformed matrix.
+    scale : float
+        Multiplicative factor that must be applied to the dot-product
+        `Z_i.T @ Z_j` to obtain the final similarity.
+        For Pearson / Spearman / bicor   → 1/(n_samples-1)
+        For Cosine / Centered-Cosine   → 1
+    """
+    n = X.shape[0]
+    
+    if method in ["pearson", "spearman", "bicor"]:
+        # Even if data is already z-scored, we need to:
+        # 1. Center (mean = 0)
+        # 2. Normalize by std (std = 1)
+        # This ensures proper correlation calculation
+        
+        # Center the data
+        mu = X.mean(axis=0, keepdims=True)
+        Z = X - mu
+        
+        # Normalize by standard deviation
+        # Use ddof=1 for sample standard deviation
+        std = Z.std(axis=0, keepdims=True, ddof=1)
+        
+        # Avoid division by zero for constant features
+        std[std == 0] = 1.0
+        
+        # Normalize
+        Z = Z / std
+        
+        # Scale factor for correlation
+        scale = 1.0 / (n - 1)
+        
+    elif method == "cosine":
+        # Normalize to unit length (L2 norm)
+        norm = np.linalg.norm(X, axis=0, keepdims=True)
+        norm[norm == 0] = 1.0
+        Z = X / norm
+        scale = 1.0
+        
+    elif method == "centered_cosine":
+        # Center then normalize to unit length
+        mu = X.mean(axis=0, keepdims=True)
+        Xc = X - mu
+        norm = np.linalg.norm(Xc, axis=0, keepdims=True)
+        norm[norm == 0] = 1.0
+        Z = Xc / norm
+        scale = 1.0
+        
+    else:
+        raise ValueError(
+            f"Method '{method}' not recognised. Choose "
+            "'pearson', 'spearman', 'cosine', 'centered_cosine' or 'bicor'."
+        )
+    
+    return Z, scale
+
+def _calculate_sparse_partial_correlations(
+    data: pd.DataFrame,
+    feature_prefixes: List[str],
+    alpha: float = 0.1, #higher for larger datasets?
+    cutoff: float = 0.3,
+    corr_mode: str = "full",
+    max_iter: int = 100
+) -> pd.DataFrame:
+    """
+    Fast non-bivariate correlation using Graphical Lasso.
+        
+    Args:
+        data: Feature matrix (features x samples)
+        alpha: Sparsity parameter (0.001-0.1 typical range)
+               Lower = denser network, slower computation
+        cutoff: Minimum absolute partial correlation to keep
+        max_iter: Maximum iterations (lower = faster but less accurate)
+    """
+    
+    # Subset features based on mode
+    if corr_mode == "full":
+        features = data.index.tolist()
+    elif corr_mode == "bipartite":
+        features = data.index.tolist()
+    else:
+        features = [f for f in data.index if f.startswith(f"{corr_mode}_")]
+    
+    log.info(f"Computing sparse partial correlations for {len(features)} features...")
+    
+    # Prepare data (samples x features for sklearn)
+    X = data.loc[features].T.fillna(0).values
+    
+    # Standardize features (important for GraphicalLasso)
+    X = StandardScaler().fit_transform(X)
+    
+    log.info(f"  Fitting Graphical Lasso (alpha={alpha}, max_iter={max_iter})...")
+    
+    # Fit model with fixed alpha (no cross-validation = much faster)
+    model = GraphicalLasso(
+        alpha=alpha,
+        max_iter=max_iter,
+        tol=1e-3,  # Slightly relaxed tolerance for speed
+        verbose=1,  # Show progress
+        assume_centered=False
+    )
+    
+    model.fit(X)
+    
+    log.info(f"  Converged in {model.n_iter_} iterations")
+    
+    # Convert precision matrix to partial correlations
+    precision = model.precision_
+    
+    # Partial correlation formula: 
+    # ρ_ij = -precision[i,j] / sqrt(precision[i,i] * precision[j,j])
+    diag = np.sqrt(np.diag(precision))
+    partial_corr = -precision / np.outer(diag, diag)
+    np.fill_diagonal(partial_corr, 0)  # Remove self-correlations
+    
+    # Extract edges above cutoff
+    log.info(f"  Extracting edges above cutoff {cutoff}...")
+    correlation_data = []
+    feature_names = data.loc[features].index.tolist()
+    
+    # Only upper triangle to avoid duplicates
+    rows, cols = np.triu_indices_from(partial_corr, k=1)
+    
+    for i, j in zip(rows, cols):
+        corr_val = partial_corr[i, j]
+        if abs(corr_val) >= cutoff:
+            correlation_data.append({
+                'feature_1': feature_names[i],
+                'feature_2': feature_names[j],
+                'correlation': corr_val
+            })
+    
+    results_df = pd.DataFrame(correlation_data)
+    log.info(f"  Found {len(results_df):,} correlations above cutoff")
+    
+    return results_df
+
+def _calculate_dcor_correlation(
+    data: pd.DataFrame,
+    output_filename: str,
+    output_dir: str,
+    feature_prefixes: List[str],
+    method: str,
+    cutoff: float,
+    keep_negative: bool,
+    corr_mode: str,
+) -> pd.DataFrame:
+    """
+    Calculate correlations using advanced methods (dcor).
+    
+    These methods don't benefit from the block-wise optimization used for
+    standard correlations, so we compute them directly.
+    """
+    
+    log.info(f"Computing {method} correlations for {data.shape[0]} features...")
+    
+    # Create feature type designation
+    ftype = pd.Series(index=data.index, dtype=object)
+    ftype[:] = None
+    
+    for i, prefix in enumerate(feature_prefixes):
+        mask = data.index.str.startswith(prefix)
+        ftype[mask] = f"datatype_{i}"
+    
+    if ftype.isnull().any():
+        invalid = ftype[ftype.isnull()].index.tolist()
+        raise ValueError(f"Feature names must start with one of {feature_prefixes}. Invalid: {invalid}")
+    
+    # Identify feature indices for each datatype
+    X = data.T.values.astype(np.float64, copy=False)
+    feature_names = data.index.to_numpy()
+    n_features = X.shape[1]
+    
+    datatype_indices = {}
+    for i, prefix in enumerate(feature_prefixes):
+        datatype_name = f"datatype_{i}"
+        mask = ftype.eq(datatype_name).values
+        datatype_indices[datatype_name] = np.where(mask)[0]
+        log.info(f"Found {len(datatype_indices[datatype_name])} features with prefix '{prefix}'.")
+    
+    # Determine which pairs to compute
+    if corr_mode == "bipartite":
+        pairs = []
+        datatypes = list(datatype_indices.keys())
+        for i, dtype1 in enumerate(datatypes):
+            for dtype2 in datatypes[i+1:]:
+                pairs.append((datatype_indices[dtype1], datatype_indices[dtype2]))
+    elif corr_mode == "full":
+        all_idx = np.arange(n_features)
+        pairs = [(all_idx, all_idx)]
+    else:
+        # Find matching datatype
+        matching_prefix = None
+        for prefix in feature_prefixes:
+            if corr_mode == prefix.rstrip('_') or corr_mode == prefix:
+                matching_prefix = prefix
+                break
+        
+        if matching_prefix is None:
+            raise ValueError(f"corr_mode '{corr_mode}' does not match any feature prefix")
+        
+        target_datatype = None
+        for i, prefix in enumerate(feature_prefixes):
+            if prefix == matching_prefix or prefix.rstrip('_') == corr_mode:
+                target_datatype = f"datatype_{i}"
+                break
+        
+        if target_datatype not in datatype_indices:
+            raise ValueError(f"No features found with prefix matching '{corr_mode}'")
+        
+        target_indices = datatype_indices[target_datatype]
+        pairs = [(target_indices, target_indices)]
+    
+    # Compute correlations based on method
+    all_results = []
+    
+    for i_idx, j_idx in pairs:
+        if method == "dcor":
+            results = _compute_distance_correlation(X, i_idx, j_idx, cutoff, keep_negative)
+        
+        all_results.extend(results)
+    
+    if not all_results:
+        empty_df = pd.DataFrame(columns=["feature_1", "feature_2", "correlation"])
+        log.info("Warning: No pairs passed the correlation cutoff.")
+        write_integration_file(data=empty_df, output_dir=output_dir, filename=output_filename, indexing=True)
+        return empty_df
+    
+    # Convert to DataFrame
+    log.info(f"Total pairs passing cutoff: {len(all_results)}")
+    tr_idx, met_idx, sims = zip(*all_results)
+    df = pd.DataFrame({
+        "feature_1": feature_names[np.array(tr_idx)],
+        "feature_2": feature_names[np.array(met_idx)],
+        "correlation": sims,
+    })
+    df["abs_corr"] = np.abs(df["correlation"])
+    df = df.sort_values("abs_corr", ascending=False).drop(columns="abs_corr")
+    
+    write_integration_file(data=df, output_dir=output_dir, filename=output_filename, indexing=True)
+    log.info("Correlation computation complete.")
+    return df
+
+def _compute_distance_correlation(
+    X: np.ndarray,
+    i_idx: np.ndarray,
+    j_idx: np.ndarray,
+    cutoff: float,
+    keep_negative: bool,
+) -> List[Tuple[int, int, float]]:
+    """
+    Compute distance correlation between features using precomputed distance 
+    matrices AND parallel processing for maximum performance.
+    
+    This approach:
+    1. Precomputes distance matrices for i_idx features once
+    2. Processes j features in parallel for each i feature
+    3. Uses the fast manual distance correlation calculation
+    
+    Args:
+        X: Data matrix (n_samples, n_features)
+        i_idx: Indices of source features
+        j_idx: Indices of target features
+        cutoff: Minimum correlation threshold
+        keep_negative: Whether to keep negative correlations (ignored for dcor)
+        
+    Returns:
+        List of (i_index, j_index, correlation) tuples passing the cutoff
+    """
+    
+    log.info("  Precomputing distance matrices for source features...")
+    distance_matrices_i = {}
+    for i in tqdm(i_idx, desc="Precomputing distances", unit="feature"):
+        x_i = X[:, i]
+        distances = np.abs(x_i[:, np.newaxis] - x_i[np.newaxis, :])
+        distance_matrices_i[i] = distances
+    
+    log.info("  Computing distance correlations in parallel...")
+    
+    def process_i_feature(i):
+        """Process all j features for a single i feature in parallel."""
+        dist_i = distance_matrices_i[i]
+        feature_results = []
+        
+        for j in j_idx:
+            if i == j:
+                continue
+            
+            x_j = X[:, j]
+            dist_j = np.abs(x_j[:, np.newaxis] - x_j[np.newaxis, :])
+            
+            # Use fast manual computation
+            dc = _fast_distance_correlation(dist_i, dist_j)
+            
+            # Distance correlation is always >= 0
+            if dc >= cutoff:
+                feature_results.append((int(i), int(j), float(dc)))
+        
+        return feature_results
+    
+    # Parallel processing over i features
+    all_results = Parallel(n_jobs=-1, backend="loky")(
+        delayed(process_i_feature)(i)
+        for i in tqdm(i_idx, desc="Distance correlation", unit="feature")
+    )
+    
+    # Flatten the nested results
+    results = [pair for feature_results in all_results for pair in feature_results]
+    
+    log.info(f"  Found {len(results)} correlations passing cutoff")
+    
+    return results
+
+def _fast_distance_correlation(dist_A: np.ndarray, dist_B: np.ndarray) -> float:
+    """
+    Fast computation of distance correlation from precomputed distance matrices.
+    
+    This implements the distance correlation formula directly to avoid
+    overhead from the dcor library's repeated calculations.
+    """
+    n = dist_A.shape[0]
+    
+    # Double center the distance matrices
+    # This is the key operation in distance correlation
+    row_mean_A = dist_A.mean(axis=1, keepdims=True)
+    col_mean_A = dist_A.mean(axis=0, keepdims=True)
+    grand_mean_A = dist_A.mean()
+    A_centered = dist_A - row_mean_A - col_mean_A + grand_mean_A
+    
+    row_mean_B = dist_B.mean(axis=1, keepdims=True)
+    col_mean_B = dist_B.mean(axis=0, keepdims=True)
+    grand_mean_B = dist_B.mean()
+    B_centered = dist_B - row_mean_B - col_mean_B + grand_mean_B
+    
+    # Compute distance covariance and variances
+    dcov_AB = np.sqrt(np.sum(A_centered * B_centered) / (n * n))
+    dvar_A = np.sqrt(np.sum(A_centered * A_centered) / (n * n))
+    dvar_B = np.sqrt(np.sum(B_centered * B_centered) / (n * n))
+    
+    # Distance correlation
+    if dvar_A > 0 and dvar_B > 0:
+        return dcov_AB / np.sqrt(dvar_A * dvar_B)
+    else:
+        return 0.0
 
 def _make_prefix_maps(prefixes: List[str]) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
@@ -1224,12 +1551,15 @@ def _detect_submodules(
     """
     Returns a list of (module_name, subgraph) tuples.
     Supported ``method`` values:
-        * "subgraphs" -  simple connected components
-        * "louvain"   -  python-louvain
-        * "leiden"    -  leidenalg (requires igraph)
-        * "wgcna"     -  soft-threshold → TOM → hierarchical clustering
-    ``kwargs`` are forwarded to the specific implementation (e.g. beta for
-    WGCNA, min_module_size, distance_cutoff …).
+        * "subgraphs" - simple connected components
+        * "louvain" - python-louvain
+        * "leiden" - leidenalg (requires igraph)
+        * "wgcna" - soft-threshold → TOM → hierarchical clustering
+        * "k_clique" - k-clique communities
+        * "greedy_modularity" - greedy modularity maximization
+        * "label_propagation" - asynchronous label propagation
+        * "girvan_newman" - Girvan-Newman method
+    ``kwargs`` are forwarded to the specific implementation.
     """
     if method == "subgraphs":
         comps = nx.connected_components(G)
@@ -1247,6 +1577,9 @@ def _detect_submodules(
     elif method == "leiden":
         # Convert to igraph (preserves node names)
         ig_g = ig.Graph.from_networkx(G)
+        node_names = list(G.nodes())
+        ig_g.vs["name"] = node_names
+        
         partition = leidenalg.find_partition(
             ig_g, leidenalg.ModularityVertexPartition, weights="weight"
         )
@@ -1303,9 +1636,67 @@ def _detect_submodules(
         
         return kept
 
+    elif method == "k_clique":
+        # K-clique percolation
+        k: int = kwargs.get("k", 3)
+        communities = nx.community.k_clique_communities(G, k)
+        return [(f"submodule_{i+1}", G.subgraph(nodes).copy())
+                for i, nodes in enumerate(communities)]
+
+    elif method == "greedy_modularity":
+        # Greedy modularity maximization
+        weight = kwargs.get("weight", "weight")
+        resolution = kwargs.get("resolution", 1)
+        cutoff = kwargs.get("cutoff", 1)
+        best_n = kwargs.get("best_n", None)
+        
+        communities = nx.community.greedy_modularity_communities(
+            G, 
+            weight=weight,
+            resolution=resolution,
+            cutoff=cutoff,
+            best_n=best_n
+        )
+        return [(f"submodule_{i+1}", G.subgraph(nodes).copy())
+                for i, nodes in enumerate(communities)]
+
+    elif method == "label_propagation":
+        # Asynchronous label propagation
+        weight = kwargs.get("weight", "weight")
+        seed = kwargs.get("seed", None)
+        
+        communities = nx.community.asyn_lpa_communities(G, weight=weight, seed=seed)
+        return [(f"submodule_{i+1}", G.subgraph(nodes).copy())
+                for i, nodes in enumerate(communities)]
+
+    elif method == "girvan_newman":
+        # Girvan-Newman method (divisive)
+        level: int = kwargs.get("level", 0)
+        most_valuable_edge = kwargs.get("most_valuable_edge", None)
+        
+        communities_generator = nx.community.girvan_newman(
+            G, 
+            most_valuable_edge=most_valuable_edge
+        )
+        
+        # Iterate to the specified level
+        for i, communities in enumerate(communities_generator):
+            if i == level:
+                break
+        
+        return [(f"submodule_{i+1}", G.subgraph(nodes).copy())
+                for i, nodes in enumerate(communities)]
+
     else:
-        raise ValueError(f"Invalid submodule method '{method}'. "
-                     "Choose from 'subgraphs', 'louvain', 'leiden', 'wgcna'.")
+        valid_methods = [
+            "subgraphs", "louvain", "leiden", "wgcna",
+            "k_clique", "greedy_modularity",
+            "label_propagation", "girvan_newman"
+        ]
+        raise ValueError(
+            f"Invalid submodule method '{method}'. "
+            f"Choose from: {', '.join(valid_methods)}"
+        )
 
 def plot_correlation_network(
     corr_table: pd.DataFrame,
@@ -1352,7 +1743,7 @@ def plot_correlation_network(
     color_map, shape_map = _make_prefix_maps(present_prefixes)
     _assign_node_attributes(G, present_prefixes, color_map, shape_map, annotation_df)
 
-    # Remove tiny isolated components (size < 3)
+    # Remove tiny isolated components
     tiny = [c for c in nx.connected_components(G) if len(c) < 3]
     if tiny:
         G.remove_nodes_from({n for comp in tiny for n in comp})
@@ -1367,11 +1758,6 @@ def plot_correlation_network(
     log.info("\tRaw graph, node table and edge table written to disk.")
 
     # submodule detection
-    if submodule_mode not in {"none", "subgraphs", "louvain", "leiden", "wgcna"}:
-        raise ValueError(
-            "submodule_mode must be one of "
-            "'none', 'subgraphs', 'louvain', 'leiden', 'wgcna'"
-        )
     if submodule_mode != "none":
         log.info(f"Detecting submodules using '{submodule_mode}'...")
         submods = _detect_submodules(
@@ -1761,6 +2147,1976 @@ def _annotate_and_save_submodules(
                 dpi=300,
             )
             plt.close()
+
+
+##############################################
+## Comparing Network Topologies
+##############################################
+
+def _try_load_existing_networks(
+    output_dir: str,
+    output_filename_prefix: str,
+    feature_prefixes: List[str]
+) -> Dict[str, nx.Graph]:
+    """
+    Try to load existing networks from disk.
+    
+    Returns empty dict if any required network files are missing.
+    """
+    networks = {}
+    
+    # Define expected network modes
+    mode_names = ['full'] + [f"{prefix.rstrip('_')}_only" for prefix in feature_prefixes]
+    
+    # Check if all required network files exist
+    for mode_name in mode_names:
+        graphml_path = os.path.join(
+            output_dir, 
+            f"{output_filename_prefix}_{mode_name}_network.graphml"
+        )
+        
+        if not os.path.exists(graphml_path):
+            log.info(f"Network file not found: {graphml_path}")
+            return {}  # Return empty dict if any file missing
+    
+    # All files exist, load them
+    log.info("Found existing network files, loading...")
+    for mode_name in mode_names:
+        graphml_path = os.path.join(
+            output_dir, 
+            f"{output_filename_prefix}_{mode_name}_network.graphml"
+        )
+        
+        try:
+            G = nx.read_graphml(graphml_path)
+            
+            # Convert node attributes back to proper types if needed
+            # (GraphML stores everything as strings)
+            for node in G.nodes():
+                if 'node_size' in G.nodes[node]:
+                    G.nodes[node]['node_size'] = int(G.nodes[node]['node_size'])
+            
+            networks[mode_name] = G
+            log.info(f"Loaded {mode_name}: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
+            
+        except Exception as e:
+            log.warning(f"Error loading {graphml_path}: {e}")
+            return {}  # Return empty if any loading fails
+    
+    return networks
+
+def _save_networks_to_disk(
+    networks: Dict[str, nx.Graph],
+    output_dir: str,
+    output_filename_prefix: str
+) -> None:
+    """
+    Save networks to disk as GraphML and CSV tables.
+    
+    Only saves essential files needed for downstream analysis.
+    """
+    log.info("Saving networks to disk for future reuse...")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for mode_name, G in networks.items():
+        base_filename = f"{output_filename_prefix}_{mode_name}"
+        
+        # Save GraphML (most important - preserves graph structure and all attributes)
+        graphml_path = os.path.join(output_dir, f"{base_filename}_network.graphml")
+        nx.write_graphml(G, graphml_path)
+        log.info(f"Saved {mode_name} network to {graphml_path}")
+        
+        # Save node and edge tables (useful for quick inspection)
+        node_table = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient="index")
+        edge_table = nx.to_pandas_edgelist(G)
+        
+        write_integration_file(
+            node_table,
+            output_dir,
+            f"{base_filename}_nodes",
+            indexing=True,
+            index_label="node_id"
+        )
+        write_integration_file(
+            edge_table,
+            output_dir,
+            f"{base_filename}_edges",
+            indexing=False
+        )
+
+def compare_network_topologies(
+    integrated_data: pd.DataFrame,
+    feature_prefixes: List[str] = None,
+    correlation_params: dict = None,
+    network_params: dict = None,
+    annotation_input: pd.DataFrame = None,
+    output_dir: str = None,
+    output_filename_prefix: str = "network_comparison",
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """
+    Compare network topologies between independent and integrated multi-omics datasets.
+    
+    Workflow:
+    1. Calculate correlations for independent and full datasets
+    2. Build networks from correlations
+    3. Compare network structures (nodes, edges, modules)
+    4. Quantify information gained through integration
+    5. Perform functional enrichment analysis
+    
+    Args:
+        integrated_data: Feature matrix (features x samples)
+        feature_prefixes: List of feature prefixes for different data types
+        correlation_params: Parameters for correlation calculation
+        network_params: Parameters for network construction
+        annotation_input: Feature annotations
+        output_dir: Directory to save results
+        output_filename_prefix: Prefix for output files
+        overwrite: Whether to overwrite existing results
+        
+    Returns:
+        Dictionary containing networks, statistics, and analysis results
+    """
+    
+    # Try to load existing networks
+    if not overwrite and output_dir:
+        networks = _try_load_existing_networks(
+            output_dir, 
+            output_filename_prefix, 
+            feature_prefixes
+        )
+        if networks:
+            log.info(f"Loaded {len(networks)} existing networks from disk")
+            return networks
+
+    # Initialize results structure
+    results = {
+        'correlation_tables': {},
+        'networks': {},
+        'topology_comparison': {},
+        'preservation_analysis': {},
+        'information_gained': {},
+        'functional_enrichment': {}
+    }
+    
+    annotation_categories = {
+        'tx': ['tx_go_acc'],
+        'mx': ['mx_subclass']
+    }
+
+    # Calculate correlations
+    log.info("=" * 80)
+    log.info("Calculating Correlation Matrices")
+    log.info("=" * 80)
+    correlation_tables = _calculate_all_correlations(
+        integrated_data=integrated_data,
+        feature_prefixes=feature_prefixes,
+        correlation_params=correlation_params,
+        output_filename_prefix=output_filename_prefix
+    )
+    
+    # Build networks from correlations
+    log.info("=" * 80)
+    log.info("Creating Networks")
+    log.info("=" * 80)
+    networks = _build_all_networks(
+        correlation_tables=correlation_tables,
+        feature_prefixes=feature_prefixes,
+        network_params=network_params,
+        annotation_input=annotation_input,
+        output_dir=output_dir,
+        output_filename_prefix=output_filename_prefix
+    )
+    results['networks'] = networks
+    
+    # Compare network topologies
+    log.info("=" * 80)
+    log.info("Network Topology Comparison")
+    log.info("=" * 80)
+    topology_stats = _compare_network_structures(
+        networks=networks,
+        feature_prefixes=feature_prefixes,
+    )
+    results['topology_comparison'] = topology_stats
+    
+    # Analyze submodule preservation
+    log.info("=" * 80)
+    log.info("Submodule Preservation Analysis")
+    log.info("=" * 80)
+    preservation_stats = _analyze_submodule_preservation(
+        networks=networks,
+        feature_prefixes=feature_prefixes,
+    )
+    results['preservation_analysis'] = preservation_stats
+    
+    # Cross-omics connectivity
+    log.info("=" * 80)
+    log.info("Cross-omics Connectivity Analysis")
+    log.info("=" * 80)
+    xomics_conn = analyze_cross_omics_connectivity(
+        full_network=networks['full'],
+        feature_prefixes=feature_prefixes
+    )
+    results['cross_omics_connectivity'] = xomics_conn
+    
+    # Simple degree entropy
+    log.info("=" * 80)
+    log.info("Information Gained Through Integration")
+    log.info("=" * 80)
+    information_theory = calculate_cross_omics_information_gain(
+        full_network=networks['full'],
+        independent_networks=networks,
+        feature_prefixes=feature_prefixes
+    )
+    results['information_theory'] = information_theory
+    
+    # Conditional entropy reduction
+    log.info("=" * 80)
+    log.info("Conditional Entropy Reduction")
+    log.info("=" * 80)
+    conditional_entropy = calculate_conditional_entropy_reduction(
+        full_network=networks['full'],
+        independent_networks=networks,
+        feature_prefixes=feature_prefixes
+    )
+    results['conditional_entropy'] = conditional_entropy
+    
+    # Integration-specific information content
+    log.info("=" * 80)
+    log.info("Integration-specific Information Content")
+    log.info("=" * 80)
+    integration_content = calculate_integration_information_content(
+        full_network=networks['full'],
+        independent_networks=networks,
+        feature_prefixes=feature_prefixes
+    )
+    results['integration_content'] = integration_content
+    
+    # Motif analysis
+    log.info("=" * 80)
+    log.info("Cross-omics Motif Analysis")
+    log.info("=" * 80)
+    motif_analysis = analyze_cross_omics_motifs(
+        full_network=networks['full'],
+        feature_prefixes=feature_prefixes
+    )
+    results['motif_analysis'] = motif_analysis
+    
+    # Emergent modules
+    log.info("=" * 80)
+    log.info("Identifying Emergent Modules")
+    log.info("=" * 80)
+    emergent_modules = identify_emergent_modules(
+        networks=networks,
+        feature_prefixes=feature_prefixes
+    )
+    results['emergent_modules'] = emergent_modules
+    
+    # Perform submodule enrichment analysis
+    log.info("=" * 80)
+    log.info("Submodule Enrichment Analysis")
+    log.info("=" * 80)
+    submod_enrichment_results = analyze_submodule_functional_enrichment(
+        networks=networks,
+        annotation_categories=annotation_categories,
+    )
+    results['submodule_enrichment'] = submod_enrichment_results
+    
+    # Perform edge enrichment analysis
+    log.info("=" * 80)
+    log.info("Edge Enrichment Analysis")
+    log.info("=" * 80)
+    edge_enrichment_results = analyze_cross_omics_edge_enrichment(
+        full_network=networks['full'],
+        annotation_categories=annotation_categories,
+        feature_prefixes=feature_prefixes,
+    )
+    results['edge_enrichment'] = edge_enrichment_results
+
+    # Generate network comparison plots
+    log.info("=" * 80)
+    log.info("Generating Comparison Network")
+    log.info("=" * 80)
+    plot_network_comparison(
+        networks=results['networks'],
+        feature_prefixes=feature_prefixes,
+        layout=network_params.get('interactive_layout', 'spring')
+    )
+
+    log.info("Analysis complete")
+    
+    return
+
+def _calculate_all_correlations(
+    integrated_data: pd.DataFrame,
+    feature_prefixes: List[str],
+    correlation_params: dict,
+    output_filename_prefix: str
+) -> Dict[str, pd.DataFrame]:
+    """Calculate correlations for all network types (independent + full)."""
+    
+    log.info("Calculating feature correlations...")
+    correlation_tables = {}
+    
+    # Use temporary directory for intermediate files
+    with tempfile.TemporaryDirectory(prefix="network_comparison_") as temp_dir:
+        
+        # Calculate independent dataset correlations
+        for prefix in feature_prefixes:
+            dataset_name = prefix.rstrip('_')
+            log.info(f"Computing {dataset_name} correlations...")
+            
+            corr_table = calculate_correlated_features(
+                data=integrated_data,
+                output_filename=f"{output_filename_prefix}_{dataset_name}_correlations",
+                output_dir=temp_dir,
+                feature_prefixes=feature_prefixes,
+                corr_mode=dataset_name,
+                method=correlation_params.get('corr_method', 'pearson'),
+                cutoff=correlation_params.get('corr_cutoff', 0.75),
+                keep_negative=correlation_params.get('keep_negative', False),
+                block_size=correlation_params.get('block_size', 500),
+                n_jobs=correlation_params.get('cores', -1),
+            )
+            
+            if not corr_table.empty:
+                correlation_tables[f"{dataset_name}_only"] = corr_table
+                log.info(f"Found {len(corr_table):,} correlations")
+        
+        # Calculate full integrated correlations
+        log.info("Computing full integrated correlations...")
+        full_corr_table = calculate_correlated_features(
+            data=integrated_data,
+            output_filename=f"{output_filename_prefix}_full_correlations",
+            output_dir=temp_dir,
+            feature_prefixes=feature_prefixes,
+            corr_mode="full",
+            method=correlation_params.get('corr_method', 'pearson'),
+            cutoff=correlation_params.get('corr_cutoff', 0.75),
+            keep_negative=correlation_params.get('keep_negative', False),
+            block_size=correlation_params.get('block_size', 500),
+            n_jobs=correlation_params.get('cores', -1),
+        )
+        
+        if not full_corr_table.empty:
+            correlation_tables['full'] = full_corr_table
+            log.info(f"Found {len(full_corr_table):,} correlations")
+    
+    return correlation_tables
+
+def _build_all_networks(
+    correlation_tables: Dict[str, pd.DataFrame],
+    feature_prefixes: List[str],
+    network_params: dict,
+    annotation_input: pd.DataFrame,
+    output_dir: str,
+    output_filename_prefix: str = "networks"
+) -> Dict[str, nx.Graph]:
+    """Build networks from correlation tables."""
+    
+    log.info("Building networks from correlations...")
+    networks = {}
+    
+    for mode_name, corr_table in correlation_tables.items():
+        log.info(f"Building {mode_name} network...")
+        
+        # Create graph from correlation table
+        G = _build_single_network(
+            corr_table=corr_table,
+            feature_prefixes=feature_prefixes,
+            annotation_input=annotation_input
+        )
+        
+        # Detect submodules
+        submodule_mode = network_params['submodule_mode']
+        if submodule_mode != 'none':
+            log.info(f"Detecting submodules using '{submodule_mode}'...")
+            G = _annotate_submodules(
+                G=G,
+                submodule_mode=submodule_mode,
+                wgcna_params=network_params['wgcna_params']
+            )
+        
+        networks[mode_name] = G
+        log.info(f"Final: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
+    
+    _save_networks_to_disk(networks, output_dir, output_filename_prefix)
+
+    return networks
+
+def _build_single_network(
+    corr_table: pd.DataFrame,
+    feature_prefixes: List[str],
+    annotation_input: pd.DataFrame
+) -> nx.Graph:
+    """Build a single network from a correlation table."""
+    
+    # Get all unique features
+    all_features = pd.Index(sorted(
+        set(corr_table["feature_1"]).union(set(corr_table["feature_2"]))
+    ))
+    
+    # Pivot to matrix format
+    correlation_df = corr_table.pivot(
+        index="feature_2",
+        columns="feature_1",
+        values="correlation"
+    ).reindex(index=all_features, columns=all_features, fill_value=0.0)
+    
+    # Build sparse adjacency and create graph
+    sparse_adj = _build_sparse_adj(correlation_df, feature_prefixes)
+    G = _graph_from_sparse(sparse_adj, correlation_df.index.to_numpy())
+    
+    # Add node attributes
+    color_map, shape_map = _make_prefix_maps(feature_prefixes)
+    _assign_node_attributes(G, feature_prefixes, color_map, shape_map, annotation_input)
+    
+    # Remove tiny components
+    tiny = [c for c in nx.connected_components(G) if len(c) < 3]
+    if tiny:
+        G.remove_nodes_from({n for comp in tiny for n in comp})
+    
+    return G
+
+def _annotate_submodules(
+    G: nx.Graph,
+    submodule_mode: str,
+    wgcna_params: dict
+) -> nx.Graph:
+    """Detect and annotate submodules in a network."""
+    
+    submods = _detect_submodules(G, method=submodule_mode, **wgcna_params)
+    
+    if submods:
+        n_mod = len(submods)
+        sub_cols = viridis(np.linspace(0, 1, n_mod))
+        sub_hex = [to_hex(c) for c in sub_cols]
+        
+        for idx, (mod_name, sub_g) in enumerate(submods, start=1):
+            col = sub_hex[(idx - 1) % len(sub_hex)]
+            for n in sub_g.nodes():
+                G.nodes[n]["submodule"] = mod_name
+                G.nodes[n]["submodule_color"] = col
+        
+        log.info(f"Detected {len(submods)} submodules")
+    else:
+        # Assign all to single submodule
+        for node in G.nodes():
+            G.nodes[node]["submodule"] = "submodule_1"
+            G.nodes[node]["submodule_color"] = "#440154"
+    
+    return G
+
+def _compare_network_structures(
+    networks: Dict[str, nx.Graph],
+    feature_prefixes: List[str],
+) -> Dict[str, Any]:
+    """Compare network structures between independent and integrated networks."""
+    
+    full_network = networks['full']
+    comparison_stats = {
+        'network_sizes': {},
+        'gained_elements': {},
+        'lost_elements': {},
+        'overlap_percentages': {}
+    }
+    
+    # Network sizes
+    for mode_name, G in networks.items():
+        comparison_stats['network_sizes'][mode_name] = {
+            'nodes': G.number_of_nodes(),
+            'edges': G.number_of_edges()
+        }
+    
+    # Compare each independent network to full network
+    for prefix in feature_prefixes:
+        dataset_name = prefix.rstrip('_')
+        mode_name = f"{dataset_name}_only"
+        
+        if mode_name not in networks:
+            continue
+        
+        log.info(f"Comparing {dataset_name} vs full network:")
+        
+        independent_network = networks[mode_name]
+        
+        # Calculate gained and lost elements
+        gained, lost = _calculate_network_differences(
+            independent_network, full_network, feature_prefixes
+        )
+        
+        comparison_stats['gained_elements'][dataset_name] = gained
+        comparison_stats['lost_elements'][dataset_name] = lost
+        
+        # Calculate overlaps
+        node_overlap = len(set(independent_network.nodes()) & set(full_network.nodes()))
+        edge_overlap = len(set(independent_network.edges()) & set(full_network.edges()))
+        
+        comparison_stats['overlap_percentages'][dataset_name] = {
+            'nodes': (node_overlap / full_network.number_of_nodes() * 100) 
+                     if full_network.number_of_nodes() > 0 else 0,
+            'edges': (edge_overlap / full_network.number_of_edges() * 100) 
+                     if full_network.number_of_edges() > 0 else 0
+        }
+    
+        log.info(f"Elements GAINED in full network:")
+        log.info(f"Nodes: {len(gained['nodes']):,}")
+        for node_type, count in gained['node_counts'].items():
+            log.info(f"{node_type}: {count:,}")
+        log.info(f"Edges: {len(gained['edges']):,}")
+        for edge_type, count in gained['edge_counts'].items():
+            log.info(f"{edge_type}: {count:,}")
+        log.info(f"Elements LOST from independent network:")
+        log.info(f"Nodes: {len(lost['nodes']):,}")
+        for node_type, count in lost['node_counts'].items():
+            log.info(f"{node_type}: {count:,}")
+        log.info(f"Edges: {len(lost['edges']):,}")
+        for edge_type, count in lost['edge_counts'].items():
+            log.info(f"{edge_type}: {count:,}")
+    
+    return comparison_stats
+
+def _calculate_network_differences(
+    independent_network: nx.Graph,
+    full_network: nx.Graph,
+    feature_prefixes: List[str]
+) -> Tuple[Dict, Dict]:
+    """Calculate nodes and edges gained/lost between networks."""
+    
+    # Nodes
+    nodes_gained = set(full_network.nodes()) - set(independent_network.nodes())
+    nodes_lost = set(independent_network.nodes()) - set(full_network.nodes())
+    
+    # Edges (accounting for undirected graph)
+    edges_gained = set(full_network.edges()) - set(independent_network.edges())
+    edges_gained = {e for e in edges_gained 
+                    if (e[1], e[0]) not in independent_network.edges()}
+    
+    edges_lost = set(independent_network.edges()) - set(full_network.edges())
+    edges_lost = {e for e in edges_lost 
+                  if (e[1], e[0]) not in full_network.edges()}
+    
+    # Categorize by feature type
+    gained = {
+        'nodes': list(nodes_gained),
+        'edges': list(edges_gained),
+        'node_counts': _count_by_prefix(nodes_gained, feature_prefixes),
+        'edge_counts': _count_edge_types(edges_gained, feature_prefixes)
+    }
+    
+    lost = {
+        'nodes': list(nodes_lost),
+        'edges': list(edges_lost),
+        'node_counts': _count_by_prefix(nodes_lost, feature_prefixes),
+        'edge_counts': _count_edge_types(edges_lost, feature_prefixes)
+    }
+    
+    return gained, lost
+
+def _count_by_prefix(
+    nodes: set,
+    feature_prefixes: List[str]
+) -> Dict[str, int]:
+    """Count nodes by feature type prefix."""
+    counts = {}
+    for prefix in feature_prefixes:
+        prefix_name = prefix.rstrip('_')
+        counts[prefix_name] = sum(1 for n in nodes if n.startswith(prefix))
+    return counts
+
+def _count_edge_types(
+    edges: set,
+    feature_prefixes: List[str]
+) -> Dict[str, int]:
+    """Count edges by connection type (within/between data types)."""
+    counts = {}
+    
+    # Get prefix pairs for classification
+    prefixes = [p.rstrip('_') for p in feature_prefixes]
+    
+    for i, prefix1 in enumerate(prefixes):
+        # Within-type edges
+        within_count = sum(1 for u, v in edges 
+                          if u.startswith(feature_prefixes[i]) and 
+                             v.startswith(feature_prefixes[i]))
+        counts[f'within_{prefix1}'] = within_count
+        
+        # Between-type edges
+        for prefix2 in prefixes[i+1:]:
+            between_count = sum(1 for u, v in edges 
+                               if (u.startswith(f'{prefix1}_') and v.startswith(f'{prefix2}_')) or
+                                  (u.startswith(f'{prefix2}_') and v.startswith(f'{prefix1}_')))
+            counts[f'{prefix1}_to_{prefix2}'] = between_count
+    
+    return counts
+
+def _analyze_submodule_preservation(
+    networks: Dict[str, nx.Graph],
+    feature_prefixes: List[str],
+) -> Dict[str, Dict]:
+    """Analyze how submodules are preserved between networks."""
+    
+    preservation_results = {}
+    
+    for prefix in feature_prefixes:
+        dataset_name = prefix.rstrip('_')
+        mode_name = f"{dataset_name}_only"
+        
+        if mode_name not in networks:
+            continue
+        
+        log.info(f"Analyzing {dataset_name} submodule preservation...")
+        
+        # Run preservation analyses
+        preservation_results[dataset_name] = {
+            'jaccard_scores': calculate_submodule_preservation(
+                networks[mode_name], networks['full'], 
+                f"{dataset_name}_", feature_prefixes
+            ),
+            'permutation_test': permutation_test_preservation(
+                networks[mode_name], networks['full'], 
+                f"{dataset_name}_", n_permutations=1000
+            )
+        }
+
+    return preservation_results
+
+def analyze_submodule_functional_enrichment(
+    networks: Dict[str, nx.Graph],
+    annotation_categories: Dict[str, List[str]],
+    p_value_threshold: float = 0.05,
+    correction_method: str = "fdr_bh",
+    min_annotation_count: int = 2
+) -> Dict[str, Any]:
+    """
+    Perform functional enrichment analysis on network submodules.
+    
+    Args:
+        networks: Dictionary of networks (must include 'full' and independent networks)
+        annotation_categories: Dict mapping dataset names to lists of annotation column names
+                             e.g., {'tx': ['tx_go_acc', 'tx_kegg_acc'], 
+                                    'mx': ['mx_npclassifier_class']}
+        p_value_threshold: Significance threshold for enrichment
+        correction_method: Multiple testing correction method
+        min_annotation_count: Minimum count for an annotation to be tested
+        
+    Returns:
+        Dictionary with enrichment analysis results
+    """
+    
+    enrichment_results = {}
+    
+    for dataset_name, annotation_columns in annotation_categories.items():
+        log.info(f"Analyzing functional enrichment for {dataset_name}...")
+        
+        # Get networks
+        indep_name = f"{dataset_name}_only"
+        if indep_name not in networks:
+            log.warning(f"Independent network {indep_name} not found, skipping")
+            continue
+        
+        independent_network = networks[indep_name]
+        full_network = networks['full']
+        
+        # Get node tables with annotations
+        indep_node_table = pd.DataFrame.from_dict(
+            dict(independent_network.nodes(data=True)), 
+            orient="index"
+        )
+        full_node_table = pd.DataFrame.from_dict(
+            dict(full_network.nodes(data=True)), 
+            orient="index"
+        )
+        
+        # Run enrichment for each annotation category
+        dataset_results = {}
+        for annotation_col in annotation_columns:
+            log.info(f"Testing enrichment for annotation: {annotation_col}")
+            
+            # Skip if column not in node tables
+            if annotation_col not in indep_node_table.columns:
+                log.warning(f"Column {annotation_col} not in independent network, skipping")
+                continue
+            if annotation_col not in full_node_table.columns:
+                log.warning(f"Column {annotation_col} not in full network, skipping")
+                continue
+            
+            # Run enrichment on independent network
+            log.info(f"Running enrichment on independent network...")
+            indep_enrichment = perform_functional_enrichment(
+                node_table=indep_node_table,
+                annotation_column=annotation_col,
+                p_value_threshold=p_value_threshold,
+                correction_method=correction_method,
+                min_annotation_count=min_annotation_count,
+                output_dir=None
+            )
+            
+            # Run enrichment on full network
+            log.info(f"Running enrichment on full network...")
+            full_enrichment = perform_functional_enrichment(
+                node_table=full_node_table,
+                annotation_column=annotation_col,
+                p_value_threshold=p_value_threshold,
+                correction_method=correction_method,
+                min_annotation_count=min_annotation_count,
+                output_dir=None
+            )
+            
+            # Compare results
+            comparison = _compare_enrichment_results(
+                indep_enrichment,
+                full_enrichment,
+                dataset_name,
+                annotation_col
+            )
+            
+            dataset_results[annotation_col] = {
+                'independent': indep_enrichment,
+                'full': full_enrichment,
+                'comparison': comparison
+            }
+        
+        enrichment_results[dataset_name] = dataset_results
+    
+    return enrichment_results
+
+def analyze_cross_omics_edge_enrichment(
+    full_network: nx.Graph,
+    annotation_categories: Dict[str, List[str]],
+    feature_prefixes: List[str],
+    p_value_threshold: float = 0.05,
+    correction_method: str = "fdr_bh",
+    min_annotation_count: int = 2
+) -> Dict[str, Any]:
+    """
+    Test if annotations are enriched in nodes with cross-omics edges.
+    
+    Args:
+        full_network: Full integrated network with node annotations
+        annotation_categories: Dict mapping dataset names to annotation column lists
+                              e.g., {'tx': ['tx_go_acc', 'tx_kegg_acc'], 
+                                     'mx': ['mx_class', 'mx_subclass']}
+        feature_prefixes: List of feature prefixes (e.g., ['tx_', 'mx_'])
+        p_value_threshold: Significance threshold
+        correction_method: Multiple testing correction method
+        min_annotation_count: Minimum count for testing an annotation
+        
+    Returns:
+        Dictionary with enrichment results per dataset and annotation category
+    """
+    
+    # Get edge table
+    edge_table = nx.to_pandas_edgelist(full_network)
+    
+    # Categorize nodes by whether they have cross-omics edges
+    nodes_with_cross_edges = set()
+    nodes_without_cross_edges = set()
+    
+    for _, row in edge_table.iterrows():
+        source = row['source']
+        target = row['target']
+        
+        # Check if edge connects different data types
+        source_type = next((p for p in feature_prefixes if source.startswith(p)), None)
+        target_type = next((p for p in feature_prefixes if target.startswith(p)), None)
+        
+        if source_type != target_type:
+            # Cross-omics edge
+            nodes_with_cross_edges.add(source)
+            nodes_with_cross_edges.add(target)
+    
+    # All nodes in network that DON'T have cross-omics edges
+    all_nodes = set(full_network.nodes())
+    nodes_without_cross_edges = all_nodes - nodes_with_cross_edges
+    
+    log.info(f"Network edge statistics:")
+    log.info(f"Total nodes: {len(all_nodes)}")
+    log.info(f"Nodes with cross-omics edges: {len(nodes_with_cross_edges)}")
+    log.info(f"Nodes without cross-omics edges: {len(nodes_without_cross_edges)}")
+    
+    # Get node table with annotations
+    node_table = pd.DataFrame.from_dict(
+        dict(full_network.nodes(data=True)), 
+        orient="index"
+    )
+    
+    # Perform enrichment for each dataset and annotation category
+    enrichment_results = {}
+    
+    for dataset_name, annotation_columns in annotation_categories.items():
+        log.info(f"Analyzing {dataset_name} annotations...")
+        dataset_results = {}
+        
+        for annotation_col in annotation_columns:
+            log.info(f"Testing enrichment for annotation: {annotation_col}")
+            # Filter to nodes from this dataset
+            dataset_prefix = f"{dataset_name}_"
+            dataset_nodes = node_table[node_table.index.str.startswith(dataset_prefix)].copy()
+            
+            # Add cross-edge status
+            dataset_nodes['has_cross_edges'] = dataset_nodes.index.isin(nodes_with_cross_edges)
+            
+            # Run enrichment test
+            enrichment_df = _test_annotation_enrichment_in_cross_edges(
+                node_table=dataset_nodes,
+                annotation_column=annotation_col,
+                p_value_threshold=p_value_threshold,
+                correction_method=correction_method,
+                min_annotation_count=min_annotation_count
+            )
+            
+            if not enrichment_df.empty:
+                dataset_results[annotation_col] = enrichment_df
+                
+                # Log significant results
+                sig_results = enrichment_df[enrichment_df['significant']]
+                if not sig_results.empty:
+                    log.info(f"Found {len(sig_results)} significant enrichments")
+                    log.info(f"Top enrichments of {annotation_col}:")
+                    for _, row in sig_results.head(20).iterrows():
+                        log.info(f"{row['annotation_term']}: "
+                                 f"Nodes with cross edges={row['nodes_with_cross_edges']}, "
+                                 f"Nodes without cross edges={row['nodes_without_cross_edges']}, "
+                                 f"Fold Enrichment={row['fold_enrichment']:.2f}, "
+                                 f"Corrected p-value={row['p_value_corr']:.2e}")
+                else:
+                    log.info(f"No significant enrichment of {annotation_col} found")
+        
+        if dataset_results:
+            enrichment_results[dataset_name] = dataset_results
+    
+    return enrichment_results
+
+def _compare_enrichment_results(
+    indep_enrichment: pd.DataFrame,
+    full_enrichment: pd.DataFrame,
+    dataset_name: str,
+    annotation_col: str
+) -> Dict[str, Any]:
+    """
+    Compare enrichment results between independent and full networks.
+    
+    Now compares by annotation_term only (not submodule), since submodule IDs
+    can differ between networks even when representing similar biological groups.
+    """
+    
+    log.info(f"Comparing enrichment results...")
+    
+    comparison = {
+        'dataset': dataset_name,
+        'annotation_category': annotation_col
+    }
+    
+    # Basic statistics
+    comparison['n_tests_independent'] = len(indep_enrichment)
+    comparison['n_tests_full'] = len(full_enrichment)
+    comparison['n_significant_independent'] = indep_enrichment['significant'].sum() if not indep_enrichment.empty else 0
+    comparison['n_significant_full'] = full_enrichment['significant'].sum() if not full_enrichment.empty else 0
+    
+    # Identify gained and lost enrichments BY ANNOTATION TERM ONLY
+    # (ignoring submodule ID since they can differ between networks)
+    if not indep_enrichment.empty and not full_enrichment.empty:
+        # Get unique significant annotation terms (not caring about which submodule)
+        indep_sig_terms = set(
+            indep_enrichment[indep_enrichment['significant']]['annotation_term'].unique()
+        )
+        
+        full_sig_terms = set(
+            full_enrichment[full_enrichment['significant']]['annotation_term'].unique()
+        )
+        
+        gained_terms = full_sig_terms - indep_sig_terms
+        lost_terms = indep_sig_terms - full_sig_terms
+        preserved_terms = indep_sig_terms & full_sig_terms
+        
+        comparison['n_gained_enrichments'] = len(gained_terms)
+        comparison['n_lost_enrichments'] = len(lost_terms)
+        comparison['n_preserved_enrichments'] = len(preserved_terms)
+        
+        # Store the actual terms for inspection
+        comparison['gained_enrichment_terms'] = list(gained_terms)
+        comparison['lost_enrichment_terms'] = list(lost_terms)
+        comparison['preserved_enrichment_terms'] = list(preserved_terms)
+        
+        # Log summary
+        log.info(f"Enrichment comparison summary (by annotation term):")
+        log.info(f"Gained enrichments: {comparison['n_gained_enrichments']}")
+        if gained_terms:
+            log.info(f"Terms: {', '.join(sorted(gained_terms))}")
+        log.info(f"Lost enrichments: {comparison['n_lost_enrichments']}")
+        if lost_terms:
+            log.info(f"Terms: {', '.join(sorted(lost_terms))}")
+        log.info(f"Preserved enrichments: {comparison['n_preserved_enrichments']}")
+        if preserved_terms:
+            log.info(f"Terms: {', '.join(sorted(preserved_terms))}")
+    
+    else:
+        comparison['n_gained_enrichments'] = 0
+        comparison['n_lost_enrichments'] = 0
+        comparison['n_preserved_enrichments'] = 0
+        comparison['gained_enrichment_terms'] = []
+        comparison['lost_enrichment_terms'] = []
+        comparison['preserved_enrichment_terms'] = []
+    
+    return comparison
+
+def _test_annotation_enrichment_in_cross_edges(
+    node_table: pd.DataFrame,
+    annotation_column: str,
+    p_value_threshold: float,
+    correction_method: str,
+    min_annotation_count: int
+) -> pd.DataFrame:
+    """
+    Test if each annotation term is enriched in nodes with cross-omics edges.
+    
+    Simple Fisher's exact test:
+    - Rows: [has cross edges, no cross edges]
+    - Cols: [has annotation, no annotation]
+    """
+    
+    # Parse annotations (handle semicolon-separated values)
+    annotation_data = []
+    for node_id, row in node_table.iterrows():
+        has_cross = row['has_cross_edges']
+        annotations_str = row[annotation_column]
+        
+        if pd.isna(annotations_str) or str(annotations_str).strip() in ['', 'Unassigned', 'NA']:
+            continue
+        
+        # Split on ;; and clean
+        annotations = [a.strip() for a in str(annotations_str).split(';;') 
+                      if a.strip() and a.strip() not in ['Unassigned', 'NA', '']]
+        
+        for ann in annotations:
+            annotation_data.append({
+                'node_id': node_id,
+                'has_cross_edges': has_cross,
+                'annotation': ann
+            })
+    
+    if not annotation_data:
+        return pd.DataFrame()
+    
+    ann_df = pd.DataFrame(annotation_data)
+    
+    # Filter by minimum count
+    annotation_counts = ann_df['annotation'].value_counts()
+    valid_annotations = annotation_counts[annotation_counts >= min_annotation_count].index
+    ann_df = ann_df[ann_df['annotation'].isin(valid_annotations)]
+    
+    if ann_df.empty:
+        return pd.DataFrame()
+    
+    # Count nodes in each category
+    total_with_cross = node_table['has_cross_edges'].sum()
+    total_without_cross = (~node_table['has_cross_edges']).sum()
+    
+    # Test each annotation
+    results = []
+    for annotation in valid_annotations:
+        nodes_with_ann = set(ann_df[ann_df['annotation'] == annotation]['node_id'].unique())
+        
+        # Build 2x2 table
+        with_cross_and_ann = sum(node_table.loc[node_table.index.isin(nodes_with_ann), 'has_cross_edges'])
+        with_cross_no_ann = total_with_cross - with_cross_and_ann
+        without_cross_and_ann = len(nodes_with_ann) - with_cross_and_ann
+        without_cross_no_ann = total_without_cross - without_cross_and_ann
+        
+        contingency_table = np.array([
+            [with_cross_and_ann, with_cross_no_ann],
+            [without_cross_and_ann, without_cross_no_ann]
+        ])
+        
+        # Expected count
+        expected = (total_with_cross * len(nodes_with_ann)) / len(node_table)
+        fold_enrichment = (with_cross_and_ann / expected) if expected > 0 else 0
+        
+        # Fisher's exact test
+        try:
+            odds_ratio, p_value = fisher_exact(contingency_table, alternative='greater')
+        except:
+            odds_ratio, p_value = np.nan, 1.0
+        
+        results.append({
+            'annotation_term': annotation,
+            'nodes_with_cross_edges': with_cross_and_ann,
+            'nodes_without_cross_edges': without_cross_and_ann,
+            'total_nodes_with_annotation': len(nodes_with_ann),
+            'expected_count': expected,
+            'fold_enrichment': fold_enrichment,
+            'odds_ratio': odds_ratio,
+            'p_value': p_value
+        })
+    
+    if not results:
+        return pd.DataFrame()
+    
+    results_df = pd.DataFrame(results)
+    
+    # Multiple testing correction
+    valid_pvals = ~results_df['p_value'].isna()
+    if valid_pvals.sum() > 0:
+        pval_results = multipletests(
+            results_df.loc[valid_pvals, 'p_value'],
+            method=correction_method,
+            alpha=p_value_threshold
+        )
+        results_df['p_value_corr'] = np.nan
+        results_df.loc[valid_pvals, 'p_value_corr'] = pval_results[1]
+        results_df['significant'] = False
+        results_df.loc[valid_pvals, 'significant'] = pval_results[0]
+    else:
+        results_df['p_value_corr'] = np.nan
+        results_df['significant'] = False
+    
+    results_df = results_df.sort_values('p_value_corr')
+    
+    return results_df
+
+def calculate_submodule_preservation(
+    independent_network: nx.Graph,
+    full_network: nx.Graph,
+    dataset_prefix: str = "tx_",
+    feature_prefixes: List[str] = ["tx_", "mx_"]
+) -> pd.DataFrame:
+    """
+    Calculate Jaccard similarity between submodules in independent vs full network
+    to measure preservation of modular structure.
+    
+    Returns DataFrame with preservation scores for each independent submodule.
+    """
+    
+    log.info(f"Calculating submodule preservation for dataset: {dataset_prefix}")
+    
+    # Get nodes for this dataset only
+    dataset_nodes = {n for n in full_network.nodes() if n.startswith(dataset_prefix)}
+    log.info(f"Found {len(dataset_nodes)} nodes with prefix '{dataset_prefix}' in full network")
+    
+    # Get submodule assignments from independent network
+    independent_modules = {}
+    for node in independent_network.nodes():
+        if node in dataset_nodes:
+            submod = independent_network.nodes[node].get('submodule', 'unknown')
+            independent_modules.setdefault(submod, set()).add(node)
+    
+    log.info(f"Independent network contains {len(independent_modules)} submodules")
+    
+    # Get submodule assignments from full network
+    full_modules = {}
+    for node in full_network.nodes():
+        if node in dataset_nodes:
+            submod = full_network.nodes[node].get('submodule', 'unknown')
+            full_modules.setdefault(submod, set()).add(node)
+    
+    log.info(f"Full network contains {len(full_modules)} submodules that include {dataset_prefix} dataset nodes")
+    
+    # Track which full network submodules were matched
+    matched_full_submodules = set()
+    
+    # Calculate Jaccard similarity for each independent module vs all full modules
+    results = []
+    log.info(f"Computing Jaccard similarities for module pairs...")
+    
+    for indep_name, indep_nodes in independent_modules.items():
+        best_match = None
+        best_jaccard = 0
+        
+        for full_name, full_nodes in full_modules.items():
+            # Jaccard = intersection / union
+            intersection = len(indep_nodes & full_nodes)
+            union = len(indep_nodes | full_nodes)
+            jaccard = intersection / union if union > 0 else 0
+            
+            if jaccard > best_jaccard:
+                best_jaccard = jaccard
+                best_match = full_name
+        
+        # Track that this full submodule was matched
+        if best_match:
+            matched_full_submodules.add(best_match)
+        
+        # Get counts for the matched full network submodule
+        matched_full_nodes = full_modules.get(best_match, set())
+        nodes_in_matched_full = len(matched_full_nodes)
+        nodes_preserved = len(indep_nodes & matched_full_nodes)
+        preservation_pct = (nodes_preserved / len(indep_nodes) * 100) if len(indep_nodes) > 0 else 0
+        
+        # Track fate of non-preserved nodes
+        non_preserved_nodes = indep_nodes - matched_full_nodes
+        
+        # Find where non-preserved nodes ended up
+        non_preserved_destinations = {}
+        nodes_not_in_any_submodule = set()
+        
+        for node in non_preserved_nodes:
+            # Check if node exists in full network
+            if node not in full_network.nodes():
+                nodes_not_in_any_submodule.add(node)
+                continue
+            
+            # Get the submodule assignment in full network
+            node_submodule = full_network.nodes[node].get('submodule', None)
+            
+            if node_submodule and node_submodule != best_match:
+                # Node went to a different submodule
+                non_preserved_destinations[node_submodule] = non_preserved_destinations.get(node_submodule, 0) + 1
+            elif not node_submodule:
+                # Node has no submodule assignment
+                nodes_not_in_any_submodule.add(node)
+        
+        # Format destination information for logging and storage
+        destination_info = []
+        if non_preserved_destinations:
+            for dest_submod, count in sorted(non_preserved_destinations.items(), key=lambda x: x[1], reverse=True):
+                destination_info.append(f"{dest_submod} ({count})")
+                
+        # Break down composition of full network submodule by data type
+        all_nodes_in_full_submodule = {
+            n for n in full_network.nodes() 
+            if full_network.nodes[n].get('submodule') == best_match
+        }
+        
+        # Count nodes by data type
+        composition = {}
+        for prefix in feature_prefixes:
+            prefix_count = sum(1 for n in all_nodes_in_full_submodule if n.startswith(prefix))
+            composition[f'{prefix.rstrip("_")}_nodes_in_full'] = prefix_count
+        
+        # Enhanced logging with non-preserved node destinations
+        composition_str = ", ".join([f"{k.replace('_nodes_in_full', '')}: {v}"
+                                    for k, v in composition.items()])
+        
+        log.info(f"{indep_name} ({len(indep_nodes)} nodes) → {best_match} "
+                f"({nodes_in_matched_full} {dataset_prefix.rstrip('_')} nodes; "
+                f"full composition: {composition_str}): "
+                f"Jaccard={best_jaccard:.3f}, {preservation_pct:.1f}% nodes preserved")
+        if destination_info:
+            log.info(f"    {len(non_preserved_nodes)} non-preserved nodes went to: {';;'.join(destination_info)}")
+        
+        # Build result dictionary
+        result = {
+            'independent_submodule': indep_name,
+            'matched_full_submodule': best_match,
+            'jaccard_similarity': best_jaccard,
+            'nodes_in_independent': len(indep_nodes),
+            'nodes_in_matched_full': nodes_in_matched_full,
+            'nodes_preserved': nodes_preserved,
+            'preservation_rate': preservation_pct / 100,
+            'nodes_not_preserved': len(non_preserved_nodes),
+            'non_preserved_destinations': destination_info
+        }
+        
+        # Add composition columns
+        result.update(composition)
+        result['total_nodes_in_full_submodule'] = len(all_nodes_in_full_submodule)
+        
+        results.append(result)
+    
+    # Identify unmatched full network submodules
+    unmatched_full_submodules = set(full_modules.keys()) - matched_full_submodules
+    
+    if unmatched_full_submodules:
+        log.info(f"Full network submodules with no corresponding nodes in independent network:")
+        for full_submod in sorted(unmatched_full_submodules):
+            nodes_in_full = len(full_modules[full_submod])
+            log.info(f"{full_submod} ({nodes_in_full} {dataset_prefix.rstrip('_')} nodes) - no match in independent network")
+    else:
+        log.info(f"All full network submodules had at least one node matched to independent network")
+    
+    results_df = pd.DataFrame(results).sort_values('jaccard_similarity', ascending=False)
+    
+    # Summary statistics
+    avg_jaccard = results_df['jaccard_similarity'].mean()
+    avg_preservation = results_df['preservation_rate'].mean()
+    
+    log.info(f"Summary statistics:")
+    log.info(f"Average Jaccard similarity: {avg_jaccard:.3f}")
+    log.info(f"Average node preservation rate: {avg_preservation:.1%}")
+    log.info(f"Modules with Jaccard > 0.7 (strong preservation): {(results_df['jaccard_similarity'] > 0.7).sum()} ({(results_df['jaccard_similarity'] > 0.7).sum() / len(results_df) * 100:.1f}%)")
+    log.info(f"Modules with Jaccard > 0.3 (moderate preservation): {(results_df['jaccard_similarity'] > 0.3).sum()} ({(results_df['jaccard_similarity'] > 0.3).sum() / len(results_df) * 100:.1f}%)")
+    log.info(f"Full network submodules not represented in independent network: {len(unmatched_full_submodules)}")
+    
+    return results_df
+
+def permutation_test_preservation(
+    independent_network: nx.Graph,
+    full_network: nx.Graph,
+    dataset_prefix: str = "tx_",
+    n_permutations: int = 1000
+) -> dict:
+    """
+    Test if submodule preservation is statistically significant via permutation test.
+    
+    Null hypothesis: Module assignments in full network are random with respect 
+    to independent network structure.
+    """
+    
+    log.info(f"Calculating observed ARI for {dataset_prefix} preservation...")
+    
+    # Get common nodes
+    common_nodes = sorted([
+        n for n in independent_network.nodes() 
+        if n in full_network.nodes() and n.startswith(dataset_prefix)
+    ])
+    
+    if not common_nodes:
+        log.warning(f"No common nodes found for {dataset_prefix}")
+        return {
+            'observed_ari': np.nan,
+            'mean_null_ari': np.nan,
+            'std_null_ari': np.nan,
+            'p_value': np.nan,
+            'z_score': np.nan
+        }
+    
+    # Get cluster labels for common nodes
+    independent_labels = [
+        independent_network.nodes[n].get('submodule', 'unknown') 
+        for n in common_nodes
+    ]
+    full_labels = [
+        full_network.nodes[n].get('submodule', 'unknown') 
+        for n in common_nodes
+    ]
+    
+    # Calculate observed ARI
+    observed_ari = adjusted_rand_score(independent_labels, full_labels)
+    
+    # Permutation test
+    log.info(f"Running permutation test with {n_permutations} iterations...")
+    null_aris = []
+    
+    for i in range(n_permutations):
+        # Shuffle full network labels
+        shuffled_full_labels = np.random.permutation(full_labels)
+        null_ari = adjusted_rand_score(independent_labels, shuffled_full_labels)
+        null_aris.append(null_ari)
+    
+    # Calculate p-value (proportion of null ARIs >= observed)
+    p_value = np.sum(np.array(null_aris) >= observed_ari) / n_permutations
+    
+    # Calculate summary statistics
+    mean_null = np.mean(null_aris)
+    std_null = np.std(null_aris)
+    z_score = (observed_ari - mean_null) / std_null if std_null > 0 else np.inf
+    
+    results = {
+        'observed_ari': observed_ari,
+        'mean_null_ari': mean_null,
+        'std_null_ari': std_null,
+        'p_value': p_value,
+        'z_score': z_score
+    }
+    
+    log.info(f"Permutation test results:")
+    log.info(f"Observed ARI: {observed_ari:.3f}")
+    log.info(f"Mean null ARI: {mean_null:.3f} ± {std_null:.3f}")
+    log.info(f"P-value: {p_value:.4f}")
+    log.info(f"Z-score: {z_score:.2f}")
+    
+    return results
+
+def analyze_cross_omics_connectivity(
+    full_network: nx.Graph,
+    feature_prefixes: List[str] = ["tx_", "mx_"]
+) -> dict:
+    """
+    Measure connectivity between omics layers in the integrated network.
+    
+    Args:
+        full_network: Full integrated network
+        feature_prefixes: List of feature prefixes for different omics types
+        
+    Returns:
+        Dictionary with cross-omics connectivity metrics
+    """
+    
+    log.info("Analyzing cross-omics connectivity...")
+    
+    # Partition nodes by omics type
+    omics_nodes = {}
+    for prefix in feature_prefixes:
+        prefix_name = prefix.rstrip('_')
+        omics_nodes[prefix_name] = {n for n in full_network.nodes() if n.startswith(prefix)}
+        log.info(f"Found {len(omics_nodes[prefix_name])} {prefix_name} nodes")
+    
+    # Count edge types
+    edge_counts = {}
+    within_edges = {}
+    
+    # Count within-omics edges
+    for prefix_name, nodes in omics_nodes.items():
+        count = sum(1 for u, v in full_network.edges() if u in nodes and v in nodes)
+        within_edges[prefix_name] = count
+        edge_counts[f'within_{prefix_name}'] = count
+    
+    # Count between-omics edges
+    between_counts = {}
+    for i, prefix1 in enumerate(feature_prefixes):
+        name1 = prefix1.rstrip('_')
+        for prefix2 in feature_prefixes[i+1:]:
+            name2 = prefix2.rstrip('_')
+            count = sum(1 for u, v in full_network.edges() 
+                       if (u in omics_nodes[name1] and v in omics_nodes[name2]) or 
+                          (u in omics_nodes[name2] and v in omics_nodes[name1]))
+            between_counts[f'{name1}_to_{name2}'] = count
+            edge_counts[f'between_{name1}_{name2}'] = count
+    
+    # Calculate connectivity densities
+    max_edges = {}
+    densities = {}
+    
+    for prefix_name, nodes in omics_nodes.items():
+        n = len(nodes)
+        max_edges[f'within_{prefix_name}'] = n * (n - 1) / 2
+        if max_edges[f'within_{prefix_name}'] > 0:
+            densities[f'within_{prefix_name}'] = within_edges[prefix_name] / max_edges[f'within_{prefix_name}']
+    
+    # Between-omics max edges and density
+    total_between_edges = sum(between_counts.values())
+    for i, prefix1 in enumerate(feature_prefixes):
+        name1 = prefix1.rstrip('_')
+        for prefix2 in feature_prefixes[i+1:]:
+            name2 = prefix2.rstrip('_')
+            max_between = len(omics_nodes[name1]) * len(omics_nodes[name2])
+            max_edges[f'between_{name1}_{name2}'] = max_between
+            if max_between > 0:
+                densities[f'between_{name1}_{name2}'] = between_counts[f'{name1}_to_{name2}'] / max_between
+    
+    # Calculate integration ratio (cross-omics edges / intra-omics edges)
+    total_within_edges = sum(within_edges.values())
+    integration_ratio = total_between_edges / total_within_edges if total_within_edges > 0 else 0
+    
+    # Count nodes with cross-omics neighbors
+    nodes_with_cross_neighbors = {}
+    for prefix_name, nodes in omics_nodes.items():
+        count = 0
+        other_nodes = set()
+        for other_prefix in feature_prefixes:
+            if other_prefix.rstrip('_') != prefix_name:
+                other_nodes.update(omics_nodes[other_prefix.rstrip('_')])
+        
+        for node in nodes:
+            neighbors = set(full_network.neighbors(node))
+            if neighbors & other_nodes:
+                count += 1
+        
+        nodes_with_cross_neighbors[prefix_name] = count
+    
+    results = {
+        'edge_counts': edge_counts,
+        'max_possible_edges': max_edges,
+        'densities': densities,
+        'integration_ratio': integration_ratio,
+        'total_within_edges': total_within_edges,
+        'total_between_edges': total_between_edges,
+        'nodes_with_cross_omics_neighbors': nodes_with_cross_neighbors
+    }
+    
+    # Log summary
+    log.info("Cross-omics connectivity summary:")
+    log.info(f"Total cross-omics edges: {total_between_edges:,}")
+    log.info(f"Total within-omics edges: {total_within_edges:,}")
+    log.info(f"Integration ratio: {integration_ratio:.3f}")
+    
+    for prefix_name, count in nodes_with_cross_neighbors.items():
+        total = len(omics_nodes[prefix_name])
+        pct = (count / total * 100) if total > 0 else 0
+        log.info(f"{prefix_name} nodes with cross-omics neighbors: {count:,}/{total:,} ({pct:.1f}%)")
+    
+    for key, density in densities.items():
+        log.info(f"{key} density: {density:.6f}")
+    
+    return results
+
+def identify_emergent_modules(
+    networks: dict,
+    feature_prefixes: List[str] = ["tx_", "mx_"]
+) -> pd.DataFrame:
+    """
+    Find multi-omics modules that only exist in the full integrated network.
+    
+    Args:
+        networks: Dictionary of networks (must include 'full' and independent networks)
+        feature_prefixes: List of feature prefixes for different omics types
+        
+    Returns:
+        DataFrame with information about emergent modules
+    """
+    
+    log.info("Identifying emergent multi-omics modules...")
+    
+    if 'full' not in networks:
+        raise ValueError("Networks dictionary must contain 'full' network")
+    
+    full_net = networks['full']
+    
+    # Get all submodules from full network
+    full_modules = {}
+    for node in full_net.nodes():
+        submod = full_net.nodes[node].get('submodule', 'unknown')
+        full_modules.setdefault(submod, []).append(node)
+    
+    log.info(f"Found {len(full_modules)} submodules in full network")
+    
+    emergent_modules = []
+    
+    for submod_name, nodes in full_modules.items():
+        # Count node types
+        node_types = {}
+        for prefix in feature_prefixes:
+            prefix_name = prefix.rstrip('_')
+            node_types[f'{prefix_name}_nodes'] = sum(1 for n in nodes if n.startswith(prefix))
+        
+        # Check if module is truly multi-omics (has nodes from multiple datasets)
+        has_multiple_omics = sum(1 for count in node_types.values() if count > 0) > 1
+        
+        if not has_multiple_omics:
+            continue
+        
+        # Check if this module configuration exists in any independent network
+        is_emergent = True
+        overlap_details = {}
+        
+        for prefix in feature_prefixes:
+            dataset_name = prefix.rstrip('_')
+            indep_net_name = f"{dataset_name}_only"
+            
+            if indep_net_name not in networks:
+                continue
+            
+            indep_net = networks[indep_net_name]
+            
+            # Get nodes of this type in the full network module
+            dataset_nodes_in_module = [n for n in nodes if n.startswith(prefix)]
+            
+            if not dataset_nodes_in_module:
+                continue
+            
+            # Check if these nodes were together in any independent module
+            independent_modules_for_nodes = {}
+            for node in dataset_nodes_in_module:
+                if node in indep_net.nodes():
+                    indep_submod = indep_net.nodes[node].get('submodule', 'unknown')
+                    independent_modules_for_nodes.setdefault(indep_submod, []).append(node)
+            
+            # Find the independent module with most overlap
+            if independent_modules_for_nodes:
+                max_overlap_module = max(independent_modules_for_nodes.items(), 
+                                       key=lambda x: len(x[1]))
+                max_overlap_count = len(max_overlap_module[1])
+                overlap_pct = (max_overlap_count / len(dataset_nodes_in_module)) * 100
+                log.info(f"Integrated submodule {submod_name}: {overlap_pct:.1f}% of {dataset_name} nodes overlap with independent submodule {max_overlap_module[0]}")
+                
+                overlap_details[dataset_name] = {
+                    'independent_module': max_overlap_module[0],
+                    'nodes_in_common': max_overlap_count,
+                    'total_nodes': len(dataset_nodes_in_module),
+                    'overlap_pct': overlap_pct
+                }
+                
+                # If >X% of nodes were already in this independent module, not emergent
+                overlap_threshold = 70
+                if overlap_pct > overlap_threshold:
+                    is_emergent = False
+                    break                    
+        
+        if is_emergent:
+            log.info(f"    Submodule {submod_name} is emergent")
+            # Calculate integration metrics
+            total_nodes = len(nodes)
+            primary_omics = max(node_types.items(), key=lambda x: x[1])[0]
+            
+            # Count cross-omics edges within this module
+            cross_omics_edges = 0
+            for u, v in full_net.edges():
+                if u in nodes and v in nodes:
+                    u_prefix = None
+                    v_prefix = None
+                    for prefix in feature_prefixes:
+                        if u.startswith(prefix):
+                            u_prefix = prefix
+                        if v.startswith(prefix):
+                            v_prefix = prefix
+                    if u_prefix and v_prefix and u_prefix != v_prefix:
+                        cross_omics_edges += 1
+            
+            module_info = {
+                'module': submod_name,
+                'n_nodes': total_nodes,
+                'cross_omics_edges': cross_omics_edges,
+                'primary_omics': primary_omics
+            }
+            module_info.update(node_types)
+            
+            # Add overlap details
+            for dataset_name, details in overlap_details.items():
+                module_info[f'{dataset_name}_overlap_pct'] = details['overlap_pct']
+            
+            emergent_modules.append(module_info)
+    
+    if not emergent_modules:
+        log.info("No emergent submodules found")
+        return pd.DataFrame()
+    
+    emergent_df = pd.DataFrame(emergent_modules)
+    emergent_df = emergent_df.sort_values('cross_omics_edges', ascending=False)
+    
+    log.info(f"Identified {len(emergent_df)} emergent submodules in the integrated network (<{overlap_threshold}% overlap of nodes with any independent modules)")
+    log.info(f"These submodules contain {emergent_df['n_nodes'].sum()} total nodes")
+    log.info(f"Average cross-omics edges per submodule: {emergent_df['cross_omics_edges'].mean():.1f}")
+    
+    return emergent_df
+
+def calculate_cross_omics_information_gain(
+    full_network: nx.Graph,
+    independent_networks: Dict[str, nx.Graph],
+    feature_prefixes: List[str]
+) -> Dict[str, float]:
+    """
+    Calculate information gain using graph entropy reduction.
+    Measures how much uncertainty about one omics layer is reduced by integration.
+    """
+    
+    log.info("Calculating information theoretic metrics...")
+
+    results = {}
+    
+    for prefix in feature_prefixes:
+        dataset_name = prefix.rstrip('_')
+        indep_name = f"{dataset_name}_only"
+        
+        if indep_name not in independent_networks:
+            continue
+        
+        # Get nodes for this dataset
+        dataset_nodes = {n for n in full_network.nodes() if n.startswith(prefix)}
+        
+        # Calculate degree distribution entropy in independent network
+        indep_degrees = [independent_networks[indep_name].degree(n) 
+                        for n in dataset_nodes 
+                        if n in independent_networks[indep_name]]
+        
+        # Calculate degree distribution entropy in full network
+        full_degrees = [full_network.degree(n) 
+                       for n in dataset_nodes 
+                       if n in full_network]
+        
+        # Shannon entropy of degree distributions
+        def degree_entropy(degrees):
+            if not degrees:
+                return 0
+            degree_counts = pd.Series(degrees).value_counts(normalize=True)
+            return -sum(p * np.log2(p) for p in degree_counts if p > 0)
+        
+        indep_entropy = degree_entropy(indep_degrees)
+        full_entropy = degree_entropy(full_degrees)
+        
+        # Information gain = increase in entropy (more connections = more information)
+        info_gain = full_entropy - indep_entropy
+        
+        results[dataset_name] = {
+            'degree_entropy_independent': indep_entropy,
+            'degree_entropy_full': full_entropy,
+            'information_gain': info_gain,
+            'relative_gain_pct': (info_gain / indep_entropy * 100) if indep_entropy > 0 else 0
+        }
+        
+        log.info(f"{dataset_name} information gain:")
+        log.info(f"Independent network entropy: {indep_entropy:.3f}")
+        log.info(f"Full network entropy: {full_entropy:.3f}")
+        log.info(f"Information gain: {info_gain:.3f} ({results[dataset_name]['relative_gain_pct']:.1f}% increase)")
+        
+        # Interpretation
+        if info_gain > 0:
+            log.info(f"Integration increased connectivity diversity for {dataset_name}")
+        elif info_gain < 0:
+            log.info(f"Integration decreased connectivity diversity for {dataset_name}")
+        else:
+            log.info(f"Integration did not change connectivity diversity for {dataset_name}")
+    
+    return results
+
+def calculate_conditional_entropy_reduction(
+    full_network: nx.Graph,
+    independent_networks: Dict[str, nx.Graph],
+    feature_prefixes: List[str]
+) -> Dict[str, float]:
+    """
+    Calculate how much uncertainty about one layer is reduced by knowing the other.
+    H(X|Y) = H(X,Y) - H(Y)
+    Reduction = H(X) - H(X|Y)
+    """
+    
+    log.info("Calculating conditional entropy reduction...")
+    
+    results = {}
+    
+    for prefix in feature_prefixes:
+        dataset_name = prefix.rstrip('_')
+        indep_name = f"{dataset_name}_only"
+        
+        if indep_name not in independent_networks:
+            continue
+        
+        # Get nodes for this dataset
+        dataset_nodes = {n for n in full_network.nodes() if n.startswith(prefix)}
+        
+        # Get nodes from OTHER datasets
+        other_nodes = {n for n in full_network.nodes() if not n.startswith(prefix)}
+        
+        # Calculate H(X) - entropy of this layer alone
+        indep_degrees = [independent_networks[indep_name].degree(n) 
+                        for n in dataset_nodes 
+                        if n in independent_networks[indep_name]]
+        h_x = _degree_entropy(indep_degrees)
+        
+        # Calculate H(X|Y) - conditional entropy given other layers
+        # Approximate by looking at degree distribution conditioned on cross-layer edges
+        conditional_entropies = []
+        for node in dataset_nodes:
+            if node not in full_network:
+                continue
+                
+            # Count edges to other omics types
+            cross_edges = sum(1 for neighbor in full_network.neighbors(node) 
+                            if neighbor in other_nodes)
+            
+            conditional_entropies.append((node, cross_edges))
+        
+        # Group by number of cross-edges and calculate entropy within each group
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for node, cross_count in conditional_entropies:
+            groups[cross_count].append(full_network.degree(node))
+        
+        # Weighted average of entropies
+        h_x_given_y = 0
+        total_nodes = len(conditional_entropies)
+        for cross_count, degrees in groups.items():
+            if degrees:
+                prob_group = len(degrees) / total_nodes
+                group_entropy = _degree_entropy(degrees)
+                h_x_given_y += prob_group * group_entropy
+        
+        # Information gain
+        reduction = h_x - h_x_given_y
+        
+        results[dataset_name] = {
+            'h_independent': h_x,
+            'h_conditional': h_x_given_y,
+            'entropy_reduction': reduction,
+            'reduction_percent': (reduction / h_x * 100) if h_x > 0 else 0
+        }
+        
+        log.info(f"{dataset_name} conditional entropy reduction:")
+        log.info(f"Independent entropy H(X): {h_x:.3f}")
+        log.info(f"Conditional entropy H(X|Y): {h_x_given_y:.3f}")
+        log.info(f"Reduction: {reduction:.3f} ({results[dataset_name]['reduction_percent']:.1f}%)")
+    
+    return results
+
+def _degree_entropy(degrees):
+    """Helper function for calculating Shannon entropy of degree distribution."""
+    if not degrees:
+        return 0
+    degree_counts = pd.Series(degrees).value_counts(normalize=True)
+    return -sum(p * np.log2(p) for p in degree_counts if p > 0)
+
+def calculate_integration_information_content(
+    full_network: nx.Graph,
+    independent_networks: Dict[str, nx.Graph],
+    feature_prefixes: List[str]
+) -> Dict[str, float]:
+    """
+    Quantify information that exists ONLY in the integrated network.
+    Measures synergistic information not present in individual layers.
+    """
+    
+    log.info("Calculating integration-specific information content...")
+    
+    results = {}
+    
+    # Count cross-layer connectivity patterns
+    cross_layer_edges = 0
+    total_edges = full_network.number_of_edges()
+    
+    omics_assignment = {}
+    for prefix in feature_prefixes:
+        for node in full_network.nodes():
+            if node.startswith(prefix):
+                omics_assignment[node] = prefix.rstrip('_')
+    
+    # Identify truly integrative edges
+    for u, v in full_network.edges():
+        if omics_assignment.get(u) != omics_assignment.get(v):
+            cross_layer_edges += 1
+    
+    # Calculate entropy of edge type distribution
+    within_layer_edges = total_edges - cross_layer_edges
+    
+    if total_edges > 0:
+        p_cross = cross_layer_edges / total_edges
+        p_within = within_layer_edges / total_edges
+        
+        # Entropy of edge type distribution
+        edge_type_entropy = 0
+        if p_cross > 0:
+            edge_type_entropy -= p_cross * np.log2(p_cross)
+        if p_within > 0:
+            edge_type_entropy -= p_within * np.log2(p_within)
+    else:
+        edge_type_entropy = 0
+    
+    # Information specific to integration
+    # Compare to maximum possible if edges were distributed uniformly
+    max_entropy = np.log2(2)  # Binary: cross-layer or within-layer
+    integration_specificity = edge_type_entropy / max_entropy if max_entropy > 0 else 0
+    
+    results['cross_layer_edges'] = cross_layer_edges
+    results['within_layer_edges'] = within_layer_edges
+    results['edge_type_entropy'] = edge_type_entropy
+    results['integration_specificity'] = integration_specificity
+    results['cross_layer_percentage'] = (cross_layer_edges / total_edges * 100) if total_edges > 0 else 0
+    
+    log.info(f"Integration information metrics:")
+    log.info(f"Cross-layer edges: {cross_layer_edges} ({results['cross_layer_percentage']:.1f}%)")
+    log.info(f"Edge type entropy: {edge_type_entropy:.3f}")
+    log.info(f"Integration specificity: {integration_specificity:.3f}")
+    
+    return results
+
+def analyze_cross_omics_motifs(
+    full_network: nx.Graph,
+    feature_prefixes: List[str],
+    max_motif_size: int = 3
+) -> Dict[str, int]:
+    """
+    Count specific cross-omics network motifs (small subgraph patterns).
+    Example motifs:
+    - One transcript connected to multiple metabolites (1-to-many)
+    - Multiple transcripts connected to one metabolite (many-to-1)
+    - Fully connected cross-omics triangles
+    """
+    
+    log.info("Analyzing cross-omics network motifs...")
+
+    motif_counts = {
+        'transcript_hub': 0,  # 1 transcript → many metabolites
+        'metabolite_hub': 0,  # 1 metabolite → many transcripts
+        'cross_triangle': 0,  # tx1-mx1, tx1-mx2, tx2-mx1, tx2-mx2 pattern
+    }
+    
+    # Identify nodes by type
+    omics_nodes = {}
+    for prefix in feature_prefixes:
+        name = prefix.rstrip('_')
+        omics_nodes[name] = {n for n in full_network.nodes() if n.startswith(prefix)}
+    
+    if len(omics_nodes) != 2:  # Currently designed for 2 omics types
+        log.warning(f"Motif analysis requires exactly 2 omics types, found {len(omics_nodes)}. Returning empty counts.")
+        return motif_counts
+    
+    type1, type2 = list(omics_nodes.keys())
+    nodes1, nodes2 = omics_nodes[type1], omics_nodes[type2]
+    
+    log.info(f"Searching for motifs between {len(nodes1)} {type1} nodes and {len(nodes2)} {type2} nodes")
+    log.info(f"Hub motif threshold: ≥3 cross-omics connections")
+    
+    # Count hub motifs (nodes with ≥3 connections to the other omics type)
+    log.info(f"Counting {type1} hub motifs (1 {type1} node → many {type2} nodes)...")
+    for node in nodes1:
+        neighbors_type2 = [n for n in full_network.neighbors(node) if n in nodes2]
+        if len(neighbors_type2) >= 3:
+            motif_counts['transcript_hub'] += 1
+    
+    log.info(f"Counting {type2} hub motifs (1 {type2} node → many {type1} nodes)...")
+    for node in nodes2:
+        neighbors_type1 = [n for n in full_network.neighbors(node) if n in nodes1]
+        if len(neighbors_type1) >= 3:
+            motif_counts['metabolite_hub'] += 1
+    
+    # Count cross-triangles (computationally expensive, limit to smaller networks)
+    if len(nodes1) < 1000 and len(nodes2) < 1000:
+        log.info(f"Counting cross-triangle motifs (pairs of {type1} nodes sharing ≥2 {type2} neighbors)...")
+        log.info(f"This may take a moment for large networks...")
+        
+        triangle_count = 0
+        for n1a, n1b in combinations(nodes1, 2):
+            # Check if both connect to same nodes in type2
+            neighbors_n1a = set(full_network.neighbors(n1a)) & nodes2
+            neighbors_n1b = set(full_network.neighbors(n1b)) & nodes2
+            shared_neighbors = neighbors_n1a & neighbors_n1b
+            
+            if len(shared_neighbors) >= 2:
+                triangle_count += 1
+        
+        motif_counts['cross_triangle'] = triangle_count
+    else:
+        log.info(f"Skipping cross-triangle analysis (network too large: {len(nodes1)} + {len(nodes2)} nodes)")
+        log.info(f"Cross-triangle motif counting is computationally expensive for networks >1000 nodes per type")
+    
+    log.info(f"Cross-omics motif analysis complete:")
+    log.info(f"{type1} hubs: {motif_counts['transcript_hub']} nodes with ≥3 {type2} connections")
+    log.info(f"{type2} hubs: {motif_counts['metabolite_hub']} nodes with ≥3 {type1} connections")
+    
+    if motif_counts['cross_triangle'] > 0:
+        log.info(f"Cross-triangles: {motif_counts['cross_triangle']} pairs of {type1} nodes sharing ≥2 {type2} neighbors")
+    else:
+        log.info(f"Cross-triangles: none found")
+    
+    # Interpretation
+    total_hubs = motif_counts['transcript_hub'] + motif_counts['metabolite_hub']
+    if total_hubs > 0:
+        log.info(f"Interpretation: Found {total_hubs} hub nodes that bridge omics layers")
+        log.info(f"These represent key regulatory or metabolic nodes in the integrated network")
+    
+    return motif_counts
+
+def plot_network_comparison(
+    networks: Dict[str, nx.Graph],
+    feature_prefixes: List[str],
+    layout: str = "spring",
+    seed: int = 555,
+    show_plot: bool = True
+) -> None:
+    """
+    Create a static matplotlib visualization comparing independent and integrated networks.
+    
+    Shows the FULL network with:
+    - All nodes in gray, shaped by data type (circle/square)
+    - Green edges: Only in full network (gained through integration)
+    - Black edges: In any independent network (preserved across integration)
+    
+    Args:
+        networks: Dictionary containing 'full' and independent networks
+        feature_prefixes: List of feature prefixes for different data types
+        output_dir: Directory to save visualization
+        output_filename: Output filename (without extension)
+        layout: Layout algorithm ('spring', 'kamada_kawai', 'circular')
+        seed: Random seed for layout reproducibility
+        show_plot: Whether to display plot inline
+        
+    Returns:
+        None (saves plot to disk)
+    """
+    
+    if 'full' not in networks:
+        raise ValueError("Networks dictionary must contain 'full' network")
+    
+    log.info("Creating static network comparison visualization...")
+    
+    full_network = networks['full']
+    
+    # Collect all edges from independent networks
+    independent_edges = set()
+    for name, network in networks.items():
+        if name != 'full':
+            independent_edges.update(network.edges())
+    
+    log.info(f"Full network: {full_network.number_of_nodes()} nodes, {full_network.number_of_edges()} edges")
+    log.info(f"Independent networks: {len(independent_edges)} total edges")
+    
+    # Compute layout on full network
+    log.info(f"Computing {layout} layout...")
+    if layout == "spring":
+        pos = nx.spring_layout(full_network, seed=seed, k=1/np.sqrt(len(full_network.nodes())))
+    elif layout == "kamada_kawai":
+        pos = nx.kamada_kawai_layout(full_network)
+    elif layout == "circular":
+        pos = nx.circular_layout(full_network)
+    elif layout == "fr":
+        pos = nx.fruchterman_reingold_layout(full_network, seed=seed)
+    else:
+        raise ValueError(f"Unsupported layout: {layout}")
+    
+    # Helper function to normalize edges for undirected comparison
+    def normalize_edge(edge):
+        return tuple(sorted(edge))
+    
+    # Normalize independent edges for comparison
+    normalized_independent = {normalize_edge(e) for e in independent_edges}
+    
+    # Categorize edges in full network
+    black_edges = []  # In independent networks
+    green_edges = []  # Only in full network
+    
+    for edge in full_network.edges():
+        if normalize_edge(edge) in normalized_independent:
+            black_edges.append(edge)
+        else:
+            green_edges.append(edge)
+    
+    log.info(f"Black edges (in independent): {len(black_edges)}")
+    log.info(f"Green edges (gained in full): {len(green_edges)}")
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(16, 12))
+    
+    # Draw nodes by data type
+    for i, prefix in enumerate(feature_prefixes):
+        nodes_of_type = [n for n in full_network.nodes() if n.startswith(prefix)]
+        
+        if not nodes_of_type:
+            continue
+        
+        # Draw nodes of this type
+        nx.draw_networkx_nodes(
+            full_network, pos,
+            nodelist=nodes_of_type,
+            node_color='#808080',
+            node_size=15,
+            node_shape='o' if i == 0 else 's',
+            alpha=0.5,
+            linewidths=0.5,
+            edgecolors='white',
+            ax=ax,
+            label=f'{prefix.rstrip("_")} nodes'
+        )
+
+    # Draw edges by preserved vs new
+    if black_edges:
+        nx.draw_networkx_edges(
+            full_network, pos,
+            edgelist=black_edges,
+            edge_color='#000000',
+            width=0.25,
+            alpha=0.25,
+            ax=ax
+        )
+    if green_edges:
+        nx.draw_networkx_edges(
+            full_network, pos,
+            edgelist=green_edges,
+            edge_color='#008000',
+            width=0.5,
+            alpha=0.5,
+            ax=ax
+        )
+    
+    # Create legend
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color='#000000', linewidth=2, label=f'Edges shared with independent networks ({len(black_edges)})'),
+        Line2D([0], [0], color='#008000', linewidth=2, label=f'Edges unique to integrated network ({len(green_edges)})')
+    ]
+        
+    # Combine legends
+    leg = ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
+    
+    # Title
+    ax.set_title(
+        f"Full Integrated Network",
+        fontsize=14,
+        pad=20
+    )
+    ax.axis('off')
+    plt.show()
+    plt.close(fig)
+    
+    return
 
 # ====================================
 # Dataset acquisition functions
@@ -2518,7 +4874,7 @@ def generate_tx_annotation_table(
         raise ValueError("Either input raw_data or computed annotation_df is empty. Cannot validate gene IDs.")
 
     annotation_df = annotation_df.set_index('transcriptome_id')
-    annotation_df = annotation_df.applymap(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
+    annotation_df = annotation_df.map(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
     write_integration_file(annotation_df, output_dir, output_filename, indexing=True)
 
     return annotation_df
@@ -3220,7 +5576,7 @@ def generate_mx_annotation_table(
     mapping_df = pd.DataFrame(mapping_data)
     mapping_df.rename(columns={'metabolite_id': 'metabolome_id'}, inplace=True)
     mapping_df = mapping_df.set_index('metabolome_id')
-    mapping_df = mapping_df.applymap(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
+    mapping_df = mapping_df.map(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
     mapping_df['display_name'] = mapping_df['Compound_Name']
     
     # Validate annotation IDs against raw data before saving
@@ -4017,10 +6373,10 @@ def filter_data(
         log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - filtered_data.shape[0]} to keep {filtered_data.shape[0]}.")
     elif filter_method == "proportion":
         log.info(f"Filtering out features with {filter_method} method in {dataset_name} that were observed in fewer than {filter_value}% samples...")
-        row_min = max(data.min(axis=1), 0)
-        min_count = (data.eq(row_min, axis=0)).sum(axis=1)
+        global_min = data.values.min()
+        min_count = (data <= global_min).sum(axis=1)
         min_proportion = min_count / data.shape[1]
-        filtered_data = data[min_proportion <= filter_value / 100]
+        filtered_data = data[min_proportion < filter_value / 100]
         log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - filtered_data.shape[0]} to keep {filtered_data.shape[0]}.")
     elif filter_method == "none":
         log.info("Not filtering any features.")
@@ -4080,36 +6436,103 @@ def scale_data(
     norm_method: str = "modified_zscore"
 ) -> pd.DataFrame:
     """
-    Normalize and scale a feature matrix using log2 and z-score, modified z-score, or log-fold-change methods.
-
-    Args:
-        df (pd.DataFrame): Feature matrix.
-        output_dir (str): Output directory.
-        dataset_name (str): Dataset name (for stdout)
-        log2 (bool): Apply log2 transformation.
-        norm_method (str): Normalization method ('zscore', 'modified_zscore', 'logfc_mean', 'logfc_median', 'logfc_geometric_mean').
-
-    Returns:
-        pd.DataFrame: Scaled feature matrix.
+    Normalize and scale feature matrix with multiple methods.
+    
+    New norm_methods:
+    - 'quantile': Force identical distributions across all features
+    - 'rank_normal': Rank-based inverse normal transformation
+    - 'vst': Variance stabilizing transformation + z-score
+    - 'vsn': Variance Stabilizing Normalization
     """
+    
     if norm_method == "none":
         log.info("Not scaling data.")
-        scaled_df = df
-    else:
-        df = df.apply(pd.to_numeric, errors='coerce')
-        if log2 is True and norm_method not in ["logfc_mean", "logfc_median", "logfc_geometric_mean"]:
-            log.info(f"Transforming {dataset_name} data by log2 before scaling...")
-            unscaled_df = df.copy()
-            df = unscaled_df.apply(pd.to_numeric, errors='coerce')
+        return df
+    
+    # Convert to numeric
+    df = df.apply(pd.to_numeric, errors='coerce')
+    
+    # Quantile normalization (forces identical distribution)
+    if norm_method == "quantile":
+        log.info(f"Applying quantile normalization to {dataset_name}...")
+        
+        # Get reference distribution (sorted values of all data)
+        reference = np.sort(df.values.flatten())
+        
+        # Apply to each column
+        scaled_values = np.zeros_like(df.values)
+        for j in range(df.shape[1]):
+            ranks = rankdata(df.iloc[:, j], method='average')
+            for i in range(df.shape[0]):
+                idx = int(ranks[i]) - 1
+                scaled_values[i, j] = reference[idx]
+        
+        scaled_df = pd.DataFrame(scaled_values, index=df.index, columns=df.columns)
+    
+    # Rank-based inverse normal transformation
+    elif norm_method == "rank_normal":
+        log.info(f"Applying rank-based inverse normal transformation to {dataset_name}...")
+        
+        def transform_col(col):
+            ranks = rankdata(col, method='average')
+            quantiles = ranks / (len(ranks) + 1)
+            return norm.ppf(quantiles)
+        
+        scaled_df = df.apply(transform_col, axis=0)
+    
+    # VST + z-score (good for count data)
+    elif norm_method == "vst":
+        log.info(f"Applying VST transformation to {dataset_name}...")
+        vst_df = np.arcsinh(np.sqrt(df))
+        scaled_df = vst_df.apply(lambda x: (x - x.mean()) / x.std(), axis=0)
+    
+    # VSN - Variance Stabilizing Normalization
+    elif norm_method == "vsn":
+        log.info(f"Applying VSN transformation to {dataset_name}...")
+        
+        # Convert to numpy array
+        X = df.values.astype(float)
+        
+        # VSN transformation function
+        def _vsn_transform(x: np.ndarray, lam: float) -> np.ndarray:
+            """Element-wise VSN transform: g_λ(x) = log2[(x + sqrt(x² + λ)) / 2]"""
+            x = np.where(x < 0, 0.0, x)
+            return np.log2((x + np.sqrt(x * x + lam)) / 2.0)
+        
+        # Estimate lambda by minimizing variance of transformed data
+        def _objective(lam_candidate: float) -> float:
+            if lam_candidate <= 0:
+                return np.inf
+            Y = _vsn_transform(X, lam_candidate)
+            return np.nanvar(Y)
+        
+        # Use scipy's bounded minimizer to find optimal lambda
+        res = minimize_scalar(
+            _objective,
+            bounds=(1e-6, 1e6),
+            method='bounded',
+            options={'xatol': 1e-8}
+        )
+        
+        if not res.success:
+            raise RuntimeError(
+                f"λ estimation failed for VSN: {res.message}. "
+                "Try a different normalization method."
+            )
+        
+        lam = res.x
+        log.info(f"  Estimated λ = {lam:.6f} for VSN transformation")
+        
+        # Apply transformation with estimated lambda
+        Y = _vsn_transform(X, lam)
+        scaled_df = pd.DataFrame(Y, index=df.index, columns=df.columns)
+    
+    elif norm_method in ["zscore", "modified_zscore", "logfc_mean", "logfc_median", "logfc_geometric_mean"]:
+        if log2 and norm_method not in ["logfc_mean", "logfc_median", "logfc_geometric_mean"]:
             df = np.log2(df + 1)
-        elif log2 is True and norm_method in ["logfc_mean", "logfc_median", "logfc_geometric_mean"]:
-            log.warning(f"Note: Not applying log2 transformation before {norm_method} scaling, as it is included in the method.")
-
         if norm_method == "zscore":
-            log.info(f"Scaling {dataset_name} data to z-scores...")
             scaled_df = df.apply(lambda x: (x - x.mean()) / x.std(), axis=0)
         elif norm_method == "modified_zscore":
-            log.info(f"Scaling {dataset_name} data to modified z-scores...")
             scaled_df = df.apply(lambda x: ((x - x.median()) * 0.6745) / (x - x.median()).abs().median(), axis=0)
         elif norm_method == "logfc_mean":
             log.info(f"Scaling {dataset_name} data using log2 fold-change relative to mean...")
@@ -4130,14 +6553,16 @@ def scale_data(
             scaled_df = np.log2(df_pseudocount.divide(geometric_means, axis=0))
         else:
             raise ValueError("Please select a valid norm_method: 'zscore', 'modified_zscore', 'logfc_mean', 'logfc_median', or 'logfc_geometric_mean'.")
+    else:
+        raise ValueError(f"Unknown norm_method: {norm_method}")
 
     # Ensure output is float, and replace NA/inf/-inf with 0
-    scaled_df = scaled_df.astype(float)
-    scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan)
-    scaled_df = scaled_df.fillna(0)
+    scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan).fillna(0).astype(float)
 
-    log.info(f"Saving scaled data for {dataset_name}...")
-    write_integration_file(scaled_df, output_dir, output_filename, indexing=True)
+    if output_dir:
+        log.info(f"Saving scaled data for {dataset_name}...")
+        write_integration_file(scaled_df, output_dir, output_filename, indexing=True)
+
     return scaled_df
 
 def remove_low_replicable_features(
@@ -4218,6 +6643,7 @@ def _draw_pca(ax, pca_df: pd.DataFrame, hue_col: str,
         palette="viridis",
         bw_adjust=2,
         ax=ax,
+        warn_singular=False
     )
     sns.scatterplot(
         data=pca_df,
@@ -4235,6 +6661,45 @@ def _draw_pca(ax, pca_df: pd.DataFrame, hue_col: str,
     ax.set_ylabel("PCA2")
     ax.set_title(title, fontsize=10)
     ax.legend(title=hue_col, loc="best", fontsize=8)
+
+def plot_simple_pca(
+    df: pd.DataFrame,
+    metadata: pd.DataFrame,
+    metadata_variables: List[str],
+    title: str = "PCA Plot"):
+    """
+    Plot a simple PCA for a single dataset and metadata variable.
+    """
+    df_samples = set(df.columns)
+    if 'unique_group' not in metadata.columns:
+        metadata['unique_group'] = metadata.index
+    meta_samples = set(metadata["unique_group"])
+    common = list(df_samples & meta_samples)
+
+    # build PCA matrix
+    X = (
+        df.T.loc[common]
+        .replace([np.inf, -np.inf], np.nan)
+        .infer_objects(copy=False)
+        .apply(pd.to_numeric, errors='coerce')
+        .fillna(0)
+    )
+
+    pca = PCA(n_components=2)
+    pcs = pca.fit_transform(X)
+    pca_df = pd.DataFrame(pcs, columns=["PCA1", "PCA2"], index=X.index)
+    pca_df = pca_df.reset_index().rename(columns={"index": "unique_group"})
+
+    # attach metadata columns (all of them - KD-plot can use any)
+    pca_df = pca_df.merge(metadata, on="unique_group", how="left")
+
+    # individual PDF plots
+    for meta_var in metadata_variables:
+        fig, ax = plt.subplots(figsize=(6, 5))
+        plot_title = f"{title} - {meta_var}"
+        _draw_pca(ax, pca_df, hue_col=meta_var, title=title, alpha=0.75)
+        display(fig)
+        plt.close(fig)
 
 def plot_pca(
     data: Dict[str, pd.DataFrame],
@@ -4272,7 +6737,13 @@ def plot_pca(
             continue
 
         # build PCA matrix
-        X = df.T.loc[common].fillna(0).replace([np.inf, -np.inf], 0)
+        X = (
+            df.T.loc[common]
+            .replace([np.inf, -np.inf], np.nan)
+            .infer_objects(copy=False)
+            .apply(pd.to_numeric, errors='coerce')
+            .fillna(0)
+        )
 
         pca = PCA(n_components=2)
         pcs = pca.fit_transform(X)
@@ -4399,6 +6870,39 @@ def plot_data_variance_indv_histogram(
     
     plt.show()
 
+
+def plot_simple_histogram(
+    dataframe: pd.DataFrame,
+    title: str,
+    bins: int = 50,
+    transparency: float = 0.8,
+    xlog: bool = False,
+) -> None:
+
+    plt.figure(figsize=(10, 6))
+    palette = sns.color_palette("viridis", 1)
+
+    sns.histplot(
+        dataframe.values.flatten(),
+        bins=bins,
+        kde=False,
+        color=palette[0],
+        element="step",
+        edgecolor="black",
+        fill=True,
+        alpha=transparency
+    )
+
+    if xlog:
+        plt.xscale('log')
+    plt.title(title)
+    plt.xlabel('Quantitative value')
+    plt.ylabel('Frequency')
+    plt.legend()
+    plt.show()
+    plt.close()
+
+
 def plot_data_variance_histogram(
     dataframes: dict[str, pd.DataFrame],
     datatype: str,
@@ -4413,10 +6917,12 @@ def plot_data_variance_histogram(
 
     Args:
         dataframes (dict of str: pd.DataFrame): Dictionary mapping labels to feature matrices.
+        datatype (str): Type of data being plotted.
         bins (int): Number of histogram bins.
         transparency (float): Alpha for bars.
         xlog (bool): Use log scale for x-axis.
         output_dir (str, optional): Output directory for plots.
+        show_plot (bool): Whether to display the plot.
 
     Returns:
         None
@@ -4941,497 +7447,6 @@ def plot_alluvial_for_submodules(
         fig.write_image(output_pdf, width=width, height=height)
 
 # ====================================
-# MOFA functions
-# ====================================
-
-def run_full_mofa2_analysis(
-    integrated_data: pd.DataFrame,
-    mofa2_views: List[str],
-    metadata: pd.DataFrame,
-    output_dir: str,
-    output_filename: str,
-    num_factors: int = 5,
-    num_features: int = 10,
-    num_iterations: int = 100,
-    training_seed: int = 555,
-    overwrite: bool = False
-) -> None:
-    """
-    Run a full MOFA2 analysis pipeline for multiple omics datasets and metadata groups.
-    https://biofam.github.io/MOFA2/
-
-    Args:
-        integrated_data (pd.DataFrame): Integreated omics dataframe (features x samples).
-        mofa2_views (list of str): Names for each omics view (e.g., ['tx', 'mx']).
-        metadata (pd.DataFrame): Metadata DataFrame (samples x variables).
-        output_dir (str): Output directory for results.
-        output_filename (str): Name for model h5 file.
-        num_factors (int): Number of MOFA factors to compute.
-        num_features (int): Number of top features to plot per factor.
-        num_iterations (int): Number of training iterations.
-        training_seed (int): Random seed for reproducibility.
-        overwrite (bool): Overwrite existing results if True.
-
-    Returns:
-        None
-    """
-
-    clear_directory(output_dir)
-
-    melted_dfs = []
-    for datatype in mofa2_views:
-        datatype_df = integrated_data.loc[integrated_data.index.str.contains(datatype)]
-        datatype_df = datatype_df.rename_axis('features').reset_index()
-        datatype_df_melted = datatype_df.melt(id_vars=['features'], var_name='sample', value_name='value')
-        datatype_df_melted['view'] = datatype
-        melted_dfs.append(datatype_df_melted)
-    mofa_data = pd.concat(melted_dfs, ignore_index=True)
-    
-    # Merge with metadata
-    mofa_metadata = metadata.loc[metadata.index.isin(mofa_data['sample'].unique())]
-    mofa_data = mofa_data.merge(mofa_metadata, left_on='sample', right_index=True, how='left')
-    mofa_data = mofa_data[['sample', 'group', 'features', 'view', 'value']]
-    mofa_data = mofa_data.rename(columns={'features': 'feature'})
-
-    log.info("Converted omics data to mofa2 format:")
-
-    # Run the model and load to memory
-    model_file = run_mofa2_model(data=mofa_data, output_dir=output_dir, output_filename=output_filename,
-                                num_factors=num_factors, num_iterations=num_iterations, 
-                                training_seed=training_seed)
-    
-    model = load_mofa2_model(model_file)
-    model.metadata = mofa_metadata
-    model.metadata.index.name = 'sample'
-
-    # Print and save output stats and info
-    info_text = f"""\
-    Information for model:\n
-        Samples: {model.shape[0]}
-        Features: {model.shape[1]}
-        Groups: {', '.join(model.groups)}
-        Datasets: {', '.join(model.views)}
-    """
-    info_file_path = os.path.join(output_dir, f"mofa2_model_summary.txt")
-    with open(info_file_path, 'w') as f:
-        f.write(info_text)
-    log.info(info_text)
-
-    # Calculate and save model stats
-    calculate_mofa2_feature_weights_and_r2(model=model, output_dir=output_dir, num_factors=num_factors)        
-
-    # Plot and save generic output graphs
-    #plot_mofa2_factor_r2(model=model, output_dir=output_subdir, num_factors=num_factors)
-    plot_mofa2_feature_weights_linear(model=model, num_features=num_features, output_dir=output_dir)
-    for dataset in mofa2_views:
-        plot_mofa2_feature_weights_scatter(model=model, data_type=dataset, factorX="Factor0", factorY="Factor1",
-                                           num_features=num_features, output_dir=output_dir)
-    # for dataset in mofa2_views:
-    #     plot_mofa2_feature_importance_per_factor(model=model, num_features=num_features,
-    #                                              data_type=dataset, output_dir=output_dir)
-    return mofa_data
-
-def run_mofa2_model(
-    data: pd.DataFrame,
-    output_dir: str = None,
-    output_filename: str = "mofa2_model.hdf5",
-    num_factors: int = 1,
-    num_iterations: int = 100,
-    training_seed: int = 555
-) -> str:
-    """
-    Run MOFA2 model training and save the model to disk.
-
-    Args:
-        data (pd.DataFrame): Melted MOFA2 input DataFrame.
-        output_dir (str): Output directory for model file.
-        num_factors (int): Number of factors to compute.
-        num_iterations (int): Number of training iterations.
-        training_seed (int): Random seed for reproducibility.
-
-    Returns:
-        str: Path to the saved MOFA2 model file.
-    """
-
-    outfile = os.path.join(output_dir, output_filename)
-        
-    ent = entry_point()
-    ent.set_data_options(
-        scale_views = False
-    )
-
-    ent.set_data_df(data)
-
-    ent.set_model_options(
-        factors = num_factors, 
-        spikeslab_weights = True, 
-        ard_weights = True,
-        ard_factors = True
-    )
-
-    ent.set_train_options(
-        iter = num_iterations,
-        convergence_mode = "fast", 
-        dropR2 = 0.001, 
-        gpu_mode = False, 
-        seed = training_seed
-    )
-
-    ent.build()
-
-    ent.run()
-
-    log.info(f"Exporting model to disk as {outfile}...")
-    ent.save(outfile=outfile,save_data=True)
-    return outfile
-
-def load_mofa2_model(filename: str):
-    """
-    Load a MOFA2 model from file.
-
-    Args:
-        filename (str): Path to MOFA2 model file.
-
-    Returns:
-        MOFA2 model object.
-    """
-
-    model = mofax.mofa_model(filename)
-    return model
-
-def calculate_mofa2_feature_weights_and_r2(
-    model,
-    output_dir: str,
-    num_factors: int
-) -> None:
-    """
-    Calculate and save MOFA2 feature weights and R2 tables for each factor.
-
-    Args:
-        model: MOFA2 model object.
-        output_dir (str): Output directory to save results.
-        num_factors (int): Number of MOFA factors.
-
-    Returns:
-        None
-    """
-
-    feature_weight_per_factor = model.get_weights(df=True)
-    feature_weight_per_factor.set_index(feature_weight_per_factor.columns[0], inplace=False)
-    feature_weight_per_factor['abs_sum'] = feature_weight_per_factor.abs().sum(axis=1)
-    feature_weight_per_factor.sort_values(by='abs_sum', ascending=False, inplace=True)
-
-    r2_table = model.get_r2(factors=list(range(num_factors))).sort_values("R2", ascending=False)
-
-    log.info(f"Saving mofa2 factor weights and R2 tables...")
-    write_integration_file(feature_weight_per_factor, output_dir, f"mofa2_feature_weight_per_factor", index_label='Feature')
-    write_integration_file(r2_table, output_dir, f"mofa2_r2_per_factor", indexing=False)
-
-def plot_mofa2_factor_r2(
-    model,
-    output_dir: str,
-    num_factors: int
-) -> "plt.Figure":
-    """
-    Plot and save the R2 values for each MOFA2 factor.
-
-    Args:
-        model: MOFA2 model object.
-        output_dir (str): Output directory to save the plot.
-        num_factors (int): Number of MOFA factors to compute.
-
-    Returns:
-        plt.Figure: The matplotlib figure object for the R2 plot.
-    """
-
-    r2_plot = mofax.plot_r2(model, factors=list(range(num_factors)), cmap="Blues")
-
-    log.info(f"Printing and saving mofa2 factor R2 plot...")
-    r2_plot.figure.savefig(f'{output_dir}/mofa2_r2_per_factor.pdf')
-
-    return r2_plot
-
-def plot_mofa2_feature_weights_linear(
-    model,
-    output_dir: str,
-    num_features: int
-) -> "plt.Figure":
-    """
-    Plot and save the linear feature weights for MOFA2 factors.
-
-    Args:
-        model: MOFA2 model object.
-        output_dir (str): Output directory to save the plot.
-        num_features (int): Number of top features to plot per factor.
-
-    Returns:
-        plt.Figure: The matplotlib figure object for the feature weights plot.
-    """
-
-    feature_plot = mofax.plot_weights(model, n_features=num_features, label_size=7)
-    feature_plot.figure.set_size_inches(16, 8)
-
-    log.info(f"Printing and saving mofa2 feature weights linear plot...")
-    feature_plot.figure.savefig(f'{output_dir}/mofa2_feature_weights_linear_plot_combined_data.pdf')
-
-    return feature_plot
-
-def plot_mofa2_feature_weights_scatter(
-    model,
-    data_type: str,
-    factorX: str,
-    factorY: str,
-    num_features: int,
-    output_dir: str
-) -> "plt.Figure":
-    """
-    Plot and save a scatterplot of feature weights for two MOFA2 factors.
-
-    Args:
-        model: MOFA2 model object.
-        data_type (str): Omics view (e.g., 'tx', 'mx').
-        factorX (str): Name of the first factor (e.g., 'Factor0').
-        factorY (str): Name of the second factor (e.g., 'Factor1').
-        num_features (int): Number of top features to plot.
-        output_dir (str): Output directory to save the plot.
-
-    Returns:
-        plt.Figure: The matplotlib figure object for the scatter plot.
-    """
-
-    feature_plot = mofax.plot_weights_scatter(
-        model,
-        view=data_type,
-        x=factorX, 
-        y=factorY, 
-        hist=True,
-        label_size=8,
-        n_features=num_features, 
-        linewidth=0, 
-        alpha=0.5,
-        height=10  # For sns.jointplot
-    )
-    feature_plot.figure.set_size_inches(10, 10)
-
-    log.info(f"Printing and saving {data_type} mofa2 feature weights scatter plot...")
-    feature_plot.figure.savefig(f'{output_dir}/mofa2_feature_weights_scatter_plot_{data_type}_data.pdf')
-
-    return feature_plot
-
-def plot_mofa2_feature_importance_per_factor(
-    model,
-    num_features: int,
-    data_type: str,
-    output_dir: str
-) -> "plt.Figure":
-    """
-    Plot and save a dotplot of feature importance per MOFA2 factor.
-
-    Args:
-        model: MOFA2 model object.
-        num_features (int): Number of top features to plot.
-        data_type (str): Omics view (e.g., 'tx', 'mx').
-        output_dir (str): Output directory to save the plot.
-
-    Returns:
-        plt.Figure: The matplotlib figure object for the dotplot.
-    """
-
-    plot = mofax.plot_weights_dotplot(model, 
-                                        n_features=num_features, 
-                                        view=data_type,
-                                        w_abs=True, 
-                                        yticklabels_size=8)
-
-    log.info(f"Printing and saving {data_type} mofa2 feature importance per factor plot...")
-    plot.figure.savefig(f'{output_dir}/mofa2_feature_importance_per_factor_for_{data_type}_data.pdf')
-
-    return plot
-
-# ====================================
-# MAGI functions
-# ====================================
-
-# def run_magi2(
-#     run_name: str,
-#     sequence_file: str,
-#     compound_file: str,
-#     output_dir: str,
-#     magi2_source_dir: str,
-#     overwrite: bool = False
-# ) -> tuple[str, str]:
-#     """
-#     Run MAGI2 analysis by submitting a SLURM job on NERSC.
-
-#     Args:
-#         run_name (str): Name for the MAGI2 run.
-#         sequence_file (str): Path to the protein FASTA file.
-#         compound_file (str): Path to the compound input file.
-#         output_dir (str): Output directory for MAGI2 results.
-#         magi2_source_dir (str): Directory containing MAGI2 scripts.
-#         overwrite (bool): Overwrite existing results if True.
-
-#     Returns:
-#         tuple: (compound_results_file, gene_results_file) paths to MAGI2 output files.
-#     """
-
-#     if os.path.exists(f"{output_dir}/{run_name}/output_{run_name}") and overwrite is False:
-#         log.info(f"MAGI2 results directory already exists: {output_dir}/{run_name}/output_{run_name}. \nNot queueing new job.")
-#         log.info("Returning path to existing results files.")
-#         compound_results_file = f"{output_dir}/{run_name}/output_{run_name}/magi2_compounds.csv"
-#         gene_results_file = f"{output_dir}/{run_name}/output_{run_name}/magi2_gene_results.csv"
-#         return compound_results_file, gene_results_file
-#     elif os.path.exists(f"{output_dir}/{run_name}/output_{run_name}/") and overwrite is True:
-#         log.info(f"Overwriting existing submodule Sankey diagrams in {os.path.join(submodules_dir, 'submodule_sankeys')}.")
-#         shutil.rmtree(os.path.join(output_dir, "magi2_sankeys"))
-#         os.makedirs(os.path.join(output_dir, "magi2_sankeys"), exist_ok=True)
-#     elif not os.path.exists(f"{output_dir}/{run_name}/output_{run_name}/"):
-#         os.makedirs(f"{output_dir}/{run_name}/output_{run_name}/", exist_ok=True)
-
-#     log.info("Queueing MAGI2 with sbatch...\n")
-
-#     SLURM_PERLMUTTER_HEADER = """#!/bin/bash
-
-# #SBATCH -N 1
-# #SBATCH --exclusive
-# #SBATCH --error="slurm.err"
-# #SBATCH --output="slurm.out"
-# #SBATCH -A m2650
-# #SBATCH -C cpu
-# #SBATCH --qos=regular
-# #SBATCH -t 6:00:00
-
-#     """
-
-#     magi2_sbatch_filename = f"{output_dir}/magi2_slurm.sbatch"
-#     magi2_runner_filename = f"{output_dir}/magi2_kickoff.sh"
-#     cmd = f"{magi2_source_dir}/run_magi2.sh {run_name} {sequence_file} {compound_file} {output_dir} {magi2_source_dir}\n\necho MAGI2 completed."
-
-#     with open(magi2_sbatch_filename,'w') as fid:
-#         fid.write(f"{SLURM_PERLMUTTER_HEADER.replace('slurm', f'{output_dir}/magi2_slurm')}\n{cmd}")
-#     with open(magi2_runner_filename,'w') as fid:
-#         fid.write(f"sbatch {magi2_sbatch_filename}")
-
-#     with open(magi2_runner_filename, 'r') as fid:
-#         cmd = fid.read()
-#         sbatch_output = subprocess.run(cmd, shell=True, executable='/bin/bash', stdout=subprocess.PIPE)
-#         sbatch_output_str = sbatch_output.stdout.decode('utf-8').replace('\n', '')
-#         job_id = sbatch_output_str.split()[-1]
-
-#     user = os.getenv('USER')
-#     log.info(f"MAGI2 job submitted with ID: {job_id}. Check status with 'squeue -u {user}'.")
-#     return "",""
-
-# def summarize_fbmn_results(
-#     fbmn_results_dir: str,
-#     polarity: str,
-#     overwrite: bool = False
-# ) -> None:
-#     """
-#     Summarize FBMN results and export a cleaned compound table.
-
-#     Args:
-#         fbmn_results_dir (str): Directory with FBMN results.
-#         polarity (str): Polarity ('positive', 'negative', 'multipolarity').
-#         overwrite (bool): Overwrite existing output if True.
-
-#     Returns:
-#         None
-#     """
-
-#     fbmn_output_filename = f"{fbmn_results_dir}/fbmn_compounds.csv"
-#     if os.path.exists(fbmn_output_filename) and overwrite is False:
-#         log.info(f"FBMN output summary already exists: {fbmn_output_filename}. Not overwriting.")
-#         return
-    
-#     log.info(f"Summarizing FBMN file {fbmn_output_filename}.")
-#     try:
-#         if polarity == "multipolarity":
-#             compound_files = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*library-results.tsv"))
-#             if compound_files:
-#                 if len(compound_files) > 1:
-#                     multipolarity_datasets = []
-#                     for mx_data_file in compound_files:
-#                         file_polarity = (
-#                             "positive" if "positive" in mx_data_file 
-#                             else "negative" if "negative" in mx_data_file 
-#                             else "NO_POLARITY"
-#                         )
-#                         mx_dataset = pd.read_csv(mx_data_file, sep='\t')
-#                         mx_data = mx_dataset.copy()
-#                         mx_data["#Scan#"] = "mx_" + mx_data["#Scan#"].astype(str) + "_" + file_polarity
-#                         multipolarity_datasets.append(mx_data)
-#                     fbmn_summary = pd.concat(multipolarity_datasets, axis=0)
-#                 elif len(compound_files) == 1:
-#                     log.info(f"Warning: Only single compound files found with polarity set to multipolarity.")
-#                     fbmn_summary = pd.read_csv(compound_files[0], sep='\t')
-#         elif polarity in ["positive", "negative"]:
-#             compound_file = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*{polarity}*library-results.tsv"))
-#             if len(compound_file) > 1:
-#                 log.info(f"Multiple compound files found: {compound_file}. \n\nPlease check {fbmn_results_dir} to verify and use the compound_filename argument.")
-#                 return None
-#             elif len(compound_file) == 0:
-#                 log.info(f"No compound files found for {polarity} polarity.")
-#                 return None
-#             elif len(compound_file) == 1:
-#                 fbmn_summary = pd.read_csv(compound_file[0], sep='\t')
-#                 fbmn_summary["#Scan#"] = "mx_" + fbmn_summary["#Scan#"].astype(str) + "_" + file_polarity
-#             log.info(f"\nUsing metabolomics compound file at {compound_file}")
-#     except Exception as e:
-#         log.info(f"Compound file could not be read due to {e}")
-#         return None
-
-#     log.info("\tConverting FBMN outputs to summary format.")
-#     fbmn_data = fbmn_summary.rename(columns={"Smiles": 'original_compound'})
-#     fbmn_data['original_compound'] = fbmn_data['original_compound'].str.strip().replace(r'^\s*$', None, regex=True)
-
-#     # Check that smiles is valid to get mol object with rdkit
-#     keep_smiles = []
-#     for smiles in list(fbmn_data['original_compound']):
-#         if pd.isna(smiles):
-#             continue
-#         smiles_str = str(smiles)
-#         mol = Chem.MolFromSmiles(smiles_str)
-#         if mol is not None:
-#             keep_smiles.append(smiles_str)
-#     fbmn_data = fbmn_data[fbmn_data['original_compound'].isin(keep_smiles)]
-
-#     fbmn_data.to_csv(fbmn_output_filename, index=False)
-    
-#     return
-
-# def convert_nucleotides_to_amino_acids(
-#     input_fasta: str
-# ) -> list:
-#     """
-#     Convert nucleotide FASTA sequences to amino acid sequences.
-
-#     Args:
-#         input_fasta (str): Path to nucleotide FASTA file.
-
-#     Returns:
-#         list: List of SeqRecord objects with amino acid sequences.
-#     """
-
-#     amino_acid_sequences = []
-    
-#     if input_fasta.endswith('.gz'):
-#         open_func = gzip.open
-#     else:
-#         open_func = open
-    
-#     with open_func(input_fasta, 'rt') as in_handle:
-#         for record in SeqIO.parse(in_handle, "fasta"):
-#             amino_acid_seq = record.seq.translate()
-#             amino_acid_seq = amino_acid_seq.replace('*', '')
-#             new_record = record[:]
-#             new_record.seq = amino_acid_seq
-#             amino_acid_sequences.append(new_record)
-    
-#     log.info(f"\tConverted nucleotide -> amino acid sequences.")
-#     return amino_acid_sequences
-
-# ====================================
 # Functional Enrichment
 # ====================================
 
@@ -5647,8 +7662,7 @@ def perform_functional_enrichment(
     log.info(f"  Total tests performed: {n_total_tests}")
     log.info(f"  Significant enrichments (< {p_value_threshold}): {n_significant}")
     log.info(f"  Background: {total_nodes_in_network_with_annotations}/{total_nodes_in_network} nodes with annotations")
-    log.info("Results preview:")
-    display(results_df.head())
+    log.info(f"List of significant functional categories: {results_df[results_df['significant'] == True]['annotation_term'].unique().tolist()}")
     
     # Save results if output directory provided
     if output_dir:
@@ -5662,326 +7676,817 @@ def perform_functional_enrichment(
     return results_df
 
 # ====================================
-# Output functions
+# MOFA functions
 # ====================================
 
-def create_excel_metadata_sheet(
-    tx_metadata: pd.DataFrame,
-    mx_metadata: pd.DataFrame,
-    output_dir: str,
-    project_name: str
-) -> None:
-    """
-    Create an Excel metadata template for user integration of transcriptomics and metabolomics metadata.
+# def run_full_mofa2_analysis(
+#     integrated_data: pd.DataFrame,
+#     mofa2_views: List[str],
+#     metadata: pd.DataFrame,
+#     output_dir: str,
+#     output_filename: str,
+#     num_factors: int = 5,
+#     num_features: int = 10,
+#     num_iterations: int = 100,
+#     training_seed: int = 555,
+#     overwrite: bool = False
+# ) -> None:
+#     """
+#     Run a full MOFA2 analysis pipeline for multiple omics datasets and metadata groups.
+#     https://biofam.github.io/MOFA2/
 
-    Args:
-        tx_metadata (pd.DataFrame): Transcriptomics metadata DataFrame.
-        mx_metadata (pd.DataFrame): Metabolomics metadata DataFrame.
-        output_dir (str): Output directory for the Excel file.
-        project_name (str): Project name for the file.
+#     Args:
+#         integrated_data (pd.DataFrame): Integreated omics dataframe (features x samples).
+#         mofa2_views (list of str): Names for each omics view (e.g., ['tx', 'mx']).
+#         metadata (pd.DataFrame): Metadata DataFrame (samples x variables).
+#         output_dir (str): Output directory for results.
+#         output_filename (str): Name for model h5 file.
+#         num_factors (int): Number of MOFA factors to compute.
+#         num_features (int): Number of top features to plot per factor.
+#         num_iterations (int): Number of training iterations.
+#         training_seed (int): Random seed for reproducibility.
+#         overwrite (bool): Overwrite existing results if True.
 
-    Returns:
-        None
-    """
+#     Returns:
+#         None
+#     """
 
-    # Create the data for the "Instructions" tab
-    log.info("Creating metadata Excel file...")
-    instructions_text = (
-        "Placeholder\n\n"
-    )
-    critical_message = (
-        "Placeholder\n\n"
-    )
+#     clear_directory(output_dir)
 
-    instructions_df = pd.DataFrame([instructions_text], columns=["Instructions"])
+#     melted_dfs = []
+#     for datatype in mofa2_views:
+#         datatype_df = integrated_data.loc[integrated_data.index.str.contains(datatype)]
+#         datatype_df = datatype_df.rename_axis('features').reset_index()
+#         datatype_df_melted = datatype_df.melt(id_vars=['features'], var_name='sample', value_name='value')
+#         datatype_df_melted['view'] = datatype
+#         melted_dfs.append(datatype_df_melted)
+#     mofa_data = pd.concat(melted_dfs, ignore_index=True)
+    
+#     # Merge with metadata
+#     mofa_metadata = metadata.loc[metadata.index.isin(mofa_data['sample'].unique())]
+#     mofa_data = mofa_data.merge(mofa_metadata, left_on='sample', right_index=True, how='left')
+#     mofa_data = mofa_data[['sample', 'group', 'features', 'view', 'value']]
+#     mofa_data = mofa_data.rename(columns={'features': 'feature'})
 
-    # Create the data for the "RNA" tab
-    transcript_df = tx_metadata[['library_name', 'sample_name', 'sample_isolated_from', 'collection_isolation_site_or_growth_conditions']]
-    transcript_df.columns = ['JGI_Library_Name', 'JGI_Metadata_SampleName', 'JGI_Metadata_IsolatedFrom', 'JGI_Metadata_Conditions']
-    transcript_df['JGI_DataType'] = "Transcriptomics"
-    transcript_df['JGI_SampleIndex'] = ['tx' + str(i) for i in range(1, len(transcript_df) + 1)]
-    transcript_example_df = pd.DataFrame({
-    'JGI_SampleIndex': ['Example', 'Example', 'Example', 'Example', 'Example', 'Example'],
-    'JGI_DataType': ['Transcriptomics', 'Transcriptomics', 'Transcriptomics', 'Transcriptomics', 'Transcriptomics', 'Transcriptomics'],
-    'JGI_Library_Name': ['GOYZZ', 'GOZAA', 'GOZBS', 'GOZBT', 'GOZAW', 'GOZAX'],
-    'JGI_Metadata_SampleName': ['Swg_Sum_GH_Q13_1', 'Swg_Sum_GH_Q13_2', 'Swg_Fall_GH_Q15_1', 'Swg_Fall_GH_Q15_2', 'Swg_Sum_FT_Q15_1', 'Swg_Sum_FT_Q15_2'],
-    'JGI_Metadata_IsolatedFrom': ['Greenhouse grown Switchgrass (UCBerkeley)', 'Greenhouse grown Switchgrass (UCBerkeley)', 'Greenhouse grown Switchgrass (UCBerkeley)', 'Greenhouse grown Switchgrass (UCBerkeley)', 'Field grown Switchgrass (UCDavis)', 'Field grown Switchgrass (UCDavis)'],
-    'JGI_Metadata_Conditions': ['Greenhouse 1st harvest, Summer_August2018', 'Greenhouse 1st harvest, Summer_August2018', 'Greenhouse 2nd harvest, Fall_Oct2018', 'Greenhouse 2nd harvest, Fall_Oct2018', 'Field trial 1st harvest, Summer_June2018', 'Field trial 1st harvest, Summer_June2018'],
-    'USER_MetadataVar_1': ['Summer', 'Summer', 'Fall', 'Fall', 'Summer', 'Summer'],
-    'USER_MetadataVar_2': ['Greenhouse', 'Greenhouse', 'Greenhouse', 'Greenhouse', 'Field', 'Field'],
-    'USER_MetadataVar_3': ['Q13', 'Q13', 'Q15', 'Q15', 'Q15', 'Q15'],
-    'USER_MetadataVar_4': [pd.NA, pd.NA, pd.NA, pd.NA, pd.NA, pd.NA],
-    'USER_MetadataVar_5': [pd.NA, pd.NA, pd.NA, pd.NA, pd.NA, pd.NA],
-    'USER_Replicate': ["1", "2", "1", "2", "1", "2"]
-    })
+#     log.info("Converted omics data to mofa2 format:")
+
+#     # Run the model and load to memory
+#     model_file = run_mofa2_model(data=mofa_data, output_dir=output_dir, output_filename=output_filename,
+#                                 num_factors=num_factors, num_iterations=num_iterations, 
+#                                 training_seed=training_seed)
+    
+#     model = load_mofa2_model(model_file)
+#     model.metadata = mofa_metadata
+#     model.metadata.index.name = 'sample'
+
+#     # Print and save output stats and info
+#     info_text = f"""\
+#     Information for model:
+#         Samples: {model.shape[0]}
+#         Features: {model.shape[1]}
+#         Groups: {', '.join(model.groups)}
+#         Datasets: {', '.join(model.views)}
+#     """
+#     info_file_path = os.path.join(output_dir, f"mofa2_model_summary.txt")
+#     with open(info_file_path, 'w') as f:
+#         f.write(info_text)
+#     log.info(info_text)
+
+#     # Calculate and save model stats
+#     calculate_mofa2_feature_weights_and_r2(model=model, output_dir=output_dir, num_factors=num_factors)        
+
+#     # Plot and save generic output graphs
+#     #plot_mofa2_factor_r2(model=model, output_dir=output_subdir, num_factors=num_factors)
+#     plot_mofa2_feature_weights_linear(model=model, num_features=num_features, output_dir=output_dir)
+#     for dataset in mofa2_views:
+#         plot_mofa2_feature_weights_scatter(model=model, data_type=dataset, factorX="Factor0", factorY="Factor1",
+#                                            num_features=num_features, output_dir=output_dir)
+#     # for dataset in mofa2_views:
+#     #     plot_mofa2_feature_importance_per_factor(model=model, num_features=num_features,
+#     #                                              data_type=dataset, output_dir=output_dir)
+#     return mofa_data
+
+# def run_mofa2_model(
+#     data: pd.DataFrame,
+#     output_dir: str = None,
+#     output_filename: str = "mofa2_model.hdf5",
+#     num_factors: int = 1,
+#     num_iterations: int = 100,
+#     training_seed: int = 555
+# ) -> str:
+#     """
+#     Run MOFA2 model training and save the model to disk.
+
+#     Args:
+#         data (pd.DataFrame): Melted MOFA2 input DataFrame.
+#         output_dir (str): Output directory for model file.
+#         num_factors (int): Number of factors to compute.
+#         num_iterations (int): Number of training iterations.
+#         training_seed (int): Random seed for reproducibility.
+
+#     Returns:
+#         str: Path to the saved MOFA2 model file.
+#     """
+
+#     outfile = os.path.join(output_dir, output_filename)
+        
+#     ent = entry_point()
+#     ent.set_data_options(
+#         scale_views = False
+#     )
+
+#     ent.set_data_df(data)
+
+#     ent.set_model_options(
+#         factors = num_factors, 
+#         spikeslab_weights = True, 
+#         ard_weights = True,
+#         ard_factors = True
+#     )
+
+#     ent.set_train_options(
+#         iter = num_iterations,
+#         convergence_mode = "fast", 
+#         dropR2 = 0.001, 
+#         gpu_mode = False, 
+#         seed = training_seed
+#     )
+
+#     ent.build()
+
+#     ent.run()
+
+#     log.info(f"Exporting model to disk as {outfile}...")
+#     ent.save(outfile=outfile,save_data=True)
+#     return outfile
+
+# def load_mofa2_model(filename: str):
+#     """
+#     Load a MOFA2 model from file.
+
+#     Args:
+#         filename (str): Path to MOFA2 model file.
+
+#     Returns:
+#         MOFA2 model object.
+#     """
+
+#     model = mofax.mofa_model(filename)
+#     return model
+
+# def calculate_mofa2_feature_weights_and_r2(
+#     model,
+#     output_dir: str,
+#     num_factors: int
+# ) -> None:
+#     """
+#     Calculate and save MOFA2 feature weights and R2 tables for each factor.
+
+#     Args:
+#         model: MOFA2 model object.
+#         output_dir (str): Output directory to save results.
+#         num_factors (int): Number of MOFA factors.
+
+#     Returns:
+#         None
+#     """
+
+#     feature_weight_per_factor = model.get_weights(df=True)
+#     feature_weight_per_factor.set_index(feature_weight_per_factor.columns[0], inplace=False)
+#     feature_weight_per_factor['abs_sum'] = feature_weight_per_factor.abs().sum(axis=1)
+#     feature_weight_per_factor.sort_values(by='abs_sum', ascending=False, inplace=True)
+
+#     r2_table = model.get_r2(factors=list(range(num_factors))).sort_values("R2", ascending=False)
+
+#     log.info(f"Saving mofa2 factor weights and R2 tables...")
+#     write_integration_file(feature_weight_per_factor, output_dir, f"mofa2_feature_weight_per_factor", index_label='Feature')
+#     write_integration_file(r2_table, output_dir, f"mofa2_r2_per_factor", indexing=False)
+
+# def plot_mofa2_factor_r2(
+#     model,
+#     output_dir: str,
+#     num_factors: int
+# ) -> "plt.Figure":
+#     """
+#     Plot and save the R2 values for each MOFA2 factor.
+
+#     Args:
+#         model: MOFA2 model object.
+#         output_dir (str): Output directory to save the plot.
+#         num_factors (int): Number of MOFA factors to compute.
+
+#     Returns:
+#         plt.Figure: The matplotlib figure object for the R2 plot.
+#     """
+
+#     r2_plot = mofax.plot_r2(model, factors=list(range(num_factors)), cmap="Blues")
+
+#     log.info(f"Printing and saving mofa2 factor R2 plot...")
+#     r2_plot.figure.savefig(f'{output_dir}/mofa2_r2_per_factor.pdf')
+
+#     return r2_plot
+
+# def plot_mofa2_feature_weights_linear(
+#     model,
+#     output_dir: str,
+#     num_features: int
+# ) -> "plt.Figure":
+#     """
+#     Plot and save the linear feature weights for MOFA2 factors.
+
+#     Args:
+#         model: MOFA2 model object.
+#         output_dir (str): Output directory to save the plot.
+#         num_features (int): Number of top features to plot per factor.
+
+#     Returns:
+#         plt.Figure: The matplotlib figure object for the feature weights plot.
+#     """
+
+#     feature_plot = mofax.plot_weights(model, n_features=num_features, label_size=7)
+#     feature_plot.figure.set_size_inches(16, 8)
+
+#     log.info(f"Printing and saving mofa2 feature weights linear plot...")
+#     feature_plot.figure.savefig(f'{output_dir}/mofa2_feature_weights_linear_plot_combined_data.pdf')
+
+#     return feature_plot
+
+# def plot_mofa2_feature_weights_scatter(
+#     model,
+#     data_type: str,
+#     factorX: str,
+#     factorY: str,
+#     num_features: int,
+#     output_dir: str
+# ) -> "plt.Figure":
+#     """
+#     Plot and save a scatterplot of feature weights for two MOFA2 factors.
+
+#     Args:
+#         model: MOFA2 model object.
+#         data_type (str): Omics view (e.g., 'tx', 'mx').
+#         factorX (str): Name of the first factor (e.g., 'Factor0').
+#         factorY (str): Name of the second factor (e.g., 'Factor1').
+#         num_features (int): Number of top features to plot.
+#         output_dir (str): Output directory to save the plot.
+
+#     Returns:
+#         plt.Figure: The matplotlib figure object for the scatter plot.
+#     """
+
+#     feature_plot = mofax.plot_weights_scatter(
+#         model,
+#         view=data_type,
+#         x=factorX, 
+#         y=factorY, 
+#         hist=True,
+#         label_size=8,
+#         n_features=num_features, 
+#         linewidth=0, 
+#         alpha=0.5,
+#         height=10  # For sns.jointplot
+#     )
+#     feature_plot.figure.set_size_inches(10, 10)
+
+#     log.info(f"Printing and saving {data_type} mofa2 feature weights scatter plot...")
+#     feature_plot.figure.savefig(f'{output_dir}/mofa2_feature_weights_scatter_plot_{data_type}_data.pdf')
+
+#     return feature_plot
+
+# def plot_mofa2_feature_importance_per_factor(
+#     model,
+#     num_features: int,
+#     data_type: str,
+#     output_dir: str
+# ) -> "plt.Figure":
+#     """
+#     Plot and save a dotplot of feature importance per MOFA2 factor.
+
+#     Args:
+#         model: MOFA2 model object.
+#         num_features (int): Number of top features to plot.
+#         data_type (str): Omics view (e.g., 'tx', 'mx').
+#         output_dir (str): Output directory to save the plot.
+
+#     Returns:
+#         plt.Figure: The matplotlib figure object for the dotplot.
+#     """
+
+#     plot = mofax.plot_weights_dotplot(model, 
+#                                         n_features=num_features, 
+#                                         view=data_type,
+#                                         w_abs=True, 
+#                                         yticklabels_size=8)
+
+#     log.info(f"Printing and saving {data_type} mofa2 feature importance per factor plot...")
+#     plot.figure.savefig(f'{output_dir}/mofa2_feature_importance_per_factor_for_{data_type}_data.pdf')
+
+#     return plot
+
+# # ====================================
+# # MAGI functions
+# # ====================================
+
+# # def run_magi2(
+# #     run_name: str,
+# #     sequence_file: str,
+# #     compound_file: str,
+# #     output_dir: str,
+# #     magi2_source_dir: str,
+# #     overwrite: bool = False
+# # ) -> tuple[str, str]:
+# #     """
+# #     Run MAGI2 analysis by submitting a SLURM job on NERSC.
+
+# #     Args:
+# #         run_name (str): Name for the MAGI2 run.
+# #         sequence_file (str): Path to the protein FASTA file.
+# #         compound_file (str): Path to the compound input file.
+# #         output_dir (str): Output directory for MAGI2 results.
+# #         magi2_source_dir (str): Directory containing MAGI2 scripts.
+# #         overwrite (bool): Overwrite existing results if True.
+
+# #     Returns:
+# #         tuple: (compound_results_file, gene_results_file) paths to MAGI2 output files.
+# #     """
+
+# #     if os.path.exists(f"{output_dir}/{run_name}/output_{run_name}") and overwrite is False:
+# #         log.info(f"MAGI2 results directory already exists: {output_dir}/{run_name}/output_{run_name}. \nNot queueing new job.")
+# #         log.info("Returning path to existing results files.")
+# #         compound_results_file = f"{output_dir}/{run_name}/output_{run_name}/magi2_compounds.csv"
+# #         gene_results_file = f"{output_dir}/{run_name}/output_{run_name}/magi2_gene_results.csv"
+# #         return compound_results_file, gene_results_file
+# #     elif os.path.exists(f"{output_dir}/{run_name}/output_{run_name}/") and overwrite is True:
+# #         log.info(f"Overwriting existing submodule Sankey diagrams in {os.path.join(submodules_dir, 'submodule_sankeys')}.")
+# #         shutil.rmtree(os.path.join(output_dir, "magi2_sankeys"))
+# #         os.makedirs(os.path.join(output_dir, "magi2_sankeys"), exist_ok=True)
+# #     elif not os.path.exists(f"{output_dir}/{run_name}/output_{run_name}/"):
+# #         os.makedirs(f"{output_dir}/{run_name}/output_{run_name}/", exist_ok=True)
+
+# #     log.info("Queueing MAGI2 with sbatch...\n")
+
+# #     SLURM_PERLMUTTER_HEADER = """#!/bin/bash
+
+# # #SBATCH -N 1
+# # #SBATCH --exclusive
+# # #SBATCH --error="slurm.err"
+# # #SBATCH --output="slurm.out"
+# # #SBATCH -A m2650
+# # #SBATCH -C cpu
+# # #SBATCH --qos=regular
+# # #SBATCH -t 6:00:00
+
+# #     """
+
+# #     magi2_sbatch_filename = f"{output_dir}/magi2_slurm.sbatch"
+# #     magi2_runner_filename = f"{output_dir}/magi2_kickoff.sh"
+# #     cmd = f"{magi2_source_dir}/run_magi2.sh {run_name} {sequence_file} {compound_file} {output_dir} {magi2_source_dir}\n\necho MAGI2 completed."
+
+# #     with open(magi2_sbatch_filename,'w') as fid:
+# #         fid.write(f"{SLURM_PERLMUTTER_HEADER.replace('slurm', f'{output_dir}/magi2_slurm')}\n{cmd}")
+# #     with open(magi2_runner_filename,'w') as fid:
+# #         fid.write(f"sbatch {magi2_sbatch_filename}")
+
+# #     with open(magi2_runner_filename, 'r') as fid:
+# #         cmd = fid.read()
+# #         sbatch_output = subprocess.run(cmd, shell=True, executable='/bin/bash', stdout=subprocess.PIPE)
+# #         sbatch_output_str = sbatch_output.stdout.decode('utf-8').replace('\n', '')
+# #         job_id = sbatch_output_str.split()[-1]
+
+# #     user = os.getenv('USER')
+# #     log.info(f"MAGI2 job submitted with ID: {job_id}. Check status with 'squeue -u {user}'.")
+# #     return "",""
+
+# # def summarize_fbmn_results(
+# #     fbmn_results_dir: str,
+# #     polarity: str,
+# #     overwrite: bool = False
+# # ) -> None:
+# #     """
+# #     Summarize FBMN results and export a cleaned compound table.
+
+# #     Args:
+# #         fbmn_results_dir (str): Directory with FBMN results.
+# #         polarity (str): Polarity ('positive', 'negative', 'multipolarity').
+# #         overwrite (bool): Overwrite existing output if True.
+
+# #     Returns:
+# #         None
+# #     """
+
+# #     fbmn_output_filename = f"{fbmn_results_dir}/fbmn_compounds.csv"
+# #     if os.path.exists(fbmn_output_filename) and overwrite is False:
+# #         log.info(f"FBMN output summary already exists: {fbmn_output_filename}. Not overwriting.")
+# #         return
+    
+# #     log.info(f"Summarizing FBMN file {fbmn_output_filename}.")
+# #     try:
+# #         if polarity == "multipolarity":
+# #             compound_files = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*library-results.tsv"))
+# #             if compound_files:
+# #                 if len(compound_files) > 1:
+# #                     multipolarity_datasets = []
+# #                     for mx_data_file in compound_files:
+# #                         file_polarity = (
+# #                             "positive" if "positive" in mx_data_file 
+# #                             else "negative" if "negative" in mx_data_file 
+# #                             else "NO_POLARITY"
+# #                         )
+# #                         mx_dataset = pd.read_csv(mx_data_file, sep='\t')
+# #                         mx_data = mx_dataset.copy()
+# #                         mx_data["#Scan#"] = "mx_" + mx_data["#Scan#"].astype(str) + "_" + file_polarity
+# #                         multipolarity_datasets.append(mx_data)
+# #                     fbmn_summary = pd.concat(multipolarity_datasets, axis=0)
+# #                 elif len(compound_files) == 1:
+# #                     log.info(f"Warning: Only single compound files found with polarity set to multipolarity.")
+# #                     fbmn_summary = pd.read_csv(compound_files[0], sep='\t')
+# #         elif polarity in ["positive", "negative"]:
+# #             compound_file = glob.glob(os.path.expanduser(f"{fbmn_results_dir}/*/*{polarity}*library-results.tsv"))
+# #             if len(compound_file) > 1:
+# #                 log.info(f"Multiple compound files found: {compound_file}. \n\nPlease check {fbmn_results_dir} to verify and use the compound_filename argument.")
+# #                 return None
+# #             elif len(compound_file) == 0:
+# #                 log.info(f"No compound files found for {polarity} polarity.")
+# #                 return None
+# #             elif len(compound_file) == 1:
+# #                 fbmn_summary = pd.read_csv(compound_file[0], sep='\t')
+# #                 fbmn_summary["#Scan#"] = "mx_" + fbmn_summary["#Scan#"].astype(str) + "_" + file_polarity
+# #             log.info(f"\nUsing metabolomics compound file at {compound_file}")
+# #     except Exception as e:
+# #         log.info(f"Compound file could not be read due to {e}")
+# #         return None
+
+# #     log.info("\tConverting FBMN outputs to summary format.")
+# #     fbmn_data = fbmn_summary.rename(columns={"Smiles": 'original_compound'})
+# #     fbmn_data['original_compound'] = fbmn_data['original_compound'].str.strip().replace(r'^\s*$', None, regex=True)
+
+# #     # Check that smiles is valid to get mol object with rdkit
+# #     keep_smiles = []
+# #     for smiles in list(fbmn_data['original_compound']):
+# #         if pd.isna(smiles):
+# #             continue
+# #         smiles_str = str(smiles)
+# #         mol = Chem.MolFromSmiles(smiles_str)
+# #         if mol is not None:
+# #             keep_smiles.append(smiles_str)
+# #     fbmn_data = fbmn_data[fbmn_data['original_compound'].isin(keep_smiles)]
+
+# #     fbmn_data.to_csv(fbmn_output_filename, index=False)
+    
+# #     return
+
+# # def convert_nucleotides_to_amino_acids(
+# #     input_fasta: str
+# # ) -> list:
+# #     """
+# #     Convert nucleotide FASTA sequences to amino acid sequences.
+
+# #     Args:
+# #         input_fasta (str): Path to nucleotide FASTA file.
+
+# #     Returns:
+# #         list: List of SeqRecord objects with amino acid sequences.
+# #     """
+
+# #     amino_acid_sequences = []
+    
+# #     if input_fasta.endswith('.gz'):
+# #         open_func = gzip.open
+# #     else:
+# #         open_func = open
+    
+# #     with open_func(input_fasta, 'rt') as in_handle:
+# #         for record in SeqIO.parse(in_handle, "fasta"):
+# #             amino_acid_seq = record.seq.translate()
+# #             amino_acid_seq = amino_acid_seq.replace('*', '')
+# #             new_record = record[:]
+# #             new_record.seq = amino_acid_seq
+# #             amino_acid_sequences.append(new_record)
+    
+# #     log.info(f"\tConverted nucleotide -> amino acid sequences.")
+# #     return amino_acid_sequences
+
+# # ====================================
+# # Output functions
+# # ====================================
+
+# def create_excel_metadata_sheet(
+#     tx_metadata: pd.DataFrame,
+#     mx_metadata: pd.DataFrame,
+#     output_dir: str,
+#     project_name: str
+# ) -> None:
+#     """
+#     Create an Excel metadata template for user integration of transcriptomics and metabolomics metadata.
+
+#     Args:
+#         tx_metadata (pd.DataFrame): Transcriptomics metadata DataFrame.
+#         mx_metadata (pd.DataFrame): Metabolomics metadata DataFrame.
+#         output_dir (str): Output directory for the Excel file.
+#         project_name (str): Project name for the file.
+
+#     Returns:
+#         None
+#     """
+
+#     # Create the data for the "Instructions" tab
+#     log.info("Creating metadata Excel file...")
+#     instructions_text = (
+#         "Placeholder\n\n"
+#     )
+#     critical_message = (
+#         "Placeholder\n\n"
+#     )
+
+#     instructions_df = pd.DataFrame([instructions_text], columns=["Instructions"])
+
+#     # Create the data for the "RNA" tab
+#     transcript_df = tx_metadata[['library_name', 'sample_name', 'sample_isolated_from', 'collection_isolation_site_or_growth_conditions']]
+#     transcript_df.columns = ['JGI_Library_Name', 'JGI_Metadata_SampleName', 'JGI_Metadata_IsolatedFrom', 'JGI_Metadata_Conditions']
+#     transcript_df['JGI_DataType'] = "Transcriptomics"
+#     transcript_df['JGI_SampleIndex'] = ['tx' + str(i) for i in range(1, len(transcript_df) + 1)]
+#     transcript_example_df = pd.DataFrame({
+#     'JGI_SampleIndex': ['Example', 'Example', 'Example', 'Example', 'Example', 'Example'],
+#     'JGI_DataType': ['Transcriptomics', 'Transcriptomics', 'Transcriptomics', 'Transcriptomics', 'Transcriptomics', 'Transcriptomics'],
+#     'JGI_Library_Name': ['GOYZZ', 'GOZAA', 'GOZBS', 'GOZBT', 'GOZAW', 'GOZAX'],
+#     'JGI_Metadata_SampleName': ['Swg_Sum_GH_Q13_1', 'Swg_Sum_GH_Q13_2', 'Swg_Fall_GH_Q15_1', 'Swg_Fall_GH_Q15_2', 'Swg_Sum_FT_Q15_1', 'Swg_Sum_FT_Q15_2'],
+#     'JGI_Metadata_IsolatedFrom': ['Greenhouse grown Switchgrass (UCBerkeley)', 'Greenhouse grown Switchgrass (UCBerkeley)', 'Greenhouse grown Switchgrass (UCBerkeley)', 'Greenhouse grown Switchgrass (UCBerkeley)', 'Field grown Switchgrass (UCDavis)', 'Field grown Switchgrass (UCDavis)'],
+#     'JGI_Metadata_Conditions': ['Greenhouse 1st harvest, Summer_August2018', 'Greenhouse 1st harvest, Summer_August2018', 'Greenhouse 2nd harvest, Fall_Oct2018', 'Greenhouse 2nd harvest, Fall_Oct2018', 'Field trial 1st harvest, Summer_June2018', 'Field trial 1st harvest, Summer_June2018'],
+#     'USER_MetadataVar_1': ['Summer', 'Summer', 'Fall', 'Fall', 'Summer', 'Summer'],
+#     'USER_MetadataVar_2': ['Greenhouse', 'Greenhouse', 'Greenhouse', 'Greenhouse', 'Field', 'Field'],
+#     'USER_MetadataVar_3': ['Q13', 'Q13', 'Q15', 'Q15', 'Q15', 'Q15'],
+#     'USER_MetadataVar_4': [pd.NA, pd.NA, pd.NA, pd.NA, pd.NA, pd.NA],
+#     'USER_MetadataVar_5': [pd.NA, pd.NA, pd.NA, pd.NA, pd.NA, pd.NA],
+#     'USER_Replicate': ["1", "2", "1", "2", "1", "2"]
+#     })
     
 
-    # Create the data for the "Metabolites" tab
-    metabolites_df = mx_metadata[['file', 'full_sample_metadata']]
-    metabolites_df = metabolites_df[~metabolites_df['file'].str.contains(r'_QC_|ctrl|CTRL|ExCtrl', regex=True)]
-    metabolites_df.columns = ['JGI_Library_Name', 'JGI_Metadata_SampleName']
-    metabolites_df['JGI_DataType'] = "Metabolomics"
-    metabolites_df['JGI_SampleIndex'] = ['mx' + str(i) for i in range(1, len(metabolites_df) + 1)]
-    metabolites_example_df = pd.DataFrame({
-    'JGI_SampleIndex': ['Example', 'Example', 'Example', 'Example', 'Example', 'Example'],
-    'JGI_DataType': ['Metabolomics', 'Metabolomics', 'Metabolomics', 'Metabolomics', 'Metabolomics', 'Metabolomics'],
-    'JGI_Library_Name': ['20190114_KBL_JM_504478_Plant_SwGr_QE-139_C18_USDAY47771_NEG_MSMS_121_Swg-SumHvst-GrnHGrwn-QsuB13_1_Rg90to1350-CE102040-30mg-S1_Run18', '20190114_KBL_JM_504478_Plant_SwGr_QE-139_C18_USDAY47771_NEG_MSMS_121_Swg-SumHvst-GrnHGrwn-QsuB13_2_Rg90to1350-CE102040-30mg-S1_Run19', \
-                        '20190114_KBL_JM_504478_Plant_SwGr_QE-139_C18_USDAY47771_NEG_MSMS_97_Swg-SumHvst-FldGrwn-QsuB15_1_Rg90to1350-CE102040-30mg-S1_Run27', '20190114_KBL_JM_504478_Plant_SwGr_QE-139_C18_USDAY47771_NEG_MSMS_97_Swg-SumHvst-FldGrwn-QsuB15_2_Rg90to1350-CE102040-30mg-S1_Run28', \
-                        '20190114_KBL_JM_504478_Plant_SwGr_QE-139_C18_USDAY47771_NEG_MSMS_82_Swg-SumHvst-FldGrwn-QsuB10_1_Rg90to1350-CE102040-30mg-S1_Run45', '20190114_KBL_JM_504478_Plant_SwGr_QE-139_C18_USDAY47771_NEG_MSMS_82_Swg-SumHvst-FldGrwn-QsuB10_2_Rg90to1350-CE102040-30mg-S1_Run46'],
-    'JGI_Metadata_SampleName': ['swg-sumhvst-grnhgrwn-qsub13', 'swg-sumhvst-grnhgrwn-qsub13', \
-                     'swg-sumhvst-fldgrwn-qsub15', 'swg-sumhvst-fldgrwn-qsub15', \
-                     'swg-sumhvst-fldgrwn-qsub10', 'swg-sumhvst-fldgrwn-qsub10'],
-    'USER_MetadataVar_1': ['Summer', 'Summer', 'Summer', 'Summer', 'Summer', 'Summer'],
-    'USER_MetadataVar_2': ['Greenhouse', 'Greenhouse', 'Field', 'Field', 'Field', 'Field'],
-    'USER_MetadataVar_3': ['Q13', 'Q13', 'Q15', 'Q15', 'Q10', 'Q10'],
-    'USER_MetadataVar_4': [pd.NA, pd.NA, pd.NA, pd.NA, pd.NA, pd.NA],
-    'USER_MetadataVar_5': [pd.NA, pd.NA, pd.NA, pd.NA, pd.NA, pd.NA],
-    'USER_Replicate': ["1", "2", "1", "2", "1", "2"]
-    })
+#     # Create the data for the "Metabolites" tab
+#     metabolites_df = mx_metadata[['file', 'full_sample_metadata']]
+#     metabolites_df = metabolites_df[~metabolites_df['file'].str.contains(r'_QC_|ctrl|CTRL|ExCtrl', regex=True)]
+#     metabolites_df.columns = ['JGI_Library_Name', 'JGI_Metadata_SampleName']
+#     metabolites_df['JGI_DataType'] = "Metabolomics"
+#     metabolites_df['JGI_SampleIndex'] = ['mx' + str(i) for i in range(1, len(metabolites_df) + 1)]
+#     metabolites_example_df = pd.DataFrame({
+#     'JGI_SampleIndex': ['Example', 'Example', 'Example', 'Example', 'Example', 'Example'],
+#     'JGI_DataType': ['Metabolomics', 'Metabolomics', 'Metabolomics', 'Metabolomics', 'Metabolomics', 'Metabolomics'],
+#     'JGI_Library_Name': ['20190114_KBL_JM_504478_Plant_SwGr_QE-139_C18_USDAY47771_NEG_MSMS_121_Swg-SumHvst-GrnHGrwn-QsuB13_1_Rg90to1350-CE102040-30mg-S1_Run18', '20190114_KBL_JM_504478_Plant_SwGr_QE-139_C18_USDAY47771_NEG_MSMS_121_Swg-SumHvst-GrnHGrwn-QsuB13_2_Rg90to1350-CE102040-30mg-S1_Run19', \
+#                         '20190114_KBL_JM_504478_Plant_SwGr_QE-139_C18_USDAY47771_NEG_MSMS_97_Swg-SumHvst-FldGrwn-QsuB15_1_Rg90to1350-CE102040-30mg-S1_Run27', '20190114_KBL_JM_504478_Plant_SwGr_QE-139_C18_USDAY47771_NEG_MSMS_97_Swg-SumHvst-FldGrwn-QsuB15_2_Rg90to1350-CE102040-30mg-S1_Run28', \
+#                         '20190114_KBL_JM_504478_Plant_SwGr_QE-139_C18_USDAY47771_NEG_MSMS_82_Swg-SumHvst-FldGrwn-QsuB10_1_Rg90to1350-CE102040-30mg-S1_Run45', '20190114_KBL_JM_504478_Plant_SwGr_QE-139_C18_USDAY47771_NEG_MSMS_82_Swg-SumHvst-FldGrwn-QsuB10_2_Rg90to1350-CE102040-30mg-S1_Run46'],
+#     'JGI_Metadata_SampleName': ['swg-sumhvst-grnhgrwn-qsub13', 'swg-sumhvst-grnhgrwn-qsub13', \
+#                      'swg-sumhvst-fldgrwn-qsub15', 'swg-sumhvst-fldgrwn-qsub15', \
+#                      'swg-sumhvst-fldgrwn-qsub10', 'swg-sumhvst-fldgrwn-qsub10'],
+#     'USER_MetadataVar_1': ['Summer', 'Summer', 'Summer', 'Summer', 'Summer', 'Summer'],
+#     'USER_MetadataVar_2': ['Greenhouse', 'Greenhouse', 'Field', 'Field', 'Field', 'Field'],
+#     'USER_MetadataVar_3': ['Q13', 'Q13', 'Q15', 'Q15', 'Q10', 'Q10'],
+#     'USER_MetadataVar_4': [pd.NA, pd.NA, pd.NA, pd.NA, pd.NA, pd.NA],
+#     'USER_MetadataVar_5': [pd.NA, pd.NA, pd.NA, pd.NA, pd.NA, pd.NA],
+#     'USER_Replicate': ["1", "2", "1", "2", "1", "2"]
+#     })
 
-    linked_data = pd.concat([transcript_df, metabolites_df], ignore_index=True, join='outer')
-    linked_data = pd.concat([transcript_example_df, linked_data], ignore_index=True, join='outer')
-    linked_data = pd.concat([metabolites_example_df, linked_data], ignore_index=True, join='outer')
-    linked_data = linked_data.reindex(columns=transcript_df.columns)
-    linked_data.fillna("-", inplace=True)
-    linked_data['USER_MetadataVar_1'] = pd.NA
-    linked_data['USER_MetadataVar_2'] = pd.NA
-    linked_data['USER_MetadataVar_3'] = pd.NA
-    linked_data['USER_MetadataVar_4'] = pd.NA
-    linked_data['USER_MetadataVar_5'] = pd.NA
-    linked_data['USER_Replicate'] = pd.NA
-    linked_data['JGI_Group'] = pd.NA
-    linked_data['JGI_Unique_SampleName'] = pd.NA
-    linked_data = linked_data[['JGI_SampleIndex', 'JGI_DataType', 'JGI_Library_Name', 'JGI_Metadata_SampleName', 'JGI_Metadata_IsolatedFrom', 'JGI_Metadata_Conditions', 'USER_MetadataVar_1', 'USER_MetadataVar_2', 'USER_MetadataVar_3', 'USER_MetadataVar_4', 'USER_MetadataVar_5', 'USER_Replicate', 'JGI_Group', 'JGI_Unique_SampleName']]
+#     linked_data = pd.concat([transcript_df, metabolites_df], ignore_index=True, join='outer')
+#     linked_data = pd.concat([transcript_example_df, linked_data], ignore_index=True, join='outer')
+#     linked_data = pd.concat([metabolites_example_df, linked_data], ignore_index=True, join='outer')
+#     linked_data = linked_data.reindex(columns=transcript_df.columns)
+#     linked_data.fillna("-", inplace=True)
+#     linked_data['USER_MetadataVar_1'] = pd.NA
+#     linked_data['USER_MetadataVar_2'] = pd.NA
+#     linked_data['USER_MetadataVar_3'] = pd.NA
+#     linked_data['USER_MetadataVar_4'] = pd.NA
+#     linked_data['USER_MetadataVar_5'] = pd.NA
+#     linked_data['USER_Replicate'] = pd.NA
+#     linked_data['JGI_Group'] = pd.NA
+#     linked_data['JGI_Unique_SampleName'] = pd.NA
+#     linked_data = linked_data[['JGI_SampleIndex', 'JGI_DataType', 'JGI_Library_Name', 'JGI_Metadata_SampleName', 'JGI_Metadata_IsolatedFrom', 'JGI_Metadata_Conditions', 'USER_MetadataVar_1', 'USER_MetadataVar_2', 'USER_MetadataVar_3', 'USER_MetadataVar_4', 'USER_MetadataVar_5', 'USER_Replicate', 'JGI_Group', 'JGI_Unique_SampleName']]
 
-    # Write to Excel file
-    output_path = f'{output_dir}/{project_name}_metadata_integration_template.xlsx'
-    with pd.ExcelWriter(output_path) as writer:
-        instructions_df.to_excel(writer, sheet_name='Instructions', index=False)
-        linked_data.to_excel(writer, sheet_name='linked_Datasets', index=False)
-        tx_metadata.to_excel(writer, sheet_name='Full_Transcript_Metadata_Ref', index=False)
-        mx_metadata.to_excel(writer, sheet_name='Full_Metabolite_Metadata_Ref', index=False)
+#     # Write to Excel file
+#     output_path = f'{output_dir}/{project_name}_metadata_integration_template.xlsx'
+#     with pd.ExcelWriter(output_path) as writer:
+#         instructions_df.to_excel(writer, sheet_name='Instructions', index=False)
+#         linked_data.to_excel(writer, sheet_name='linked_Datasets', index=False)
+#         tx_metadata.to_excel(writer, sheet_name='Full_Transcript_Metadata_Ref', index=False)
+#         mx_metadata.to_excel(writer, sheet_name='Full_Metabolite_Metadata_Ref', index=False)
 
-    # Load the workbook and set the wrap text format for the Instructions sheet
-    workbook = load_workbook(output_path)
-    worksheet = workbook['Instructions']
-    worksheet['B1'] = "CRITICAL:"
-    worksheet['B1'].font = Font(color='FF0000', bold=True)
-    worksheet['B2'] = critical_message
-    worksheet['B2'].font = Font(bold=True)
-    for row in worksheet.iter_rows():
-        for cell in row:
-            cell.alignment = Alignment(wrap_text=True, vertical='top')
-    # Set column widths for the Instructions sheet
-    worksheet.column_dimensions['A'].width = 130
-    worksheet.column_dimensions['B'].width = 130
-    worksheet.row_dimensions[2].height = 1070
+#     # Load the workbook and set the wrap text format for the Instructions sheet
+#     workbook = load_workbook(output_path)
+#     worksheet = workbook['Instructions']
+#     worksheet['B1'] = "CRITICAL:"
+#     worksheet['B1'].font = Font(color='FF0000', bold=True)
+#     worksheet['B2'] = critical_message
+#     worksheet['B2'].font = Font(bold=True)
+#     for row in worksheet.iter_rows():
+#         for cell in row:
+#             cell.alignment = Alignment(wrap_text=True, vertical='top')
+#     # Set column widths for the Instructions sheet
+#     worksheet.column_dimensions['A'].width = 130
+#     worksheet.column_dimensions['B'].width = 130
+#     worksheet.row_dimensions[2].height = 1070
     
-    # Set column widths for the RNA sheet
-    worksheet = workbook['linked_Datasets']
-    for col, width in zip('ABCDEFGHIJKLMN', [15,15,20,30,40,70,30,30,30,30,30,15,40,40]): worksheet.column_dimensions[col].width = width
-    # Add formula to combine metadata columns
-    for row in range(2, worksheet.max_row + 1):
-        group_formula = (
-            f'=IF(AND(LEN(G{row})=0, LEN(H{row})=0, LEN(I{row})=0, LEN(J{row})=0, LEN(K{row})=0),"Undefined Group", '
-            f'IF(LEN(G{row})>0,G{row},"")'
-            f'&IF(LEN(H{row})>0,"---"&H{row},"")'
-            f'&IF(LEN(I{row})>0,"---"&I{row},"")'
-            f'&IF(LEN(J{row})>0,"---"&J{row},"")'
-            f'&IF(LEN(K{row})>0,"---"&K{row},""))'
-        )
-        worksheet[f'M{row}'] = group_formula
-        unique_formula = f'=IF(LEN(L{row})>0,M{row}&"---"&L{row},"Missing Replicate Number")'
-        worksheet[f'N{row}'] = unique_formula
-    # Highlight cells for user to fill in
-    fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-    thin_border = Border(left=Side(style='thin', color='000000'),
-                         right=Side(style='thin', color='000000'),
-                         top=Side(style='thin', color='000000'),
-                         bottom=Side(style='thin', color='000000'))    
-    for row in range(14, worksheet.max_row + 1):
-        for col in ['G', 'H', 'I', 'J', 'K', 'L']:
-            worksheet[f'{col}{row}'].fill = fill
-            worksheet[f'{col}{row}'].border = thin_border
-    for row in range(2, 14):
-        for col in range(1, worksheet.max_column + 1):
-            cell = worksheet.cell(row=row, column=col)
-            cell.font = Font(italic=True, color="D3D3D3")
-    worksheet.freeze_panes = worksheet['A14']
+#     # Set column widths for the RNA sheet
+#     worksheet = workbook['linked_Datasets']
+#     for col, width in zip('ABCDEFGHIJKLMN', [15,15,20,30,40,70,30,30,30,30,30,15,40,40]): worksheet.column_dimensions[col].width = width
+#     # Add formula to combine metadata columns
+#     for row in range(2, worksheet.max_row + 1):
+#         group_formula = (
+#             f'=IF(AND(LEN(G{row})=0, LEN(H{row})=0, LEN(I{row})=0, LEN(J{row})=0, LEN(K{row})=0),"Undefined Group", '
+#             f'IF(LEN(G{row})>0,G{row},"")'
+#             f'&IF(LEN(H{row})>0,"---"&H{row},"")'
+#             f'&IF(LEN(I{row})>0,"---"&I{row},"")'
+#             f'&IF(LEN(J{row})>0,"---"&J{row},"")'
+#             f'&IF(LEN(K{row})>0,"---"&K{row},""))'
+#         )
+#         worksheet[f'M{row}'] = group_formula
+#         unique_formula = f'=IF(LEN(L{row})>0,M{row}&"---"&L{row},"Missing Replicate Number")'
+#         worksheet[f'N{row}'] = unique_formula
+#     # Highlight cells for user to fill in
+#     fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+#     thin_border = Border(left=Side(style='thin', color='000000'),
+#                          right=Side(style='thin', color='000000'),
+#                          top=Side(style='thin', color='000000'),
+#                          bottom=Side(style='thin', color='000000'))    
+#     for row in range(14, worksheet.max_row + 1):
+#         for col in ['G', 'H', 'I', 'J', 'K', 'L']:
+#             worksheet[f'{col}{row}'].fill = fill
+#             worksheet[f'{col}{row}'].border = thin_border
+#     for row in range(2, 14):
+#         for col in range(1, worksheet.max_column + 1):
+#             cell = worksheet.cell(row=row, column=col)
+#             cell.font = Font(italic=True, color="D3D3D3")
+#     worksheet.freeze_panes = worksheet['A14']
 
-    log.info(f"\tMetadata instructions Excel file exported to {output_path}")
-    # Save the workbook
-    workbook.save(output_path)
+#     log.info(f"\tMetadata instructions Excel file exported to {output_path}")
+#     # Save the workbook
+#     workbook.save(output_path)
 
-def copy_data(
-    src_dir: str,
-    results_subdir: str,
-    file_map: dict,
-    plots: bool = False,
-    plot_pattern: str = "*.pdf"
-) -> None:
-    """
-    Copy data and plot files to user output directories.
+# def copy_data(
+#     src_dir: str,
+#     results_subdir: str,
+#     file_map: dict,
+#     plots: bool = False,
+#     plot_pattern: str = "*.pdf"
+# ) -> None:
+#     """
+#     Copy data and plot files to user output directories.
 
-    Args:
-        src_dir (str): Source directory.
-        results_subdir (str): Destination subdirectory.
-        file_map (dict): Mapping of source to destination filenames.
-        plots (bool): Copy plot files if True.
-        plot_pattern (str): Glob pattern for plot files.
+#     Args:
+#         src_dir (str): Source directory.
+#         results_subdir (str): Destination subdirectory.
+#         file_map (dict): Mapping of source to destination filenames.
+#         plots (bool): Copy plot files if True.
+#         plot_pattern (str): Glob pattern for plot files.
 
-    Returns:
-        None
-    """
-    os.makedirs(results_subdir, exist_ok=True)
-    # Copy main files
-    for src, dst in file_map.items():
-        src_path = os.path.join(src_dir, src)
-        dst_path = os.path.join(results_subdir, dst)
-        if os.path.exists(src_path):
-            shutil.copy(src_path, dst_path)
-        else:
-            log.info(f"Warning: Source file not found: {src_path}")
+#     Returns:
+#         None
+#     """
+#     os.makedirs(results_subdir, exist_ok=True)
+#     # Copy main files
+#     for src, dst in file_map.items():
+#         src_path = os.path.join(src_dir, src)
+#         dst_path = os.path.join(results_subdir, dst)
+#         if os.path.exists(src_path):
+#             shutil.copy(src_path, dst_path)
+#         else:
+#             log.info(f"Warning: Source file not found: {src_path}")
 
-    if not plots:
-        return
+#     if not plots:
+#         return
 
-    # Helper to copy plot files
-    def copy_plot_files(pattern, subfolder):
-        plot_dir = os.path.join(src_dir, "plots")
-        dest_dir = os.path.join(results_subdir, subfolder)
-        os.makedirs(dest_dir, exist_ok=True)
-        for file_path in glob.glob(os.path.join(plot_dir, pattern)):
-            file_name = os.path.basename(file_path)
-            shutil.copy(file_path, os.path.join(dest_dir, file_name))
+#     # Helper to copy plot files
+#     def copy_plot_files(pattern, subfolder):
+#         plot_dir = os.path.join(src_dir, "plots")
+#         dest_dir = os.path.join(results_subdir, subfolder)
+#         os.makedirs(dest_dir, exist_ok=True)
+#         for file_path in glob.glob(os.path.join(plot_dir, pattern)):
+#             file_name = os.path.basename(file_path)
+#             shutil.copy(file_path, os.path.join(dest_dir, file_name))
 
-    copy_plot_files(f"*_nonnormalized{plot_pattern}", "plots_of_non-normalized_data")
-    copy_plot_files(f"*_normalized{plot_pattern}", "plots_of_normalized_data")
-    copy_plot_files(f"*_grid{plot_pattern}", "plots_of_combined_data")
+#     copy_plot_files(f"*_nonnormalized{plot_pattern}", "plots_of_non-normalized_data")
+#     copy_plot_files(f"*_normalized{plot_pattern}", "plots_of_normalized_data")
+#     copy_plot_files(f"*_grid{plot_pattern}", "plots_of_combined_data")
 
-def create_user_output_directory(
-    mx_dir: str,
-    tx_dir: str,
-    integrated_dir: str,
-    final_dir: str,
-    project_name: str
-) -> None:
-    """
-    Organize and copy results to a user-facing output directory structure.
+# def create_user_output_directory(
+#     mx_dir: str,
+#     tx_dir: str,
+#     integrated_dir: str,
+#     final_dir: str,
+#     project_name: str
+# ) -> None:
+#     """
+#     Organize and copy results to a user-facing output directory structure.
 
-    Args:
-        mx_dir (str): Metabolomics results directory.
-        tx_dir (str): Transcriptomics results directory.
-        integrated_dir (str): Integrated results directory.
-        final_dir (str): Final user output directory.
-        project_name (str): Name of the project.
+#     Args:
+#         mx_dir (str): Metabolomics results directory.
+#         tx_dir (str): Transcriptomics results directory.
+#         integrated_dir (str): Integrated results directory.
+#         final_dir (str): Final user output directory.
+#         project_name (str): Name of the project.
 
-    Returns:
-        None
-    """
+#     Returns:
+#         None
+#     """
 
-    copy_data(
-        tx_dir,
-        f"{final_dir}/transcript_results",
-        {
-            #"tx_metadata.csv": "full_transcript_metadata.csv",
-            "integrated_metadata.csv": "transcript_metadata.csv",
-            "tx_data_nonnormalized.csv": "transcript_count_data_non-normalized.csv",
-            "tx_data_normalized.csv": "transcript_count_data_normalized.csv"
-        },
-        plots=True
-    )
-    copy_data(
-        mx_dir,
-        f"{final_dir}/metabolite_results",
-        {
-            #"mx_metadata.csv": "full_metabolite_metadata.csv",
-            "integrated_metadata.csv": "metabolite_metadata.csv",
-            "mx_data_nonnormalized.csv": "metabolite_count_data_non-normalized.csv",
-            "mx_data_normalized.csv": "metabolite_count_data_normalized.csv"
-        },
-        plots=True
-    )
-    copy_data(
-        integrated_dir,
-        f"{final_dir}/integrated_results",
-        {
-            "integrated_metadata.csv": "integrated_metadata.csv",
-            "integrated_data.csv": "integrated_data.csv",
-            "integrated_data_annotated.csv": "integrated_data_annotated.csv"
-        },
-        plots=False
-    )
+#     copy_data(
+#         tx_dir,
+#         f"{final_dir}/transcript_results",
+#         {
+#             #"tx_metadata.csv": "full_transcript_metadata.csv",
+#             "integrated_metadata.csv": "transcript_metadata.csv",
+#             "tx_data_nonnormalized.csv": "transcript_count_data_non-normalized.csv",
+#             "tx_data_normalized.csv": "transcript_count_data_normalized.csv"
+#         },
+#         plots=True
+#     )
+#     copy_data(
+#         mx_dir,
+#         f"{final_dir}/metabolite_results",
+#         {
+#             #"mx_metadata.csv": "full_metabolite_metadata.csv",
+#             "integrated_metadata.csv": "metabolite_metadata.csv",
+#             "mx_data_nonnormalized.csv": "metabolite_count_data_non-normalized.csv",
+#             "mx_data_normalized.csv": "metabolite_count_data_normalized.csv"
+#         },
+#         plots=True
+#     )
+#     copy_data(
+#         integrated_dir,
+#         f"{final_dir}/integrated_results",
+#         {
+#             "integrated_metadata.csv": "integrated_metadata.csv",
+#             "integrated_data.csv": "integrated_data.csv",
+#             "integrated_data_annotated.csv": "integrated_data_annotated.csv"
+#         },
+#         plots=False
+#     )
 
-    # Integrated data and plots
-    integrated_results_subdir = f"{final_dir}/integrated_results"
-    subdirs = {
-        "data_distributions": f"{integrated_results_subdir}/data_distributions",
-        "network_analyses": f"{integrated_results_subdir}/network_analyses",
-        "mofa2_analyses": f"{integrated_results_subdir}/mofa2_analyses",
-        "magi2_analyses": f"{integrated_results_subdir}/magi2_analyses"
-    }
+#     # Integrated data and plots
+#     integrated_results_subdir = f"{final_dir}/integrated_results"
+#     subdirs = {
+#         "data_distributions": f"{integrated_results_subdir}/data_distributions",
+#         "network_analyses": f"{integrated_results_subdir}/network_analyses",
+#         "mofa2_analyses": f"{integrated_results_subdir}/mofa2_analyses",
+#         "magi2_analyses": f"{integrated_results_subdir}/magi2_analyses"
+#     }
 
-    for subdir in subdirs.values():
-        os.makedirs(subdir, exist_ok=True)
-    for src, dst in subdirs.items():
-        shutil.copytree(f"{integrated_dir}/{src}", dst, dirs_exist_ok=True)
-        if "magi" in src:
-            for file in glob.glob(os.path.join(dst, "*.sh")) + \
-                        glob.glob(os.path.join(dst, project_name, "log*")) + \
-                        glob.glob(os.path.join(dst, project_name, "error*")) + \
-                        [os.path.join(dst, project_name, f"output_{project_name}", "magi_results.csv")]:
-                os.remove(file)
-            intermediate_dir = os.path.join(dst, project_name, f"output_{project_name}", "intermediate_files")
-            shutil.rmtree(intermediate_dir)
+#     for subdir in subdirs.values():
+#         os.makedirs(subdir, exist_ok=True)
+#     for src, dst in subdirs.items():
+#         shutil.copytree(f"{integrated_dir}/{src}", dst, dirs_exist_ok=True)
+#         if "magi" in src:
+#             for file in glob.glob(os.path.join(dst, "*.sh")) + \
+#                         glob.glob(os.path.join(dst, project_name, "log*")) + \
+#                         glob.glob(os.path.join(dst, project_name, "error*")) + \
+#                         [os.path.join(dst, project_name, f"output_{project_name}", "magi_results.csv")]:
+#                 os.remove(file)
+#             intermediate_dir = os.path.join(dst, project_name, f"output_{project_name}", "intermediate_files")
+#             shutil.rmtree(intermediate_dir)
 
-    log.info(f"User output directory structure created at {final_dir}")
+#     log.info(f"User output directory structure created at {final_dir}")
 
-    return
+#     return
 
-def upload_to_google_drive(
-    project_folder: str,
-    project_name: str,
-    overwrite: bool = True
-) -> None:
-    """
-    Upload all contents of the user results directory to 
-    Google Drive JGI_MXTX_Integration_Projects/{project_name} using rclone.
-    """
-    dest_folder = f"JGI_MXTX_Integration_Projects:{project_name}/"
-    orig_folder = project_folder
+# def upload_to_google_drive(
+#     project_folder: str,
+#     project_name: str,
+#     overwrite: bool = True
+# ) -> None:
+#     """
+#     Upload all contents of the user results directory to 
+#     Google Drive JGI_MXTX_Integration_Projects/{project_name} using rclone.
+#     """
+#     dest_folder = f"JGI_MXTX_Integration_Projects:{project_name}/"
+#     orig_folder = project_folder
 
-    if overwrite is True:
-        log.info("Warning! Overwriting existing files in Google Drive.")
-        upload_command = (
-            f'/global/cfs/cdirs/m342/USA/shared-envs/rclone/bin/rclone sync '
-            f'"{orig_folder}/" "{dest_folder}"'
-        )
-    else:
-        log.info("Warning! Not overwriting existing files in Google Drive, may have previous files in the output.")
-        upload_command = (
-            f'/global/cfs/cdirs/m342/USA/shared-envs/rclone/bin/rclone copy --ignore-existing '
-            f'"{orig_folder}/" "{dest_folder}"'
-        )
-    try:
-        log.info(f"Uploading to Google Drive with command:\t{upload_command}")
-        subprocess.check_output(upload_command, shell=True)
-    except Exception as e:
-        log.info(f"Warning! Google Drive upload failed with exception: {e}. Command: {upload_command}")
-        return
+#     if overwrite is True:
+#         log.info("Warning! Overwriting existing files in Google Drive.")
+#         upload_command = (
+#             f'/global/cfs/cdirs/m342/USA/shared-envs/rclone/bin/rclone sync '
+#             f'"{orig_folder}/" "{dest_folder}"'
+#         )
+#     else:
+#         log.info("Warning! Not overwriting existing files in Google Drive, may have previous files in the output.")
+#         upload_command = (
+#             f'/global/cfs/cdirs/m342/USA/shared-envs/rclone/bin/rclone copy --ignore-existing '
+#             f'"{orig_folder}/" "{dest_folder}"'
+#         )
+#     try:
+#         log.info(f"Uploading to Google Drive with command:\t{upload_command}")
+#         subprocess.check_output(upload_command, shell=True)
+#     except Exception as e:
+#         log.info(f"Warning! Google Drive upload failed with exception: {e}. Command: {upload_command}")
+#         return
 
-    # Check that upload worked
-    check_upload_command = (
-        f'/global/cfs/cdirs/m342/USA/shared-envs/rclone/bin/rclone ls "{dest_folder}" --max-depth 2'
-    )
-    try:
-        check_upload_out = subprocess.check_output(check_upload_command, shell=True)
-        if check_upload_out.decode('utf-8').strip():
-            log.info(f"Google Drive upload confirmed!")
-            return
-        else:
-            log.info(f"Warning! Google Drive upload check failed because no data was returned with command: {check_upload_command}. Upload may not have been successful.")
-            return
-    except Exception as e:
-        log.info(f"Warning! Google Drive upload failed on upload check with exception: {e}. Command: {check_upload_command}")
-        return
+#     # Check that upload worked
+#     check_upload_command = (
+#         f'/global/cfs/cdirs/m342/USA/shared-envs/rclone/bin/rclone ls "{dest_folder}" --max-depth 2'
+#     )
+#     try:
+#         check_upload_out = subprocess.check_output(check_upload_command, shell=True)
+#         if check_upload_out.decode('utf-8').strip():
+#             log.info(f"Google Drive upload confirmed!")
+#             return
+#         else:
+#             log.info(f"Warning! Google Drive upload check failed because no data was returned with command: {check_upload_command}. Upload may not have been successful.")
+#             return
+#     except Exception as e:
+#         log.info(f"Warning! Google Drive upload failed on upload check with exception: {e}. Command: {check_upload_command}")
+#         return

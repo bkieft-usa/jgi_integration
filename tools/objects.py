@@ -1258,12 +1258,28 @@ class MX(Dataset):
                 chromatography=self.chromatography,
                 polarity=self.polarity,
                 datatype=self.datatype,
-                filtered_mx=False,
+                filtered_mx=True,
             )
             if result.empty:
                 log.error(f"No data found for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
                 sys.exit(1)
-            self.raw_data = result
+
+            # Normalize raw data sample-wise using median-of-ratios method
+            log.info("Normalizing MX raw data using median-of-ratios method")
+            scale = 1.0
+            feature_col_name = result.columns[0]
+            result = result.set_index(feature_col_name)
+            min_dataset_value = result[result > 0].min().min()
+            mask = (result > min_dataset_value).any(axis=1)
+            counts_pos = result.loc[mask]
+            log_counts = np.log(counts_pos)
+            geo_means = np.exp(log_counts.mean(axis=1))
+            ratios = counts_pos.divide(geo_means, axis=0)
+            size_factors = ratios.median(axis=0)
+            norm_counts = result.div(size_factors, axis=1) * scale
+            norm_counts = norm_counts.reset_index()
+
+            self.raw_data = norm_counts
             log.info(f"\tCreated raw data for MX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
             log.info(f"Created table: {self._raw_data_filename}")
             log.info("Created attribute: raw_data")
@@ -1398,7 +1414,23 @@ class TX(Dataset):
             if result.empty:
                 log.error(f"No data found for TX dataset. Please check your raw data files.")
                 sys.exit(1)
-            self.raw_data = result
+            
+            # Normalize raw data sample-wise using median-of-ratios method
+            log.info("Normalizing TX raw data using median-of-ratios method")
+            scale = 1.0
+            feature_col_name = result.columns[0]
+            result = result.set_index(feature_col_name)
+            min_dataset_value = result[result > 0].min().min()
+            mask = (result > min_dataset_value).any(axis=1)
+            counts_pos = result.loc[mask]
+            log_counts = np.log(counts_pos)
+            geo_means = np.exp(log_counts.mean(axis=1))
+            ratios = counts_pos.divide(geo_means, axis=0)
+            size_factors = ratios.median(axis=0)
+            norm_counts = result.div(size_factors, axis=1) * scale
+            norm_counts = norm_counts.reset_index()
+
+            self.raw_data = norm_counts
             log.info(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
             log.info(f"Created table: {self._raw_data_filename}")
             log.info("Created attribute: raw_data")
@@ -1575,7 +1607,7 @@ class Analysis(DataAwareBaseHandler):
             'feature_network_edge_table': 'feature_network_edge_table.csv',
             'feature_network_node_table': 'feature_network_node_table.csv',
             'functional_enrichment_table': 'functional_enrichment_table.csv',
-            'mofa_data': 'mofa_data.csv',
+            #'mofa_data': 'mofa_data.csv',
         }
         for attr, filename in manual_file_storage.items():
             setattr(self, f"_{attr}_filename", filename)
@@ -1772,7 +1804,7 @@ class Analysis(DataAwareBaseHandler):
             _link_data_method()
             return
 
-    def plot_dataset_distributions(self, datatype: str = "normalized", bins: int = 50, transparency: float = 0.8, xlog: bool = False, show_plot: bool = True, show_progress: bool = True) -> None:
+    def plot_dataset_distributions(self, datatype: str = "normalized", bins: int = 100, transparency: float = 0.8, xlog: bool = False, show_plot: bool = True, show_progress: bool = True) -> None:
         """Plot histograms of feature values for each dataset in the analysis."""
         def _plot_distributions_method():
             log.info("Plotting feature value distributions for all datasets")
@@ -1950,6 +1982,23 @@ class Analysis(DataAwareBaseHandler):
             _feature_selection_method()
             return
 
+    def run_full_network_analyzer(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+        
+        correlation_params = self.analysis_parameters.get('correlation', {})
+        networking_params = self.analysis_parameters.get('networking', {})
+        output_dir = os.path.join(self.output_dir, "network_analyzer_results")
+        results = hlp.compare_network_topologies(
+            integrated_data=self.integrated_data_selected,
+            feature_prefixes=[ds.dataset_name + "_" for ds in self.datasets],
+            correlation_params=correlation_params,
+            network_params=networking_params,
+            annotation_input=self.feature_annotation_table,
+            output_dir=output_dir,
+            overwrite=overwrite,
+        )
+
+        return results
+
     def calculate_correlated_features(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
         """Hybrid: Class validation + external hlp.calculate_correlated_features function."""
         def _correlation_method():
@@ -1964,6 +2013,7 @@ class Analysis(DataAwareBaseHandler):
                 'data': self.integrated_data_selected,
                 'output_filename': self._feature_correlation_table_filename,
                 'output_dir': self.output_dir,
+                'output_filename': self._feature_correlation_table_filename,
                 'feature_prefixes': [ds.dataset_name + "_" for ds in self.datasets],
                 'method': correlation_params.get('corr_method', 'pearson'),
                 'cutoff': correlation_params.get('corr_cutoff', 0.5),
@@ -2106,62 +2156,62 @@ class Analysis(DataAwareBaseHandler):
             _enrichment_method()
             return
 
-    def run_mofa2_analysis(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
-        """Hybrid: Class parameter setup + external hlp.run_full_mofa2_analysis function."""
-        def _mofa_method():
-            mofa_subdir = "mofa"
-            mofa_dir = os.path.join(self.output_dir, mofa_subdir)
-            os.makedirs(mofa_dir, exist_ok=True)
-            log.info("Running MOFA2 Analysis")
+    # def run_mofa2_analysis(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+    #     """Hybrid: Class parameter setup + external hlp.run_full_mofa2_analysis function."""
+    #     def _mofa_method():
+    #         mofa_subdir = "mofa"
+    #         mofa_dir = os.path.join(self.output_dir, mofa_subdir)
+    #         os.makedirs(mofa_dir, exist_ok=True)
+    #         log.info("Running MOFA2 Analysis")
             
-            # Check with subdirectory path
-            mofa_data_path = os.path.join(mofa_subdir, self._mofa_data_filename)
-            if self.check_and_load_attribute('mofa_data', mofa_data_path, self.overwrite):
-                log.info(f"MOFA2 model already exists. Using existing data.")
-                return
+    #         # Check with subdirectory path
+    #         mofa_data_path = os.path.join(mofa_subdir, self._mofa_data_filename)
+    #         if self.check_and_load_attribute('mofa_data', mofa_data_path, self.overwrite):
+    #             log.info(f"MOFA2 model already exists. Using existing data.")
+    #             return
 
-            mofa2_params = self.analysis_parameters.get('mofa', {})
-            call_params = {
-                'integrated_data': self.integrated_data_selected,
-                'mofa2_views': [ds.dataset_name for ds in self.datasets],
-                'metadata': self.integrated_metadata,
-                'output_dir': mofa_dir,
-                'output_filename': self._mofa_data_filename,
-                'num_factors': mofa2_params.get('num_mofa_factors', 5),
-                'num_features': 10,
-                'num_iterations': mofa2_params.get('num_mofa_iterations', 100),
-                'training_seed': mofa2_params.get('seed_for_training', 555),
-                'overwrite': self.overwrite
-            }
-            call_params.update(kwargs)
+    #         mofa2_params = self.analysis_parameters.get('mofa', {})
+    #         call_params = {
+    #             'integrated_data': self.integrated_data_selected,
+    #             'mofa2_views': [ds.dataset_name for ds in self.datasets],
+    #             'metadata': self.integrated_metadata,
+    #             'output_dir': mofa_dir,
+    #             'output_filename': self._mofa_data_filename,
+    #             'num_factors': mofa2_params.get('num_mofa_factors', 5),
+    #             'num_features': 10,
+    #             'num_iterations': mofa2_params.get('num_mofa_iterations', 100),
+    #             'training_seed': mofa2_params.get('seed_for_training', 555),
+    #             'overwrite': self.overwrite
+    #         }
+    #         call_params.update(kwargs)
             
-            mofa_data = hlp.run_full_mofa2_analysis(**call_params)
+    #         mofa_data = hlp.run_full_mofa2_analysis(**call_params)
 
-            if mofa_data.empty:
-                log.error(f"Running MOFA2 analysis resulted in empty model. Please check your integrated data and MOFA2 parameters.")
-                sys.exit(1)
+    #         if mofa_data.empty:
+    #             log.error(f"Running MOFA2 analysis resulted in empty model. Please check your integrated data and MOFA2 parameters.")
+    #             sys.exit(1)
             
-            # Temporarily update filename to include subdirectory
-            original_filename = self._mofa_data_filename
-            self._mofa_data_filename = mofa_data_path
+    #         # Temporarily update filename to include subdirectory
+    #         original_filename = self._mofa_data_filename
+    #         self._mofa_data_filename = mofa_data_path
             
-            # Set the attribute (saves to subdirectory)
-            self.mofa_data = mofa_data
+    #         # Set the attribute (saves to subdirectory)
+    #         self.mofa_data = mofa_data
             
-            # Restore original filename
-            self._mofa_data_filename = original_filename
+    #         # Restore original filename
+    #         self._mofa_data_filename = original_filename
 
-            log.info(f"Created table: {self._mofa_data_filename}")
-            log.info("Created attribute: mofa_data")
+    #         log.info(f"Created table: {self._mofa_data_filename}")
+    #         log.info("Created attribute: mofa_data")
 
-        if show_progress:
-            self.workflow_tracker.set_current_step('run_mofa2')
-            _mofa_method()
-            self._complete_tracking('run_mofa2')
-            return
-        else:
-            _mofa_method()
-            return
+    #     if show_progress:
+    #         self.workflow_tracker.set_current_step('run_mofa2')
+    #         _mofa_method()
+    #         self._complete_tracking('run_mofa2')
+    #         return
+    #     else:
+    #         _mofa_method()
+    #         return
 
     def query(self, text_query: str, limit: int = 500) -> pd.DataFrame:
         """Natural language interface to query analysis data."""
@@ -2230,7 +2280,7 @@ manual_file_storage = {
     'feature_network_edge_table': 'feature_network_edge_table.csv',
     'feature_network_node_table': 'feature_network_node_table.csv',
     'functional_enrichment_table': 'functional_enrichment_table.csv',
-    'mofa_data': 'mofa_data.csv'
+    #'mofa_data': 'mofa_data.csv'
 }
 #for attr in config['analysis']['file_storage']:
 for attr, filename in manual_file_storage.items():
