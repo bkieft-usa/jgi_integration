@@ -26,6 +26,7 @@ from IPython.display import display, Image
 
 # --- Typing ---
 from typing import List, Tuple, Union, Optional, Dict, Any, Callable, Literal
+from collections import defaultdict
 
 # --- Scientific computing & data analysis ---
 import numpy as np
@@ -51,6 +52,7 @@ import seaborn as sns
 from matplotlib.cm import viridis
 from matplotlib.colors import to_hex
 from plotly.subplots import make_subplots
+from matplotlib.lines import Line2D
 
 # --- Machine learning & statistics ---
 from sklearn.decomposition import PCA
@@ -2176,7 +2178,7 @@ def _try_load_existing_networks(
         )
         
         if not os.path.exists(graphml_path):
-            log.info(f"Network file not found: {graphml_path}")
+            log.info(f"Network file not found. Proceeding with correlation and network construction.")
             return {}  # Return empty dict if any file missing
     
     # All files exist, load them
@@ -2253,81 +2255,64 @@ def compare_network_topologies(
     output_dir: str = None,
     output_filename_prefix: str = "network_comparison",
     overwrite: bool = False,
+    plot_interactive: bool = False,
 ) -> Dict[str, Any]:
     """
     Compare network topologies between independent and integrated multi-omics datasets.
-    
-    Workflow:
-    1. Calculate correlations for independent and full datasets
-    2. Build networks from correlations
-    3. Compare network structures (nodes, edges, modules)
-    4. Quantify information gained through integration
-    5. Perform functional enrichment analysis
-    
-    Args:
-        integrated_data: Feature matrix (features x samples)
-        feature_prefixes: List of feature prefixes for different data types
-        correlation_params: Parameters for correlation calculation
-        network_params: Parameters for network construction
-        annotation_input: Feature annotations
-        output_dir: Directory to save results
-        output_filename_prefix: Prefix for output files
-        overwrite: Whether to overwrite existing results
         
     Returns:
         Dictionary containing networks, statistics, and analysis results
     """
     
-    # Try to load existing networks
-    if not overwrite and output_dir:
-        networks = _try_load_existing_networks(
-            output_dir, 
-            output_filename_prefix, 
-            feature_prefixes
-        )
-        if networks:
-            log.info(f"Loaded {len(networks)} existing networks from disk")
-            return networks
-
     # Initialize results structure
     results = {
-        'correlation_tables': {},
-        'networks': {},
         'topology_comparison': {},
         'preservation_analysis': {},
-        'information_gained': {},
-        'functional_enrichment': {}
+        'cross_omics_connectivity': {},
+        'conditional_entropy': {},
+        'motif_analysis': {},
+        'submodule_enrichment': {},
+        'edge_enrichment': {},
     }
     
+    # Default annotations for downstream tests
     annotation_categories = {
         'tx': ['tx_go_acc'],
         'mx': ['mx_subclass']
     }
 
-    # Calculate correlations
-    log.info("=" * 80)
-    log.info("Calculating Correlation Matrices")
-    log.info("=" * 80)
-    correlation_tables = _calculate_all_correlations(
-        integrated_data=integrated_data,
-        feature_prefixes=feature_prefixes,
-        correlation_params=correlation_params,
-        output_filename_prefix=output_filename_prefix
+    # Try to load existing networks
+    networks = _try_load_existing_networks(
+        output_dir, 
+        output_filename_prefix, 
+        feature_prefixes
     )
-    
-    # Build networks from correlations
-    log.info("=" * 80)
-    log.info("Creating Networks")
-    log.info("=" * 80)
-    networks = _build_all_networks(
-        correlation_tables=correlation_tables,
-        feature_prefixes=feature_prefixes,
-        network_params=network_params,
-        annotation_input=annotation_input,
-        output_dir=output_dir,
-        output_filename_prefix=output_filename_prefix
-    )
-    results['networks'] = networks
+    if networks and overwrite is False:
+        log.info(f"Loaded {len(networks)} existing networks from disk")
+    else:
+        # Calculate correlations
+        log.info("=" * 80)
+        log.info("Calculating Correlation Matrices")
+        log.info("=" * 80)
+        correlation_tables = _calculate_all_correlations(
+            integrated_data=integrated_data,
+            feature_prefixes=feature_prefixes,
+            correlation_params=correlation_params,
+            output_filename_prefix=output_filename_prefix
+        )
+        
+        # Build networks from correlations
+        log.info("=" * 80)
+        log.info("Creating Networks")
+        log.info("=" * 80)
+        networks = _build_all_networks(
+            correlation_tables=correlation_tables,
+            feature_prefixes=feature_prefixes,
+            network_params=network_params,
+            annotation_input=annotation_input,
+            output_dir=output_dir,
+            output_filename_prefix=output_filename_prefix
+        )
     
     # Compare network topologies
     log.info("=" * 80)
@@ -2359,17 +2344,6 @@ def compare_network_topologies(
     )
     results['cross_omics_connectivity'] = xomics_conn
     
-    # Simple degree entropy
-    log.info("=" * 80)
-    log.info("Information Gained Through Integration")
-    log.info("=" * 80)
-    information_theory = calculate_cross_omics_information_gain(
-        full_network=networks['full'],
-        independent_networks=networks,
-        feature_prefixes=feature_prefixes
-    )
-    results['information_theory'] = information_theory
-    
     # Conditional entropy reduction
     log.info("=" * 80)
     log.info("Conditional Entropy Reduction")
@@ -2381,17 +2355,6 @@ def compare_network_topologies(
     )
     results['conditional_entropy'] = conditional_entropy
     
-    # Integration-specific information content
-    log.info("=" * 80)
-    log.info("Integration-specific Information Content")
-    log.info("=" * 80)
-    integration_content = calculate_integration_information_content(
-        full_network=networks['full'],
-        independent_networks=networks,
-        feature_prefixes=feature_prefixes
-    )
-    results['integration_content'] = integration_content
-    
     # Motif analysis
     log.info("=" * 80)
     log.info("Cross-omics Motif Analysis")
@@ -2401,16 +2364,6 @@ def compare_network_topologies(
         feature_prefixes=feature_prefixes
     )
     results['motif_analysis'] = motif_analysis
-    
-    # Emergent modules
-    log.info("=" * 80)
-    log.info("Identifying Emergent Modules")
-    log.info("=" * 80)
-    emergent_modules = identify_emergent_modules(
-        networks=networks,
-        feature_prefixes=feature_prefixes
-    )
-    results['emergent_modules'] = emergent_modules
     
     # Perform submodule enrichment analysis
     log.info("=" * 80)
@@ -2433,15 +2386,33 @@ def compare_network_topologies(
     )
     results['edge_enrichment'] = edge_enrichment_results
 
+    # Generate independent plots
+    log.info("=" * 80)
+    log.info("Generating Independent Networks")
+    log.info("=" * 80)
+    plot_independent_networks(
+        networks=networks,
+        feature_prefixes=feature_prefixes,
+        layout=network_params.get('interactive_layout', 'spring')
+    )
+
     # Generate network comparison plots
     log.info("=" * 80)
     log.info("Generating Comparison Network")
     log.info("=" * 80)
     plot_network_comparison(
-        networks=results['networks'],
+        networks=networks,
         feature_prefixes=feature_prefixes,
         layout=network_params.get('interactive_layout', 'spring')
     )
+
+    if plot_interactive:
+        widget = plot_interactive_network_comparison(
+            networks=networks,
+            feature_prefixes=feature_prefixes,
+            layout=network_params.get('interactive_layout', 'spring')
+        )
+        display(widget)
 
     log.info("Analysis complete")
     
@@ -3311,19 +3282,7 @@ def calculate_submodule_preservation(
         # Add composition columns
         result.update(composition)
         result['total_nodes_in_full_submodule'] = len(all_nodes_in_full_submodule)
-        
         results.append(result)
-    
-    # Identify unmatched full network submodules
-    unmatched_full_submodules = set(full_modules.keys()) - matched_full_submodules
-    
-    if unmatched_full_submodules:
-        log.info(f"Full network submodules with no corresponding nodes in independent network:")
-        for full_submod in sorted(unmatched_full_submodules):
-            nodes_in_full = len(full_modules[full_submod])
-            log.info(f"{full_submod} ({nodes_in_full} {dataset_prefix.rstrip('_')} nodes) - no match in independent network")
-    else:
-        log.info(f"All full network submodules had at least one node matched to independent network")
     
     results_df = pd.DataFrame(results).sort_values('jaccard_similarity', ascending=False)
     
@@ -3336,7 +3295,6 @@ def calculate_submodule_preservation(
     log.info(f"Average node preservation rate: {avg_preservation:.1%}")
     log.info(f"Modules with Jaccard > 0.7 (strong preservation): {(results_df['jaccard_similarity'] > 0.7).sum()} ({(results_df['jaccard_similarity'] > 0.7).sum() / len(results_df) * 100:.1f}%)")
     log.info(f"Modules with Jaccard > 0.3 (moderate preservation): {(results_df['jaccard_similarity'] > 0.3).sum()} ({(results_df['jaccard_similarity'] > 0.3).sum() / len(results_df) * 100:.1f}%)")
-    log.info(f"Full network submodules not represented in independent network: {len(unmatched_full_submodules)}")
     
     return results_df
 
@@ -3531,214 +3489,6 @@ def analyze_cross_omics_connectivity(
     
     return results
 
-def identify_emergent_modules(
-    networks: dict,
-    feature_prefixes: List[str] = ["tx_", "mx_"]
-) -> pd.DataFrame:
-    """
-    Find multi-omics modules that only exist in the full integrated network.
-    
-    Args:
-        networks: Dictionary of networks (must include 'full' and independent networks)
-        feature_prefixes: List of feature prefixes for different omics types
-        
-    Returns:
-        DataFrame with information about emergent modules
-    """
-    
-    log.info("Identifying emergent multi-omics modules...")
-    
-    if 'full' not in networks:
-        raise ValueError("Networks dictionary must contain 'full' network")
-    
-    full_net = networks['full']
-    
-    # Get all submodules from full network
-    full_modules = {}
-    for node in full_net.nodes():
-        submod = full_net.nodes[node].get('submodule', 'unknown')
-        full_modules.setdefault(submod, []).append(node)
-    
-    log.info(f"Found {len(full_modules)} submodules in full network")
-    
-    emergent_modules = []
-    
-    for submod_name, nodes in full_modules.items():
-        # Count node types
-        node_types = {}
-        for prefix in feature_prefixes:
-            prefix_name = prefix.rstrip('_')
-            node_types[f'{prefix_name}_nodes'] = sum(1 for n in nodes if n.startswith(prefix))
-        
-        # Check if module is truly multi-omics (has nodes from multiple datasets)
-        has_multiple_omics = sum(1 for count in node_types.values() if count > 0) > 1
-        
-        if not has_multiple_omics:
-            continue
-        
-        # Check if this module configuration exists in any independent network
-        is_emergent = True
-        overlap_details = {}
-        
-        for prefix in feature_prefixes:
-            dataset_name = prefix.rstrip('_')
-            indep_net_name = f"{dataset_name}_only"
-            
-            if indep_net_name not in networks:
-                continue
-            
-            indep_net = networks[indep_net_name]
-            
-            # Get nodes of this type in the full network module
-            dataset_nodes_in_module = [n for n in nodes if n.startswith(prefix)]
-            
-            if not dataset_nodes_in_module:
-                continue
-            
-            # Check if these nodes were together in any independent module
-            independent_modules_for_nodes = {}
-            for node in dataset_nodes_in_module:
-                if node in indep_net.nodes():
-                    indep_submod = indep_net.nodes[node].get('submodule', 'unknown')
-                    independent_modules_for_nodes.setdefault(indep_submod, []).append(node)
-            
-            # Find the independent module with most overlap
-            if independent_modules_for_nodes:
-                max_overlap_module = max(independent_modules_for_nodes.items(), 
-                                       key=lambda x: len(x[1]))
-                max_overlap_count = len(max_overlap_module[1])
-                overlap_pct = (max_overlap_count / len(dataset_nodes_in_module)) * 100
-                log.info(f"Integrated submodule {submod_name}: {overlap_pct:.1f}% of {dataset_name} nodes overlap with independent submodule {max_overlap_module[0]}")
-                
-                overlap_details[dataset_name] = {
-                    'independent_module': max_overlap_module[0],
-                    'nodes_in_common': max_overlap_count,
-                    'total_nodes': len(dataset_nodes_in_module),
-                    'overlap_pct': overlap_pct
-                }
-                
-                # If >X% of nodes were already in this independent module, not emergent
-                overlap_threshold = 70
-                if overlap_pct > overlap_threshold:
-                    is_emergent = False
-                    break                    
-        
-        if is_emergent:
-            log.info(f"    Submodule {submod_name} is emergent")
-            # Calculate integration metrics
-            total_nodes = len(nodes)
-            primary_omics = max(node_types.items(), key=lambda x: x[1])[0]
-            
-            # Count cross-omics edges within this module
-            cross_omics_edges = 0
-            for u, v in full_net.edges():
-                if u in nodes and v in nodes:
-                    u_prefix = None
-                    v_prefix = None
-                    for prefix in feature_prefixes:
-                        if u.startswith(prefix):
-                            u_prefix = prefix
-                        if v.startswith(prefix):
-                            v_prefix = prefix
-                    if u_prefix and v_prefix and u_prefix != v_prefix:
-                        cross_omics_edges += 1
-            
-            module_info = {
-                'module': submod_name,
-                'n_nodes': total_nodes,
-                'cross_omics_edges': cross_omics_edges,
-                'primary_omics': primary_omics
-            }
-            module_info.update(node_types)
-            
-            # Add overlap details
-            for dataset_name, details in overlap_details.items():
-                module_info[f'{dataset_name}_overlap_pct'] = details['overlap_pct']
-            
-            emergent_modules.append(module_info)
-    
-    if not emergent_modules:
-        log.info("No emergent submodules found")
-        return pd.DataFrame()
-    
-    emergent_df = pd.DataFrame(emergent_modules)
-    emergent_df = emergent_df.sort_values('cross_omics_edges', ascending=False)
-    
-    log.info(f"Identified {len(emergent_df)} emergent submodules in the integrated network (<{overlap_threshold}% overlap of nodes with any independent modules)")
-    log.info(f"These submodules contain {emergent_df['n_nodes'].sum()} total nodes")
-    log.info(f"Average cross-omics edges per submodule: {emergent_df['cross_omics_edges'].mean():.1f}")
-    
-    return emergent_df
-
-def calculate_cross_omics_information_gain(
-    full_network: nx.Graph,
-    independent_networks: Dict[str, nx.Graph],
-    feature_prefixes: List[str]
-) -> Dict[str, float]:
-    """
-    Calculate information gain using graph entropy reduction.
-    Measures how much uncertainty about one omics layer is reduced by integration.
-    """
-    
-    log.info("Calculating information theoretic metrics...")
-
-    results = {}
-    
-    for prefix in feature_prefixes:
-        dataset_name = prefix.rstrip('_')
-        indep_name = f"{dataset_name}_only"
-        
-        if indep_name not in independent_networks:
-            continue
-        
-        # Get nodes for this dataset
-        dataset_nodes = {n for n in full_network.nodes() if n.startswith(prefix)}
-        
-        # Calculate degree distribution entropy in independent network
-        indep_degrees = [independent_networks[indep_name].degree(n) 
-                        for n in dataset_nodes 
-                        if n in independent_networks[indep_name]]
-        
-        # Calculate degree distribution entropy in full network
-        full_degrees = [full_network.degree(n) 
-                       for n in dataset_nodes 
-                       if n in full_network]
-        
-        # Shannon entropy of degree distributions
-        def degree_entropy(degrees):
-            if not degrees:
-                return 0
-            degree_counts = pd.Series(degrees).value_counts(normalize=True)
-            return -sum(p * np.log2(p) for p in degree_counts if p > 0)
-        
-        indep_entropy = degree_entropy(indep_degrees)
-        full_entropy = degree_entropy(full_degrees)
-        
-        # Information gain = increase in entropy (more connections = more information)
-        info_gain = full_entropy - indep_entropy
-        
-        results[dataset_name] = {
-            'degree_entropy_independent': indep_entropy,
-            'degree_entropy_full': full_entropy,
-            'information_gain': info_gain,
-            'relative_gain_pct': (info_gain / indep_entropy * 100) if indep_entropy > 0 else 0
-        }
-        
-        log.info(f"{dataset_name} information gain:")
-        log.info(f"Independent network entropy: {indep_entropy:.3f}")
-        log.info(f"Full network entropy: {full_entropy:.3f}")
-        log.info(f"Information gain: {info_gain:.3f} ({results[dataset_name]['relative_gain_pct']:.1f}% increase)")
-        
-        # Interpretation
-        if info_gain > 0:
-            log.info(f"Integration increased connectivity diversity for {dataset_name}")
-        elif info_gain < 0:
-            log.info(f"Integration decreased connectivity diversity for {dataset_name}")
-        else:
-            log.info(f"Integration did not change connectivity diversity for {dataset_name}")
-    
-    return results
-
 def calculate_conditional_entropy_reduction(
     full_network: nx.Graph,
     independent_networks: Dict[str, nx.Graph],
@@ -3787,7 +3537,6 @@ def calculate_conditional_entropy_reduction(
             conditional_entropies.append((node, cross_edges))
         
         # Group by number of cross-edges and calculate entropy within each group
-        from collections import defaultdict
         groups = defaultdict(list)
         for node, cross_count in conditional_entropies:
             groups[cross_count].append(full_network.degree(node))
@@ -3825,69 +3574,6 @@ def _degree_entropy(degrees):
     degree_counts = pd.Series(degrees).value_counts(normalize=True)
     return -sum(p * np.log2(p) for p in degree_counts if p > 0)
 
-def calculate_integration_information_content(
-    full_network: nx.Graph,
-    independent_networks: Dict[str, nx.Graph],
-    feature_prefixes: List[str]
-) -> Dict[str, float]:
-    """
-    Quantify information that exists ONLY in the integrated network.
-    Measures synergistic information not present in individual layers.
-    """
-    
-    log.info("Calculating integration-specific information content...")
-    
-    results = {}
-    
-    # Count cross-layer connectivity patterns
-    cross_layer_edges = 0
-    total_edges = full_network.number_of_edges()
-    
-    omics_assignment = {}
-    for prefix in feature_prefixes:
-        for node in full_network.nodes():
-            if node.startswith(prefix):
-                omics_assignment[node] = prefix.rstrip('_')
-    
-    # Identify truly integrative edges
-    for u, v in full_network.edges():
-        if omics_assignment.get(u) != omics_assignment.get(v):
-            cross_layer_edges += 1
-    
-    # Calculate entropy of edge type distribution
-    within_layer_edges = total_edges - cross_layer_edges
-    
-    if total_edges > 0:
-        p_cross = cross_layer_edges / total_edges
-        p_within = within_layer_edges / total_edges
-        
-        # Entropy of edge type distribution
-        edge_type_entropy = 0
-        if p_cross > 0:
-            edge_type_entropy -= p_cross * np.log2(p_cross)
-        if p_within > 0:
-            edge_type_entropy -= p_within * np.log2(p_within)
-    else:
-        edge_type_entropy = 0
-    
-    # Information specific to integration
-    # Compare to maximum possible if edges were distributed uniformly
-    max_entropy = np.log2(2)  # Binary: cross-layer or within-layer
-    integration_specificity = edge_type_entropy / max_entropy if max_entropy > 0 else 0
-    
-    results['cross_layer_edges'] = cross_layer_edges
-    results['within_layer_edges'] = within_layer_edges
-    results['edge_type_entropy'] = edge_type_entropy
-    results['integration_specificity'] = integration_specificity
-    results['cross_layer_percentage'] = (cross_layer_edges / total_edges * 100) if total_edges > 0 else 0
-    
-    log.info(f"Integration information metrics:")
-    log.info(f"Cross-layer edges: {cross_layer_edges} ({results['cross_layer_percentage']:.1f}%)")
-    log.info(f"Edge type entropy: {edge_type_entropy:.3f}")
-    log.info(f"Integration specificity: {integration_specificity:.3f}")
-    
-    return results
-
 def analyze_cross_omics_motifs(
     full_network: nx.Graph,
     feature_prefixes: List[str],
@@ -3906,7 +3592,6 @@ def analyze_cross_omics_motifs(
     motif_counts = {
         'transcript_hub': 0,  # 1 transcript → many metabolites
         'metabolite_hub': 0,  # 1 metabolite → many transcripts
-        'cross_triangle': 0,  # tx1-mx1, tx1-mx2, tx2-mx1, tx2-mx2 pattern
     }
     
     # Identify nodes by type
@@ -3938,34 +3623,9 @@ def analyze_cross_omics_motifs(
         if len(neighbors_type1) >= 3:
             motif_counts['metabolite_hub'] += 1
     
-    # Count cross-triangles (computationally expensive, limit to smaller networks)
-    if len(nodes1) < 1000 and len(nodes2) < 1000:
-        log.info(f"Counting cross-triangle motifs (pairs of {type1} nodes sharing ≥2 {type2} neighbors)...")
-        log.info(f"This may take a moment for large networks...")
-        
-        triangle_count = 0
-        for n1a, n1b in combinations(nodes1, 2):
-            # Check if both connect to same nodes in type2
-            neighbors_n1a = set(full_network.neighbors(n1a)) & nodes2
-            neighbors_n1b = set(full_network.neighbors(n1b)) & nodes2
-            shared_neighbors = neighbors_n1a & neighbors_n1b
-            
-            if len(shared_neighbors) >= 2:
-                triangle_count += 1
-        
-        motif_counts['cross_triangle'] = triangle_count
-    else:
-        log.info(f"Skipping cross-triangle analysis (network too large: {len(nodes1)} + {len(nodes2)} nodes)")
-        log.info(f"Cross-triangle motif counting is computationally expensive for networks >1000 nodes per type")
-    
     log.info(f"Cross-omics motif analysis complete:")
     log.info(f"{type1} hubs: {motif_counts['transcript_hub']} nodes with ≥3 {type2} connections")
     log.info(f"{type2} hubs: {motif_counts['metabolite_hub']} nodes with ≥3 {type1} connections")
-    
-    if motif_counts['cross_triangle'] > 0:
-        log.info(f"Cross-triangles: {motif_counts['cross_triangle']} pairs of {type1} nodes sharing ≥2 {type2} neighbors")
-    else:
-        log.info(f"Cross-triangles: none found")
     
     # Interpretation
     total_hubs = motif_counts['transcript_hub'] + motif_counts['metabolite_hub']
@@ -3975,11 +3635,142 @@ def analyze_cross_omics_motifs(
     
     return motif_counts
 
+def plot_independent_networks(
+    networks: Dict[str, nx.Graph],
+    feature_prefixes: List[str],
+    layout: str = "spring",
+    seed: int = 42,
+    show_plot: bool = True
+) -> None:
+    """
+    Create static matplotlib visualizations for each independent network.
+    
+    Uses the same visual style as plot_network_comparison:
+    - All nodes in gray, shaped by data type (circle/square/triangle)
+    - Black edges with consistent styling
+    
+    Args:
+        networks: Dictionary containing independent networks (e.g., 'tx_only', 'mx_only')
+        feature_prefixes: List of feature prefixes for different data types
+        layout: Layout algorithm ('spring', 'kamada_kawai', 'circular', 'fr')
+        seed: Random seed for layout reproducibility
+        show_plot: Whether to display plots inline
+        
+    Returns:
+        None (displays plots)
+    """
+    
+    log.info("Creating static network visualizations for independent networks...")
+    
+    # Filter to only independent networks (exclude 'full')
+    independent_networks = {
+        name: G for name, G in networks.items() 
+        if name != 'full'
+    }
+    
+    if not independent_networks:
+        log.warning("No independent networks found to plot")
+        return
+    
+    # Plot each independent network
+    for network_name, network in independent_networks.items():
+        log.info(f"Plotting {network_name} network: {network.number_of_nodes()} nodes, {network.number_of_edges()} edges")
+        
+        # Compute layout
+        log.info(f"  Computing {layout} layout...")
+        if layout == "spring":
+            pos = nx.spring_layout(network, seed=seed, k=1/np.sqrt(len(network.nodes())))
+        elif layout == "kamada_kawai":
+            pos = nx.kamada_kawai_layout(network)
+        elif layout == "circular":
+            pos = nx.circular_layout(network)
+        elif layout == "fr":
+            pos = nx.fruchterman_reingold_layout(network, seed=seed)
+        else:
+            raise ValueError(f"Unsupported layout: {layout}")
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(16, 12))
+        
+        # Draw nodes by data type with matching styles
+        for i, prefix in enumerate(feature_prefixes):
+            nodes_of_type = [n for n in network.nodes() if n.startswith(prefix)]
+            
+            if not nodes_of_type:
+                continue
+            
+            # Use circle for first type, triangle for others (matching comparison plot)
+            node_shape = 'o' if i == 0 else '^'
+            
+            nx.draw_networkx_nodes(
+                network, pos,
+                nodelist=nodes_of_type,
+                node_color='#808080',  # Gray
+                node_size=15,
+                node_shape=node_shape,
+                alpha=0.4,
+                linewidths=0.5,
+                edgecolors='white',
+                ax=ax,
+                label=f'{prefix.rstrip("_")} nodes'
+            )
+        
+        # Draw all edges in black (matching the "preserved" style from comparison plot)
+        nx.draw_networkx_edges(
+            network, pos,
+            edgelist=network.edges(),
+            edge_color='#000000',  # Black
+            width=0.25,
+            alpha=0.25,
+            ax=ax
+        )
+        
+        # Create legend
+        legend_elements = []
+        
+        # Add node type legends
+        for i, prefix in enumerate(feature_prefixes):
+            if any(n.startswith(prefix) for n in network.nodes()):
+                marker = 'o' if i == 0 else '^'
+                legend_elements.append(
+                    Line2D([0], [0], marker=marker, color='w', 
+                          label=f'{prefix.rstrip("_")} nodes', 
+                          markerfacecolor='#808080', markersize=8, alpha=0.4)
+                )
+        
+        # Add edge legend
+        legend_elements.append(
+            Line2D([0], [0], color='#000000', linewidth=2, 
+                  label=f'Edges ({network.number_of_edges()})')
+        )
+        
+        # Add legend to plot
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
+        
+        # Format network name for title
+        display_name = network_name.replace('_only', '').replace('_', ' ').title()
+        
+        # Title
+        ax.set_title(
+            f"{display_name} Independent Network",
+            fontsize=14,
+            pad=20
+        )
+        ax.axis('off')
+        
+        if show_plot:
+            plt.show()
+        plt.close(fig)
+    
+    log.info("Independent network plotting complete")
+    
+    return
+
 def plot_network_comparison(
     networks: Dict[str, nx.Graph],
     feature_prefixes: List[str],
     layout: str = "spring",
-    seed: int = 555,
+    seed: int = 42,
     show_plot: bool = True
 ) -> None:
     """
@@ -4068,8 +3859,8 @@ def plot_network_comparison(
             nodelist=nodes_of_type,
             node_color='#808080',
             node_size=15,
-            node_shape='o' if i == 0 else 's',
-            alpha=0.5,
+            node_shape='o' if i == 0 else '^',
+            alpha=0.4,
             linewidths=0.5,
             edgecolors='white',
             ax=ax,
@@ -4097,10 +3888,11 @@ def plot_network_comparison(
         )
     
     # Create legend
-    from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], color='#000000', linewidth=2, label=f'Edges shared with independent networks ({len(black_edges)})'),
-        Line2D([0], [0], color='#008000', linewidth=2, label=f'Edges unique to integrated network ({len(green_edges)})')
+        Line2D([0], [0], color='#008000', linewidth=2, label=f'Edges unique to integrated network ({len(green_edges)})'),
+        Line2D([0], [0], marker='o', color='w', label=f'{feature_prefixes[0].rstrip("_")} nodes', markerfacecolor='#808080', markersize=8, alpha=0.4),
+        Line2D([0], [0], marker='^', color='w', label=f'{feature_prefixes[1].rstrip("_")} nodes', markerfacecolor='#808080', markersize=8, alpha=0.4)
     ]
         
     # Combine legends
@@ -4117,6 +3909,234 @@ def plot_network_comparison(
     plt.close(fig)
     
     return
+
+def plot_interactive_network_comparison(
+    networks: Dict[str, nx.Graph],
+    feature_prefixes: List[str],
+    layout: str = "spring",
+    seed: int = 42,
+) -> go.FigureWidget:
+    """
+    Create an interactive Plotly visualization comparing independent and integrated networks.
+    
+    Shows the FULL network with:
+    - Nodes colored by submodule assignment
+    - Node shapes differ by data type (circle/triangle)
+    - Gray edges: Within same data type (intra-omics)
+    - Black edges: Between different data types (cross-omics)
+    - Preserved vs gained edges shown by line style
+    
+    Args:
+        networks: Dictionary containing 'full' and independent networks
+        feature_prefixes: List of feature prefixes for different data types
+        layout: Layout algorithm ('spring', 'kamada_kawai', 'circular', 'fr')
+        seed: Random seed for layout reproducibility
+        
+    Returns:
+        go.FigureWidget: Interactive Plotly widget
+    """
+    
+    if 'full' not in networks:
+        raise ValueError("Networks dictionary must contain 'full' network")
+    
+    log.info("Creating interactive network comparison visualization...")
+    
+    full_network = networks['full']
+    
+    # Collect all edges from independent networks
+    independent_edges = set()
+    for name, network in networks.items():
+        if name != 'full':
+            independent_edges.update(network.edges())
+    
+    log.info(f"Full network: {full_network.number_of_nodes()} nodes, {full_network.number_of_edges()} edges")
+    log.info(f"Independent networks: {len(independent_edges)} total edges")
+    
+    # Compute layout on full network
+    log.info(f"Computing {layout} layout...")
+    if layout == "spring":
+        pos = nx.spring_layout(full_network, seed=seed, k=10/np.sqrt(len(full_network.nodes())), weight="weight", iterations=100)
+    elif layout == "kamada_kawai":
+        pos = nx.kamada_kawai_layout(full_network)
+    elif layout == "circular":
+        pos = nx.circular_layout(full_network)
+    elif layout == "fr":
+        pos = nx.fruchterman_reingold_layout(full_network, seed=seed)
+    else:
+        raise ValueError(f"Unsupported layout: {layout}")
+    
+    # Helper function to normalize edges for undirected comparison
+    def normalize_edge(edge):
+        return tuple(sorted(edge))
+    
+    # Normalize independent edges for comparison
+    normalized_independent = {normalize_edge(e) for e in independent_edges}
+    
+    # Helper function to determine edge type
+    def get_edge_type(u, v):
+        """Determine if edge is within or between data types"""
+        u_type = next((p for p in feature_prefixes if u.startswith(p)), None)
+        v_type = next((p for p in feature_prefixes if v.startswith(p)), None)
+        return "cross" if u_type != v_type else "intra"
+    
+    # Categorize edges in full network
+    gray_preserved_edges = []  # Intra-omics edges in independent networks
+    gray_gained_edges = []     # Intra-omics edges only in full network
+    black_preserved_edges = [] # Cross-omics edges in independent networks
+    black_gained_edges = []    # Cross-omics edges only in full network
+    
+    for edge in full_network.edges():
+        edge_type = get_edge_type(edge[0], edge[1])
+        is_preserved = normalize_edge(edge) in normalized_independent
+        
+        if edge_type == "intra":
+            if is_preserved:
+                gray_preserved_edges.append(edge)
+            else:
+                gray_gained_edges.append(edge)
+        else:  # cross-omics
+            if is_preserved:
+                black_preserved_edges.append(edge)
+            else:
+                black_gained_edges.append(edge)
+    
+    log.info(f"Gray edges (intra-omics preserved): {len(gray_preserved_edges)}")
+    log.info(f"Gray edges (intra-omics gained): {len(gray_gained_edges)}")
+    log.info(f"Black edges (cross-omics preserved): {len(black_preserved_edges)}")
+    log.info(f"Black edges (cross-omics gained): {len(black_gained_edges)}")
+    
+    # Build edge traces
+    def create_edge_trace(edges, color, width, dash, name):
+        edge_x, edge_y = [], []
+        for u, v in edges:
+            x0, y0 = pos[u]
+            x1, y1 = pos[v]
+            edge_x += [x0, x1, None]
+            edge_y += [y0, y1, None]
+        
+        return go.Scatter(
+            x=edge_x, y=edge_y,
+            mode="lines",
+            line=dict(width=width, color=color, dash=dash),
+            hoverinfo="none",
+            showlegend=True,
+            name=name
+        )
+    
+    # Create edge traces (preserved = solid, gained = dashed)
+    edge_traces = [
+        create_edge_trace(gray_preserved_edges, "#888888", 1, "solid", 
+                         f"Intra-omics preserved ({len(gray_preserved_edges)})"),
+        create_edge_trace(gray_gained_edges, "#888888", 1, "dash", 
+                         f"Intra-omics gained ({len(gray_gained_edges)})"),
+        create_edge_trace(black_preserved_edges, "#000000", 2, "solid", 
+                         f"Cross-omics preserved ({len(black_preserved_edges)})"),
+        create_edge_trace(black_gained_edges, "#000000", 2, "dash", 
+                         f"Cross-omics gained ({len(black_gained_edges)})"),
+    ]
+    
+    # Get unique submodules and create color palette
+    log.info("Building node traces...")
+    submodules = set()
+    for n in full_network.nodes():
+        submod = full_network.nodes[n].get('submodule', 'unassigned')
+        if submod:
+            submodules.add(submod)
+    
+    n_submodules = len(submodules)
+    submodule_colors = viridis(np.linspace(0, 1, n_submodules))
+    submodule_color_map = {
+        submod: to_hex(submodule_colors[i]) 
+        for i, submod in enumerate(sorted(submodules))
+    }
+    
+    # Create separate node traces for each data type (to get different shapes)
+    node_traces = []
+    
+    # Map Plotly symbols to match matplotlib: circle for first type, triangle-up for others
+    plotly_symbols = ['circle', 'triangle-up', 'square', 'diamond', 'cross']
+    
+    for i, prefix in enumerate(feature_prefixes):
+        # Get nodes of this type
+        nodes_of_type = [n for n in full_network.nodes() if n.startswith(prefix)]
+        
+        if not nodes_of_type:
+            continue
+        
+        node_x, node_y, node_color, node_size, hover_txt = [], [], [], [], []
+        
+        for n in nodes_of_type:
+            data = full_network.nodes[n]
+            x, y = pos[n]
+            node_x.append(x)
+            node_y.append(y)
+            
+            # Color by submodule
+            submodule = data.get("submodule", "unassigned")
+            node_color.append(submodule_color_map.get(submodule, "#808080"))
+            node_size.append(data.get("node_size", 10))
+            
+            # Build hover text
+            hover_parts = [str(n)]
+            if submodule:
+                hover_parts.append(f"{submodule.replace('_', ' ')}")
+            
+            # Add annotations
+            display_name = data.get('display_name', 'Unassigned')
+            if display_name != 'Unassigned':
+                hover_parts.append(display_name)
+            
+            hover_txt.append("<br>".join(hover_parts))
+        
+        # Create trace for this data type with specific symbol
+        symbol = plotly_symbols[i % len(plotly_symbols)]
+        
+        node_trace = go.Scatter(
+            x=node_x, y=node_y,
+            mode="markers",
+            marker=dict(
+                size=node_size,
+                color=node_color,
+                symbol=symbol,
+                opacity=0.9,
+                line=dict(width=1, color="#222"),
+            ),
+            hoverinfo="text",
+            text=hover_txt,
+            hovertemplate="%{text}<extra></extra>",
+            showlegend=True,
+            name=f"{prefix.rstrip('_')} nodes",
+            customdata=nodes_of_type,
+        )
+        
+        node_traces.append(node_trace)
+    
+    # Assemble figure widget
+    log.info("Assembling interactive network widget...")
+    fig = go.FigureWidget(
+        data=edge_traces + node_traces,
+        layout=go.Layout(
+            title="Integrated Network Comparison (interactive)",
+            title_x=0.5,
+            showlegend=True,
+            hovermode="closest",
+            margin=dict(l=20, r=20, t=60, b=20),
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            height=900,
+            width=1200,
+            clickmode="event+select",
+            legend=dict(
+                x=1.02,
+                y=1,
+                xanchor='left',
+                yanchor='top'
+            )
+        ),
+    )
+    
+    log.info("Interactive network comparison complete")
+    return fig
 
 # ====================================
 # Dataset acquisition functions
@@ -7653,6 +7673,7 @@ def perform_functional_enrichment(
 
     # Sort by corrected p-value, then by fold enrichment
     results_df = results_df.sort_values(['p_value_corr', 'fold_enrichment'], ascending=[True, False])
+    sig_results_df = results_df[results_df['significant'] == True]
 
     # Summary statistics
     n_significant = results_df['significant'].sum()
@@ -7662,8 +7683,13 @@ def perform_functional_enrichment(
     log.info(f"  Total tests performed: {n_total_tests}")
     log.info(f"  Significant enrichments (< {p_value_threshold}): {n_significant}")
     log.info(f"  Background: {total_nodes_in_network_with_annotations}/{total_nodes_in_network} nodes with annotations")
-    log.info(f"List of significant functional categories: {results_df[results_df['significant'] == True]['annotation_term'].unique().tolist()}")
-    
+    log.info(f"List of significant functional categories: ")
+    if n_significant > 0:
+        for idx, row in sig_results_df.iterrows():
+            log.info(f"    Submodule: {row['submodule']}, Annotation: {row['annotation_term']}, Fold Enrichment: {row['fold_enrichment']:.2f}, Corrected p-value: {row['p_value_corr']:.4e}")
+    else:
+        log.info("    None")
+
     # Save results if output directory provided
     if output_dir:
         write_integration_file(
@@ -7688,7 +7714,7 @@ def perform_functional_enrichment(
 #     num_factors: int = 5,
 #     num_features: int = 10,
 #     num_iterations: int = 100,
-#     training_seed: int = 555,
+#     training_seed: int = 42,
 #     overwrite: bool = False
 # ) -> None:
 #     """
@@ -7772,7 +7798,7 @@ def perform_functional_enrichment(
 #     output_filename: str = "mofa2_model.hdf5",
 #     num_factors: int = 1,
 #     num_iterations: int = 100,
-#     training_seed: int = 555
+#     training_seed: int = 42
 # ) -> str:
 #     """
 #     Run MOFA2 model training and save the model to disk.

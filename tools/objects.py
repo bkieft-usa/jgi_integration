@@ -1995,6 +1995,7 @@ class Analysis(DataAwareBaseHandler):
             annotation_input=self.feature_annotation_table,
             output_dir=output_dir,
             overwrite=overwrite,
+            plot_interactive=networking_params.get('interactive_plot', False),
         )
 
         return results
