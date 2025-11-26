@@ -1804,7 +1804,7 @@ class Analysis(DataAwareBaseHandler):
             _link_data_method()
             return
 
-    def plot_dataset_distributions(self, datatype: str = "normalized", bins: int = 100, transparency: float = 0.8, xlog: bool = False, show_plot: bool = True, show_progress: bool = True) -> None:
+    def plot_dataset_distributions(self, datatype: str = "normalized", show_progress: bool = True) -> None:
         """Plot histograms of feature values for each dataset in the analysis."""
         def _plot_distributions_method():
             log.info("Plotting feature value distributions for all datasets")
@@ -1816,11 +1816,7 @@ class Analysis(DataAwareBaseHandler):
             hlp.plot_data_variance_histogram(
                 dataframes=dataframes,
                 datatype=datatype,
-                bins=bins,
-                transparency=transparency,
-                xlog=xlog,
                 output_dir=self.output_dir,
-                show_plot=show_plot
             )
 
         _plot_distributions_method()

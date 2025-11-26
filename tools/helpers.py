@@ -1796,18 +1796,17 @@ def plot_correlation_network(
         log.info("\tMain graph updated with submodule annotations and written to disk.")
 
     # interactive plot
-    if show_plot:
-        log.info("Rendering interactive network in notebook…")
-        color_attr = "submodule_color" if submodule_mode != "none" else "datatype_color"
-        log.info("Pre-computing network layout...")
-        widget = _nx_to_plotly_widget(
-            G,
-            node_color_attr=color_attr,
-            node_size_attr="node_size",
-            layout=interactive_layout,
-            seed=42,
-        )
-        display(widget)
+    log.info("Rendering interactive network in notebook…")
+    color_attr = "submodule_color" if submodule_mode != "none" else "datatype_color"
+    log.info("Pre-computing network layout...")
+    widget = _nx_to_plotly_widget(
+        G,
+        node_color_attr=color_attr,
+        node_size_attr="node_size",
+        layout=interactive_layout,
+        seed=42,
+    )
+    display(widget)
 
     return node_table, edge_table
 
@@ -3686,6 +3685,8 @@ def plot_independent_networks(
             pos = nx.circular_layout(network)
         elif layout == "fr":
             pos = nx.fruchterman_reingold_layout(network, seed=seed)
+        elif layout == "atlas":
+            pos = nx.forceatlas2_layout(network, seed=seed)
         else:
             raise ValueError(f"Unsupported layout: {layout}")
         
@@ -3820,6 +3821,8 @@ def plot_network_comparison(
         pos = nx.circular_layout(full_network)
     elif layout == "fr":
         pos = nx.fruchterman_reingold_layout(full_network, seed=seed)
+    elif layout == "atlas":
+        pos = nx.forceatlas2_layout(full_network, seed=seed)
     else:
         raise ValueError(f"Unsupported layout: {layout}")
     
@@ -6777,6 +6780,8 @@ def plot_pca(
         # individual PDF plots
         plot_paths[d_type] = {}
         for meta_var in metadata_variables:
+            if meta_var == "group":
+                continue
             fig, ax = plt.subplots(figsize=(6, 5))
             title = f"{dataset_name} - {d_type} - {meta_var}"
             _draw_pca(ax, pca_df, hue_col=meta_var, title=title, alpha=alpha)
@@ -6814,6 +6819,8 @@ def plot_pdf_grids(
     Returns the path to the grid PDF.
     """
     pdf_metadata_vars = metadata_variables.copy()
+    if "group" in pdf_metadata_vars:
+        pdf_metadata_vars.remove("group")
     data_types = list(pca_frames.keys())
     n_rows, n_cols = len(data_types), len(pdf_metadata_vars)
 
@@ -6847,59 +6854,17 @@ def plot_pdf_grids(
 
     return
 
-def plot_data_variance_indv_histogram(
-    data: pd.DataFrame,
-    bins: int = 50,
-    transparency: float = 0.8,
-    xlog: bool = False,
-    dataset_name: str = None,
-    output_dir: str = None
-) -> None:
-    """
-    Plot a histogram of all values in a single dataset.
-
-    Args:
-        data (pd.DataFrame): Feature matrix.
-        bins (int): Number of histogram bins.
-        transparency (float): Alpha for bars.
-        xlog (bool): Use log scale for x-axis.
-        dataset_name (str, optional): Name for output file.
-        output_dir (str, optional): Output directory for plots.
-
-    Returns:
-        None
-    """
-
-    plt.figure(figsize=(10, 6))
-    sns.histplot(data.values.flatten(), bins=bins, kde=False, color=sns.color_palette("viridis", 1)[0], 
-                    edgecolor="black", fill=True, alpha=transparency)
-    
-    if xlog:
-        plt.xscale('log')
-    plt.title(f'Histogram of {dataset_name}')
-    plt.xlabel('Quantitative value')
-    plt.ylabel('Frequency')
-    
-    # Save the plot if output_dir is specified
-    if output_dir:
-        output_subdir = f"{output_dir}/data_distributions"
-        os.makedirs(output_subdir, exist_ok=True)
-        filename = f"distribution_of_{dataset_name}.pdf"
-        log.info(f"Saving plot to {output_subdir}/{filename}")
-        plt.savefig(f"{output_subdir}/{filename}")
-    
-    plt.show()
-
-
 def plot_simple_histogram(
     dataframe: pd.DataFrame,
-    title: str,
+    plot_title: str,
+    output_dir: str = None,
     bins: int = 50,
     transparency: float = 0.8,
     xlog: bool = False,
+    ylog: bool = True,
 ) -> None:
 
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(6, 4))
     palette = sns.color_palette("viridis", 1)
 
     sns.histplot(
@@ -6913,12 +6878,23 @@ def plot_simple_histogram(
         alpha=transparency
     )
 
+    plt.xlabel('Normalized Abundance')
     if xlog:
         plt.xscale('log')
-    plt.title(title)
-    plt.xlabel('Quantitative value')
+        plt.xlabel('Normalized Abundance (log)')
+
     plt.ylabel('Frequency')
-    plt.legend()
+    if ylog:
+        plt.yscale('log')
+        plt.ylabel('Frequency (log)')
+
+    plt.title(plot_title)
+
+    # Save the plot if output_dir is specified
+    filename = f"{plot_title.replace(' ', '_')}.pdf"
+    log.info(f"Saving plot to {output_dir}/{filename}...")
+    plt.savefig(f"{output_dir}/{filename}")
+
     plt.show()
     plt.close()
 
@@ -6929,8 +6905,8 @@ def plot_data_variance_histogram(
     bins: int = 50,
     transparency: float = 0.8,
     xlog: bool = False,
+    ylog: bool = False,
     output_dir: str = None,
-    show_plot: bool = True
 ) -> None:
     """
     Plot histograms of values for multiple datasets on the same plot.
@@ -6942,13 +6918,12 @@ def plot_data_variance_histogram(
         transparency (float): Alpha for bars.
         xlog (bool): Use log scale for x-axis.
         output_dir (str, optional): Output directory for plots.
-        show_plot (bool): Whether to display the plot.
 
     Returns:
         None
     """
 
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(6, 4))
     palette = sns.color_palette("viridis", len(dataframes))
 
     for i, (label, df) in enumerate(dataframes.items()):
@@ -6964,21 +6939,26 @@ def plot_data_variance_histogram(
             alpha=transparency
         )
 
+    plt.xlabel('Normalized Abundance')
     if xlog:
         plt.xscale('log')
-    plt.title('Histogram of DataFrames')
-    plt.xlabel('Quantitative value')
+        plt.xlabel('Normalized Abundance (log)')
+
     plt.ylabel('Frequency')
-    plt.title('Data structure')
+    if ylog:
+        plt.yscale('log')
+        plt.ylabel('Frequency (log)')
+
+    plt.title(f'Histogram of Integrated Datasets ({datatype})')
+
     plt.legend()
 
     # Save the plot if output_dir is specified
     filename = f"distribution_of_{datatype}_datasets.pdf"
     log.info(f"Saving plot to {output_dir}/{filename}...")
     plt.savefig(f"{output_dir}/{filename}")
-    if show_plot is True:
-        log.info("Datasets should follow similar distributions, while quantitative values can be slightly shifted:")
-        plt.show()
+    
+    plt.show()
     plt.close()
 
 def plot_feature_abundance_by_metadata(
