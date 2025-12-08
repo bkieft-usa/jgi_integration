@@ -1238,6 +1238,10 @@ class MX(Dataset):
         self.polarity = self.dataset_config['polarity']
         self.mode = "untargeted" # Currently only untargeted supported, not configurable
         self.datatype = "peak-height" # Currently only peak-height supported, not configurable
+        if 'metabolite_fraction' in self.dataset_config:
+            self.metabolite_fraction = self.dataset_config['metabolite_fraction']
+        else:
+            self.metabolite_fraction = None
         self._get_raw_metadata(overwrite=self.overwrite, show_progress=False, superuser=superuser)
         self._get_raw_data(overwrite=self.overwrite, show_progress=False)
         self._generate_annotation_table(overwrite=self.overwrite, show_progress=False)
@@ -1258,7 +1262,6 @@ class MX(Dataset):
                 chromatography=self.chromatography,
                 polarity=self.polarity,
                 datatype=self.datatype,
-                filtered_mx=True,
             )
             if result.empty:
                 log.error(f"No data found for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
@@ -1272,6 +1275,8 @@ class MX(Dataset):
             min_dataset_value = result[result > 0].min().min()
             mask = (result > min_dataset_value).any(axis=1)
             counts_pos = result.loc[mask]
+            # Replace zeros with a small positive value to avoid log(0) warning
+            counts_pos = counts_pos.replace(0, np.finfo(float).eps)
             log_counts = np.log(counts_pos)
             geo_means = np.exp(log_counts.mean(axis=1))
             ratios = counts_pos.divide(geo_means, axis=0)
@@ -1309,7 +1314,6 @@ class MX(Dataset):
                     polarity=self.polarity,
                     datatype=self.datatype,
                     chromatography=self.chromatography,
-                    filtered_mx=False,
                     overwrite=overwrite,
                     superuser=superuser
                 )
@@ -1320,7 +1324,6 @@ class MX(Dataset):
                         polarity=self.polarity,
                         datatype=self.datatype,
                         chromatography=self.chromatography,
-                        filtered_mx=False,
                         extract=True,
                         overwrite=overwrite,
                         superuser=superuser
@@ -1413,8 +1416,6 @@ class TX(Dataset):
             )
             if result.empty:
                 log.error(f"No data found for TX dataset. Please check your raw data files.")
-                sys.exit(1)
-            
             # Normalize raw data sample-wise using median-of-ratios method
             log.info("Normalizing TX raw data using median-of-ratios method")
             scale = 1.0
@@ -1423,10 +1424,13 @@ class TX(Dataset):
             min_dataset_value = result[result > 0].min().min()
             mask = (result > min_dataset_value).any(axis=1)
             counts_pos = result.loc[mask]
+            counts_pos = counts_pos.replace(0, np.finfo(float).eps)
             log_counts = np.log(counts_pos)
             geo_means = np.exp(log_counts.mean(axis=1))
             ratios = counts_pos.divide(geo_means, axis=0)
             size_factors = ratios.median(axis=0)
+            norm_counts = result.div(size_factors, axis=1) * scale
+            norm_counts = norm_counts.reset_index()
             norm_counts = result.div(size_factors, axis=1) * scale
             norm_counts = norm_counts.reset_index()
 
@@ -1470,6 +1474,34 @@ class TX(Dataset):
                 )
             else:
                 tx_files = pd.read_csv(tx_files_path, sep='\t')
+                if 'index' in self.dataset_config:
+                    analysis_index = self.dataset_config['index']
+                    log.info("Confirm that the data_processing.yml configuration has the correct analysis index selected (the 'ix' column, integer) from all libraries available for this project:")
+                    # Move column ix as index for display purposes
+                    tx_files_display = tx_files.set_index('ix')
+                    display(tx_files_display)
+                    # Copy files from the unprocessed directory over to the dataset_raw_dir
+                    unprocessed_dir = os.path.join(self.dataset_raw_dir, "unprocessed")
+                    selected_libs = tx_files[tx_files['ix'] == self.dataset_config['index']]
+                    for _, row in selected_libs.iterrows():
+                        apid = row['APID']
+                        gff3_file_src = os.path.join(unprocessed_dir, os.path.basename(row['ref_gff']))
+                        gff_file_dest = os.path.join(self.dataset_raw_dir, "genes.gff3")
+                        counts_file_src = os.path.join(unprocessed_dir, f"tx_counts_data_{analysis_index}_{apid}.csv")
+                        counts_file_dest = os.path.join(self.dataset_raw_dir, "counts.csv")
+                        kegg_annotation_file_src = os.path.join(unprocessed_dir, os.path.basename(row['ref_protein_kegg']))
+                        kegg_annotation_file_dest = os.path.join(self.dataset_raw_dir, "kegg_annotation_table.tsv")
+                        metadata_file_src = os.path.join(unprocessed_dir, f"tx_metadata_{analysis_index}_{apid}.csv")
+                        metadata_file_dest = os.path.join(self.dataset_raw_dir, "portal_metadata.csv")
+                        for src_file, dest_file in [
+                            (gff3_file_src, gff_file_dest),
+                            (counts_file_src, counts_file_dest),
+                            (kegg_annotation_file_src, kegg_annotation_file_dest),
+                            (metadata_file_src, metadata_file_dest)
+                        ]:
+                            shutil.copy2(src_file, dest_file)
+                    self.apid = apid
+                    log.info(f"Using APID: {self.apid} for TX dataset metadata extraction.")
             if not hasattr(self, 'apid') or self.apid is None:
                 apid_file = os.path.join(self.dataset_raw_dir, "apid.txt")
                 if os.path.exists(apid_file):
@@ -1742,7 +1774,7 @@ class Analysis(DataAwareBaseHandler):
             
             # Call external function
             linked_metadata = hlp.link_metadata_with_custom_script(datasets=self.datasets,
-                                                                    custom_script_path=self.metadata_link_script)
+                                                                   custom_script_path=self.metadata_link_script)
             
             # Set results back to datasets
             for ds in self.datasets:
@@ -1953,7 +1985,6 @@ class Analysis(DataAwareBaseHandler):
                 'data': self.integrated_data,
                 'metadata': self.integrated_metadata,
                 'config': feature_selection_params, 
-                'max_features': feature_selection_params.get('max_features', 5000),
                 'output_dir': self.output_dir,
                 'output_filename': self._integrated_data_selected_filename,
             }
@@ -2051,14 +2082,13 @@ class Analysis(DataAwareBaseHandler):
             if self.check_and_load_attribute('feature_network_node_table', self._feature_network_node_table_filename, self.overwrite) and \
                 self.check_and_load_attribute('feature_network_edge_table', self._feature_network_edge_table_filename, self.overwrite):
                 networking_params = self.analysis_parameters.get('networking', {})
-                if networking_params.get('interactive_plot', False):
-                    log.info("Displaying existing network visualization...")
-                    hlp.display_existing_network(
-                        graph_file=self._feature_network_graph_filename,
-                        node_table=self.feature_network_node_table,
-                        edge_table=self.feature_network_edge_table,
-                        interactive_layout=networking_params.get('interactive_layout', None)
-                    )
+                log.info("Displaying existing network visualization...")
+                hlp.display_existing_network(
+                    graph_file=self._feature_network_graph_filename,
+                    node_table=self.feature_network_node_table,
+                    edge_table=self.feature_network_edge_table,
+                    network_layout=networking_params.get('network_layout', None)
+                )
                 return
             else: # necessary to clear carryover from previous analyses
                 hlp.clear_directory(submodule_dir)
@@ -2080,9 +2110,7 @@ class Analysis(DataAwareBaseHandler):
                 'output_filenames': output_filenames,
                 'annotation_df': self.feature_annotation_table,
                 'submodule_mode': networking_params.get('submodule_mode', 'community'),
-                'show_plot': networking_params.get('interactive_plot', False),
-                'interactive_layout': networking_params.get('interactive_layout', None),
-                'wgcna_params': networking_params.get('wgcna_params', {"beta": 5, "min_module_size": 10, "distance_cutoff": 0.25})
+                'network_layout': networking_params.get('network_layout', None),
             }
             call_params.update(kwargs)
             

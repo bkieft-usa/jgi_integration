@@ -82,6 +82,7 @@ from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 
 # --- Network analysis ---
 import networkx as nx
+from networkx.algorithms.community.quality import modularity as nx_modularity
 import community as community_louvain
 import igraph as ig
 import leidenalg
@@ -310,7 +311,6 @@ def load_openai_api_key(key_file_path: str = "/home/jovyan/work/input_data/dev/.
             log.warning("API key file is empty")
             return None
             
-        log.info("OpenAI API key loaded successfully")
         return api_key
         
     except PermissionError:
@@ -707,7 +707,6 @@ def perform_feature_selection(
     data: pd.DataFrame,
     metadata: pd.DataFrame,
     config: Dict[str, Any],
-    max_features: int = 5000,
     output_dir: str = None,
     output_filename: str = None
 ) -> pd.DataFrame:
@@ -723,6 +722,9 @@ def perform_feature_selection(
     """
 
     method = config.get("selected_method")
+    max_features = config.get("max_features", 5000)
+    if method == "variance":
+        max_features = config["variance"].get("top_n", max_features)
     if not method:
         raise ValueError("'selected_method' not defined in config.")
     method = method.lower().strip()
@@ -889,7 +891,7 @@ def calculate_correlated_features(
             alpha=0.01,
             cutoff=cutoff,
             corr_mode=corr_mode,
-            max_iter=100
+            max_iter=500
         )
     
     # Create feature type designation based on prefixes
@@ -1556,7 +1558,6 @@ def _detect_submodules(
         * "subgraphs" - simple connected components
         * "louvain" - python-louvain
         * "leiden" - leidenalg (requires igraph)
-        * "wgcna" - soft-threshold → TOM → hierarchical clustering
         * "k_clique" - k-clique communities
         * "greedy_modularity" - greedy modularity maximization
         * "label_propagation" - asynchronous label propagation
@@ -1569,10 +1570,16 @@ def _detect_submodules(
                 for i, c in enumerate(comps)]
 
     elif method == "louvain":
-        partition = community_louvain.best_partition(G, weight="weight")
+        G_abs = G.copy()
+        for u, v, data in G_abs.edges(data=True):
+            if 'weight' in data:
+                data['weight'] = abs(data['weight'])
+        partition = community_louvain.best_partition(G_abs, weight="weight")
         modules: Dict[int, List[str]] = {}
         for node, comm in partition.items():
             modules.setdefault(comm, []).append(node)
+        
+        # Return subgraphs from ORIGINAL graph (preserves negative weights)
         return [(f"submodule_{i+1}", G.subgraph(nodes).copy())
                 for i, (comm, nodes) in enumerate(sorted(modules.items()))]
 
@@ -1590,53 +1597,6 @@ def _detect_submodules(
             nodes = [ig_g.vs[idx]["name"] for idx in community]
             modules.append((f"submodule_{i+1}", G.subgraph(nodes).copy()))
         return modules
-
-    elif method == "wgcna":
-        # build adjacency from the correlation matrix (soft-threshold)
-        beta: int = kwargs.get("beta", 6)
-        min_mod_sz: int = kwargs.get("min_module_size", 10)
-        dist_cut: float = kwargs.get("distance_cutoff", 0.25)
-
-        # original correlation dataframe (must be symmetric)
-        corr = nx.to_pandas_adjacency(G, weight="weight")
-        raw_corr = np.sqrt(corr.values) / 100.0
-        raw_corr = np.clip(raw_corr, -1, 1) * np.sign(corr.values)   # keep sign
-
-        # soft-threshold adjacency
-        adj = np.abs(raw_corr) ** beta
-
-        # topological overlap matrix (TOM)
-        A = sp.csr_matrix(adj)
-        A2 = A @ A
-        k = np.asarray(A.sum(axis=1)).ravel()
-        min_k = np.minimum.outer(k, k)
-        denom = min_k + 1 - adj
-        tom = (A2 + A) / denom
-        
-        # Convert to dense array before using fill_diagonal
-        tom = tom.toarray()
-        np.fill_diagonal(tom, 1.0)
-
-        # hierarchical clustering on TOM-distance
-        dist = 1.0 - tom
-        condensed = squareform(dist, checks=False)
-        Z = linkage(condensed, method="average")
-        cluster_labels = fcluster(Z, t=dist_cut, criterion="distance")
-        
-        # discard clusters that are too small and create submodules
-        modules = {}
-        for lbl, node in zip(cluster_labels, corr.index):
-            modules.setdefault(lbl, []).append(node)
-        
-        # Filter modules by minimum size and create subgraphs
-        kept = []
-        for i, (lbl, nodes) in enumerate(sorted(modules.items())):
-            if len(nodes) >= min_mod_sz:
-                submodule_name = f"submodule_{i+1}"
-                subgraph = G.subgraph(nodes).copy()
-                kept.append((submodule_name, subgraph))
-        
-        return kept
 
     elif method == "k_clique":
         # K-clique percolation
@@ -1691,7 +1651,7 @@ def _detect_submodules(
 
     else:
         valid_methods = [
-            "subgraphs", "louvain", "leiden", "wgcna",
+            "subgraphs", "louvain", "leiden",
             "k_clique", "greedy_modularity",
             "label_propagation", "girvan_newman"
         ]
@@ -1709,13 +1669,11 @@ def plot_correlation_network(
     datasets: List = None,
     annotation_df: Optional[pd.DataFrame] = None,
     submodule_mode: str = "louvain",
-    show_plot: bool = False,
-    interactive_layout: str = None,
-    wgcna_params: dict = {}
+    network_layout: str = None,
 ) -> None:
     """
     Build a correlation graph from a long-format table, optionally
-    detect submodules (connected components, Louvain, Leiden or WGCNA)
+    detect submodules (connected components, Louvain, Leiden)
     and write everything to disk.
 
     Parameters are identical to your original function; the only
@@ -1765,9 +1723,6 @@ def plot_correlation_network(
         submods = _detect_submodules(
             G,
             method=submodule_mode,
-            beta=wgcna_params["beta"],
-            min_module_size=wgcna_params["min_module_size"],
-            distance_cutoff=wgcna_params["distance_cutoff"],
         )
         
         # Always annotate nodes with submodule information, even if only one submodule
@@ -1803,8 +1758,8 @@ def plot_correlation_network(
         G,
         node_color_attr=color_attr,
         node_size_attr="node_size",
-        layout=interactive_layout,
-        seed=42,
+        layout=network_layout,
+        seed=1111,
     )
     display(widget)
 
@@ -1814,7 +1769,7 @@ def display_existing_network(
     graph_file: str,
     node_table: pd.DataFrame,
     edge_table: pd.DataFrame,
-    interactive_layout: str = None
+    network_layout: str = None
 ) -> None:
     """
     Display an existing network visualization from saved files.
@@ -1827,7 +1782,7 @@ def display_existing_network(
         Node table DataFrame with node attributes
     edge_table : pd.DataFrame
         Edge table DataFrame with edge information
-    interactive_layout : str, optional
+    network_layout : str, optional
         Layout algorithm for the interactive plot
     """
     
@@ -1909,8 +1864,8 @@ def display_existing_network(
             G,
             node_color_attr=color_attr,
             node_size_attr="node_size",
-            layout=interactive_layout,
-            seed=42,
+            layout=network_layout,
+            seed=1111,
         )
         
         # Display the widget
@@ -1931,7 +1886,7 @@ def _nx_to_plotly_widget(
     node_size_attr="node_size",
     node_shape_attr="datatype_shape",
     layout=None,
-    seed=42,
+    seed=1111,
 ):
     """
     Convert a NetworkX graph to a Plotly FigureWidget.
@@ -1978,20 +1933,32 @@ def _nx_to_plotly_widget(
     else:
         raise ValueError(f"Unsupported layout `{layout}`")
 
-    # Build edge trace
+    # Build edge trace WITH HOVER TEXT INCLUDING CORRELATION
     log.info("Building edge traces...")
     edge_x, edge_y = [], []
+    edge_hover_text = []
+    
     for u, v in G.edges():
         x0, y0 = pos[u]
         x1, y1 = pos[v]
         edge_x += [x0, x1, None]
         edge_y += [y0, y1, None]
+        
+        # Get correlation weight from edge data
+        edge_data = G.get_edge_data(u, v)
+        correlation = edge_data.get('weight', 0.0) if edge_data else 0.0
+        
+        # Create hover text with correlation value
+        edge_hover_text.append(f"{u} : {v} ({correlation:.3f})")
+        # Add two more None entries to match the x/y coordinate structure
+        edge_hover_text.extend([None, None])
 
     edge_trace = go.Scatter(
         x=edge_x, y=edge_y,
         mode="lines",
         line=dict(width=1, color="#888"),
-        hoverinfo="none",
+        hoverinfo="text",
+        hovertext=edge_hover_text,
         showlegend=False,
     )
 
@@ -2392,7 +2359,7 @@ def compare_network_topologies(
     plot_independent_networks(
         networks=networks,
         feature_prefixes=feature_prefixes,
-        layout=network_params.get('interactive_layout', 'spring')
+        layout=network_params.get('network_layout', 'spring')
     )
 
     # Generate network comparison plots
@@ -2402,14 +2369,14 @@ def compare_network_topologies(
     plot_network_comparison(
         networks=networks,
         feature_prefixes=feature_prefixes,
-        layout=network_params.get('interactive_layout', 'spring')
+        layout=network_params.get('network_layout', 'spring')
     )
 
     if plot_interactive:
         widget = plot_interactive_network_comparison(
             networks=networks,
             feature_prefixes=feature_prefixes,
-            layout=network_params.get('interactive_layout', 'spring')
+            layout=network_params.get('network_layout', 'spring')
         )
         display(widget)
 
@@ -2504,7 +2471,6 @@ def _build_all_networks(
             G = _annotate_submodules(
                 G=G,
                 submodule_mode=submodule_mode,
-                wgcna_params=network_params['wgcna_params']
             )
         
         networks[mode_name] = G
@@ -2551,11 +2517,10 @@ def _build_single_network(
 def _annotate_submodules(
     G: nx.Graph,
     submodule_mode: str,
-    wgcna_params: dict
 ) -> nx.Graph:
     """Detect and annotate submodules in a network."""
     
-    submods = _detect_submodules(G, method=submodule_mode, **wgcna_params)
+    submods = _detect_submodules(G, method=submodule_mode)
     
     if submods:
         n_mod = len(submods)
@@ -3638,7 +3603,7 @@ def plot_independent_networks(
     networks: Dict[str, nx.Graph],
     feature_prefixes: List[str],
     layout: str = "spring",
-    seed: int = 42,
+    seed: int = 1111,
     show_plot: bool = True
 ) -> None:
     """
@@ -3771,7 +3736,7 @@ def plot_network_comparison(
     networks: Dict[str, nx.Graph],
     feature_prefixes: List[str],
     layout: str = "spring",
-    seed: int = 42,
+    seed: int = 1111,
     show_plot: bool = True
 ) -> None:
     """
@@ -3917,7 +3882,7 @@ def plot_interactive_network_comparison(
     networks: Dict[str, nx.Graph],
     feature_prefixes: List[str],
     layout: str = "spring",
-    seed: int = 42,
+    seed: int = 1111,
 ) -> go.FigureWidget:
     """
     Create an interactive Plotly visualization comparing independent and integrated networks.
@@ -4152,7 +4117,7 @@ def find_mx_parent_folder(
     polarity: str,
     datatype: str,
     chromatography: str,
-    filtered_mx: bool = False,
+    filtered_mx: bool = True,
     overwrite: bool = False,
     superuser: bool = False
 ) -> str:
@@ -4267,7 +4232,7 @@ def gather_mx_files(
     polarity: str,
     datatype: str,
     chromatography: str,
-    filtered_mx: bool = False,
+    filtered_mx: bool = True,
     extract: bool = False,
     overwrite: bool = False
 ) -> tuple:
@@ -4560,7 +4525,7 @@ def get_mx_data(
     chromatography: str,
     polarity: str,
     datatype: str = "peak-height",
-    filtered_mx: bool = False,
+    filtered_mx: bool = True,
     superuser: bool = False,
 ) -> pd.DataFrame:
     """
@@ -4731,6 +4696,11 @@ def get_tx_data(
 
     tx_data_pattern = f"{input_dir}/{type}.txt"
     tx_data_files = glob.glob(os.path.expanduser(tx_data_pattern))
+    tx_data_files_sep = "\t"
+    if not tx_data_files:
+        tx_data_pattern = f"{input_dir}/{type}.csv"
+        tx_data_files = glob.glob(os.path.expanduser(tx_data_pattern))
+        tx_data_files_sep = ","
     
     if tx_data_files:
         if len(tx_data_files) > 1:
@@ -4738,7 +4708,7 @@ def get_tx_data(
             log.info("Please specify the correct file.")
             return None
         tx_data_filename = tx_data_files[0]  # Assuming you want the first (and only) match
-        tx_data = pd.read_csv(tx_data_filename, sep='\t')
+        tx_data = pd.read_csv(tx_data_filename, sep=tx_data_files_sep)
         tx_data = tx_data.rename(columns={tx_data.columns[0]: 'GeneID'})
         
         # Add prefix 'tx_' if not already present
@@ -4930,8 +4900,6 @@ def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.Data
     log.info(f"  Raw data genes: {len(raw_data_genes)}")
     log.info(f"  Annotation genes: {len(annotation_genes)}")
     log.info(f"  Common genes: {len(common_genes)} ({len(common_genes)/len(raw_data_genes)*100:.1f}% of raw data)")
-    log.info(f"  Raw data only: {len(raw_only)}")
-    log.info(f"  Annotation only: {len(annotation_only)}")
     
     # Warn if low overlap
     overlap_pct = len(common_genes) / len(raw_data_genes) * 100
@@ -5671,8 +5639,6 @@ def _validate_annotation_metabolite_ids(annotation_df: pd.DataFrame, raw_data: p
     log.info(f"  Raw data metabolites: {len(raw_data_metabolites)}")
     log.info(f"  Annotation metabolites: {len(annotation_metabolites)}")
     log.info(f"  Common metabolites: {len(common_metabolites)} ({len(common_metabolites)/len(raw_data_metabolites)*100:.1f}% of raw data)")
-    log.info(f"  Raw data only: {len(raw_only)}")
-    log.info(f"  Annotation only: {len(annotation_only)}")
     
     # Warn if low overlap
     overlap_pct = len(common_metabolites) / len(raw_data_metabolites) * 100 if len(raw_data_metabolites) > 0 else 0
@@ -6113,7 +6079,10 @@ def link_metadata_with_custom_script(
 
     # Setup dataset info for external function
     dataset_info = {
-        ds.dataset_name: {"outdir": ds.output_dir, "apid": getattr(ds, "apid", None), "raw": ds._raw_metadata_filename}
+        ds.dataset_name: {"outdir": ds.output_dir, 
+                          "apid": getattr(ds, "apid", None), 
+                          "raw": ds._raw_metadata_filename,
+                          "metab_fraction": ds.metabolite_fraction if hasattr(ds, "metabolite_fraction") else None}
         for ds in datasets
     }
     
@@ -6703,7 +6672,6 @@ def plot_simple_pca(
     X = (
         df.T.loc[common]
         .replace([np.inf, -np.inf], np.nan)
-        .infer_objects(copy=False)
         .apply(pd.to_numeric, errors='coerce')
         .fillna(0)
     )
@@ -6723,6 +6691,11 @@ def plot_simple_pca(
         _draw_pca(ax, pca_df, hue_col=meta_var, title=title, alpha=0.75)
         display(fig)
         plt.close(fig)
+    
+    # Print sample locations on PCA as table of X,Y coordinates
+    coord_df = pca_df[['unique_group', 'PCA1', 'PCA2']]
+    print("PCA Sample Coordinates:")
+    display(coord_df)
 
 def plot_pca(
     data: Dict[str, pd.DataFrame],
@@ -6760,13 +6733,14 @@ def plot_pca(
             continue
 
         # build PCA matrix
-        X = (
-            df.T.loc[common]
-            .replace([np.inf, -np.inf], np.nan)
-            .infer_objects(copy=False)
-            .apply(pd.to_numeric, errors='coerce')
-            .fillna(0)
-        )
+        with pd.option_context('future.no_silent_downcasting', True):
+            X = (
+                df.T.loc[common]
+                .replace([np.inf, -np.inf], np.nan)
+                .infer_objects(copy=False)
+                .apply(pd.to_numeric, errors='coerce')
+                .fillna(0)
+            )
 
         pca = PCA(n_components=2)
         pcs = pca.fit_transform(X)
@@ -6890,10 +6864,11 @@ def plot_simple_histogram(
 
     plt.title(plot_title)
 
-    # Save the plot if output_dir is specified
-    filename = f"{plot_title.replace(' ', '_')}.pdf"
-    log.info(f"Saving plot to {output_dir}/{filename}...")
-    plt.savefig(f"{output_dir}/{filename}")
+    if output_dir:
+        # Save the plot if output_dir is specified
+        filename = f"{plot_title.replace(' ', '_')}.pdf"
+        log.info(f"Saving plot to {output_dir}/{filename}...")
+        plt.savefig(f"{output_dir}/{filename}")
 
     plt.show()
     plt.close()
@@ -7694,7 +7669,7 @@ def perform_functional_enrichment(
 #     num_factors: int = 5,
 #     num_features: int = 10,
 #     num_iterations: int = 100,
-#     training_seed: int = 42,
+#     training_seed: int = 1111,
 #     overwrite: bool = False
 # ) -> None:
 #     """
@@ -7778,7 +7753,7 @@ def perform_functional_enrichment(
 #     output_filename: str = "mofa2_model.hdf5",
 #     num_factors: int = 1,
 #     num_iterations: int = 100,
-#     training_seed: int = 42
+#     training_seed: int = 1111
 # ) -> str:
 #     """
 #     Run MOFA2 model training and save the model to disk.
