@@ -2117,6 +2117,11 @@ def _annotate_and_save_submodules(
             plt.close()
 
 
+###################
+# Add MAGI2 evidence
+###################
+
+
 ##############################################
 ## Comparing Network Topologies
 ##############################################
@@ -5392,11 +5397,18 @@ def _add_protein_id_mapping(
                     gene_to_product[gene_id] = product
     
     log.info(f"Found {len(gene_to_protein)} gene-to-protein mappings")
-    log.info(f"Found {len(gene_to_product)} gene-to-product mappings")
 
-    merged_df['transcriptome_id'] = merged_df['transcriptome_id'].astype(str)
-    merged_df['protein_id'] = merged_df['transcriptome_id'].map(gene_to_protein).fillna('')
-    merged_df['display_name'] = merged_df['transcriptome_id'].map(gene_to_product).fillna('')
+    if 'transcriptome_id' in merged_df.columns and 'protein_id' not in merged_df.columns:
+        merged_df['transcriptome_id'] = merged_df['transcriptome_id'].astype(str)
+        merged_df['protein_id'] = merged_df['transcriptome_id'].map(gene_to_protein).fillna('')
+        merged_df['display_name'] = merged_df['transcriptome_id'].map(gene_to_product).fillna('')
+    elif 'protein_id' in merged_df.columns and 'transcriptome_id' not in merged_df.columns:
+        merged_df['protein_id'] = merged_df['protein_id'].astype(str)
+        protein_to_gene = {str(v): k for k, v in gene_to_protein.items()}
+        merged_df['transcriptome_id'] = merged_df['protein_id'].map(protein_to_gene).fillna(merged_df['protein_id'])
+        merged_df['display_name'] = merged_df['transcriptome_id'].map(gene_to_product).fillna('')
+    else:
+        log.error("Merged dataframe either has both columns or neither - check your data structure")
 
     return merged_df
 
@@ -5535,6 +5547,7 @@ def generate_mx_annotation_table(
                     'metabolite_id': met_id,
                     'molecular_formula': concat_unique_values(matches.get('molecular_formula', pd.Series())),
                     'Compound_Name': concat_unique_values(matches.get('Compound_Name', pd.Series())),
+                    'Smiles': concat_unique_values(matches.get('Smiles', pd.Series())),
                     'INCHI': concat_unique_values(matches.get('INCHI', pd.Series())),
                     'InChiKey': concat_unique_values(pd.Series(inchikey_values)),
                     'superclass': concat_unique_values(matches.get('superclass', pd.Series())),
@@ -5552,6 +5565,7 @@ def generate_mx_annotation_table(
             'metabolite_id': met_id,
             'molecular_formula': None,
             'Compound_Name': None,
+            'Smiles': None,
             'INCHI': None,
             'InChiKey': None,
             'superclass': None,

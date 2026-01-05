@@ -1240,6 +1240,7 @@ class MX(Dataset):
         self.datatype = "peak-height" # Currently only peak-height supported, not configurable
         if 'metabolite_fraction' in self.dataset_config:
             self.metabolite_fraction = self.dataset_config['metabolite_fraction']
+            log.info(f"Using only metabolite fraction '{self.metabolite_fraction}' for MX dataset.")
         else:
             self.metabolite_fraction = None
         self._get_raw_metadata(overwrite=self.overwrite, show_progress=False, superuser=superuser)
@@ -1583,6 +1584,7 @@ class Analysis(DataAwareBaseHandler):
         # Use hash-based tags for output directory
         self.data_processing_tag = project.data_processing_hash
         self.analysis_tag = project.analysis_hash
+        self.magi_raw_dir = os.path.join(self.project.raw_data_dir, 'magi')
         analysis_outdir = self._set_up_analysis_outdir(self.project, self.data_processing_tag, 
                                                       self.analysis_tag, overwrite=self.overwrite)
         self.output_dir = analysis_outdir
@@ -1635,6 +1637,7 @@ class Analysis(DataAwareBaseHandler):
             'feature_annotation_table': 'feature_annotation_table.csv',
             'integrated_data_selected': 'integrated_data_selected.csv',
             'feature_correlation_table': 'feature_correlation_table.csv',
+            'magi_results_table': 'magi_results_table.csv',
             'feature_network_graph': 'feature_network_graph.graphml',
             'feature_network_edge_table': 'feature_network_edge_table.csv',
             'feature_network_node_table': 'feature_network_node_table.csv',
@@ -2035,7 +2038,6 @@ class Analysis(DataAwareBaseHandler):
                 log.info(f"\tFeature correlation table object 'feature_correlation_table' with {self.feature_correlation_table.shape[0]} feature pairs.")
                 return
             
-            # Get parameters from config with defaults
             correlation_params = self.analysis_parameters.get('correlation', {})
             call_params = {
                 'data': self.integrated_data_selected,
@@ -2078,7 +2080,6 @@ class Analysis(DataAwareBaseHandler):
             submodule_dir = os.path.join(self.output_dir, submodule_subdir)
             os.makedirs(submodule_dir, exist_ok=True)
             
-            # Check if tables already exist
             if self.check_and_load_attribute('feature_network_node_table', self._feature_network_node_table_filename, self.overwrite) and \
                 self.check_and_load_attribute('feature_network_edge_table', self._feature_network_edge_table_filename, self.overwrite):
                 networking_params = self.analysis_parameters.get('networking', {})
@@ -2301,6 +2302,7 @@ manual_file_storage = {
     'feature_annotation_table': 'feature_annotation_table.csv',
     'integrated_data_selected': 'integrated_data_selected.csv',
     'feature_correlation_table': 'feature_correlation_table.csv',
+    'magi_results_table': 'magi_results_table.csv',
     'feature_network_graph': 'feature_network_graph.graphml',
     'feature_network_edge_table': 'feature_network_edge_table.csv',
     'feature_network_node_table': 'feature_network_node_table.csv',
