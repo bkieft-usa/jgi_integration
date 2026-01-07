@@ -785,6 +785,92 @@ def perform_feature_selection(
     write_integration_file(subset, output_dir, output_filename, indexing=True)
     return subset
 
+def calculate_feature_pair_correlation(
+    data: pd.DataFrame,
+    feature_1: str,
+    feature_2: str,
+    method: str = "pearson"
+) -> Dict[str, float]:
+    """
+    Calculate correlation between two specific features.
+    
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Feature-by-sample matrix (features as rows, samples as columns).
+        Should be normalized/scaled as desired before calling this function.
+    feature_1 : str
+        Name of first feature (must be in data.index)
+    feature_2 : str
+        Name of second feature (must be in data.index)
+    method : str, default 'pearson'
+        Correlation method - 'pearson' or 'spearman'
+    
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - 'feature_1': first feature name
+        - 'feature_2': second feature name
+        - 'correlation': correlation coefficient
+        - 'p_value': p-value for the correlation
+        - 'n_samples': number of samples used (non-NaN in both features)
+
+    """
+    
+    # Validate inputs
+    if feature_1 not in data.index:
+        raise ValueError(f"Feature '{feature_1}' not found in data")
+    if feature_2 not in data.index:
+        raise ValueError(f"Feature '{feature_2}' not found in data")
+    
+    valid_methods = {"pearson", "spearman"}
+    if method not in valid_methods:
+        raise ValueError(f"Method must be one of {valid_methods}")
+    
+    # Extract feature vectors
+    x = data.loc[feature_1].values
+    y = data.loc[feature_2].values
+    
+    # Remove samples where either feature is NaN
+    mask = ~(np.isnan(x) | np.isnan(y))
+    x_clean = x[mask]
+    y_clean = y[mask]
+    
+    n_samples = len(x_clean)
+    
+    if n_samples < 3:
+        log.warning(f"Only {n_samples} non-NaN samples for correlation. Need at least 3.")
+        return {
+            'feature_1': feature_1,
+            'feature_2': feature_2,
+            'correlation': np.nan,
+            'p_value': np.nan,
+            'n_samples': n_samples
+        }
+    
+    # Calculate correlation
+    if method == "pearson":
+        from scipy.stats import pearsonr
+        corr, pval = pearsonr(x_clean, y_clean)
+    else:  # spearman
+        from scipy.stats import spearmanr
+        corr, pval = spearmanr(x_clean, y_clean)
+    
+    log.info(f"Correlation between {feature_1} and {feature_2}:")
+    log.info(f"  Method: {method}")
+    log.info(f"  Correlation: {corr:.4f}")
+    log.info(f"  P-value: {pval:.2e}")
+    log.info(f"  N samples: {n_samples}")
+    
+    return {
+        'feature_1': feature_1,
+        'feature_2': feature_2,
+        'correlation': corr,
+        'p_value': pval,
+        'n_samples': n_samples
+    }
+
 def _block_pair(
     Z_i: np.ndarray,
     Z_j: np.ndarray,
@@ -2121,6 +2207,407 @@ def _annotate_and_save_submodules(
 # Add MAGI2 evidence
 ###################
 
+def parse_magi_table(
+    annotation_table: pd.DataFrame,
+    magi_raw_dir: str,
+    tx_raw_dir: str,
+    output_dir: str,
+    output_filename: str
+) -> pd.DataFrame:
+    """
+    Parse MAGI2 output files and return a DataFrame with metabolite and transcript IDs (names)
+    that match existing feature IDs in the integrated dataset.
+    
+    Handles multiple annotations per feature stored as ;;-separated strings.
+    Uses GFF file to map protein IDs to gene IDs for transcripts.
+    """
+
+    magi_df = pd.read_csv(os.path.join(magi_raw_dir, "magi_combined_results.csv"))
+    magi_df = magi_df[['original_compound', 'gene_ID', 'rhea_ID_r2g', 'rhea_ID_g2r', 'MAGI_score']]
+    
+    # Ensure all columns are strings except MAGI_score
+    for col in magi_df.columns:
+        if col != 'MAGI_score':
+            magi_df[col] = magi_df[col].astype(str)
+    
+    # Ensure MAGI_score is numeric
+    magi_df['MAGI_score'] = pd.to_numeric(magi_df['MAGI_score'], errors='coerce')
+    
+    # Parse gene_ID to extract protein_id (3rd pipe-separated element)
+    log.info("Parsing gene_ID to extract protein IDs...")
+    magi_df['parsed_protein_id'] = magi_df['gene_ID'].str.split('|').str[2]
+    
+    # Find GFF file in the same directory structure as annotation table
+    gff_files = []
+    for pattern in ['*.gff3', '*.gff3.gz', '*.gff', '*.gff.gz']:
+        gff_files.extend(glob.glob(os.path.join(tx_raw_dir, '**', pattern), recursive=True))
+    if not gff_files:
+        raise ValueError(f"No GFF3 file found in {tx_raw_dir} or subdirectories. "
+                        "GFF file is required for mapping protein IDs to gene IDs.")
+    gff_file = gff_files[0]  # Use first GFF file found
+    log.info(f"Using GFF file: {os.path.basename(gff_file)}")
+    
+    # Parse GFF3 file to create protein_id -> gene_id mapping
+    log.info("Parsing GFF file to create protein ID to gene ID mappings...")
+    protein_to_gene = {}
+    
+    open_func = gzip.open if gff_file.endswith('.gz') else open
+    with open_func(gff_file, 'rt') as f:
+        for line in f:
+            if line.startswith('#') or line.strip() == '':
+                continue
+                
+            fields = line.strip().split('\t')
+            if len(fields) < 9:
+                continue
+            
+            # Only process 'gene' features
+            if fields[2] != 'gene':
+                continue
+            
+            attributes = fields[8]
+            
+            # Extract gene ID (the feature ID we want)
+            gene_match = re.search(r'ID=([^;]+)', attributes)
+            if not gene_match:
+                continue
+            gene_id = gene_match.group(1)
+            
+            # Extract protein ID
+            protein_match = re.search(r'proteinId=([^;]+)', attributes)
+            if not protein_match:
+                continue
+            protein_id = protein_match.group(1)
+            
+            # Store mapping
+            protein_to_gene[protein_id] = gene_id
+    
+    log.info(f"Found {len(protein_to_gene)} protein-to-gene mappings in GFF file")
+    
+    # Map protein IDs to gene IDs (feature IDs)
+    def map_protein_to_gene(protein_id):
+        if protein_id in protein_to_gene:
+            gene_id = protein_to_gene[protein_id]
+            # Add 'tx_' prefix if not already present
+            if not gene_id.startswith('tx_'):
+                return f'tx_{gene_id}'
+            return gene_id
+        return None
+    
+    log.info("Mapping MAGI protein IDs to transcript feature IDs...")
+    magi_df['gene_feature_id'] = magi_df['parsed_protein_id'].apply(map_protein_to_gene)
+    
+    # Now handle metabolite mapping using annotation table
+    log.info("Creating SMILES to feature ID mappings from annotation table...")
+    smiles_to_features = {}
+    
+    # Ensure annotation_table columns are strings
+    for col in annotation_table.columns:
+        if col not in ['feature_id']:
+            annotation_table[col] = annotation_table[col].astype(str)
+    
+    for idx, row in annotation_table.iterrows():
+        feature_id = str(row['feature_id'])
+        smiles_str = str(row.get('mx_Smiles', ''))
+        
+        # Skip if no SMILES data
+        if smiles_str in ['nan', 'Unassigned', 'NA', '', 'None']:
+            continue
+        
+        # Split on ;; and add each SMILES to the mapping
+        for smiles in smiles_str.split(';;'):
+            smiles = smiles.strip()
+            if smiles and smiles not in ['nan', 'Unassigned', 'NA', '']:
+                if smiles not in smiles_to_features:
+                    smiles_to_features[smiles] = []
+                smiles_to_features[smiles].append(feature_id)
+    
+    log.info(f"Created {len(smiles_to_features)} unique SMILES mappings")
+    
+    # Map SMILES to feature IDs (with ;;-separated values)
+    def map_smiles_to_features(smiles):
+        if smiles in smiles_to_features:
+            return ';;'.join(smiles_to_features[smiles])
+        return None
+    
+    log.info("Mapping MAGI SMILES to metabolite feature IDs...")
+    magi_df['compound_feature_id'] = magi_df['original_compound'].apply(map_smiles_to_features)
+    
+    # Drop the intermediate column
+    magi_df = magi_df.drop(columns=['parsed_protein_id'])
+    
+    # Reorder columns for clarity
+    cols = ['compound_feature_id', 'gene_feature_id', 'original_compound', 'gene_ID', 
+            'rhea_ID_r2g', 'rhea_ID_g2r', 'MAGI_score']
+    magi_df = magi_df[cols]
+    
+    # Final type check: ensure all columns are strings except MAGI_score
+    for col in magi_df.columns:
+        if col != 'MAGI_score':
+            magi_df[col] = magi_df[col].astype(str)
+    
+    # Log summary statistics
+    n_total = len(magi_df)
+    n_mapped_genes = magi_df['gene_feature_id'].notna().sum()
+    n_mapped_compounds = magi_df['compound_feature_id'].notna().sum()
+    n_both_mapped = ((magi_df['gene_feature_id'].notna()) & 
+                     (magi_df['compound_feature_id'].notna())).sum()
+    
+    # Count multiple mappings
+    n_multi_genes = magi_df['gene_feature_id'].str.contains(';;', na=False).sum()
+    n_multi_compounds = magi_df['compound_feature_id'].str.contains(';;', na=False).sum()
+    
+    log.info(f"MAGI mapping summary:")
+    log.info(f"  Total MAGI predictions: {n_total}")
+    log.info(f"  Genes mapped to features: {n_mapped_genes} ({n_mapped_genes/n_total*100:.1f}%)")
+    log.info(f"    With multiple mappings: {n_multi_genes}")
+    log.info(f"  Compounds mapped to features: {n_mapped_compounds} ({n_mapped_compounds/n_total*100:.1f}%)")
+    log.info(f"    With multiple mappings: {n_multi_compounds}")
+    log.info(f"  Both mapped: {n_both_mapped} ({n_both_mapped/n_total*100:.1f}%)")
+    
+    # Save the mapped table
+    write_integration_file(
+        data=magi_df,
+        output_dir=output_dir,
+        filename=output_filename,
+        indexing=True
+    )
+    
+    return magi_df
+
+def add_magi_scores_to_correlation_table(
+    correlation_table: pd.DataFrame,
+    magi_df: pd.DataFrame,
+    output_dir: str = None,
+    output_filename: str = "correlation_table_with_magi_scores"
+) -> pd.DataFrame:
+    """
+    Add MAGI scores to a feature correlation table based on gene-compound pairs.
+    Only considers bipartite correlations (between different dataset types).
+    
+    For each correlated feature pair from different datasets, checks if they appear 
+    in the MAGI predictions and adds the MAGI_score if found. Handles multiple 
+    feature IDs stored as ;;-separated strings.
+    
+    Args:
+        correlation_table: DataFrame with columns ['feature_1', 'feature_2', 'correlation']
+        magi_df: DataFrame from parse_magi_table() with MAGI predictions and feature mappings
+        output_dir: Directory to save the output table
+        output_filename: Filename for the output table
+        
+    Returns:
+        DataFrame with only bipartite correlations and added 'MAGI_score' column
+    """
+    
+    log.info("Adding MAGI scores to correlation table...")
+    log.info(f"  Total correlation pairs: {len(correlation_table):,}")
+    log.info(f"  MAGI predictions: {len(magi_df):,}")
+    
+    # Create a copy to avoid modifying the original
+    result_df = correlation_table.copy()
+    
+    # Ensure correlation_table columns are strings except correlation
+    for col in result_df.columns:
+        if col not in ['correlation', 'MAGI_score']:
+            result_df[col] = result_df[col].astype(str)
+    
+    # Ensure correlation column is numeric
+    result_df['correlation'] = pd.to_numeric(result_df['correlation'], errors='coerce')
+    
+    # Filter for bipartite correlations only (different dataset prefixes)
+    # Extract dataset prefix (everything before the first underscore)
+    result_df['dataset_1'] = result_df['feature_1'].str.split('_').str[0]
+    result_df['dataset_2'] = result_df['feature_2'].str.split('_').str[0]
+    
+    # Keep only pairs where datasets differ
+    bipartite_mask = result_df['dataset_1'] != result_df['dataset_2']
+    result_df = result_df[bipartite_mask].copy()
+    
+    # Drop the temporary dataset columns
+    result_df = result_df.drop(columns=['dataset_1', 'dataset_2'])
+    
+    log.info(f"  Bipartite correlation pairs (different datasets): {len(result_df):,}")
+    
+    # Initialize MAGI_score column with NaN
+    result_df['MAGI_score'] = np.nan
+
+    # Ensure magi_df columns are strings except MAGI_score
+    for col in magi_df.columns:
+        if col != 'MAGI_score':
+            magi_df[col] = magi_df[col].astype(str)
+    
+    # Ensure MAGI_score is numeric
+    magi_df['MAGI_score'] = pd.to_numeric(magi_df['MAGI_score'], errors='coerce')
+    
+    # Build lookup dictionaries for efficient matching
+    # Key: (gene_feature_id, compound_feature_id) -> MAGI_score
+    magi_lookup = {}
+    
+    for idx, row in magi_df.iterrows():
+        gene_ids = row['gene_feature_id']
+        compound_ids = row['compound_feature_id']
+        magi_score = row['MAGI_score']
+        
+        # Skip if either mapping is missing
+        if pd.isna(gene_ids) or pd.isna(compound_ids) or gene_ids == 'nan' or compound_ids == 'nan':
+            continue
+        
+        # Handle ;;-separated multiple IDs
+        gene_id_list = [g.strip() for g in str(gene_ids).split(';;') if g.strip() and g.strip() != 'nan']
+        compound_id_list = [c.strip() for c in str(compound_ids).split(';;') if c.strip() and c.strip() != 'nan']
+        
+        # Create all possible gene-compound pairs
+        for gene_id in gene_id_list:
+            for compound_id in compound_id_list:
+                # Store both orderings since we don't know which feature is which
+                magi_lookup[(gene_id, compound_id)] = magi_score
+                magi_lookup[(compound_id, gene_id)] = magi_score
+    
+    log.info(f"  Built MAGI lookup with {len(magi_lookup):,} gene-compound pairs")
+    # Find only valid non-None pairs
+    valid_magi_lookup = {k: v for k, v in magi_lookup.items() if k[0] != 'None' and k[1] != 'None'}
+    log.info(f"  Valid MAGI lookup pairs (excluding 'None'): {len(valid_magi_lookup):,}")
+    magi_lookup = valid_magi_lookup
+    
+    # Match correlation pairs to MAGI predictions
+    matches_found = 0
+    
+    for idx, row in result_df.iterrows():
+        feature_1 = row['feature_1']
+        feature_2 = row['feature_2']
+        
+        # Check if pair exists in MAGI lookup (either ordering)
+        pair_key = (feature_1, feature_2)
+        
+        if pair_key in magi_lookup:
+            result_df.at[idx, 'MAGI_score'] = magi_lookup[pair_key]
+            matches_found += 1
+    
+    # Summary statistics
+    n_with_magi = result_df['MAGI_score'].notna().sum()
+    pct_with_magi = (n_with_magi / len(result_df) * 100) if len(result_df) > 0 else 0
+    
+    log.info(f"MAGI score matching summary (bipartite pairs only):")
+    log.info(f"  Bipartite correlation pairs with MAGI support: {n_with_magi:,} ({pct_with_magi:.1f}%)")
+    
+    if n_with_magi > 0:
+        # Show distribution of MAGI scores for matched pairs
+        magi_scores = result_df['MAGI_score'].dropna()
+        log.info(f"  MAGI score range: {magi_scores.min():.3f} - {magi_scores.max():.3f}")
+        log.info(f"  MAGI score mean: {magi_scores.mean():.3f}")
+        log.info(f"  MAGI score median: {magi_scores.median():.3f}")
+    
+    # Save results if output directory provided
+    if output_dir:
+        write_integration_file(
+            data=result_df,
+            output_dir=output_dir,
+            filename=output_filename,
+            indexing=True
+        )
+    
+    # Create scatter plot if requested
+    if n_with_magi > 0:
+        log.info("Creating MAGI vs. Correlation scatter plot...")
+        plot_magi_vs_correlation(
+            correlation_table=result_df,
+            output_dir=output_dir,
+            output_filename=f"{output_filename}_scatter",
+            show_plot=True
+        )
+    
+    return result_df
+
+def plot_magi_vs_correlation(
+    correlation_table: pd.DataFrame,
+    output_dir: str = None,
+    output_filename: str = "magi_vs_correlation_scatter",
+    show_plot: bool = True
+) -> Dict[str, float]:
+    """
+    Plot MAGI scores vs correlation scores with a fitted regression line.
+    
+    Args:
+        correlation_table: DataFrame with 'correlation' and 'MAGI_score' columns
+        output_dir: Directory to save the plot
+        output_filename: Filename for the plot (without extension)
+        show_plot: Whether to display the plot inline
+        
+    Returns:
+        Dictionary with regression statistics (slope, intercept, r_squared, p_value)
+    """
+    
+    # Filter to only rows with MAGI scores
+    data_with_magi = correlation_table.dropna(subset=['MAGI_score'])
+    
+    if data_with_magi.empty:
+        log.warning("No MAGI scores found for plotting")
+        return {}
+    
+    log.info(f"Plotting {len(data_with_magi):,} correlations with MAGI scores")
+    
+    # Extract data
+    x = data_with_magi['correlation'].values
+    y = data_with_magi['MAGI_score'].values
+    
+    # Fit linear regression
+    from scipy.stats import linregress
+    slope, intercept, r_value, p_value, std_err = linregress(x, y)
+    r_squared = r_value ** 2
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Scatter plot
+    ax.scatter(x, y, alpha=0.5, s=20, c='#440154', edgecolors='none')
+    
+    # Fitted line
+    x_line = np.linspace(x.min(), x.max(), 100)
+    y_line = slope * x_line + intercept
+    ax.plot(x_line, y_line, 'r-', linewidth=2, 
+            label=f'y = {slope:.3f}x + {intercept:.3f}\nR² = {r_squared:.3f}, p = {p_value:.2e}')
+    
+    # Labels and styling
+    ax.set_xlabel('Correlation Score', fontsize=12)
+    ax.set_ylabel('MAGI Score', fontsize=12)
+    ax.set_title('MAGI Score vs. Correlation Score', fontsize=14, pad=20)
+    ax.legend(loc='best', fontsize=10, framealpha=0.9)
+    ax.grid(True, alpha=0.3)
+    
+    # Add density information using hexbin overlay
+    ax2 = ax.twinx()
+    ax2.set_yticks([])
+    
+    plt.tight_layout()
+    
+    # Save plot
+    if output_dir:
+        output_path = f"{output_dir}/{output_filename}.pdf"
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        log.info(f"Saved plot to {output_path}")
+    
+    # Display plot
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+    
+    # Log statistics
+    log.info(f"Regression statistics:")
+    log.info(f"  Slope: {slope:.4f}")
+    log.info(f"  Intercept: {intercept:.4f}")
+    log.info(f"  R²: {r_squared:.4f}")
+    log.info(f"  P-value: {p_value:.2e}")
+    log.info(f"  Std Error: {std_err:.4f}")
+    
+    return {
+        'slope': slope,
+        'intercept': intercept,
+        'r_squared': r_squared,
+        'p_value': p_value,
+        'std_err': std_err,
+        'n_points': len(data_with_magi)
+    }
 
 ##############################################
 ## Comparing Network Topologies
@@ -4122,7 +4609,7 @@ def find_mx_parent_folder(
     polarity: str,
     datatype: str,
     chromatography: str,
-    filtered_mx: bool = True,
+    filtered_mx: bool = False,
     overwrite: bool = False,
     superuser: bool = False
 ) -> str:
@@ -4237,7 +4724,7 @@ def gather_mx_files(
     polarity: str,
     datatype: str,
     chromatography: str,
-    filtered_mx: bool = True,
+    filtered_mx: bool = False,
     extract: bool = False,
     overwrite: bool = False
 ) -> tuple:
@@ -4530,7 +5017,7 @@ def get_mx_data(
     chromatography: str,
     polarity: str,
     datatype: str = "peak-height",
-    filtered_mx: bool = True,
+    filtered_mx: bool = False,
     superuser: bool = False,
 ) -> pd.DataFrame:
     """
@@ -5229,82 +5716,6 @@ def _aggregate_algal_annotations(df: pd.DataFrame) -> pd.DataFrame:
     aggregated_df = df.groupby('protein_id')[annotation_columns].agg(join_unique_values).reset_index()
     
     return aggregated_df
-
-def _add_gene_id_mapping(
-    merged_df: pd.DataFrame,
-    raw_data_dir: str,
-    genome_type: str
-) -> pd.DataFrame:
-    """
-    Add transcriptome_id mapping from GFF3 file to the merged annotation table for algal genomes.
-    Maps protein_id to transcriptome_id and adds display_name from product field.
-    
-    Args:
-        merged_df (pd.DataFrame): Merged annotation dataframe with protein_id
-        raw_data_dir (str): Directory containing GFF3 file
-        genome_type (str): Genome type
-        
-    Returns:
-        pd.DataFrame: Annotation dataframe with transcriptome_id and display_name columns added
-    """
-    
-    # Look for GFF3 file in the raw data directory
-    gff_files = glob.glob(os.path.join(raw_data_dir, "*.gff3"))
-    if not gff_files:
-        gff_files = glob.glob(os.path.join(raw_data_dir, "genes.gff3"))
-    
-    if not gff_files:
-        log.warning("No GFF3 file found for gene ID mapping")
-        # Create transcriptome_id from protein_id if no GFF3 found
-        merged_df['transcriptome_id'] = merged_df['protein_id']
-        merged_df['display_name'] = ''
-        return merged_df
-    
-    gff_file = gff_files[0]  # Use first GFF3 file found
-    log.info(f"Adding gene ID mapping from {os.path.basename(gff_file)}")
-    
-    # Parse GFF3 file to create protein_id -> gene_id mapping and product mapping
-    protein_to_gene = {}
-    protein_to_product = {}
-    
-    with open(gff_file, 'r') as f:
-        for line in f:
-            if line.startswith('#') or line.strip() == '':
-                continue
-                
-            fields = line.strip().split('\t')
-            if len(fields) >= 9 and fields[2] == 'gene':
-                attributes = fields[8]
-                
-                # Extract gene ID from ID= field
-                gene_match = re.search(r'ID=([^;]+)', attributes)
-                if not gene_match:
-                    continue
-                gene_id = gene_match.group(1)
-                
-                # Extract protein ID from proteinId= field
-                protein_match = re.search(r'proteinId=([^;]+)', attributes)
-                if protein_match:
-                    protein_id = protein_match.group(1)
-                    protein_to_gene[str(protein_id)] = str(gene_id)
-                    
-                    # Extract product information from product= field
-                    product_match = re.search(r'product=([^;]+)', attributes)
-                    if product_match:
-                        product = product_match.group(1).strip()
-                        protein_to_product[str(protein_id)] = product
-                    else:
-                        protein_to_product[str(protein_id)] = ''
-    
-    log.info(f"Found {len(protein_to_gene)} protein-to-gene mappings")
-    log.info(f"Found {len(protein_to_product)} protein-to-product mappings")
-    
-    # Add extracted columns to merged_df
-    merged_df['protein_id'] = merged_df['protein_id'].astype(str)
-    merged_df['transcriptome_id'] = merged_df['protein_id'].map(protein_to_gene).fillna(merged_df['protein_id'])
-    merged_df['display_name'] = merged_df['protein_id'].map(protein_to_product).fillna('')
-
-    return merged_df
 
 def _add_protein_id_mapping(
     merged_df: pd.DataFrame,
@@ -6989,7 +7400,7 @@ def plot_feature_abundance_by_metadata(
         linked_data['color_shape_group'] = linked_data[color_group].astype(str) + "_" + linked_data[shape_group].astype(str)
         
         plt.figure(figsize=(12, 8))
-        sns.violinplot(x='color_shape_group', y='abundance', data=linked_data, palette='viridis')
+        sns.violinplot(x='color_shape_group', y='abundance', data=linked_data, hue='color_shape_group', palette='viridis', legend=False)
         sns.stripplot(x='color_shape_group', y='abundance', data=linked_data, color='k', alpha=0.5, jitter=True)
         plt.xlabel(f'{color_group} and {shape_group}')
         plt.ylabel('Z-scored abundance')
@@ -6999,7 +7410,7 @@ def plot_feature_abundance_by_metadata(
     else:
         # Plot the data
         plt.figure(figsize=(12, 8))
-        sns.violinplot(x=metadata_group, y='abundance', data=linked_data, palette='viridis')
+        sns.violinplot(x=metadata_group, y='abundance', data=linked_data, hue=metadata_group, palette='viridis', legend=False)
         sns.stripplot(x=metadata_group, y='abundance', data=linked_data, color='k', alpha=0.5, jitter=True)
         plt.xlabel(metadata_group)
         plt.ylabel('Z-scored abundance')
@@ -7117,7 +7528,9 @@ def plot_submodule_abundance_by_metadata(
             x='color_shape_group', 
             y='mean_abundance', 
             data=linked_data, 
-            palette='viridis'
+            hue='color_shape_group',
+            palette='viridis',
+            legend=False
         )
         sns.stripplot(
             x='color_shape_group', 
@@ -7140,7 +7553,9 @@ def plot_submodule_abundance_by_metadata(
             x=metadata_group, 
             y='mean_abundance', 
             data=linked_data, 
-            palette='viridis'
+            hue=metadata_group,
+            palette='viridis',
+            legend=False
         )
         sns.stripplot(
             x=metadata_group, 

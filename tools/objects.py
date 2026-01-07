@@ -933,6 +933,7 @@ class DataAwareBaseHandler(BaseDataHandler):
             'linked_metadata': 'Metadata linked across samples',
             'feature_network_node_table': 'Network nodes with submodule assignments',
             'feature_correlation_table': 'Pairwise feature correlations',
+            'feature_correlation_table_magi': 'Pairwise feature correlations with MAGI results',
             'integrated_data': 'Combined data from multiple datasets',
             # Add more as needed
         }
@@ -1637,6 +1638,7 @@ class Analysis(DataAwareBaseHandler):
             'feature_annotation_table': 'feature_annotation_table.csv',
             'integrated_data_selected': 'integrated_data_selected.csv',
             'feature_correlation_table': 'feature_correlation_table.csv',
+            'feature_correlation_table_magi': 'feature_correlation_table_magi.csv',
             'magi_results_table': 'magi_results_table.csv',
             'feature_network_graph': 'feature_network_graph.graphml',
             'feature_network_edge_table': 'feature_network_edge_table.csv',
@@ -2073,6 +2075,78 @@ class Analysis(DataAwareBaseHandler):
             _correlation_method()
             return
 
+    def analyze_magi_results(self, overwrite: bool = False, show_progress: bool = False, **kwargs) -> None:
+        """Hybrid: Class parameter setup + external hlp.analyze_magi_results function."""
+        def _magi_method():
+            log.info("Analyzing MAGI Results")
+            if self.check_and_load_attribute('magi_results_table', self._magi_results_table_filename, overwrite):
+                log.info(f"\tMAGI results table object 'magi_results_table' with {self.magi_results_table.shape[0]} reactions.")
+                return
+            
+            tx_dataset = next((dataset for dataset in self.datasets if dataset.dataset_name == 'tx'), None)
+            call_params = {
+                'annotation_table': self.feature_annotation_table,
+                'magi_raw_dir': self.magi_raw_dir,
+                'tx_raw_dir': tx_dataset.dataset_raw_dir if tx_dataset else None,
+                'output_dir': self.output_dir,
+                'output_filename': self._magi_results_table_filename,
+            }
+            call_params.update(kwargs)
+            
+            result = hlp.parse_magi_table(**call_params)
+
+            if result.empty:
+                log.error(f"Analyzing MAGI results resulted in empty table. Please check your MAGI raw data.")
+                sys.exit(1)
+            self.magi_results_table = result
+            log.info(f"Created a MAGI results table with {self.magi_results_table.shape[0]} reactions.")
+            log.info(f"Created table: {self._magi_results_table_filename}")
+            log.info("Created attribute: magi_results_table")
+
+        if show_progress:
+            self.workflow_tracker.set_current_step('analyze_magi_results')
+            _magi_method()
+            self._complete_tracking('analyze_magi_results')
+            return
+        else:
+            _magi_method()
+            return
+
+    def merge_magi_results(self, overwrite: bool = False, show_progress: bool = False, **kwargs) -> None:
+        """Hybrid: Class parameter setup + external hlp.analyze_magi_results function."""
+        def _magi_merge_method():
+            log.info("Merging MAGI Results with Correlation Table")
+            if self.check_and_load_attribute('feature_correlation_table_magi', self._feature_correlation_table_magi_filename, overwrite):
+                log.info(f"\tFeature correlation table with MAGI results object 'feature_correlation_table_magi' with {self.feature_correlation_table_magi.shape[0]} feature pairs.")
+                return
+            
+            call_params = {
+                'correlation_table': self.feature_correlation_table,
+                'magi_df': self.magi_results_table,
+                'output_dir': self.output_dir,
+                'output_filename': self._feature_correlation_table_magi_filename,
+            }
+            call_params.update(kwargs)
+            
+            result = hlp.add_magi_scores_to_correlation_table(**call_params)
+
+            if result.empty:
+                log.error(f"Merging MAGI results with correlation table resulted in empty table.")
+                sys.exit(1)
+            self.feature_correlation_table_magi = result
+            log.info(f"Created a feature correlation table including MAGI results with {self.feature_correlation_table_magi.shape[0]} feature pairs.")
+            log.info(f"Created table: {self._feature_correlation_table_magi_filename}")
+            log.info("Created attribute: feature_correlation_table_magi")
+
+        if show_progress:
+            self.workflow_tracker.set_current_step('merge_magi_results')
+            _magi_merge_method()
+            self._complete_tracking('merge_magi_results')
+            return
+        else:
+            _magi_merge_method()
+            return
+
     def plot_correlation_network(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
         def _network_method():
             log.info("Plotting Correlation Network")
@@ -2248,7 +2322,7 @@ class Analysis(DataAwareBaseHandler):
         # Register analysis data
         log.info("Registering data for the analysis object:")
         for attr_name in ['integrated_data', 'integrated_metadata', 'feature_network_node_table', 
-                         'feature_correlation_table', 'feature_annotation_table', 'functional_enrichment_table']:
+                         'feature_correlation_table', 'feature_correlation_table_magi','feature_annotation_table', 'functional_enrichment_table']:
             if hasattr(self, attr_name):
                 df = getattr(self, attr_name)
                 if not df.empty:
@@ -2302,6 +2376,7 @@ manual_file_storage = {
     'feature_annotation_table': 'feature_annotation_table.csv',
     'integrated_data_selected': 'integrated_data_selected.csv',
     'feature_correlation_table': 'feature_correlation_table.csv',
+    'feature_correlation_table_magi': 'feature_correlation_table_magi.csv',
     'magi_results_table': 'magi_results_table.csv',
     'feature_network_graph': 'feature_network_graph.graphml',
     'feature_network_edge_table': 'feature_network_edge_table.csv',
