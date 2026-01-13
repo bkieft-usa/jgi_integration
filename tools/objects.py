@@ -2052,7 +2052,8 @@ class Analysis(DataAwareBaseHandler):
                 'keep_negative': correlation_params.get('keep_negative', False),
                 'block_size': correlation_params.get('block_size', 500),
                 'n_jobs': correlation_params.get('cores', -1),
-                'corr_mode': correlation_params.get('corr_mode', 'bipartite')
+                'corr_mode': correlation_params.get('corr_mode', 'bipartite'),
+                'calculate_r2': True
             }
             call_params.update(kwargs)
             
@@ -2088,6 +2089,7 @@ class Analysis(DataAwareBaseHandler):
                 'annotation_table': self.feature_annotation_table,
                 'magi_raw_dir': self.magi_raw_dir,
                 'tx_raw_dir': tx_dataset.dataset_raw_dir if tx_dataset else None,
+                'score_cutoff': 0,
                 'output_dir': self.output_dir,
                 'output_filename': self._magi_results_table_filename,
             }
@@ -2122,6 +2124,7 @@ class Analysis(DataAwareBaseHandler):
             
             call_params = {
                 'correlation_table': self.feature_correlation_table,
+                'scatter_correlation': "r_squared", # correlation, r_squared
                 'magi_df': self.magi_results_table,
                 'output_dir': self.output_dir,
                 'output_filename': self._feature_correlation_table_magi_filename,

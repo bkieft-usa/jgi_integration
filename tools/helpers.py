@@ -911,6 +911,7 @@ def calculate_correlated_features(
     block_size: int = 500,
     n_jobs: int = 1,
     corr_mode: str = "bipartite",
+    calculate_r2: bool = False,
 ) -> pd.DataFrame:
     """
     Compute feature correlation on an already normalised feature-by-sample matrix.
@@ -943,6 +944,9 @@ def calculate_correlated_features(
         - "bipartite": Only compute correlations between different datatypes
         - "full": Compute all pairwise correlations
         - Any other string: Should match a feature prefix
+    calculate_r2 : bool, default False
+        If True, also compute R-squared values by fitting a linear regression
+        line to each feature pair. Adds an 'r_squared' column to output.
 
     Returns
     ---
@@ -1137,6 +1141,50 @@ def calculate_correlated_features(
             "correlation": sims,
         }
     )
+    
+    # Calculate R-squared if requested
+    if calculate_r2:
+        log.info("Computing R-squared values for feature pairs...")
+        r2_values = []
+        
+        for idx, row in df.iterrows():
+            feat1 = row['feature_1']
+            feat2 = row['feature_2']
+            
+            # Get feature vectors
+            x = data.loc[feat1].values
+            y = data.loc[feat2].values
+            
+            # Remove NaN values
+            mask = ~(np.isnan(x) | np.isnan(y))
+            x_clean = x[mask]
+            y_clean = y[mask]
+            
+            if len(x_clean) < 3:
+                # Not enough points for meaningful regression
+                r2_values.append(np.nan)
+                continue
+            
+            # Fit linear regression: y = mx + b
+            # Using least squares: y = X @ beta, where X = [ones, x]
+            X_design = np.vstack([np.ones(len(x_clean)), x_clean]).T
+            beta, residuals, rank, s = np.linalg.lstsq(X_design, y_clean, rcond=None)
+            
+            # Calculate R-squared
+            y_pred = X_design @ beta
+            ss_res = np.sum((y_clean - y_pred) ** 2)  # Residual sum of squares
+            ss_tot = np.sum((y_clean - np.mean(y_clean)) ** 2)  # Total sum of squares
+            
+            if ss_tot > 0:
+                r2 = 1 - (ss_res / ss_tot)
+            else:
+                r2 = 0.0  # Constant y values
+            
+            r2_values.append(r2)
+        
+        df['r_squared'] = r2_values
+        log.info(f"R-squared computation complete. Mean R²: {np.nanmean(r2_values):.4f}")
+    
     df["abs_corr"] = np.abs(df["correlation"])
     df = df.sort_values("abs_corr", ascending=False).drop(columns="abs_corr")
 
@@ -2211,6 +2259,7 @@ def parse_magi_table(
     annotation_table: pd.DataFrame,
     magi_raw_dir: str,
     tx_raw_dir: str,
+    score_cutoff: float,
     output_dir: str,
     output_filename: str
 ) -> pd.DataFrame:
@@ -2232,6 +2281,11 @@ def parse_magi_table(
     
     # Ensure MAGI_score is numeric
     magi_df['MAGI_score'] = pd.to_numeric(magi_df['MAGI_score'], errors='coerce')
+    
+    # Filter by score cutoff
+    log.info(f"MAGI entries before score cutoff ({score_cutoff}): {len(magi_df)}")
+    magi_df = magi_df[magi_df['MAGI_score'] >= score_cutoff].reset_index(drop=True)
+    log.info(f"MAGI entries after score cutoff ({score_cutoff}): {len(magi_df)}")
     
     # Parse gene_ID to extract protein_id (3rd pipe-separated element)
     log.info("Parsing gene_ID to extract protein IDs...")
@@ -2377,6 +2431,7 @@ def parse_magi_table(
 
 def add_magi_scores_to_correlation_table(
     correlation_table: pd.DataFrame,
+    scatter_correlation: str,
     magi_df: pd.DataFrame,
     output_dir: str = None,
     output_filename: str = "correlation_table_with_magi_scores"
@@ -2511,6 +2566,7 @@ def add_magi_scores_to_correlation_table(
         log.info("Creating MAGI vs. Correlation scatter plot...")
         plot_magi_vs_correlation(
             correlation_table=result_df,
+            corr_values=scatter_correlation,
             output_dir=output_dir,
             output_filename=f"{output_filename}_scatter",
             show_plot=True
@@ -2520,6 +2576,7 @@ def add_magi_scores_to_correlation_table(
 
 def plot_magi_vs_correlation(
     correlation_table: pd.DataFrame,
+    corr_values: str = "correlation",
     output_dir: str = None,
     output_filename: str = "magi_vs_correlation_scatter",
     show_plot: bool = True
@@ -2547,8 +2604,10 @@ def plot_magi_vs_correlation(
     log.info(f"Plotting {len(data_with_magi):,} correlations with MAGI scores")
     
     # Extract data
-    x = data_with_magi['correlation'].values
+    x = data_with_magi[corr_values].values
+    x = x.astype(float)
     y = data_with_magi['MAGI_score'].values
+    y = y.astype(float)
     
     # Fit linear regression
     from scipy.stats import linregress
@@ -7083,7 +7142,8 @@ def plot_simple_pca(
     df: pd.DataFrame,
     metadata: pd.DataFrame,
     metadata_variables: List[str],
-    title: str = "PCA Plot"):
+    title: str = "PCA Plot",
+    output_dir: str = None,):
     """
     Plot a simple PCA for a single dataset and metadata variable.
     """
@@ -7115,8 +7175,15 @@ def plot_simple_pca(
         plot_title = f"{title} - {meta_var}"
         _draw_pca(ax, pca_df, hue_col=meta_var, title=title, alpha=0.75)
         display(fig)
-        plt.close(fig)
     
+        if output_dir:
+            # Save the plot if output_dir is specified
+            filename = f"{plot_title.replace(' ', '_').replace('-', '_')}.pdf"
+            log.info(f"Saving plot to {output_dir}/{filename}...")
+            fig.savefig(f"{output_dir}/{filename}")
+        
+        plt.close(fig)
+
     # Print sample locations on PCA as table of X,Y coordinates
     coord_df = pca_df[['unique_group', 'PCA1', 'PCA2']]
     print("PCA Sample Coordinates:")
@@ -7545,6 +7612,14 @@ def plot_submodule_abundance_by_metadata(
         plt.title(f'Mean abundance of {submodule_name} ({len(available_features)} features) by {color_group} and {shape_group}')
         plt.xticks(rotation=90)
         plt.tight_layout()
+        
+        if save_plot and output_dir:
+            output_subdir = f"{output_dir}/boxplots"
+            os.makedirs(output_subdir, exist_ok=True)
+            filename = f"avg_abundance_of_{submodule_name}_nodes_by_{metadata_group}.pdf"
+            log.info(f"Saving plot to {output_subdir}/{filename}")
+            plt.savefig(f"{output_subdir}/{filename}")
+        
         plt.show()
     else:
         # Single metadata variable
@@ -7570,14 +7645,15 @@ def plot_submodule_abundance_by_metadata(
         plt.title(f'Mean abundance of {submodule_name} ({len(available_features)} features) by {metadata_group}')
         plt.xticks(rotation=90)
         plt.tight_layout()
+        
+        if save_plot and output_dir:
+            output_subdir = f"{output_dir}/boxplots"
+            os.makedirs(output_subdir, exist_ok=True)
+            filename = f"avg_abundance_of_{submodule_name}_nodes_by_{metadata_group}.pdf"
+            log.info(f"Saving plot to {output_subdir}/{filename}")
+            plt.savefig(f"{output_subdir}/{filename}")
+        
         plt.show()
-
-    if save_plot and output_dir:
-        output_subdir = f"{output_dir}/boxplots"
-        os.makedirs(output_subdir, exist_ok=True)
-        filename = f"avg_abundance_of_{submodule_name}_nodes_by_{metadata_group}.pdf"
-        log.info(f"Saving plot to {output_subdir}/{filename}")
-        plt.savefig(f"{output_subdir}/{filename}")
 
 def plot_replicate_correlation(
     data: pd.DataFrame,
