@@ -362,6 +362,7 @@ def glm_selection(
     significance_level: float = 0.05,
     log2fc_cutoff: float = 0.25,
     max_features: int = 10000,
+    output_dir: str = None,
 ) -> pd.DataFrame:
     """
     Fit a Gaussian GLM for each feature vs. a categorical metadata column.
@@ -468,6 +469,27 @@ def glm_selection(
     
     # Multiple-testing correction
     adj, sig_mask = _fdr_correct(pvals_s.values, alpha=significance_level)
+    adj_s = pd.Series(adj, index=data.index, name="pvalue_adj")
+    
+    # Create results DataFrame with all test statistics
+    results_df = pd.DataFrame({
+        'feature': data.index,
+        'pvalue': pvals_s.values,
+        'pvalue_adj': adj_s.values,
+        'log2fc': coeffs_s.values,
+        'significant': sig_mask
+    })
+    results_df = results_df.sort_values(['pvalue_adj', 'log2fc'], ascending=[True, False])
+    
+    # Write results to file if output_dir provided
+    if output_dir:
+        results_filename = f"glm_results_{category}"
+        write_integration_file(
+            data=results_df,
+            output_dir=output_dir,
+            filename=results_filename,
+            indexing=False
+        )
     
     # Apply both filters
     passes = sig_mask & (np.abs(coeffs) >= log2fc_cutoff)
@@ -487,6 +509,7 @@ def kruskal_selection(
     significance_level: float = 0.05,
     lfc_cutoff: float = 0.5,
     max_features: int = 10000,
+    output_dir: str = None,
 ) -> pd.DataFrame:
     """
     Kruskal-Wallis test per feature against a categorical metadata column.
@@ -586,6 +609,27 @@ def kruskal_selection(
     
     # Multiple-testing correction
     adj, sig_mask = _fdr_correct(pvals_s.values, alpha=significance_level)
+    adj_s = pd.Series(adj, index=data.index, name="pvalue_adj")
+    
+    # Create results DataFrame with all test statistics
+    results_df = pd.DataFrame({
+        'feature': data.index,
+        'pvalue': pvals_s.values,
+        'pvalue_adj': adj_s.values,
+        'effect_size': eff_s.values,
+        'significant': sig_mask
+    })
+    results_df = results_df.sort_values('pvalue_adj')
+    
+    # Write results to file if output_dir provided
+    if output_dir:
+        results_filename = f"kruskal-wallis_results_{category}"
+        write_integration_file(
+            data=results_df,
+            output_dir=output_dir,
+            filename=results_filename,
+            indexing=False
+        )
     
     # Apply both thresholds
     passes = sig_mask & (eff_s.abs() >= lfc_cutoff)
@@ -595,6 +639,7 @@ def kruskal_selection(
         selected = eff_s.loc[selected].abs().sort_values(ascending=False).index[:max_features].tolist()
     
     log.info(f"Kruskal-Wallis selected {len(selected)} features")
+    
     return data.loc[selected]
 
 def feature_list_selection(
@@ -771,6 +816,10 @@ def perform_feature_selection(
     if selection_function is not feature_list_selection and \
        selection_function is not variance_selection:
         kwargs["metadata"] = metadata
+    
+    # Add output_dir for glm_selection and kruskal_selection
+    if selection_function in (glm_selection, kruskal_selection):
+        kwargs["output_dir"] = output_dir
 
     log.info(f"Performing feature selection using method '{method}'.")
     try:
@@ -899,6 +948,168 @@ def _block_pair(
         (int(idx_i[ii[k]]), int(idx_j[jj[k]]), float(sim[ii[k], jj[k]]))
         for k in range(ii.size)
     ]
+
+def plot_correlation_heatmap(
+    corr_table: pd.DataFrame,
+    corr_min: float = -1.0,
+    max_features: int = 1000,
+    output_dir: str = None,
+    output_filename: str = "correlation_heatmap",
+    cmap: str = "viridis",
+    figsize: tuple = (12, 10),
+    levels: int = 50,
+    vmin: float = None,
+    vmax: float = None,
+    show_colorbar: bool = True,
+    cluster_features: bool = True,
+) -> None:
+    """
+    Plot a smooth contoured heatmap of pairwise correlation data.
+    
+    Args:
+        corr_table (pd.DataFrame): Long-format correlation table with columns 
+                                   ['feature_1', 'feature_2', 'correlation'].
+        output_dir (str, optional): Output directory for saving plots.
+        output_filename (str): Output filename (without extension).
+        cmap (str): Colormap for the heatmap (default: 'viridis').
+        figsize (tuple): Figure size in inches.
+        levels (int): Number of contour levels for smoothness.
+        vmin (float, optional): Minimum value for color scale.
+        vmax (float, optional): Maximum value for color scale.
+        show_colorbar (bool): Whether to show the colorbar.
+        cluster_features (bool): Whether to cluster features to group high correlations.
+    
+    Returns:
+        None
+    """
+    
+    log.info(f"Creating contoured correlation heatmap...")
+    
+    # Filter by correlation min
+    corr_table = corr_table[corr_table['correlation'] >= corr_min].copy()
+
+    # Filter by number of max features, with highest correlations retained
+    corr_table = corr_table.sort_values(by='correlation', ascending=False)
+    corr_table = corr_table.head(max_features)
+
+    # Pivot the long-format table to a square correlation matrix
+    corr_matrix = corr_table.pivot(
+        index='feature_2',
+        columns='feature_1', 
+        values='correlation'
+    )
+    
+    # Fill any missing values with 0
+    corr_matrix = corr_matrix.fillna(0)
+    
+    # Ensure matrix is symmetric (correlation should be symmetric)
+    all_features = sorted(set(corr_table['feature_1']).union(set(corr_table['feature_2'])))
+    corr_matrix = corr_matrix.reindex(index=all_features, columns=all_features, fill_value=0)
+    
+    # Make symmetric
+    corr_matrix = corr_matrix.combine_first(corr_matrix.T)
+    
+    # Set diagonal to 1 (self-correlation)
+    np.fill_diagonal(corr_matrix.values, 1.0)
+    
+    log.info(f"Correlation matrix shape: {corr_matrix.shape}")
+    log.info(f"Correlation range: [{corr_matrix.min().min():.3f}, {corr_matrix.max().max():.3f}]")
+    
+    # Cluster features if requested
+    if cluster_features:
+        log.info("Clustering features using hierarchical clustering...")
+        # Use absolute correlation for distance metric
+        distance_matrix = 1 - np.abs(corr_matrix.values)
+        
+        # Convert to condensed distance matrix for linkage
+        from scipy.spatial.distance import squareform
+        condensed_dist = squareform(distance_matrix, checks=False)
+        
+        # Perform hierarchical clustering
+        linkage_matrix = linkage(condensed_dist, method='average')
+        
+        # Get the order of features from the dendrogram
+        from scipy.cluster.hierarchy import dendrogram
+        dendro = dendrogram(linkage_matrix, no_plot=True)
+        feature_order = dendro['leaves']
+        
+        # Reorder the correlation matrix
+        corr_matrix = corr_matrix.iloc[feature_order, feature_order]
+        
+        log.info("Feature clustering complete")
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Determine color scale limits
+    if vmin is None:
+        vmin = corr_matrix.min().min()
+    if vmax is None:
+        vmax = corr_matrix.max().max()
+    
+    # Create smooth contour plot
+    x = np.arange(corr_matrix.shape[1])
+    y = np.arange(corr_matrix.shape[0])
+    X, Y = np.meshgrid(x, y)
+    
+    # Plot filled contours for smooth appearance
+    contourf = ax.contourf(
+        X, Y, corr_matrix.values,
+        levels=levels,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        extend='both'
+    )
+    
+    # Optional: Add contour lines for better definition
+    contour = ax.contour(
+        X, Y, corr_matrix.values,
+        levels=10,
+        colors='black',
+        alpha=0.2,
+        linewidths=0.5
+    )
+    
+    # Add colorbar
+    if show_colorbar:
+        cbar = plt.colorbar(contourf, ax=ax)
+        cbar.set_label('Correlation', rotation=270, labelpad=20)
+    
+    # Set axis labels and ticks
+    ax.set_xlabel('Features', fontsize=12)
+    ax.set_ylabel('Features', fontsize=12)
+    title = 'Pairwise Feature Correlations'
+    if cluster_features:
+        title += ' (Clustered)'
+    ax.set_title(title, fontsize=14, pad=20)
+    
+    # For large matrices, showing all feature names is impractical
+    if len(all_features) > 50:
+        ax.set_xticks([])
+        ax.set_yticks([])
+        log.info(f"Matrix too large ({len(all_features)} features), hiding tick labels")
+    else:
+        # Show all feature names for smaller matrices
+        ax.set_xticks(x)
+        ax.set_yticks(y)
+        ax.set_xticklabels(corr_matrix.columns, rotation=90, fontsize=8)
+        ax.set_yticklabels(corr_matrix.index, fontsize=8)
+    
+    plt.tight_layout()
+    
+    # Save plot if output directory specified
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        filename = f"{output_filename}.pdf"
+        output_path = os.path.join(output_dir, filename)
+        log.info(f"Saving plot to {output_path}...")
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    
+    plt.show()
+    plt.close()
+    
+    return
 
 def calculate_correlated_features(
     data: pd.DataFrame,
@@ -4668,7 +4879,7 @@ def find_mx_parent_folder(
     polarity: str,
     datatype: str,
     chromatography: str,
-    filtered_mx: bool = False,
+    filtered_mx: bool = True,
     overwrite: bool = False,
     superuser: bool = False
 ) -> str:
@@ -4783,7 +4994,7 @@ def gather_mx_files(
     polarity: str,
     datatype: str,
     chromatography: str,
-    filtered_mx: bool = False,
+    filtered_mx: bool = True,
     extract: bool = False,
     overwrite: bool = False
 ) -> tuple:
@@ -5076,7 +5287,7 @@ def get_mx_data(
     chromatography: str,
     polarity: str,
     datatype: str = "peak-height",
-    filtered_mx: bool = False,
+    filtered_mx: bool = True,
     superuser: bool = False,
 ) -> pd.DataFrame:
     """
@@ -7491,6 +7702,12 @@ def plot_feature_abundance_by_metadata(
         filename = f"abundance_of_{feature}_by_{metadata_group}.pdf"
         log.info(f"Saving plot to {output_subdir}/{filename}")
         plt.savefig(f"{output_subdir}/{filename}")
+        plt.show()
+    else:
+        plt.show()
+
+    plt.close()
+    return
 
 def plot_submodule_abundance_by_metadata(
     data: pd.DataFrame,
