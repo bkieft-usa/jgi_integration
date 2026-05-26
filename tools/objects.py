@@ -321,7 +321,7 @@ SQL Query:
         if self.client:
             try:
                 response = self.client.chat.completions.create(
-                    model="openai/chatgpt:latest",
+                    model="anthropic/claude-sonnet",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0
                 )
@@ -1968,7 +1968,7 @@ class Analysis(DataAwareBaseHandler):
     def plot_submodule_avg_abundance(self, submodule_name: str, metadata_cat: str = 'group', save_plot: bool = True) -> None:
         """Plot average abundance of features in submodules across metadata groups."""
         hlp.plot_submodule_abundance_by_metadata(
-            data=self.integrated_data,
+            data=self.integrated_data_selected,
             metadata=self.integrated_metadata,
             node_table=self.feature_network_node_table,
             submodule_name=submodule_name,

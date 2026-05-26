@@ -949,9 +949,184 @@ def _block_pair(
         for k in range(ii.size)
     ]
 
+def plot_feature_pair_correlation(
+    data: pd.DataFrame,
+    metadata: pd.DataFrame,
+    feature_1: str,
+    feature_2: str,
+    color_by: str = None,
+    output_dir: str = None,
+    show_plot: bool = True,
+    figsize: tuple = (8, 6),
+    alpha: float = 0.7,
+    s: int = 50
+) -> dict:
+    """
+    Create a scatter plot showing the correlation between two features,
+    optionally colored by a metadata category.
+    
+    Args:
+        data (pd.DataFrame): Feature matrix (features x samples)
+        metadata (pd.DataFrame): Metadata DataFrame (samples x variables)
+        feature_1 (str): Name of first feature (x-axis)
+        feature_2 (str): Name of second feature (y-axis)
+        color_by (str, optional): Metadata column to use for point colors
+        output_dir (str, optional): Directory to save plot
+        show_plot (bool): Whether to display plot inline
+        figsize (tuple): Figure size in inches
+        alpha (float): Point transparency (0-1)
+        s (int): Point size
+
+    """
+    
+    # Validate features exist in data
+    if feature_1 not in data.index:
+        raise ValueError(f"Feature '{feature_1}' not found in data")
+    if feature_2 not in data.index:
+        raise ValueError(f"Feature '{feature_2}' not found in data")
+    
+    # Extract feature vectors
+    x = data.loc[feature_1].values
+    y = data.loc[feature_2].values
+    
+    # Create DataFrame for plotting
+    plot_df = pd.DataFrame({
+        'x': x,
+        'y': y,
+        'sample': data.columns
+    })
+    
+    # Merge with metadata if color_by specified
+    if color_by is not None:
+        if color_by not in metadata.columns:
+            raise ValueError(f"Metadata column '{color_by}' not found")
+        
+        # Merge on sample names
+        plot_df = plot_df.merge(
+            metadata[[color_by]], 
+            left_on='sample', 
+            right_index=True, 
+            how='left'
+        )
+    
+    # Remove NaN values for correlation calculation
+    mask = ~(np.isnan(plot_df['x']) | np.isnan(plot_df['y']))
+    plot_df_clean = plot_df[mask].copy()
+    
+    if len(plot_df_clean) < 3:
+        log.warning(f"Only {len(plot_df_clean)} valid samples for correlation")
+        return {
+            'feature_1': feature_1,
+            'feature_2': feature_2,
+            'r': np.nan,
+            'p_value': np.nan,
+            'n_samples': len(plot_df_clean)
+        }
+    
+    # Calculate correlation statistics
+    from scipy.stats import pearsonr
+    r, p_value = pearsonr(plot_df_clean['x'], plot_df_clean['y'])
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Create scatter plot
+    if color_by is not None and color_by in plot_df_clean.columns:
+        # Get unique groups and sort them
+        unique_groups = plot_df_clean[color_by].unique()
+        
+        # Sort groups - try numeric first, then alphabetic
+        try:
+            # Try to convert to numeric and sort
+            unique_groups_sorted = sorted(unique_groups, key=lambda x: float(x))
+        except (ValueError, TypeError):
+            # If conversion fails, sort alphabetically
+            unique_groups_sorted = sorted(unique_groups, key=str)
+        
+        # Plot with color grouping using viridis palette
+        colors = plt.cm.viridis(np.linspace(0, 1, len(unique_groups_sorted)))
+        
+        for idx, group in enumerate(unique_groups_sorted):
+            group_data = plot_df_clean[plot_df_clean[color_by] == group]
+            ax.scatter(
+                group_data['x'], 
+                group_data['y'],
+                label=group,
+                alpha=alpha,
+                s=s,
+                color=colors[idx],
+                edgecolors='black',
+                linewidth=0.5
+            )
+        ax.legend(title=color_by, loc='best', framealpha=0.9)
+    else:
+        # Plot without color grouping (use viridis purple)
+        ax.scatter(
+            plot_df_clean['x'],
+            plot_df_clean['y'],
+            alpha=alpha,
+            s=s,
+            c='#440154',  # Viridis dark purple
+            edgecolors='black',
+            linewidth=0.5
+        )
+    
+    # Add regression line
+    x_line = np.linspace(plot_df_clean['x'].min(), plot_df_clean['x'].max(), 100)
+    slope, intercept = np.polyfit(plot_df_clean['x'], plot_df_clean['y'], 1)
+    y_line = slope * x_line + intercept
+    ax.plot(x_line, y_line, 'r--', linewidth=2, alpha=0.7, label='Linear fit')
+    
+    # Formatting
+    ax.set_xlabel(feature_1, fontsize=12)
+    ax.set_ylabel(feature_2, fontsize=12)
+    ax.set_title(
+        f'Correlation: {feature_1} vs {feature_2}\n' +
+        f'r = {r:.3f}, p = {p_value:.2e}, n = {len(plot_df_clean)}',
+        fontsize=12,
+        pad=15
+    )
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save plot if output directory specified
+    output_filename = f"correlation_{feature_1}_vs_{feature_2}"
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{output_filename}.pdf")
+        fig.savefig(output_path, dpi=300, bbox_inches='tight')
+        log.info(f"Saved plot to {output_path}")
+    
+    # Display plot
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+    
+    # Log statistics
+    log.info(f"Correlation statistics:")
+    log.info(f"  Features: {feature_1} vs {feature_2}")
+    log.info(f"  Pearson r: {r:.4f}")
+    log.info(f"  P-value: {p_value:.2e}")
+    log.info(f"  N samples: {len(plot_df_clean)}")
+    
+    return
+
+    # return {
+    #     'feature_1': feature_1,
+    #     'feature_2': feature_2,
+    #     'r': r,
+    #     'p_value': p_value,
+    #     'n_samples': len(plot_df_clean),
+    #     'slope': slope,
+    #     'intercept': intercept
+    # }
+
 def plot_correlation_heatmap(
     corr_table: pd.DataFrame,
     corr_min: float = -1.0,
+    corr_type: str = "correlation",
     max_features: int = 1000,
     output_dir: str = None,
     output_filename: str = "correlation_heatmap",
@@ -986,17 +1161,17 @@ def plot_correlation_heatmap(
     log.info(f"Creating contoured correlation heatmap...")
     
     # Filter by correlation min
-    corr_table = corr_table[corr_table['correlation'] >= corr_min].copy()
+    corr_table = corr_table[corr_table[corr_type] >= corr_min].copy()
 
     # Filter by number of max features, with highest correlations retained
-    corr_table = corr_table.sort_values(by='correlation', ascending=False)
+    corr_table = corr_table.sort_values(by=corr_type, ascending=False)
     corr_table = corr_table.head(max_features)
 
     # Pivot the long-format table to a square correlation matrix
     corr_matrix = corr_table.pivot(
         index='feature_2',
         columns='feature_1', 
-        values='correlation'
+        values=corr_type
     )
     
     # Fill any missing values with 0
@@ -1074,12 +1249,12 @@ def plot_correlation_heatmap(
     # Add colorbar
     if show_colorbar:
         cbar = plt.colorbar(contourf, ax=ax)
-        cbar.set_label('Correlation', rotation=270, labelpad=20)
+        cbar.set_label(corr_type, rotation=270, labelpad=20)
     
     # Set axis labels and ticks
     ax.set_xlabel('Features', fontsize=12)
     ax.set_ylabel('Features', fontsize=12)
-    title = 'Pairwise Feature Correlations'
+    title = f'Pairwise Feature {corr_type.capitalize()}'
     if cluster_features:
         title += ' (Clustered)'
     ax.set_title(title, fontsize=14, pad=20)
@@ -7684,7 +7859,6 @@ def plot_feature_abundance_by_metadata(
         plt.ylabel('Z-scored abundance')
         plt.title(f'Abundance of {feature} by {color_group} and {shape_group}')
         plt.xticks(rotation=90)
-        plt.show()
     else:
         # Plot the data
         plt.figure(figsize=(12, 8))
@@ -7694,19 +7868,19 @@ def plot_feature_abundance_by_metadata(
         plt.ylabel('Z-scored abundance')
         plt.title(f'Abundance of {feature} by {metadata_group}')
         plt.xticks(rotation=90)
-        plt.show()
 
+    # Save before showing
     if save_plot and output_dir:
         output_subdir = f"{output_dir}/boxplots"
         os.makedirs(output_subdir, exist_ok=True)
         filename = f"abundance_of_{feature}_by_{metadata_group}.pdf"
         log.info(f"Saving plot to {output_subdir}/{filename}")
-        plt.savefig(f"{output_subdir}/{filename}")
-        plt.show()
-    else:
-        plt.show()
-
+        plt.savefig(f"{output_subdir}/{filename}", bbox_inches='tight')
+    
+    # Show after saving
+    plt.show()
     plt.close()
+    
     return
 
 def plot_submodule_abundance_by_metadata(
@@ -7807,7 +7981,7 @@ def plot_submodule_abundance_by_metadata(
             linked_data[color_group].astype(str) + "_" + linked_data[shape_group].astype(str)
         )
         
-        plt.figure(figsize=(12, 8))
+        plt.figure(figsize=(10, 7))
         sns.violinplot(
             x='color_shape_group', 
             y='mean_abundance', 
@@ -7840,7 +8014,7 @@ def plot_submodule_abundance_by_metadata(
         plt.show()
     else:
         # Single metadata variable
-        plt.figure(figsize=(12, 8))
+        plt.figure(figsize=(10, 7))
         sns.violinplot(
             x=metadata_group, 
             y='mean_abundance', 
