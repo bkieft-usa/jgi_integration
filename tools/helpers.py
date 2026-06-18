@@ -5791,10 +5791,7 @@ def generate_tx_annotation_table(
         write_integration_file(empty_df, output_dir, output_filename, indexing=False)
         return empty_df
     elif genome_type == "plant":
-        log.info(f"Annotation processing for '{genome_type}' genome type is not yet implemented.")
-        empty_df = pd.DataFrame(columns=['transcriptome_id'])
-        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
-        return empty_df
+        annotation_df = _process_plant_annotations(raw_data_dir, output_dir, output_filename)
     else:
         raise ValueError(f"Invalid genome_type '{genome_type}'. Must be one of: 'microbe', 'algal', 'metagenome', 'plant'")
 
@@ -6013,6 +6010,186 @@ def _process_algal_annotations(
     
     return final_df
 
+def _process_plant_annotations(
+    raw_data_dir: str,
+    output_dir: str,
+    output_filename: str
+) -> pd.DataFrame:
+    """
+    Process plant (Phytozome) annotation files and merge into a single table.
+
+    Plant data has a single annotation file called ``kegg_annotation_table.tsv``
+    whose columns are::
+
+        #pacId  locusName  transcriptName  peptideName  Pfam  Panther  KOG
+        KEGG/ec  KO  GO  Best-hit-arabi-name  arabi-symbol  arabi-defline
+
+    The ``transcriptName`` column (e.g. ``LOC_Os01g04030.1``) is used as the
+    primary identifier and is mapped to ``transcriptome_id`` via the GFF3
+    ``mRNA`` feature ``Name`` attribute.  ``pacId`` is stored as ``protein_id``
+    (it is the numeric Phytozome protein/pacid identifier).
+
+    Args:
+        raw_data_dir (str): Directory containing ``kegg_annotation_table.tsv``
+            and optionally a ``genes.gff3`` file.
+        output_dir (str): Output directory for the merged annotation table.
+        output_filename (str): Filename for the output annotation table.
+
+    Returns:
+        pd.DataFrame: Merged annotation table with ``transcriptome_id`` and
+            annotation columns.
+    """
+
+    log.info(f"Processing plant annotations from {raw_data_dir}")
+
+    # Plant has exactly one annotation file
+    annotation_file = os.path.join(raw_data_dir, "kegg_annotation_table.tsv")
+
+    if not os.path.isfile(annotation_file):
+        log.warning(f"kegg_annotation_table.tsv not found in {raw_data_dir}")
+        empty_df = pd.DataFrame(columns=['transcriptome_id'])
+        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
+        return empty_df
+
+    log.info(f"Found annotation file: {os.path.basename(annotation_file)}")
+
+    df = _read_and_select_plant_annotations(annotation_file)
+    if df is None or df.empty:
+        log.warning(f"No valid data in {os.path.basename(annotation_file)}")
+        empty_df = pd.DataFrame(columns=['transcriptome_id'])
+        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
+        return empty_df
+
+    # Aggregate to one row per transcript (handles any duplicate transcriptName rows)
+    agg_df = _aggregate_plant_annotations(df)
+    log.info(f"  Processed {os.path.basename(annotation_file)}: {len(agg_df)} transcripts")
+
+    # Fill NaN values with empty strings for consistency
+    agg_df = agg_df.fillna('')
+
+    # Add transcriptome_id mapping from GFF3 file (transcriptName -> transcriptome_id)
+    merged_df = _add_protein_id_mapping(agg_df, raw_data_dir, "plant")
+
+    # Compress to one gene per row with semicolon-separated annotations
+    final_df = _compress_annotation_table(merged_df)
+
+    log.info(f"Final annotation table: {len(final_df)} genes with {len(final_df.columns)} annotation columns")
+
+    # Save the merged annotation table
+    write_integration_file(final_df, output_dir, output_filename, indexing=False)
+
+    return final_df
+
+
+def _read_and_select_plant_annotations(file_path: str) -> pd.DataFrame:
+    """
+    Read and select relevant columns from the plant Phytozome
+    ``kegg_annotation_table.tsv`` annotation file.
+
+    The file uses a ``#``-prefixed header line and tab separation.  The
+    following source columns are extracted and renamed:
+
+    ==================  =================
+    Source column       Output column
+    ==================  =================
+    ``#pacId``          ``protein_id``
+    ``transcriptName``  ``transcriptome_id``
+    ``Pfam``            ``pfam_acc``
+    ``Panther``         ``panther_acc``
+    ``KOG``             ``kog_acc``
+    ``KEGG/ec``         ``kegg_ec``
+    ``KO``              ``ko_acc``
+    ``GO``              ``go_acc``
+    ``Best-hit-arabi-name`` ``arabi_hit``
+    ``arabi-symbol``    ``arabi_symbol``
+    ``arabi-defline``   ``arabi_defline``
+    ==================  =================
+
+    Args:
+        file_path (str): Path to ``kegg_annotation_table.tsv``.
+
+    Returns:
+        pd.DataFrame or None: Processed annotation dataframe, or ``None`` on
+            error.
+    """
+
+    try:
+        df = pd.read_csv(file_path, sep='\t', comment=None, low_memory=False)
+
+        # The header line starts with '#pacId'; strip leading '#' from column names
+        df.columns = [c.lstrip('#') for c in df.columns]
+
+        required_cols = ['pacId', 'transcriptName']
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            log.warning(f"Missing required columns {missing} in {os.path.basename(file_path)}")
+            return None
+
+        # Map source columns to standardised output names; only keep columns
+        # that are actually present in the file.
+        col_map = {
+            'pacId':               'protein_id',
+            'transcriptName':      'transcriptome_id',
+            'Pfam':                'pfam_acc',
+            'Panther':             'panther_acc',
+            'KOG':                 'kog_acc',
+            'KEGG/ec':             'kegg_ec',
+            'KO':                  'ko_acc',
+            'GO':                  'go_acc',
+            'Best-hit-arabi-name': 'arabi_hit',
+            'arabi-symbol':        'arabi_symbol',
+            'arabi-defline':       'arabi_defline',
+        }
+
+        available_map = {src: dst for src, dst in col_map.items() if src in df.columns}
+        df = df[list(available_map.keys())].copy()
+        df.rename(columns=available_map, inplace=True)
+
+        # Ensure protein_id is stored as string (pacId is numeric in the file)
+        df['protein_id'] = df['protein_id'].astype(str)
+
+        # Drop rows where the transcript name is missing
+        df = df.dropna(subset=['transcriptome_id'])
+        df = df[df['transcriptome_id'].astype(str).str.strip() != '']
+
+        return df
+
+    except Exception as e:
+        log.warning(f"Error reading plant annotation file {file_path}: {e}")
+        return None
+
+
+def _aggregate_plant_annotations(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate plant annotations by ``transcriptome_id``, collapsing any
+    duplicate rows for the same transcript into ``;;``-separated strings.
+
+    Args:
+        df (pd.DataFrame): Annotation dataframe with a ``transcriptome_id``
+            column produced by :func:`_read_and_select_plant_annotations`.
+
+    Returns:
+        pd.DataFrame: Aggregated dataframe with one row per ``transcriptome_id``.
+    """
+
+    def join_unique_values(series):
+        """Join unique non-empty values with double semicolon."""
+        unique_vals = sorted({
+            str(x).strip() for x in series.dropna()
+            if str(x).strip() and str(x).strip().lower() not in ['nan', 'none', '']
+        })
+        return ';;'.join(unique_vals) if unique_vals else ''
+
+    annotation_columns = [col for col in df.columns if col != 'transcriptome_id']
+    aggregated_df = (
+        df.groupby('transcriptome_id')[annotation_columns]
+        .agg(join_unique_values)
+        .reset_index()
+    )
+
+    return aggregated_df
+
+
 def _read_and_select_microbe_annotations(file_path: str) -> pd.DataFrame:
     """
     Read and select relevant columns from microbe annotation files.
@@ -6216,6 +6393,10 @@ def _add_protein_id_mapping(
                 feature_type = 'CDS'
                 protein_attribute = 'locus_tag'
                 display_attribute = 'product'
+            elif genome_type == "plant":
+                feature_type = 'mRNA'
+                protein_attribute = 'pacid'
+                display_attribute = 'Name'
             else:
                 # For other genome types, try gene first, then CDS
                 feature_type = 'gene'
@@ -6254,7 +6435,18 @@ def _add_protein_id_mapping(
     
     log.info(f"Found {len(gene_to_protein)} gene-to-protein mappings")
 
-    if 'transcriptome_id' in merged_df.columns and 'protein_id' not in merged_df.columns:
+    if genome_type == "plant":
+        # Plant annotation files already carry both transcriptome_id (transcriptName)
+        # and protein_id (pacId).  The GFF3 mRNA Name attribute equals transcriptName,
+        # so build a pacid -> transcriptName lookup for display_name.
+        merged_df['protein_id'] = merged_df['protein_id'].astype(str)
+        merged_df['transcriptome_id'] = merged_df['transcriptome_id'].astype(str)
+        # gene_to_product maps GFF3 ID -> Name (transcriptName); invert via pacid
+        pacid_to_name = {str(v): gene_to_product.get(k, '') for k, v in gene_to_protein.items()}
+        merged_df['display_name'] = merged_df['protein_id'].map(pacid_to_name).fillna(
+            merged_df['transcriptome_id']
+        )
+    elif 'transcriptome_id' in merged_df.columns and 'protein_id' not in merged_df.columns:
         merged_df['transcriptome_id'] = merged_df['transcriptome_id'].astype(str)
         merged_df['protein_id'] = merged_df['transcriptome_id'].map(gene_to_protein).fillna('')
         merged_df['display_name'] = merged_df['transcriptome_id'].map(gene_to_product).fillna('')
