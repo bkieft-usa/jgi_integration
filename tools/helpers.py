@@ -6060,14 +6060,14 @@ def _process_plant_annotations(
         write_integration_file(empty_df, output_dir, output_filename, indexing=False)
         return empty_df
 
-    # Aggregate to one row per transcript (handles any duplicate transcriptName rows)
+    # Aggregate to one row per locus (handles any duplicate locusName rows)
     agg_df = _aggregate_plant_annotations(df)
-    log.info(f"  Processed {os.path.basename(annotation_file)}: {len(agg_df)} transcripts")
+    log.info(f"  Processed {os.path.basename(annotation_file)}: {len(agg_df)} loci")
 
     # Fill NaN values with empty strings for consistency
     agg_df = agg_df.fillna('')
 
-    # Add transcriptome_id mapping from GFF3 file (transcriptName -> transcriptome_id)
+    # Map locus_name -> GFF3 gene ID= to set transcriptome_id matching raw data
     merged_df = _add_protein_id_mapping(agg_df, raw_data_dir, "plant")
 
     # Compress to one gene per row with semicolon-separated annotations
@@ -6129,7 +6129,8 @@ def _read_and_select_plant_annotations(file_path: str) -> pd.DataFrame:
         # that are actually present in the file.
         col_map = {
             'pacId':               'protein_id',
-            'transcriptName':      'transcriptome_id',
+            'locusName':           'locus_name',
+            'transcriptName':      'transcript_name',
             'Pfam':                'pfam_acc',
             'Panther':             'panther_acc',
             'KOG':                 'kog_acc',
@@ -6148,9 +6149,9 @@ def _read_and_select_plant_annotations(file_path: str) -> pd.DataFrame:
         # Ensure protein_id is stored as string (pacId is numeric in the file)
         df['protein_id'] = df['protein_id'].astype(str)
 
-        # Drop rows where the transcript name is missing
-        df = df.dropna(subset=['transcriptome_id'])
-        df = df[df['transcriptome_id'].astype(str).str.strip() != '']
+        # Drop rows where the locus name is missing (primary join key)
+        df = df.dropna(subset=['locus_name'])
+        df = df[df['locus_name'].astype(str).str.strip() != '']
 
         return df
 
@@ -6161,15 +6162,18 @@ def _read_and_select_plant_annotations(file_path: str) -> pd.DataFrame:
 
 def _aggregate_plant_annotations(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Aggregate plant annotations by ``transcriptome_id``, collapsing any
-    duplicate rows for the same transcript into ``;;``-separated strings.
+    Aggregate plant annotations by ``locus_name``, collapsing any duplicate
+    rows for the same locus into ``;;``-separated strings.
+
+    ``locus_name`` (from the ``locusName`` column) is the gene-level identifier
+    that matches the raw transcriptomics data GeneIDs after GFF3 ID mapping.
 
     Args:
-        df (pd.DataFrame): Annotation dataframe with a ``transcriptome_id``
-            column produced by :func:`_read_and_select_plant_annotations`.
+        df (pd.DataFrame): Annotation dataframe with a ``locus_name`` column
+            produced by :func:`_read_and_select_plant_annotations`.
 
     Returns:
-        pd.DataFrame: Aggregated dataframe with one row per ``transcriptome_id``.
+        pd.DataFrame: Aggregated dataframe with one row per ``locus_name``.
     """
 
     def join_unique_values(series):
@@ -6180,9 +6184,9 @@ def _aggregate_plant_annotations(df: pd.DataFrame) -> pd.DataFrame:
         })
         return ';;'.join(unique_vals) if unique_vals else ''
 
-    annotation_columns = [col for col in df.columns if col != 'transcriptome_id']
+    annotation_columns = [col for col in df.columns if col != 'locus_name']
     aggregated_df = (
-        df.groupby('transcriptome_id')[annotation_columns]
+        df.groupby('locus_name')[annotation_columns]
         .agg(join_unique_values)
         .reset_index()
     )
@@ -6436,16 +6440,48 @@ def _add_protein_id_mapping(
     log.info(f"Found {len(gene_to_protein)} gene-to-protein mappings")
 
     if genome_type == "plant":
-        # Plant annotation files already carry both transcriptome_id (transcriptName)
-        # and protein_id (pacId).  The GFF3 mRNA Name attribute equals transcriptName,
-        # so build a pacid -> transcriptName lookup for display_name.
-        merged_df['protein_id'] = merged_df['protein_id'].astype(str)
-        merged_df['transcriptome_id'] = merged_df['transcriptome_id'].astype(str)
-        # gene_to_product maps GFF3 ID -> Name (transcriptName); invert via pacid
-        pacid_to_name = {str(v): gene_to_product.get(k, '') for k, v in gene_to_protein.items()}
-        merged_df['display_name'] = merged_df['protein_id'].map(pacid_to_name).fillna(
-            merged_df['transcriptome_id']
+        # For plant data the annotation table uses locusName (e.g. LOC_Os01g04030)
+        # as the gene-level key, while the raw transcriptomics data uses the GFF3
+        # gene feature ID= value (e.g. LOC_Os01g04030.MSUv7.0).
+        # gene_to_protein here maps GFF3 gene ID= -> pacid (protein_attribute='pacid'
+        # is set on mRNA features, so gene_to_protein is actually empty for plant
+        # when feature_type='mRNA' was used above).
+        #
+        # Re-parse the GFF3 gene features to build locus_name (Name=) -> gene_id (ID=).
+        locus_to_gene_id = {}
+        gene_id_to_display = {}
+        gff_files_plant = glob.glob(os.path.join(raw_data_dir, "*.gff3"))
+        if not gff_files_plant:
+            gff_files_plant = glob.glob(os.path.join(raw_data_dir, "genes.gff3"))
+        if gff_files_plant:
+            with open(gff_files_plant[0], 'r') as _gf:
+                for _line in _gf:
+                    if _line.startswith('#') or not _line.strip():
+                        continue
+                    _fields = _line.strip().split('\t')
+                    if len(_fields) < 9 or _fields[2] != 'gene':
+                        continue
+                    _attrs = _fields[8]
+                    _id_m = re.search(r'ID=([^;]+)', _attrs)
+                    _name_m = re.search(r'Name=([^;]+)', _attrs)
+                    if _id_m and _name_m:
+                        _gene_id = _id_m.group(1)
+                        _locus = _name_m.group(1)
+                        locus_to_gene_id[_locus] = _gene_id
+                        gene_id_to_display[_gene_id] = _locus
+        log.info(f"Plant GFF3: built {len(locus_to_gene_id)} locus_name -> gene_id mappings")
+
+        merged_df['locus_name'] = merged_df['locus_name'].astype(str)
+        # Map locus_name -> GFF3 gene ID= (the transcriptome_id used in raw data)
+        merged_df['transcriptome_id'] = merged_df['locus_name'].map(locus_to_gene_id).fillna(
+            merged_df['locus_name']
         )
+        merged_df['display_name'] = merged_df['transcriptome_id'].map(gene_id_to_display).fillna(
+            merged_df['locus_name']
+        )
+        # protein_id comes from pacId in the annotation file; keep as-is
+        if 'protein_id' not in merged_df.columns:
+            merged_df['protein_id'] = ''
     elif 'transcriptome_id' in merged_df.columns and 'protein_id' not in merged_df.columns:
         merged_df['transcriptome_id'] = merged_df['transcriptome_id'].astype(str)
         merged_df['protein_id'] = merged_df['transcriptome_id'].map(gene_to_protein).fillna('')
