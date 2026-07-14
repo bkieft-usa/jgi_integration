@@ -19,7 +19,9 @@ import warnings
 import logging
 import json
 import tempfile
+import requests
 from functools import reduce
+from rapidfuzz import fuzz, process
 
 # --- Display and plotting ---
 from IPython.display import display, Image
@@ -342,6 +344,28 @@ def _subset_by_rank(
     ordered = scores[score_col].sort_values(ascending=ascending).index
     log.info(f"Selecting top {max_features} features by {score_col}.")
     return list(ordered[:max_features])
+
+def lfc_selection(
+    data: pd.DataFrame,
+    log2fc_cutoff: float = 0.25,
+    max_features: int = 10000,
+) -> pd.DataFrame:
+    """
+    Select features based on log2-fold change.
+    1. Keeps features with at least one value >= log2fc_cutoff.
+    2. If count > max_features, keeps the top N features with the highest absolute LFC.
+    """
+    numeric_df = data.select_dtypes(include=['number'])
+    keep_mask = (numeric_df.abs() >= log2fc_cutoff).any(axis=1)
+    selected = data[keep_mask]
+
+    if len(selected) > max_features:
+        max_abs_values = selected.select_dtypes(include=['number']).abs().max(axis=1)
+        top_indices = max_abs_values.sort_values(ascending=False).head(max_features).index
+        selected = selected.loc[top_indices]
+
+    log.info(f"LFC selected {len(selected)} features (max_features={max_features})")
+    return selected
 
 def variance_selection(
     data: pd.DataFrame,
@@ -768,6 +792,8 @@ def perform_feature_selection(
 
     method = config.get("selected_method")
     max_features = config.get("max_features", 5000)
+    if method is None:
+        return data
     if method == "variance":
         max_features = config["variance"].get("top_n", max_features)
     if not method:
@@ -787,8 +813,9 @@ def perform_feature_selection(
                   f"but metadata has {metadata.shape[0]} samples. Subsetting metadata.")
         metadata = metadata.loc[common_samples]
 
-    # Map method name → function and its required keys
+    # Map method name to function and its required keys
     method_map: Dict[str, Tuple[Callable, List[str]]] = {
+        "lfc": (lfc_selection, ["lfc"]),
         "variance": (variance_selection, ["variance"]),
         "glm": (glm_selection, ["glm"]),
         "kruskalwallis": (kruskal_selection, ["kruskalwallis"]),
@@ -814,7 +841,8 @@ def perform_feature_selection(
     kwargs["max_features"] = max_features
     kwargs["data"] = data
     if selection_function is not feature_list_selection and \
-       selection_function is not variance_selection:
+       selection_function is not variance_selection and \
+       selection_function is not lfc_selection:
         kwargs["metadata"] = metadata
     
     # Add output_dir for glm_selection and kruskal_selection
@@ -824,8 +852,6 @@ def perform_feature_selection(
     log.info(f"Performing feature selection using method '{method}'.")
     try:
         subset = selection_function(**kwargs)
-    except ValueError:
-        raise
     except Exception as exc:
         raise ValueError(f"Error while executing method '{method}': {exc}") from exc
 
@@ -5802,6 +5828,11 @@ def generate_tx_annotation_table(
 
     annotation_df = annotation_df.set_index('transcriptome_id')
     annotation_df = annotation_df.map(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
+
+    if not annotation_df.empty:
+        ec_to_rxn = _build_ec_to_rxn(cache_path=Path(output_dir) / "modelseed_reactions.tsv")
+        annotation_df['modelseed_rxn'] = annotation_df['kegg_ec'].map(ec_to_rxn)
+
     write_integration_file(annotation_df, output_dir, output_filename, indexing=True)
 
     return annotation_df
@@ -6469,7 +6500,6 @@ def _add_protein_id_mapping(
                         _locus = _name_m.group(1)
                         locus_to_gene_id[_locus] = _gene_id
                         gene_id_to_display[_gene_id] = _locus
-        log.info(f"Plant GFF3: built {len(locus_to_gene_id)} locus_name -> gene_id mappings")
 
         merged_df['locus_name'] = merged_df['locus_name'].astype(str)
         # Map locus_name -> GFF3 gene ID= (the transcriptome_id used in raw data)
@@ -6526,6 +6556,433 @@ def _compress_annotation_table(
     log.info(f"Compressed annotations from {len(merged_df)} rows to {len(compressed_df)} unique genes")
     
     return compressed_df
+
+def _get_modelseed_reactions(cache_path: Path) -> pd.DataFrame:
+    """Load the ModelSEED reactions table, fetching and caching it if needed."""
+    _MODELSEED_REACTIONS_URL = (
+        "https://raw.githubusercontent.com/ModelSEED/ModelSEEDDatabase/"
+        "master/Biochemistry/reactions.tsv"
+    )
+    if cache_path.exists():
+        log.info(f"Loading ModelSEED reactions from local cache: {cache_path}")
+    else:
+        log.info(f"Fetching ModelSEED reactions table from {_MODELSEED_REACTIONS_URL}")
+        resp = requests.get(_MODELSEED_REACTIONS_URL, timeout=30)
+        resp.raise_for_status()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(resp.text, encoding="utf-8")
+        log.info(f"Saved ModelSEED reactions cache to {cache_path}")
+
+    return pd.read_csv(cache_path, sep="\t", low_memory=False)
+
+def _get_modelseed_compounds(cache_path: Path) -> pd.DataFrame:
+    """Load the ModelSEED compounds table, fetching and caching it if needed.
+    """
+
+    _MODELSEED_COMPOUNDS_URL = (
+        "https://raw.githubusercontent.com/ModelSEED/ModelSEEDDatabase/"
+        "master/Biochemistry/compounds.tsv"
+    )
+    if cache_path.exists():
+        log.info(f"Loading ModelSEED compounds from local cache: {cache_path}")
+    else:
+        log.info(f"Fetching ModelSEED compounds table from {_MODELSEED_COMPOUNDS_URL}")
+        resp = requests.get(_MODELSEED_COMPOUNDS_URL, timeout=30)
+        resp.raise_for_status()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(resp.text, encoding="utf-8")
+        log.info(f"Saved ModelSEED compounds cache to {cache_path}")
+
+    return pd.read_csv(cache_path, sep="\t", low_memory=False)
+
+def _inchikey_prefix(inchikey: str, n_chars: int = 25) -> str:
+    """Return the first two dash-separated sections of an InChIKey.
+
+    Standard InChIKey: 14-char skeleton + '-' + 10-char stereo layer + '-' + 1-char flag.
+    The first two sections together = 25 chars (14 + 1 + 10).
+    """
+    return inchikey.strip()[:n_chars]
+
+def _build_ec_to_rxn(cache_path: Path) -> dict[str, str]:
+    """Return a mapping of EC Number to semicolon-joined ModelSEED rxn IDs.
+
+    This is the primary route for transcripts annotated with EC numbers
+    (e.g. via eggNOG-mapper, InterProScan, KOfamScan --ec, PRIAM, etc.).
+    """
+    df = _get_modelseed_reactions(cache_path)
+
+    if "ec_numbers" not in df.columns or "id" not in df.columns:
+        log.error(
+            "ModelSEED reactions TSV does not contain expected columns "
+            "'id' / 'ec_numbers'. Available: %s", list(df.columns)
+        )
+        return {}
+
+    ec_map: dict[str, set[str]] = {}
+    for rxn_id, ec_field in zip(df["id"], df["ec_numbers"]):
+        if not isinstance(ec_field, str) or not ec_field.strip():
+            continue
+        for ec in ec_field.split("|"):
+            ec = ec.strip()
+            if ec:
+                ec_map.setdefault(ec, set()).add(rxn_id)
+
+    return {ec: ";".join(sorted(rxns)) for ec, rxns in ec_map.items()}
+
+def _build_inchikey_to_cpd(cache_path: Path) -> dict[str, str]:
+    """Return a mapping of exact InChIKey to semicolon-joined ModelSEED CPD IDs."""
+    df = _get_modelseed_compounds(cache_path)
+
+    if "inchikey" not in df.columns or "id" not in df.columns:
+        log.error(
+            "ModelSEED compounds TSV does not contain expected columns "
+            "'id' / 'inchikey'. Available: %s", list(df.columns)
+        )
+        return {}
+
+    df = df[["id", "inchikey"]].dropna(subset=["inchikey"])
+    df = df[df["inchikey"].str.strip() != ""]
+
+    return df.groupby("inchikey")["id"].agg(lambda ids: ";".join(ids)).to_dict()
+
+def _build_inchikey_prefix_to_cpd(cache_path: Path) -> dict[str, str]:
+    """Return a mapping of 25-char InChIKey prefix to semicolon-joined ModelSEED CPD IDs."""
+    df = _get_modelseed_compounds(cache_path)
+
+    if "inchikey" not in df.columns or "id" not in df.columns:
+        log.error(
+            "ModelSEED compounds TSV does not contain expected columns "
+            "'id' / 'inchikey'. Available: %s", list(df.columns)
+        )
+        return {}
+
+    df = df[["id", "inchikey"]].dropna(subset=["inchikey"])
+    df = df[df["inchikey"].str.strip() != ""]
+    df = df.assign(_prefix=df["inchikey"].map(_inchikey_prefix))
+
+    return (
+        df.groupby("_prefix")["id"]
+        .agg(lambda ids: ";".join(sorted(set(ids))))
+        .to_dict()
+    )
+
+def _build_fuzzy_name_candidates(cache_path: Path) -> tuple[list[str], list[str]]:
+    """Return parallel lists of (name+aliases text, cpd id) for fuzzy matching."""
+    df = _get_modelseed_compounds(cache_path)
+
+    if "name" not in df.columns or "id" not in df.columns:
+        log.error(
+            "ModelSEED compounds TSV does not contain expected columns "
+            "'id' / 'name'. Available: %s", list(df.columns)
+        )
+        return [], []
+
+    df = df[["id", "name", "aliases"]].dropna(subset=["name"])
+    combined_text = df["name"].fillna("") + " " + df.get("aliases", pd.Series("", index=df.index)).fillna("")
+
+    return combined_text.tolist(), df["id"].tolist()
+
+def match_inchikey(
+    inchikey: str,
+    exact_lookup: dict[str, str],
+    prefix_lookup: dict[str, str],
+) -> str | None:
+    """Try exact InChIKey match, then fall back to 25-char prefix match."""
+    inchikey = inchikey.strip()
+    hit = exact_lookup.get(inchikey)
+    if hit:
+        return hit
+    return prefix_lookup.get(_inchikey_prefix(inchikey))
+
+def match_name_fuzzy(
+    name: str,
+    fuzzy_texts: list[str],
+    fuzzy_cpds: list[str],
+    score_cutoff: float = 85.0,
+) -> str | None:
+    """Fuzzy substring match of `name` against ModelSEED name/aliases text.
+
+    Logs a warning whenever this fallback actually assigns a cpd.
+    """
+    if not name or pd.isna(name) or not fuzzy_texts:
+        return None
+
+    result = process.extractOne(
+        name,
+        fuzzy_texts,
+        scorer=fuzz.partial_ratio,
+        score_cutoff=score_cutoff,
+    )
+    if result is None:
+        return None
+
+    matched_text, score, idx = result
+    cpd_id = fuzzy_cpds[idx]
+    log.warning(
+        "Fuzzy name match used: '%s' ~ ModelSEED '%s' (cpd=%s, score=%.1f)",
+        name, matched_text, cpd_id, score,
+    )
+    return cpd_id
+
+def resolve_modelseed_ids(
+    inchikey_str,
+    compound_name_str,
+    exact_lookup: dict[str, str],
+    prefix_lookup: dict[str, str],
+    fuzzy_texts: list[str],
+    fuzzy_cpds: list[str],
+    key_sep: str = ";;",
+    name_sep: str = ";;",
+    val_sep: str = ";",
+    fuzzy_score_cutoff: float = 85.0,
+):
+    """Resolve one annotation_df row to a set of unique ModelSEED cpd IDs.
+
+    Tries, in order:
+      1. Exact InChIKey match (for each key in a multi-key string)
+      2. 25-char InChIKey prefix match (structure + stereo layer only)
+      3. Fuzzy substring match of Compound_Name against name/aliases (fallback only)
+    """
+    cpds: set[str] = set()
+
+    if not pd.isna(inchikey_str):
+        for key in str(inchikey_str).split(key_sep):
+            key = key.strip()
+            if not key:
+                continue
+            hit = match_inchikey(key, exact_lookup, prefix_lookup)
+            if hit:
+                cpds.update(hit.split(val_sep))
+
+    if not cpds and not pd.isna(compound_name_str):
+        for name in str(compound_name_str).split(name_sep):
+            name = name.strip()
+            if not name:
+                continue
+            fuzzy_hit = match_name_fuzzy(name, fuzzy_texts, fuzzy_cpds, fuzzy_score_cutoff)
+            if fuzzy_hit:
+                cpds.update(fuzzy_hit.split(val_sep))
+
+    return val_sep.join(sorted(cpds)) if cpds else pd.NA
+
+def _parse_stoichiometry(stoich) -> list[str]:
+    """Extract compound IDs referenced in a ModelSEED stoichiometry string.
+
+    Format: "coeff:cpdid:compartment_index:compartment_id:cpd_name;coeff:cpdid:...".
+    """
+    cpd_ids: list[str] = []
+    if not isinstance(stoich, str):
+        return cpd_ids
+    for term in stoich.split(";"):
+        parts = term.split(":")
+        if len(parts) >= 2:
+            cpd_ids.append(parts[1].strip())
+    return cpd_ids
+
+
+def _build_rxn_to_pathways(cache_path: Path) -> dict[str, dict[str, set[str]]]:
+    """Return rxn_id -> {pathway_source: {pathway_ids}}."""
+    df = _get_modelseed_reactions(cache_path)
+    if "pathways" not in df.columns or "id" not in df.columns:
+        log.error(
+            "ModelSEED reactions TSV missing 'pathways' column. Available: %s",
+            list(df.columns),
+        )
+        return {}
+
+    result: dict[str, dict[str, set[str]]] = {}
+    for rxn_id, pw_field in zip(df["id"], df["pathways"]):
+        parsed = _parse_pipe_field(pw_field)
+        if parsed:
+            result[rxn_id] = {src: set(ids) for src, ids in parsed.items()}
+    return result
+
+
+def _build_cpd_to_pathways(cache_path: Path) -> dict[str, dict[str, set[str]]]:
+    """Return cpd_id -> {pathway_source: {pathway_ids}}.
+
+    Derived by walking through every reaction a compound participates in
+    and unioning the pathway annotations of those reactions.
+    """
+    df = _get_modelseed_reactions(cache_path)
+    if "stoichiometry" not in df.columns or "pathways" not in df.columns:
+        log.error(
+            "ModelSEED reactions TSV missing 'stoichiometry'/'pathways' columns. "
+            "Available: %s", list(df.columns),
+        )
+        return {}
+
+    cpd_pathways: dict[str, dict[str, set[str]]] = {}
+    for stoich, pw_field in zip(df["stoichiometry"], df["pathways"]):
+        pathways = _parse_pipe_field(pw_field)
+        if not pathways:
+            continue
+        for cpd_id in _parse_stoichiometry(stoich):
+            entry = cpd_pathways.setdefault(cpd_id, {})
+            for source, ids in pathways.items():
+                entry.setdefault(source, set()).update(ids)
+    return cpd_pathways
+
+
+def _build_ec_to_pathways(cache_path: Path) -> dict[str, dict[str, set[str]]]:
+    """Return ec_number -> {pathway_source: {pathway_ids}} directly (shortcut
+    that skips the intermediate rxn_id, but is equivalent to composing
+    _build_ec_to_rxn with _build_rxn_to_pathways).
+    """
+    df = _get_modelseed_reactions(cache_path)
+    if "ec_numbers" not in df.columns or "pathways" not in df.columns:
+        log.error(
+            "ModelSEED reactions TSV missing 'ec_numbers'/'pathways' columns. "
+            "Available: %s", list(df.columns),
+        )
+        return {}
+
+    ec_pathways: dict[str, dict[str, set[str]]] = {}
+    for ec_field, pw_field in zip(df["ec_numbers"], df["pathways"]):
+        if not isinstance(ec_field, str) or not ec_field.strip():
+            continue
+        pathways = _parse_pipe_field(pw_field)
+        if not pathways:
+            continue
+        for ec in ec_field.split("|"):
+            ec = ec.strip()
+            if not ec:
+                continue
+            entry = ec_pathways.setdefault(ec, {})
+            for source, ids in pathways.items():
+                entry.setdefault(source, set()).update(ids)
+    return ec_pathways
+
+def _parse_pipe_field(value) -> dict[str, list[str]]:
+    """Parse a ModelSEED 'aliases' or 'pathways' style field.
+
+    Format: "Source1: id1;id2|Source2: id3;id4"
+    Returns {source: [ids, ...]}.
+    """
+    result: dict[str, list[str]] = {}
+    if not isinstance(value, str) or not value.strip():
+        return result
+
+    for entry in value.split("|"):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        source, ids = entry.split(":", 1)
+        source = source.strip()
+        id_list = [i.strip() for i in ids.split(";") if i.strip()]
+        if id_list:
+            result.setdefault(source, []).extend(id_list)
+    return result
+
+def _merge_modelseed_ids(
+    annotation_df: pd.DataFrame,
+    lookup: dict[str, str],
+    inchikey_col: str = "InChiKey",
+    key_sep: str = ";;",
+    val_sep: str = ";",
+) -> pd.Series:
+    """Vectorized resolution of multi-InChIKey column to unique ModelSEED cpd IDs."""
+
+    # Split multi-inchikey strings into long format, keeping original index
+    exploded = (
+        annotation_df[inchikey_col]
+        .str.split(key_sep)
+        .explode()
+        .str.strip()
+    )
+
+    # Map each single inchikey -> its ';'-joined cpd string, then split & explode again
+    mapped = (
+        exploded.map(lookup)
+        .str.split(val_sep)
+        .explode()
+    )
+
+    # Drop misses, dedupe + join per original row
+    result = (
+        mapped.dropna()
+        .groupby(level=0)
+        .agg(lambda s: val_sep.join(sorted(set(s))))
+    )
+
+    return result.reindex(annotation_df.index)
+
+def add_modelseed_pathway_column(
+    df: pd.DataFrame,
+    cache_path: Path,
+    pathway_sources: tuple[str, ...] = ("KEGG", "MetaCyc", "PlantCyc"),
+    rxn_col: str = "tx_modelseed_rxn",
+    cpd_col: str = "mx_modelseed_id",
+    out_col: str = "modelseed_pathway",
+    sep: str = ";",
+    missing_token: str = "Unassigned",
+) -> pd.DataFrame:
+    """Add a `modelseed_pathway` column that unifies transcripts and metabolites
+    onto the shared ModelSEED pathway namespace.
+
+    Transcript rows are resolved via `tx_modelseed_rxn` (rxn IDs -> pathways),
+    metabolite rows via `mx_modelseed_id` (cpd IDs -> pathways). Both lookups
+    draw from the same `pathway_sources`, so a transcript and a metabolite
+    that land in the same pathway get an identical value in `out_col` --
+    that shared string is your cross-data-type join key.
+
+    Parameters
+    ----------
+    pathway_sources:
+        Pathway annotation source(s) from the ModelSEED reactions `pathways`
+        field to pull from, e.g. "KEGG", "MetaCyc", "PlantCyc". Multiple
+        sources are unioned per row.
+    sep:
+        Delimiter for multi-valued IDs in `rxn_col`/`cpd_col`, and also used
+        to join multiple resolved pathway IDs in `out_col`.
+    missing_token:
+        Sentinel string used in this table for "no annotation" (both empty
+        cells and the literal "Unassigned").
+    """
+    rxn_to_pathways = _build_rxn_to_pathways(cache_path)
+    cpd_to_pathways = _build_cpd_to_pathways(cache_path)
+
+    def _is_missing(val: object) -> bool:
+        return (
+            val is None
+            or (isinstance(val, float) and pd.isna(val))
+            or not isinstance(val, str)
+            or val.strip() in ("", missing_token)
+        )
+
+    def _resolve(raw_ids: object, lookup: dict[str, dict[str, set[str]]]) -> set[str]:
+        pathways: set[str] = set()
+        if _is_missing(raw_ids):
+            return pathways
+        for _id in raw_ids.split(sep):
+            _id = _id.strip()
+            if not _id or _id == missing_token:
+                continue
+            entry = lookup.get(_id, {})
+            for source in pathway_sources:
+                pathways.update(entry.get(source, set()))
+        return pathways
+
+    def _row_pathway(row: pd.Series) -> str:
+        pathways: set[str] = set()
+        if rxn_col in row.index:
+            pathways |= _resolve(row[rxn_col], rxn_to_pathways)
+        if cpd_col in row.index:
+            pathways |= _resolve(row[cpd_col], cpd_to_pathways)
+        return sep.join(sorted(pathways)) if pathways else missing_token
+
+    out = df.copy()
+    out[out_col] = out.apply(_row_pathway, axis=1)
+
+    n_mapped = (out[out_col] != missing_token).sum()
+    n_tx_mapped = (~out[rxn_col].apply(_is_missing) & (out[out_col] != missing_token)).sum()
+    n_mx_mapped = (~out[cpd_col].apply(_is_missing) & (out[out_col] != missing_token)).sum()
+    log.info(
+        f"Assigned {out_col} for {n_mapped}/{len(out)} rows "
+        f"(transcripts: {n_tx_mapped}, metabolites: {n_mx_mapped}; "
+        f"sources={pathway_sources})"
+    )
+    return out
 
 def generate_mx_annotation_table(
     raw_data: pd.DataFrame, 
@@ -6667,7 +7124,26 @@ def generate_mx_annotation_table(
     mapping_df = mapping_df.set_index('metabolome_id')
     mapping_df = mapping_df.map(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
     mapping_df['display_name'] = mapping_df['Compound_Name']
-    
+
+    # add modelSeed ID based on inchikey
+    if not mapping_df.empty:
+        cache_path = Path(output_dir) / "modelseed_compounds.tsv"
+        exact_lookup = _build_inchikey_to_cpd(cache_path)
+        prefix_lookup = _build_inchikey_prefix_to_cpd(cache_path)
+        fuzzy_texts, fuzzy_cpds = _build_fuzzy_name_candidates(cache_path)
+
+        mapping_df["modelseed_id"] = mapping_df.apply(
+            lambda row: resolve_modelseed_ids(
+                row["InChiKey"],
+                row["Compound_Name"],
+                exact_lookup,
+                prefix_lookup,
+                fuzzy_texts,
+                fuzzy_cpds,
+            ),
+            axis=1,
+        )
+
     # Validate annotation IDs against raw data before saving
     if not raw_data.empty and not mapping_df.empty:
         _validate_annotation_metabolite_ids(mapping_df, raw_data)
@@ -6827,6 +7303,9 @@ def annotate_integrated_features(
                 log.info(f"  Features with annotations: {len(matches)}")
                 log.info(f"  Annotation columns added: {len(ann_table.columns)}")
     
+    # Add ModelSEED pathway column
+    final_annotation_df = add_modelseed_pathway_column(final_annotation_df, cache_path=Path(output_dir) / "modelseed_reactions.tsv")
+
     # Fill NaN values with 'Unassigned'
     final_annotation_df = final_annotation_df.fillna('Unassigned')
     
@@ -7276,123 +7755,426 @@ def link_data_across_datasets(
 
     return unified_data
 
+def _resolve_lfc_pairs(
+    groups: List[str],
+) -> List[Tuple[str, str]]:
+    """
+    Return validated (group_a, group_b) pairs for LFC contrasts.
+    """
+    groups = sorted(list({str(g) for g in groups}))
+    if len(groups) < 2:
+        raise ValueError("At least 2 groups are required to compute LFC contrasts.")
+
+    return list(combinations(groups, 2))
+
+def _build_group_means(
+    data: pd.DataFrame,
+    metadata: pd.DataFrame,
+    sample_col: str,
+    group_col: str
+) -> pd.DataFrame:
+    """
+    Build a feature x group mean matrix from feature x sample data.
+    """
+    if sample_col not in metadata.columns:
+        raise ValueError(f"Column '{sample_col}' not found in metadata.")
+    if group_col not in metadata.columns:
+        raise ValueError(f"Column '{group_col}' not found in metadata.")
+
+    meta = metadata[[sample_col, group_col]].dropna().copy()
+    meta[sample_col] = meta[sample_col].astype(str)
+    meta[group_col] = meta[group_col].astype(str)
+
+    # Keep only metadata rows whose samples exist in data columns
+    available_samples = [c for c in data.columns if str(c) in set(meta[sample_col])]
+    if len(available_samples) == 0:
+        raise ValueError("No overlapping sample IDs between metadata and data columns.")
+
+    data_sub = data[[c for c in data.columns if str(c) in set(available_samples)]].copy()
+    meta_sub = meta[meta[sample_col].isin([str(c) for c in data_sub.columns])].copy()
+
+    group_to_samples = (
+        meta_sub.groupby(group_col)[sample_col]
+        .apply(lambda s: [x for x in s.tolist() if x in [str(c) for c in data_sub.columns]])
+    .to_dict()
+    )
+    group_to_samples = {g: s for g, s in group_to_samples.items() if len(s) > 0}
+
+    if len(group_to_samples) < 2:
+        raise ValueError(
+            f"Need at least 2 non-empty groups to compute LFC. Found groups: {list(group_to_samples.keys())}"
+        )
+
+    # Use string-indexed data columns for robust matching
+    data_sub.columns = data_sub.columns.astype(str)
+
+    group_means = pd.DataFrame(
+        {g: data_sub[samples].mean(axis=1) for g, samples in group_to_samples.items()},
+        index=data_sub.index
+    )
+    return group_means
 
 def integrate_metadata(
     datasets: list,
     metadata_vars: List[str] = [],
-    unifying_col: str = 'unique_group',
+    unifying_col: str = "unique_group",
     output_filename: str = "integrated_metadata",
-    output_dir: str = None
+    output_dir: str = None,
+    method: Literal["replicate_matched", "lfc"] = "replicate_matched",
+    group_col: str = "group",
+    overlap_only: bool = True,
+    lfc_pairs: Optional[List[Union[str, Tuple[str, str]]]] = None,
 ) -> pd.DataFrame:
     """
-    Integrate multiple metadata tables into a single DataFrame using a unifying column.
+    Integrate metadata in one of two modes:
 
-    Args:
-        datasets (list): List of dataset objects with linked_metadata attributes.
-        metadata_vars (list of str): Metadata columns to include.
-        unifying_col (str): Column name to join on.
-        output_dir (str, optional): Output directory to save integrated metadata.
-
-    Returns:
-        pd.DataFrame: Integrated metadata DataFrame.
+    - replicate_matched: original sample-level integration by unifying_col
+    - lfc: contrast-level integration where each row is a groupA_vs_groupB contrast
     """
 
-    log.info("Creating a single integrated (shared) metadata table across datasets...")
+    def _resolve_pairs(groups: List[str]) -> List[Tuple[str, str]]:
+        groups = sorted(list({str(g) for g in groups}))
+        if len(groups) < 2:
+            raise ValueError("At least 2 groups are required to build LFC contrasts.")
 
-    metadata_tables = [ds.linked_metadata for ds in datasets if hasattr(ds, "linked_metadata")]
+        if lfc_pairs is None:
+            return list(combinations(groups, 2))
 
-    subset_cols = metadata_vars + [unifying_col]
-    integrated_metadata = metadata_tables[0][subset_cols].copy()
+        valid_groups = set(groups)
+        resolved: List[Tuple[str, str]] = []
 
-    # Merge all subsequent tables
-    for i, table in enumerate(metadata_tables[1:], start=2):
-        integrated_metadata = integrated_metadata.merge(
-            table[subset_cols],
-            on=unifying_col,
-            suffixes=(None, f'_{i}'),
-            how='outer'
+        for pair in lfc_pairs:
+            if isinstance(pair, str):
+                if "_vs_" not in pair:
+                    raise ValueError(
+                        f"Invalid lfc_pairs entry '{pair}'. Use 'A_vs_B' or ('A','B')."
+                    )
+                a, b = pair.split("_vs_", 1)
+            elif isinstance(pair, (tuple, list)) and len(pair) == 2:
+                a, b = str(pair[0]), str(pair[1])
+            else:
+                raise ValueError(
+                    f"Invalid lfc_pairs entry '{pair}'. Use 'A_vs_B' or ('A','B')."
+                )
+
+            if a == b:
+                raise ValueError(f"Invalid contrast {a}_vs_{b}: groups must differ.")
+            if a not in valid_groups or b not in valid_groups:
+                raise ValueError(
+                    f"Contrast {a}_vs_{b} contains unknown groups. Valid groups: {sorted(valid_groups)}"
+                )
+            resolved.append((a, b))
+
+        # Deduplicate while preserving order
+        deduped: List[Tuple[str, str]] = []
+        seen = set()
+        for p in resolved:
+            if p not in seen:
+                deduped.append(p)
+                seen.add(p)
+        return deduped
+
+    if method not in {"replicate_matched", "lfc"}:
+        raise ValueError("method must be 'replicate_matched' or 'lfc'.")
+
+    # Original behavior
+    if method == "replicate_matched":
+        log.info("Creating a single integrated (shared) metadata table across datasets...")
+
+        metadata_tables = [ds.linked_metadata for ds in datasets if hasattr(ds, "linked_metadata")]
+        if not metadata_tables:
+            raise ValueError("No datasets with linked_metadata available.")
+
+        subset_cols = metadata_vars + [unifying_col]
+        integrated_metadata = metadata_tables[0][subset_cols].copy()
+
+        for i, table in enumerate(metadata_tables[1:], start=2):
+            integrated_metadata = integrated_metadata.merge(
+                table[subset_cols],
+                on=unifying_col,
+                suffixes=(None, f"_{i}"),
+                how="outer",
+            )
+
+            for column in metadata_vars:
+                col1 = column
+                col2 = f"{column}_{i}"
+                if col2 in integrated_metadata.columns:
+                    integrated_metadata[column] = integrated_metadata[col1].combine_first(
+                        integrated_metadata[col2]
+                    )
+                    integrated_metadata.drop(columns=[col2], inplace=True)
+
+        integrated_metadata.rename(columns={unifying_col: "sample"}, inplace=True)
+        integrated_metadata.sort_values("sample", inplace=True)
+        integrated_metadata.drop_duplicates(inplace=True)
+        integrated_metadata.set_index("sample", inplace=True)
+
+        if output_dir:
+            log.info("Writing integrated metadata table...")
+            write_integration_file(
+                data=integrated_metadata,
+                output_dir=output_dir,
+                filename=output_filename,
+            )
+
+        return integrated_metadata
+
+    # LFC mode
+    log.info("Creating integrated metadata table in LFC mode (contrast-level rows)...")
+
+    group_sets = []
+    for ds in datasets:
+        if not hasattr(ds, "linked_metadata") or ds.linked_metadata is None or ds.linked_metadata.empty:
+            raise ValueError(f"Dataset {ds.dataset_name} missing linked_metadata.")
+        if group_col not in ds.linked_metadata.columns:
+            raise ValueError(
+                f"Dataset {ds.dataset_name} linked_metadata missing group column '{group_col}'."
+            )
+
+        ds_groups = set(ds.linked_metadata[group_col].dropna().astype(str).unique())
+        if len(ds_groups) < 2:
+            raise ValueError(
+                f"Dataset {ds.dataset_name} has fewer than 2 groups in '{group_col}'."
+            )
+        group_sets.append(ds_groups)
+
+    if not group_sets:
+        raise ValueError("No valid datasets available to build LFC metadata.")
+
+    if overlap_only and len(group_sets) > 1:
+        groups = sorted(list(set.intersection(*group_sets)))
+    else:
+        groups = sorted(list(set.union(*group_sets)))
+
+    if len(groups) < 2:
+        raise ValueError("Not enough groups available to build LFC contrasts.")
+
+    pairs = _resolve_pairs(groups)
+
+    rows = []
+    for a, b in pairs:
+        contrast = f"{a}_vs_{b}"
+        rows.append(
+            {
+                "sample": contrast,
+                "contrast": contrast,
+                "group_a": a,
+                "group_b": b,
+                group_col: contrast,
+            }
         )
-        # Collapse columns if they match
-        for column in metadata_vars:
-            col1 = column
-            col2 = f"{column}_{i}"
-            if col2 in integrated_metadata.columns:
-                integrated_metadata[column] = integrated_metadata[col1].combine_first(integrated_metadata[col2])
-                integrated_metadata.drop(columns=[col2], inplace=True)
 
-    integrated_metadata.rename(columns={unifying_col: 'sample'}, inplace=True)
-    integrated_metadata.sort_values('sample', inplace=True)
-    integrated_metadata.drop_duplicates(inplace=True)
-    integrated_metadata.set_index('sample', inplace=True)
+    integrated_metadata = pd.DataFrame(rows).drop_duplicates(subset=["sample"]).set_index("sample")
 
-    log.info("Writing integrated metadata table...")
-    write_integration_file(data=integrated_metadata, output_dir=output_dir, filename=output_filename)
-    
+    # Keep expected columns present for downstream compatibility
+    for col in metadata_vars:
+        if col not in integrated_metadata.columns:
+            integrated_metadata[col] = np.nan
+
+    if output_dir:
+        log.info("Writing integrated metadata table...")
+        write_integration_file(
+            data=integrated_metadata,
+            output_dir=output_dir,
+            filename=output_filename,
+        )
+
     return integrated_metadata
+
 
 def integrate_data(
     datasets: list,
     overlap_only: bool = True,
     output_filename: str = "integrated_data",
-    output_dir: str = None
+    output_dir: str = None,
+    method: Literal["replicate_matched", "lfc"] = "replicate_matched",
+    group_col: str = "group",
+    sample_col: str = "unique_group",
+    data_attr: str = "devarianced_data",
+    pseudocount: float = 1.0,
+    lfc_pairs: Optional[List[Union[str, Tuple[str, str]]]] = None,
 ) -> pd.DataFrame:
     """
-    Integrate multiple normalized datasets into a single feature matrix by concatenating features.
+    Integrate datasets in one of two modes:
 
-    Args:
-        datasets (list): List of dataset objects with normalized_data attributes.
-        overlap_only (bool): If True, restrict to overlapping samples across datasets.
-        output_dir (str, optional): Output directory to save integrated data.
-
-    Returns:
-        pd.DataFrame: Integrated feature matrix with all datasets combined.
+    - replicate_matched: original behavior (feature x matched-sample matrix)
+    - lfc: feature x contrast matrix where columns are pairwise group log2 fold-change
     """
-    
-    log.info("Creating a single integrated feature matrix across datasets...")
-    
-    # Collect normalized data from all datasets
+
+    def _resolve_pairs(groups: List[str]) -> List[Tuple[str, str]]:
+        groups = sorted(list({str(g) for g in groups}))
+        if len(groups) < 2:
+            raise ValueError("At least 2 groups are required to compute LFC.")
+
+        if lfc_pairs is None:
+            return list(combinations(groups, 2))
+
+        valid_groups = set(groups)
+        resolved: List[Tuple[str, str]] = []
+
+        for pair in lfc_pairs:
+            if isinstance(pair, str):
+                if "_vs_" not in pair:
+                    raise ValueError(
+                        f"Invalid lfc_pairs entry '{pair}'. Use 'A_vs_B' or ('A','B')."
+                    )
+                a, b = pair.split("_vs_", 1)
+            elif isinstance(pair, (tuple, list)) and len(pair) == 2:
+                a, b = str(pair[0]), str(pair[1])
+            else:
+                raise ValueError(
+                    f"Invalid lfc_pairs entry '{pair}'. Use 'A_vs_B' or ('A','B')."
+                )
+
+            if a == b:
+                raise ValueError(f"Invalid contrast {a}_vs_{b}: groups must differ.")
+            if a not in valid_groups or b not in valid_groups:
+                raise ValueError(
+                    f"Contrast {a}_vs_{b} contains unknown groups. Valid groups: {sorted(valid_groups)}"
+                )
+            resolved.append((a, b))
+
+        deduped: List[Tuple[str, str]] = []
+        seen = set()
+        for p in resolved:
+            if p not in seen:
+                deduped.append(p)
+                seen.add(p)
+        return deduped
+
+    if method not in {"replicate_matched", "lfc"}:
+        raise ValueError("method must be 'replicate_matched' or 'lfc'.")
+
+    # Original behavior
+    if method == "replicate_matched":
+        log.info("Creating a single integrated feature matrix across datasets...")
+
+        dataset_data = {}
+        sample_sets = {}
+
+        for ds in datasets:
+            if hasattr(ds, "normalized_data") and ds.normalized_data is not None and not ds.normalized_data.empty:
+                data_copy = ds.normalized_data.copy()
+                if not data_copy.index.astype(str).str.startswith(f"{ds.dataset_name}_").all():
+                    data_copy.index = [f"{ds.dataset_name}_{idx}" for idx in data_copy.index]
+
+                dataset_data[ds.dataset_name] = data_copy
+                sample_sets[ds.dataset_name] = set(data_copy.columns.astype(str))
+                log.info(f"\tAdding {data_copy.shape[0]} features from {ds.dataset_name}")
+            else:
+                raise ValueError(
+                    f"Dataset {ds.dataset_name} missing normalized_data. Run processing pipeline first."
+                )
+
+        if overlap_only and len(dataset_data) > 1:
+            log.info("\tRestricting to overlapping samples across all datasets...")
+            overlapping_samples = set.intersection(*sample_sets.values())
+
+            if not overlapping_samples:
+                raise ValueError("No overlapping samples found across datasets.")
+
+            shared_cols = sorted(list(overlapping_samples))
+            for ds_name, data in dataset_data.items():
+                data.columns = data.columns.astype(str)
+                dataset_data[ds_name] = data[shared_cols]
+                log.info(f"\t{ds_name}: {len(shared_cols)} overlapping samples")
+
+        integrated_data = pd.concat(dataset_data.values(), axis=0)
+        integrated_data.index.name = "features"
+        integrated_data = integrated_data.fillna(0)
+
+        log.info(
+            f"Final integrated dataset: {integrated_data.shape[0]} features x {integrated_data.shape[1]} samples"
+        )
+
+        if output_dir:
+            log.info("Writing integrated data table...")
+            write_integration_file(integrated_data, output_dir, output_filename, indexing=True)
+
+        return integrated_data
+
+    # LFC mode
+    if pseudocount <= 0:
+        raise ValueError("pseudocount must be > 0 in LFC mode.")
+
+    log.info("Creating integrated feature matrix in LFC mode...")
+
     dataset_data = {}
-    sample_sets = {}
-    
+    contrast_sets = {}
+
     for ds in datasets:
-        if hasattr(ds, 'normalized_data') and not ds.normalized_data.empty:
-            # Add dataset prefix to feature names to avoid conflicts
-            data_copy = ds.normalized_data.copy()
-            if not data_copy.index.str.startswith(f"{ds.dataset_name}_").any():
-                data_copy.index = [f"{ds.dataset_name}_{idx}" for idx in data_copy.index]
-            
-            dataset_data[ds.dataset_name] = data_copy
-            sample_sets[ds.dataset_name] = set(data_copy.columns)
-            log.info(f"\tAdding {data_copy.shape[0]} features from {ds.dataset_name}")
-        else:
-            raise ValueError(f"Dataset {ds.dataset_name} missing normalized_data. Run processing pipeline first.")
-    
-    # Handle overlapping samples if requested
+        if not hasattr(ds, data_attr):
+            raise ValueError(f"Dataset {ds.dataset_name} has no attribute '{data_attr}'.")
+
+        source_df = getattr(ds, data_attr)
+        if source_df is None or source_df.empty:
+            raise ValueError(
+                f"Dataset {ds.dataset_name} attribute '{data_attr}' is empty."
+            )
+
+        if not hasattr(ds, "linked_metadata") or ds.linked_metadata is None or ds.linked_metadata.empty:
+            raise ValueError(f"Dataset {ds.dataset_name} missing linked_metadata for LFC mode.")
+
+        # Build group means from feature x sample matrix
+        group_means = _build_group_means(
+            data=source_df,
+            metadata=ds.linked_metadata,
+            sample_col=sample_col,
+            group_col=group_col,
+        )
+
+        pairs = _resolve_pairs(list(group_means.columns))
+
+        lfc_df = pd.DataFrame(index=group_means.index)
+        for a, b in pairs:
+            contrast = f"{a}_vs_{b}"
+            lfc_df[contrast] = np.log2(
+                (group_means[a].astype(float) + pseudocount)
+                / (group_means[b].astype(float) + pseudocount)
+            )
+
+        # Add dataset prefix to feature names
+        if not lfc_df.index.astype(str).str.startswith(f"{ds.dataset_name}_").all():
+            lfc_df.index = [f"{ds.dataset_name}_{idx}" for idx in lfc_df.index]
+
+        dataset_data[ds.dataset_name] = lfc_df
+        contrast_sets[ds.dataset_name] = set(lfc_df.columns.astype(str))
+
+        log.info(
+            f"\t{ds.dataset_name}: {lfc_df.shape[0]} features x {lfc_df.shape[1]} contrasts"
+        )
+
+    if not dataset_data:
+        raise ValueError("No datasets available for LFC integration.")
+
     if overlap_only and len(dataset_data) > 1:
-        log.info("\tRestricting to overlapping samples across all datasets...")
-        overlapping_samples = set.intersection(*sample_sets.values())
-        
-        if not overlapping_samples:
-            raise ValueError("No overlapping samples found across datasets.")
-        
-        # Filter each dataset to only include overlapping samples
-        for ds_name, data in dataset_data.items():
-            overlapping_cols = [col for col in overlapping_samples if col in data.columns]
-            dataset_data[ds_name] = data[overlapping_cols]
-            log.info(f"\t{ds_name}: {len(overlapping_cols)} overlapping samples")
-    
-    # Combine all datasets vertically (concatenate features)
+        common_contrasts = set.intersection(*contrast_sets.values())
+        if not common_contrasts:
+            raise ValueError(
+                "No shared LFC contrasts across datasets. Use overlap_only=False or align groups."
+            )
+        final_cols = sorted(list(common_contrasts))
+        log.info(f"\tRestricting to {len(final_cols)} shared contrasts.")
+    else:
+        final_cols = sorted(list(set.union(*contrast_sets.values())))
+        log.info(f"\tUsing union of contrasts ({len(final_cols)} total).")
+
+    for ds_name in dataset_data:
+        dataset_data[ds_name] = dataset_data[ds_name].reindex(columns=final_cols)
+
     integrated_data = pd.concat(dataset_data.values(), axis=0)
-    integrated_data.index.name = 'features'
+    integrated_data.index.name = "features"
     integrated_data = integrated_data.fillna(0)
-    
-    log.info(f"Final integrated dataset: {integrated_data.shape[0]} features x {integrated_data.shape[1]} samples")
-    
-    # Save result if output directory provided
+
+    log.info(
+        f"Final LFC integrated dataset: {integrated_data.shape[0]} features x {integrated_data.shape[1]} contrasts"
+    )
+
     if output_dir:
         log.info("Writing integrated data table...")
         write_integration_file(integrated_data, output_dir, output_filename, indexing=True)
-    
+
     return integrated_data
 
 # ====================================

@@ -1607,6 +1607,7 @@ class Analysis(DataAwareBaseHandler):
         self._setup_analysis_filenames()
 
         self.analysis_parameters = self.analysis_config.get('analysis_parameters', {})
+        self.integration_parameters = self.analysis_config.get('integration_parameters', {})
         self.datasets = datasets or []
     
         log.info(f"Created analysis with {len(self.datasets)} datasets.")
@@ -1859,68 +1860,135 @@ class Analysis(DataAwareBaseHandler):
         _plot_distributions_method()
         return
 
-    def integrate_metadata(self, overwrite: bool = False, show_progress: bool = True) -> None:
+    def integrate_metadata(
+        self,
+        group_col: str = "group",
+        overlap_only: bool = True,
+        lfc_pairs: Optional[List[Any]] = None,
+        overwrite: bool = False,
+        show_progress: bool = True
+    ) -> None:
         """Hybrid: Class validation + external hlp.integrate_metadata function."""
         def _integrate_metadata_method():
-            log.info("Integrating metadata across data types")
-            if self.check_and_load_attribute('integrated_metadata', self._integrated_metadata_filename, self.overwrite):
-                log.info(f"\tIntegrated metadata object 'integrated_metadata' with {self.integrated_metadata.shape[0]} samples and {self.integrated_metadata.shape[1]} metadata fields.")
+
+            method = self.integration_parameters.get('method', 'replicate_matched')
+
+            log.info(f"Integrating metadata across data types (method={method})")
+
+            # Avoid stale cache/file reuse when switching modes
+            can_reuse_cached = (
+                method == "replicate_matched"
+                and self.check_and_load_attribute(
+                    "integrated_metadata",
+                    self._integrated_metadata_filename,
+                    overwrite or self.overwrite
+                )
+            )
+            if can_reuse_cached:
+                log.info(
+                    f"\tIntegrated metadata object 'integrated_metadata' with "
+                    f"{self.integrated_metadata.shape[0]} rows and {self.integrated_metadata.shape[1]} columns."
+                )
                 return
-            
+
             result = hlp.integrate_metadata(
                 datasets=self.datasets,
                 metadata_vars=self.project.study_variables,
-                unifying_col='unique_group',
+                unifying_col="unique_group",
                 output_filename=self._integrated_metadata_filename,
-                output_dir=self.output_dir
+                output_dir=self.output_dir,
+                method=method,
+                group_col=group_col,
+                overlap_only=overlap_only,
+                lfc_pairs=lfc_pairs,
             )
+
             if result.empty:
-                log.error(f"Integrating metadata resulted in empty table. Please check your datasets and linked metadata.")
+                log.error("Integrating metadata resulted in empty table. Please check datasets and parameters.")
                 sys.exit(1)
+
             self.integrated_metadata = result
-            log.info(f"Created a single integrated metadata table with {self.integrated_metadata.shape[0]} samples and {self.integrated_metadata.shape[1]} metadata fields.")
+            log.info(
+                f"Created integrated metadata table with {self.integrated_metadata.shape[0]} rows "
+                f"and {self.integrated_metadata.shape[1]} columns."
+            )
             log.info(f"Created table: {self._integrated_metadata_filename}")
             log.info("Created attribute: integrated_metadata")
 
         if show_progress:
-            self.workflow_tracker.set_current_step('integrate_metadata')
+            self.workflow_tracker.set_current_step("integrate_metadata")
             _integrate_metadata_method()
-            self._complete_tracking('integrate_metadata')
+            self._complete_tracking("integrate_metadata")
             return
-        else:
-            _integrate_metadata_method()
-            return
+        _integrate_metadata_method()
+        return
 
-    def integrate_data(self, overlap_only: bool = True, overwrite: bool = False, show_progress: bool = True) -> None:
+
+    def integrate_data(
+        self,
+        overlap_only: bool = True,
+        group_col: str = "group",
+        sample_col: str = "unique_group",
+        data_attr: str = "devarianced_data",
+        pseudocount: float = 1.0,
+        lfc_pairs: Optional[List[Any]] = None,
+        overwrite: bool = False,
+        show_progress: bool = True
+    ) -> None:
         """Hybrid: Class validation + external hlp.integrate_data function."""
         def _integrate_data_method():
-            log.info("Integrating data matrices across data types")
-            if self.check_and_load_attribute('integrated_data', self._integrated_data_filename, self.overwrite):
-                log.info(f"\tIntegrated data object 'integrated_data' with {self.integrated_data.shape[0]} features and {self.integrated_data.shape[1]} samples.")
+            method = self.integration_parameters.get('method', 'replicate_matched')
+
+            log.info(f"Integrating data matrices across data types (method={method})")
+
+            # Avoid stale cache/file reuse when switching modes
+            can_reuse_cached = (
+                method == "replicate_matched"
+                and self.check_and_load_attribute(
+                    "integrated_data",
+                    self._integrated_data_filename,
+                    overwrite or self.overwrite
+                )
+            )
+            if can_reuse_cached:
+                log.info(
+                    f"\tIntegrated data object 'integrated_data' with "
+                    f"{self.integrated_data.shape[0]} features and {self.integrated_data.shape[1]} columns."
+                )
                 return
-            
+
             result = hlp.integrate_data(
                 datasets=self.datasets,
                 overlap_only=overlap_only,
                 output_filename=self._integrated_data_filename,
-                output_dir=self.output_dir
+                output_dir=self.output_dir,
+                method=method,
+                group_col=group_col,
+                sample_col=sample_col,
+                data_attr=data_attr,
+                pseudocount=pseudocount,
+                lfc_pairs=lfc_pairs,
             )
+
             if result.empty:
-                log.error(f"Integrating data resulted in empty table. Please check your datasets and linked data.")
+                log.error("Integrating data resulted in empty table. Please check datasets and parameters.")
                 sys.exit(1)
+
             self.integrated_data = result
-            log.info(f"Created a single integrated data table with {self.integrated_data.shape[0]} samples and {self.integrated_data.shape[1]} features.")
+            log.info(
+                f"Created integrated data table with {self.integrated_data.shape[0]} features "
+                f"and {self.integrated_data.shape[1]} columns."
+            )
             log.info(f"Created table: {self._integrated_data_filename}")
             log.info("Created attribute: integrated_data")
 
         if show_progress:
-            self.workflow_tracker.set_current_step('integrate_data')
+            self.workflow_tracker.set_current_step("integrate_data")
             _integrate_data_method()
-            self._complete_tracking('integrate_data')
+            self._complete_tracking("integrate_data")
             return
-        else:
-            _integrate_data_method()
-            return
+        _integrate_data_method()
+        return
 
     def annotate_integrated_features(self, overlap_only: bool = True, overwrite: bool = False, show_progress: bool = False) -> pd.DataFrame:       
         """Hybrid: Class orchestration + external annotate_integrated_features function."""
