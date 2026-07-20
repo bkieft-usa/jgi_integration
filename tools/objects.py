@@ -386,6 +386,7 @@ class WorkflowProgressTracker:
             {'id': 'feature_selection', 'label': 'Feature Selection', 'category': 'analysis'},
             {'id': 'calculate_correlations', 'label': 'Calculate Correlations', 'category': 'analysis'},
             {'id': 'plot_correlation_network', 'label': 'Plot Correlation Network', 'category': 'analysis'},
+            {'id': 'group_features', 'label': 'Group Features', 'category': 'analysis'},
             #{'id': 'run_mofa2', 'label': 'Run MOFA2 Analysis', 'category': 'analysis'}
         ]
         
@@ -1609,12 +1610,45 @@ class Analysis(DataAwareBaseHandler):
         self.analysis_parameters = self.analysis_config.get('analysis_parameters', {})
         self.integration_parameters = self.analysis_config.get('integration_parameters', {})
         self.datasets = datasets or []
+
+        # Set integration_mode from config so it is available even before integrate_data() runs.
+        # It is updated again (with the same value) inside integrate_data() for clarity.
+        # Possible values: "replicate_matched" | "lfc"
+        self._integration_mode: str = self.integration_parameters.get('method', 'replicate_matched')
     
         log.info(f"Created analysis with {len(self.datasets)} datasets.")
         for ds in self.datasets:
             log.info(f"\t- {ds.dataset_name} with output directory: {ds.output_dir}")
         
         self._complete_tracking('create_analysis')
+
+    @property
+    def integration_mode(self) -> str:
+        """
+        The integration method used to produce ``integrated_data`` / ``integrated_data_selected``.
+
+        * ``"replicate_matched"`` — replicates are paired across data types; the
+          quantitative feature matrix contains scaled + normalised raw values, one
+          column per sample.
+        * ``"lfc"`` — replicates are not paired; the quantitative feature matrix
+          contains log2-fold-changes of replicate medians, one column per pairwise
+          group contrast.
+
+        All downstream methods (``group_features()``, ``compare_groups_to_pathways()``,
+        ``perform_feature_selection()``, etc.) use ``self.integrated_data_selected``
+        as their quantitative input regardless of which mode is active.  This
+        attribute is provided so that methods that need to branch on the data
+        semantics (e.g. axis labels, distance metrics) can do so without re-reading
+        the config.
+        """
+        return self._integration_mode
+
+    @integration_mode.setter
+    def integration_mode(self, value: str) -> None:
+        valid = {"replicate_matched", "lfc"}
+        if value not in valid:
+            raise ValueError(f"integration_mode must be one of {valid}, got '{value}'")
+        self._integration_mode = value
 
     @staticmethod
     def _set_up_analysis_outdir(project: Project, data_processing_tag: str, analysis_tag: str, overwrite: bool = False) -> str:
@@ -1955,6 +1989,7 @@ class Analysis(DataAwareBaseHandler):
                     f"\tIntegrated data object 'integrated_data' with "
                     f"{self.integrated_data.shape[0]} features and {self.integrated_data.shape[1]} columns."
                 )
+                self.integration_mode = method  # ensure attribute is set on cache hit
                 return
 
             result = hlp.integrate_data(
@@ -1975,10 +2010,12 @@ class Analysis(DataAwareBaseHandler):
                 sys.exit(1)
 
             self.integrated_data = result
+            self.integration_mode = method  # record which branch was used
             log.info(
                 f"Created integrated data table with {self.integrated_data.shape[0]} features "
                 f"and {self.integrated_data.shape[1]} columns."
             )
+            log.info(f"integration_mode set to '{self.integration_mode}'")
             log.info(f"Created table: {self._integrated_data_filename}")
             log.info("Created attribute: integrated_data")
 
@@ -2104,16 +2141,24 @@ class Analysis(DataAwareBaseHandler):
         """Hybrid: Class validation + external hlp.calculate_correlated_features function."""
         def _correlation_method():
             log.info("Calculating Correlated Features")
+
+            # Support both old 'correlation' key and new 'feature_grouping.network_modules' key
+            feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
+            selected_method = feature_grouping_params.get('selected_method', 'network_modules')
+            correlation_params = feature_grouping_params.get('network_modules', self.analysis_parameters.get('correlation', {}))
+
+            if selected_method != 'network_modules':
+                log.info(f"Selected feature grouping method is '{selected_method}'; skipping correlation computation (not required).")
+                return
+
             if self.check_and_load_attribute('feature_correlation_table', self._feature_correlation_table_filename, self.overwrite):
                 log.info(f"\tFeature correlation table object 'feature_correlation_table' with {self.feature_correlation_table.shape[0]} feature pairs.")
                 return
-            
-            correlation_params = self.analysis_parameters.get('correlation', {})
+
             call_params = {
                 'data': self.integrated_data_selected,
                 'output_filename': self._feature_correlation_table_filename,
                 'output_dir': self.output_dir,
-                'output_filename': self._feature_correlation_table_filename,
                 'feature_prefixes': [ds.dataset_name + "_" for ds in self.datasets],
                 'method': correlation_params.get('corr_method', 'pearson'),
                 'cutoff': correlation_params.get('corr_cutoff', 0.5),
@@ -2285,6 +2330,167 @@ class Analysis(DataAwareBaseHandler):
             _network_method()
             return
 
+    def group_features_step(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+        """Unified feature grouping dispatcher supporting network_modules, hierarchical_clustering, and hdbscan."""
+        def _group_method():
+            log.info("Grouping Features")
+            submodule_subdir = "submodules"
+            submodule_dir = os.path.join(self.output_dir, submodule_subdir)
+            os.makedirs(submodule_dir, exist_ok=True)
+
+            feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
+            selected_method = feature_grouping_params.get('selected_method', 'network_modules')
+            method_params = feature_grouping_params.get(selected_method, {})
+
+            # Check if outputs already exist
+            if self.check_and_load_attribute('feature_network_node_table', self._feature_network_node_table_filename, self.overwrite) and \
+                self.check_and_load_attribute('feature_network_edge_table', self._feature_network_edge_table_filename, self.overwrite):
+                if selected_method == 'network_modules':
+                    log.info("Displaying existing network visualization...")
+                    hlp.display_existing_network(
+                        graph_file=self._feature_network_graph_filename,
+                        node_table=self.feature_network_node_table,
+                        edge_table=self.feature_network_edge_table,
+                        network_layout=method_params.get('network_layout', None)
+                    )
+                else:
+                    log.info(f"Feature grouping table already exists ({selected_method}). Loaded from disk.")
+                return
+            else:
+                hlp.clear_directory(submodule_dir)
+
+            output_filenames = {
+                'graph': self._feature_network_graph_filename,
+                'node_table': self._feature_network_node_table_filename,
+                'edge_table': self._feature_network_edge_table_filename,
+                'submodule_path': submodule_dir
+            }
+
+            # For network_modules, feature_correlation_table must exist
+            feature_correlation_table = None
+            if selected_method == 'network_modules':
+                if not hasattr(self, 'feature_correlation_table') or self.feature_correlation_table is None:
+                    log.error("feature_correlation_table is required for network_modules grouping. Run calculate_correlated_features() first.")
+                    sys.exit(1)
+                feature_correlation_table = self.feature_correlation_table
+
+            call_params = {
+                'data': self.integrated_data_selected,
+                'method': selected_method,
+                'method_params': method_params,
+                'output_dir': self.output_dir,
+                'output_filenames': output_filenames,
+                'datasets': self.datasets,
+                'annotation_df': self.feature_annotation_table,
+                'integrated_data': self.integrated_data_selected,
+                'integrated_metadata': self.integrated_metadata,
+                'feature_correlation_table': feature_correlation_table,
+            }
+            call_params.update(kwargs)
+
+            node_table, edge_table = hlp.group_features(**call_params)
+
+            if node_table.empty:
+                log.error(f"Feature grouping resulted in empty node table. Please check your data and grouping parameters.")
+                sys.exit(1)
+
+            self.feature_network_node_table = node_table
+            self.feature_network_edge_table = edge_table
+
+            log.info(f"Created table: {self._feature_network_node_table_filename}")
+            log.info("Created attribute: feature_network_node_table")
+            log.info(f"Created table: {self._feature_network_edge_table_filename}")
+            log.info("Created attribute: feature_network_edge_table")
+
+        if show_progress:
+            self.workflow_tracker.set_current_step('plot_correlation_network')
+            _group_method()
+            self._complete_tracking('plot_correlation_network')
+            return
+        else:
+            _group_method()
+            return
+
+    def group_features(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+        """
+        Public entry point for feature grouping.
+
+        Reads ``feature_grouping.selected_method`` from the analysis config and
+        dispatches to the appropriate grouping backend:
+
+        * ``network_modules``        – pairwise correlation → graph → community detection
+          (requires ``calculate_correlated_features()`` to have been run first)
+        * ``hierarchical_clustering`` – scipy hierarchical clustering on LFC vectors
+        * ``hdbscan``                – HDBSCAN density-based clustering on LFC vectors
+
+        All methods write a node table (``feature_network_node_table``) with a
+        unified ``group`` column and an edge table (``feature_network_edge_table``)
+        to disk, and store them as attributes on the Analysis object.
+
+        For ``network_modules`` the correlation step is run automatically if
+        ``feature_correlation_table`` is not yet present.
+        """
+        feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
+        selected_method = feature_grouping_params.get('selected_method', 'network_modules')
+
+        # For network_modules, run the correlation step first if needed
+        if selected_method == 'network_modules':
+            if not hasattr(self, 'feature_correlation_table') or \
+               (hasattr(self, 'feature_correlation_table') and self.feature_correlation_table.empty):
+                log.info("network_modules selected — running calculate_correlated_features() first...")
+                self.calculate_correlated_features(overwrite=overwrite, show_progress=show_progress)
+
+        self.group_features_step(overwrite=overwrite, show_progress=show_progress, **kwargs)
+
+    def compare_groups_to_pathways(
+        self,
+        pathway_col: str = "modelseed_pathway",
+        top_n: int = 50,
+        rank_by: str = "n_features",
+        exclude_nopathway: bool = False,
+        min_group_size: int = 3,
+        fdr_method: str = "fdr_bh",
+        alpha: float = 0.05,
+        **plot_kwargs,
+    ) -> dict:
+        """
+        Compare data-driven feature groups against knowledge-driven pathway annotations.
+
+        Calls ``hlp.compare_groups_to_pathways()`` using the node table from
+        ``group_features()`` and the feature annotation table from
+        ``annotate_integrated_features()``.
+
+        Returns a dict with keys:
+            ``counts_df``, ``row_normalized_df``, ``pathway_stats_df``,
+            ``enrichment_df``, ``fig_counts``, ``fig_normalized``,
+            ``ari``, ``nmi``, ``n_features_compared``
+
+        See ``hlp.compare_groups_to_pathways()`` for full parameter documentation.
+        """
+        if not hasattr(self, 'feature_network_node_table') or self.feature_network_node_table.empty:
+            raise RuntimeError(
+                "feature_network_node_table is empty. Run analysis.group_features() first."
+            )
+        if not hasattr(self, 'feature_annotation_table') or self.feature_annotation_table.empty:
+            raise RuntimeError(
+                "feature_annotation_table is empty. Run analysis.annotate_integrated_features() first."
+            )
+
+        return hlp.compare_groups_to_pathways(
+            node_table=self.feature_network_node_table,
+            annotation_table=self.feature_annotation_table,
+            quant_df=self.integrated_data_selected,
+            pathway_col=pathway_col,
+            top_n=top_n,
+            rank_by=rank_by,
+            exclude_nopathway=exclude_nopathway,
+            min_group_size=min_group_size,
+            fdr_method=fdr_method,
+            alpha=alpha,
+            output_dir=self.output_dir,
+            **plot_kwargs,
+        )
+
     def perform_functional_enrichment(self, overwrite: bool = False, show_progress: bool = False, **kwargs) -> None:
         """Hybrid: Class parameter setup + external hlp.perform_functional_enrichment function."""
         def _enrichment_method():
@@ -2293,13 +2499,23 @@ class Analysis(DataAwareBaseHandler):
                 log.info(f"\tFunctional enrichment table object 'functional_enrichment_table' with {self.functional_enrichment_table.shape[0]} functional categories.")
                 return
 
-            networking_params = self.analysis_parameters.get('networking', {})
-            if networking_params.get('submodule_mode', 'community') == 'none':
-                log.warning("Submodule mode is set to 'none'; skipping functional enrichment analysis.")
-                return
+            feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
+            selected_method = feature_grouping_params.get('selected_method', 'network_modules')
+            if selected_method == 'network_modules':
+                method_params = feature_grouping_params.get('network_modules', self.analysis_parameters.get('networking', {}))
+                if method_params.get('submodule_mode', 'louvain') == 'none':
+                    log.warning("Submodule mode is set to 'none'; skipping functional enrichment analysis.")
+                    return
+
             functional_enrichment_params = self.analysis_parameters.get('functional_enrichment', {})
+
+            # Ensure node_table has a 'submodule' column (synthesize from 'group' if needed)
+            node_table_for_enrichment = self.feature_network_node_table.copy()
+            if 'submodule' not in node_table_for_enrichment.columns and 'group' in node_table_for_enrichment.columns:
+                node_table_for_enrichment['submodule'] = node_table_for_enrichment['group']
+
             call_params = {
-                'node_table': self.feature_network_node_table,
+                'node_table': node_table_for_enrichment,
                 'annotation_column': functional_enrichment_params.get('annotation_column', None),
                 'p_value_threshold': functional_enrichment_params.get('pvalue_cutoff', 0.05),
                 'correction_method': functional_enrichment_params.get('correction_method', 'fdr_bh'),

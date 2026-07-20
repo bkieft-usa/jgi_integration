@@ -2392,7 +2392,358 @@ def plot_correlation_network(
     )
     display(widget)
 
+    # Add unified 'group' column as alias for 'submodule' for downstream compatibility
+    if 'submodule' in node_table.columns:
+        node_table['group'] = node_table['submodule']
+        write_integration_file(data=node_table, output_dir=output_dir, filename=output_filenames["node_table"], indexing=True, index_label="node_id")
+
     return node_table, edge_table
+
+
+def group_features_hierarchical(
+    data: pd.DataFrame,
+    distance_metric: str = "correlation",
+    linkage_method: str = "average",
+    height_cutoff: float = 0.3,
+    output_dir: str = None,
+    output_filenames: Dict[str, str] = None,
+    datasets: List = None,
+    annotation_df: Optional[pd.DataFrame] = None,
+    integrated_data: pd.DataFrame = None,
+    integrated_metadata: pd.DataFrame = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Group features by hierarchical clustering of their LFC vectors.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        LFC matrix with features as rows and comparisons as columns.
+    distance_metric : str
+        scipy pdist metric, default "correlation" (= 1 - Pearson).
+    linkage_method : str
+        scipy linkage method, default "average".
+    height_cutoff : float
+        fcluster distance threshold; features within this distance cluster
+        together. Default 0.3.
+    output_dir : str
+        Directory to write output files.
+    output_filenames : Dict[str, str]
+        Dict with keys "node_table" and "edge_table".
+    datasets : List
+        List of dataset objects with a .dataset_name attribute (used for
+        node coloring).
+    annotation_df : pd.DataFrame, optional
+        Feature annotation table; merged on feature ID if provided.
+    integrated_data : pd.DataFrame
+        Not used for clustering; accepted for API consistency.
+    integrated_metadata : pd.DataFrame
+        Not used for clustering; accepted for API consistency.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.DataFrame]
+        (node_table, edge_table) where node_table is indexed by feature ID
+        with a 'group' column, and edge_table is empty.
+    """
+    from scipy.spatial.distance import pdist
+    from scipy.cluster.hierarchy import linkage, fcluster
+
+    log.info("Grouping features by hierarchical clustering...")
+
+    # Drop non-numeric columns, handle NaN
+    numeric_data = data.select_dtypes(include=[np.number])
+    numeric_data = numeric_data.loc[~numeric_data.isna().all(axis=1)]
+    numeric_data = numeric_data.fillna(0)
+
+    # Compute pairwise distances and run linkage
+    dist = pdist(numeric_data.values, metric=distance_metric)
+    Z = linkage(dist, method=linkage_method)
+    labels = fcluster(Z, t=height_cutoff, criterion='distance')
+
+    # Build group series
+    group_series = pd.Series(
+        [f"group_{lbl}" for lbl in labels],
+        index=numeric_data.index,
+        name="group",
+    )
+
+    # Determine prefix color/shape maps
+    feature_ids = numeric_data.index.tolist()
+    all_prefixes = [ds.dataset_name + "_" for ds in (datasets or [])]
+    present_prefixes = [p for p in all_prefixes if any(f.startswith(p) for f in feature_ids)]
+    color_map, shape_map = _make_prefix_maps(present_prefixes)
+
+    # Assign color and shape per feature
+    def _get_color(fid):
+        for p in present_prefixes:
+            if fid.startswith(p):
+                return color_map.get(p, "gray")
+        return "gray"
+
+    def _get_shape(fid):
+        for p in present_prefixes:
+            if fid.startswith(p):
+                return shape_map.get(p, "circle")
+        return "circle"
+
+    node_table = pd.DataFrame({
+        "group": group_series,
+        "datatype_color": [_get_color(f) for f in feature_ids],
+        "datatype_shape": [_get_shape(f) for f in feature_ids],
+    }, index=feature_ids)
+    node_table.index.name = "node_id"
+
+    # Merge annotation columns if provided
+    if annotation_df is not None and not annotation_df.empty:
+        ann = annotation_df.copy()
+        if 'feature_id' in ann.columns:
+            ann = ann.set_index('feature_id')
+        ann_cols = [c for c in ann.columns if c not in node_table.columns]
+        node_table = node_table.join(ann[ann_cols], how='left')
+
+    n_groups = node_table['group'].nunique()
+    log.info(f"\tHierarchical clustering found {n_groups} groups across {len(node_table)} features.")
+
+    # Write outputs
+    write_integration_file(data=node_table, output_dir=output_dir, filename=output_filenames["node_table"], indexing=True, index_label="node_id")
+    empty_edge_table = pd.DataFrame(columns=['source', 'target', 'weight'])
+    write_integration_file(data=empty_edge_table, output_dir=output_dir, filename=output_filenames["edge_table"], indexing=True, index_label="edge_index")
+
+    return node_table, empty_edge_table
+
+
+def group_features_hdbscan(
+    data: pd.DataFrame,
+    metric: str = "euclidean",
+    min_cluster_size: int = 5,
+    min_samples: int = 3,
+    output_dir: str = None,
+    output_filenames: Dict[str, str] = None,
+    datasets: List = None,
+    annotation_df: Optional[pd.DataFrame] = None,
+    integrated_data: pd.DataFrame = None,
+    integrated_metadata: pd.DataFrame = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Group features using HDBSCAN density-based clustering on their LFC vectors.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        LFC matrix with features as rows and comparisons as columns.
+    metric : str
+        HDBSCAN distance metric, default "euclidean". If "correlation" is
+        passed, a correlation distance matrix is precomputed and
+        metric="precomputed" is used internally.
+    min_cluster_size : int
+        Minimum group size, default 5.
+    min_samples : int
+        Core point threshold, default 3.
+    output_dir : str
+        Directory to write output files.
+    output_filenames : Dict[str, str]
+        Dict with keys "node_table" and "edge_table".
+    datasets : List
+        List of dataset objects with a .dataset_name attribute.
+    annotation_df : pd.DataFrame, optional
+        Feature annotation table; merged on feature ID if provided.
+    integrated_data : pd.DataFrame
+        Not used for clustering; accepted for API consistency.
+    integrated_metadata : pd.DataFrame
+        Not used for clustering; accepted for API consistency.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.DataFrame]
+        (node_table, edge_table) where node_table is indexed by feature ID
+        with a 'group' column, and edge_table is empty.
+    """
+    try:
+        import hdbscan
+    except ImportError:
+        raise ImportError(
+            "The 'hdbscan' package is required for group_features_hdbscan(). "
+            "Install it with: pip install hdbscan"
+        )
+
+    from scipy.spatial.distance import pdist, squareform
+
+    log.info("Grouping features by HDBSCAN clustering...")
+
+    # Drop non-numeric columns, handle NaN
+    numeric_data = data.select_dtypes(include=[np.number])
+    numeric_data = numeric_data.fillna(0)
+
+    # Handle correlation metric (not natively supported by HDBSCAN)
+    if metric == "correlation":
+        X = squareform(pdist(numeric_data.values, metric='correlation'))
+        hdbscan_metric = "precomputed"
+    else:
+        X = numeric_data.values
+        hdbscan_metric = metric
+
+    # Run HDBSCAN
+    raw_labels = hdbscan.HDBSCAN(
+        metric=hdbscan_metric,
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+    ).fit_predict(X)
+
+    # Map labels: -1 → "noise", others → "group_{label+1}"
+    group_labels = [
+        "noise" if lbl == -1 else f"group_{lbl + 1}"
+        for lbl in raw_labels
+    ]
+
+    feature_ids = numeric_data.index.tolist()
+
+    # Determine prefix color/shape maps
+    all_prefixes = [ds.dataset_name + "_" for ds in (datasets or [])]
+    present_prefixes = [p for p in all_prefixes if any(f.startswith(p) for f in feature_ids)]
+    color_map, shape_map = _make_prefix_maps(present_prefixes)
+
+    def _get_color(fid):
+        for p in present_prefixes:
+            if fid.startswith(p):
+                return color_map.get(p, "gray")
+        return "gray"
+
+    def _get_shape(fid):
+        for p in present_prefixes:
+            if fid.startswith(p):
+                return shape_map.get(p, "circle")
+        return "circle"
+
+    node_table = pd.DataFrame({
+        "group": group_labels,
+        "datatype_color": [_get_color(f) for f in feature_ids],
+        "datatype_shape": [_get_shape(f) for f in feature_ids],
+    }, index=feature_ids)
+    node_table.index.name = "node_id"
+
+    # Merge annotation columns if provided
+    if annotation_df is not None and not annotation_df.empty:
+        ann = annotation_df.copy()
+        if 'feature_id' in ann.columns:
+            ann = ann.set_index('feature_id')
+        ann_cols = [c for c in ann.columns if c not in node_table.columns]
+        node_table = node_table.join(ann[ann_cols], how='left')
+
+    n_groups = sum(1 for g in group_labels if g != "noise")
+    n_noise = sum(1 for g in group_labels if g == "noise")
+    unique_groups = len(set(g for g in group_labels if g != "noise"))
+    log.info(f"\tHDBSCAN found {unique_groups} groups across {n_groups} features; {n_noise} features assigned to noise.")
+
+    # Write outputs
+    write_integration_file(data=node_table, output_dir=output_dir, filename=output_filenames["node_table"], indexing=True, index_label="node_id")
+    empty_edge_table = pd.DataFrame(columns=['source', 'target', 'weight'])
+    write_integration_file(data=empty_edge_table, output_dir=output_dir, filename=output_filenames["edge_table"], indexing=True, index_label="edge_index")
+
+    return node_table, empty_edge_table
+
+
+def group_features(
+    data: pd.DataFrame,
+    method: str,
+    method_params: Dict,
+    output_dir: str,
+    output_filenames: Dict[str, str],
+    datasets: List,
+    annotation_df: Optional[pd.DataFrame],
+    integrated_data: pd.DataFrame,
+    integrated_metadata: pd.DataFrame,
+    feature_correlation_table: Optional[pd.DataFrame] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Unified dispatcher that routes to the correct feature-grouping function.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        LFC matrix with features as rows and comparisons as columns.
+    method : str
+        One of "network_modules", "hierarchical_clustering", "hdbscan".
+    method_params : Dict
+        Sub-block from config for the selected method (e.g. all keys under
+        ``network_modules:`` or ``hierarchical_clustering:``).
+    output_dir : str
+        Directory to write output files.
+    output_filenames : Dict[str, str]
+        Dict with keys "node_table" and "edge_table".
+    datasets : List
+        List of dataset objects with a .dataset_name attribute.
+    annotation_df : pd.DataFrame, optional
+        Feature annotation table.
+    integrated_data : pd.DataFrame
+        Full integrated data matrix (passed through for API consistency).
+    integrated_metadata : pd.DataFrame
+        Integrated metadata (passed through for API consistency).
+    feature_correlation_table : pd.DataFrame, optional
+        Pre-computed correlation table required when method="network_modules".
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.DataFrame]
+        (node_table, edge_table) produced by the selected grouping method.
+
+    Raises
+    ------
+    ValueError
+        If an unknown method name is supplied.
+    """
+    if method == "network_modules":
+        node_table, edge_table = plot_correlation_network(
+            corr_table=feature_correlation_table,
+            integrated_data=integrated_data,
+            integrated_metadata=integrated_metadata,
+            output_dir=output_dir,
+            output_filenames=output_filenames,
+            datasets=datasets,
+            annotation_df=annotation_df,
+            submodule_mode=method_params.get('submodule_mode', 'louvain'),
+            network_layout=method_params.get('network_layout', None),
+        )
+        # Add 'group' column as alias for 'submodule' (plot_correlation_network
+        # already does this, but guard here for safety)
+        if 'submodule' in node_table.columns and 'group' not in node_table.columns:
+            node_table['group'] = node_table['submodule']
+        return node_table, edge_table
+
+    elif method == "hierarchical_clustering":
+        return group_features_hierarchical(
+            data=data,
+            distance_metric=method_params.get('distance_metric', 'correlation'),
+            linkage_method=method_params.get('linkage_method', 'average'),
+            height_cutoff=method_params.get('height_cutoff', 0.3),
+            output_dir=output_dir,
+            output_filenames=output_filenames,
+            datasets=datasets,
+            annotation_df=annotation_df,
+            integrated_data=integrated_data,
+            integrated_metadata=integrated_metadata,
+        )
+
+    elif method == "hdbscan":
+        return group_features_hdbscan(
+            data=data,
+            metric=method_params.get('metric', 'euclidean'),
+            min_cluster_size=method_params.get('min_cluster_size', 5),
+            min_samples=method_params.get('min_samples', 3),
+            output_dir=output_dir,
+            output_filenames=output_filenames,
+            datasets=datasets,
+            annotation_df=annotation_df,
+            integrated_data=integrated_data,
+            integrated_metadata=integrated_metadata,
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown feature_grouping method '{method}'. "
+            "Choose from: network_modules, hierarchical_clustering, hdbscan"
+        )
+
 
 def display_existing_network(
     graph_file: str,
@@ -10287,6 +10638,227 @@ def generate_pathway_submodule_heatmap(
     )
 
     return counts_df, row_normalized_df, pathway_stats_df, enrichment_df, fig_counts, fig_normalized
+
+
+def compare_groups_to_pathways(
+    node_table: pd.DataFrame,
+    annotation_table: pd.DataFrame,
+    quant_df: pd.DataFrame | None = None,
+    pathway_col: str = "modelseed_pathway",
+    group_col: str = "group",
+    top_n: int = 50,
+    rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
+    exclude_nopathway: bool = False,
+    min_group_size: int = 3,
+    fdr_method: str = "fdr_bh",
+    alpha: float = 0.05,
+    output_dir: str | None = None,
+    **plot_kwargs,
+) -> Dict[str, Any]:
+    """
+    Compare data-driven feature groups against knowledge-driven pathway annotations.
+
+    Combines two complementary analyses into a single call:
+
+    1. **Pathway × group heatmap** — builds a pathway × group count matrix
+       (top ``top_n`` pathways by feature count or cumulative |LFC|), runs
+       hypergeometric over-representation tests (BH-FDR corrected), and plots
+       both a raw-count and a row-normalised clustermap with significance stars.
+
+    2. **Adjusted Rand Index (ARI) and Normalised Mutual Information (NMI)** —
+       single-number summaries of how well the data-driven grouping recovers
+       pathway structure.  Features with no pathway annotation or assigned to
+       the HDBSCAN noise class (``"noise"``) are excluded from the ARI/NMI
+       calculation.
+
+    Parameters
+    ----------
+    node_table : pd.DataFrame
+        Feature-level node table produced by ``group_features()`` (or any of
+        the three grouping backends).  Must be indexed by feature ID and contain
+        a ``group`` column (and optionally a ``submodule`` column — both are
+        accepted).
+    annotation_table : pd.DataFrame
+        Feature annotation table indexed by feature ID.  Must contain
+        ``pathway_col`` (default ``"modelseed_pathway"``).
+    quant_df : pd.DataFrame, optional
+        Feature × comparison LFC matrix.  Required only when
+        ``rank_by="cumulative_abs_lfc"``.
+    pathway_col : str
+        Column in ``annotation_table`` that holds pathway labels.  Pathways may
+        be semicolon-separated; the first token is used as the primary pathway
+        for ARI/NMI.
+    group_col : str
+        Column in ``node_table`` that holds the data-driven group labels.
+        Defaults to ``"group"``.  Falls back to ``"submodule"`` if ``"group"``
+        is absent.
+    top_n : int
+        Number of top-ranked pathways to show in the heatmap.
+    rank_by : {"n_features", "cumulative_abs_lfc"}
+        Pathway ranking metric.
+    exclude_nopathway : bool
+        If True, features with no pathway annotation are excluded from the
+        heatmap (they are always excluded from ARI/NMI).
+    min_group_size : int
+        Groups with fewer than this many features are dropped from both the
+        heatmap and the ARI/NMI calculation.
+    fdr_method : str
+        Multiple-testing correction method (default ``"fdr_bh"``).
+    alpha : float
+        Significance threshold for the enrichment test and star overlay.
+    output_dir : str, optional
+        Directory to save heatmap PDFs.  If ``None``, figures are displayed
+        only.
+    **plot_kwargs
+        Forwarded to ``plot_pathway_submodule_clustermaps`` (e.g. ``figsize``,
+        ``counts_cmap``, ``dpi``).
+
+    Returns
+    -------
+    dict with keys:
+        ``counts_df``         – pathway × group raw-count matrix
+        ``row_normalized_df`` – row-normalised version of ``counts_df``
+        ``pathway_stats_df``  – per-pathway stats (n_features, optional LFC score)
+        ``enrichment_df``     – hypergeometric enrichment results
+        ``fig_counts``        – matplotlib Figure (raw counts)
+        ``fig_normalized``    – matplotlib Figure (row-normalised)
+        ``ari``               – Adjusted Rand Index (float)
+        ``nmi``               – Normalised Mutual Information (float)
+        ``n_features_compared`` – number of features used for ARI/NMI
+    """
+    from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+    from sklearn.preprocessing import LabelEncoder
+
+    # ------------------------------------------------------------------ #
+    # 1. Resolve group column                                              #
+    # ------------------------------------------------------------------ #
+    if group_col not in node_table.columns:
+        if "submodule" in node_table.columns:
+            log.info(
+                f"Column '{group_col}' not found in node_table; "
+                "falling back to 'submodule'."
+            )
+            group_col = "submodule"
+        else:
+            raise ValueError(
+                f"Neither '{group_col}' nor 'submodule' found in node_table columns: "
+                f"{node_table.columns.tolist()}"
+            )
+
+    # ------------------------------------------------------------------ #
+    # 2. Merge pathway annotation onto node table                         #
+    # ------------------------------------------------------------------ #
+    node_df = node_table.copy()
+
+    # Ensure 'submodule' column exists for generate_pathway_submodule_heatmap
+    if "submodule" not in node_df.columns:
+        node_df["submodule"] = node_df[group_col]
+
+    if pathway_col not in node_df.columns:
+        if pathway_col not in annotation_table.columns:
+            raise ValueError(
+                f"Pathway column '{pathway_col}' not found in annotation_table. "
+                f"Available columns: {annotation_table.columns.tolist()}"
+            )
+        node_df = node_df.join(annotation_table[[pathway_col]], how="left")
+
+    log.info(
+        f"Annotated node table: {node_df.shape[0]} features, "
+        f"{node_df[group_col].nunique()} groups, "
+        f"{node_df[pathway_col].nunique()} unique pathways"
+    )
+
+    # ------------------------------------------------------------------ #
+    # 3. Pathway × group heatmap + hypergeometric enrichment              #
+    # ------------------------------------------------------------------ #
+    log.info("Building pathway × group heatmap and running enrichment tests...")
+    (
+        counts_df,
+        row_normalized_df,
+        pathway_stats_df,
+        enrichment_df,
+        fig_counts,
+        fig_normalized,
+    ) = generate_pathway_submodule_heatmap(
+        node_df=node_df,
+        quant_df=quant_df,
+        top_n=top_n,
+        rank_by=rank_by,
+        exclude_nopathway=exclude_nopathway,
+        min_submodule_size=min_group_size,
+        output_dir=output_dir,
+        fdr_method=fdr_method,
+        alpha=alpha,
+        **plot_kwargs,
+    )
+
+    n_sig = int(enrichment_df["significant"].sum()) if not enrichment_df.empty else 0
+    log.info(
+        f"Significant pathway-group enrichments (padj < {alpha}): "
+        f"{n_sig} of {len(enrichment_df)} tested pairs"
+    )
+
+    # ------------------------------------------------------------------ #
+    # 4. ARI and NMI                                                      #
+    # ------------------------------------------------------------------ #
+    comparison_df = node_df[[group_col, pathway_col]].copy()
+
+    # Drop features with no pathway or in the noise class
+    comparison_df = comparison_df[
+        comparison_df[pathway_col].notna()
+        & (comparison_df[pathway_col].astype(str) != "Unassigned")
+        & (comparison_df[pathway_col].astype(str) != "")
+        & comparison_df[group_col].notna()
+        & (comparison_df[group_col].astype(str) != "noise")
+    ]
+
+    # Apply min_group_size filter
+    if min_group_size > 0:
+        group_sizes = comparison_df[group_col].value_counts()
+        valid_groups = group_sizes[group_sizes >= min_group_size].index
+        comparison_df = comparison_df[comparison_df[group_col].isin(valid_groups)]
+
+    ari, nmi = np.nan, np.nan
+    n_compared = len(comparison_df)
+
+    if n_compared >= 2:
+        # Use primary pathway (first token if semicolon-separated)
+        comparison_df = comparison_df.copy()
+        comparison_df["_primary_pathway"] = (
+            comparison_df[pathway_col].astype(str).str.split(";").str[0].str.strip()
+        )
+
+        le_group = LabelEncoder()
+        le_pathway = LabelEncoder()
+        group_labels = le_group.fit_transform(comparison_df[group_col].astype(str))
+        pathway_labels = le_pathway.fit_transform(comparison_df["_primary_pathway"])
+
+        ari = float(adjusted_rand_score(pathway_labels, group_labels))
+        nmi = float(normalized_mutual_info_score(pathway_labels, group_labels))
+
+        log.info(f"Features used for ARI/NMI comparison : {n_compared:,}")
+        log.info(f"Data-driven groups                   : {comparison_df[group_col].nunique()}")
+        log.info(f"Unique pathways (primary)             : {comparison_df['_primary_pathway'].nunique()}")
+        log.info(f"Adjusted Rand Index (ARI)             : {ari:.4f}  (1=perfect, 0=random)")
+        log.info(f"Normalised Mutual Info (NMI)          : {nmi:.4f}  (1=perfect, 0=none)")
+    else:
+        log.warning(
+            f"Only {n_compared} features remain after filtering for ARI/NMI — "
+            "skipping calculation."
+        )
+
+    return {
+        "counts_df": counts_df,
+        "row_normalized_df": row_normalized_df,
+        "pathway_stats_df": pathway_stats_df,
+        "enrichment_df": enrichment_df,
+        "fig_counts": fig_counts,
+        "fig_normalized": fig_normalized,
+        "ari": ari,
+        "nmi": nmi,
+        "n_features_compared": n_compared,
+    }
+
 
 # ====================================
 # MOFA functions
