@@ -1,0 +1,58 @@
+# NOTE: Parameters with XXX should not be changed
+
+analysis:
+  integration_parameters:
+    method: lfc # replicate_matched
+  analysis_parameters:
+    feature_selection:
+      selected_method: lfc
+      max_features: 10000
+      variance:
+        top_n: 5000
+      lfc:
+        log2fc_cutoff: 1.25
+      glm:
+        category:
+        reference:
+        significance_level: 0.05
+        log2fc_cutoff: 0.25
+      kruskalwallis:
+        category: group
+        significance_level: 0.05
+        lfc_cutoff: 0.25
+      feature_list:
+        feature_list_file:
+      lasso:
+        category:
+      random_forest:
+        category:
+      mutual_info:
+        category:
+    # selected_method controls which grouping approach is used to cluster features after
+    # integration. All methods produce a `group` column in the output node table
+    # (replacing the old `submodule` column).
+    feature_grouping:
+      selected_method: network_modules # network_modules, hierarchical_clustering, hdbscan
+      network_modules:
+        corr_method: spearman
+        corr_cutoff: 0.9
+        keep_negative: false
+        block_size: 500
+        cores: -1
+        corr_mode: bipartite
+        submodule_mode: louvain
+        interactive_plot: false
+        network_layout: spring
+      hierarchical_clustering:
+        distance_metric: correlation  # scipy pdist metric; 'correlation' = 1 - pearson
+        linkage_method: average       # scipy linkage method
+        height_cutoff: 0.3            # fcluster distance threshold; analogous to corr_cutoff
+      hdbscan:
+        metric: correlation           # distance metric for HDBSCAN
+        min_cluster_size: 5           # minimum features per group
+        min_samples: 3                # core point threshold
+    functional_enrichment:
+      annotation_column: GO
+      pvalue_cutoff: 0.05
+      min_genes_per_term: 1
+      correction_method: fdr_bh

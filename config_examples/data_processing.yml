@@ -1,0 +1,38 @@
+# NOTE: Parameters with XXX should not be changed
+
+datasets:
+  tx:
+    dataset_dir: transcriptomics # XXX
+    normalization_parameters:
+      filtering:
+        method: minimum
+        value: 200
+      devariancing:
+        method: percent
+        value: 5
+      scaling:
+        log2: true
+        method: vst
+      replicate_handling:
+        method: variance
+        group: group
+        value: 0.5
+  mx:
+    dataset_dir: metabolomics # XXX
+    chromatography: HILIC
+    polarity: multipolarity
+    metabolite_fraction: cells
+    normalization_parameters:
+      filtering:
+        method: minimum
+        value: 2000
+      devariancing:
+        method: percent
+        value: 5
+      scaling:
+        log2: true
+        method: vst
+      replicate_handling:
+        method: variance
+        group: group
+        value: 0.5
