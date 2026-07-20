@@ -8477,8 +8477,8 @@ def integrate_data(
         sample_sets = {}
 
         for ds in datasets:
-            if hasattr(ds, "normalized_data") and ds.normalized_data is not None and not ds.normalized_data.empty:
-                data_copy = ds.normalized_data.copy()
+            if hasattr(ds, "replicate_filtered_data") and ds.replicate_filtered_data is not None and not ds.replicate_filtered_data.empty:
+                data_copy = ds.replicate_filtered_data.copy()
                 if not data_copy.index.astype(str).str.startswith(f"{ds.dataset_name}_").all():
                     data_copy.index = [f"{ds.dataset_name}_{idx}" for idx in data_copy.index]
 
@@ -8487,7 +8487,7 @@ def integrate_data(
                 log.info(f"\tAdding {data_copy.shape[0]} features from {ds.dataset_name}")
             else:
                 raise ValueError(
-                    f"Dataset {ds.dataset_name} missing normalized_data. Run processing pipeline first."
+                    f"Dataset {ds.dataset_name} missing replicate_filtered_data. Run processing pipeline first."
                 )
 
         if overlap_only and len(dataset_data) > 1:
@@ -8869,6 +8869,7 @@ def remove_low_replicable_features(
     method: str = "variance",
     group_col: str = "group",
     threshold: float = 0.6,
+    sigma_threshold: float = 2.0,
 ):
     """
     Remove features (rows) from `data` with high within-group variability.
@@ -8887,7 +8888,7 @@ def remove_low_replicable_features(
         # Get groups and prepare sample mapping
         groups = metadata[group_col].unique()
         group_sample_map = {
-            group: [s for s in metadata[metadata[group_col] == group]['unique_group'].tolist() 
+            group: [s for s in metadata[metadata[group_col] == group]['unique_group'].tolist()
                    if s in data.columns]
             for group in groups
         }
@@ -8914,12 +8915,200 @@ def remove_low_replicable_features(
         
         log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - replicable_data.shape[0]} to keep {replicable_data.shape[0]}.")
     
+    elif method == "sigma":
+        if group_col not in metadata.columns:
+            raise ValueError(f"Column '{group_col}' not found in metadata.")
+        
+        log.info(f"Removing features with outlier replicates (sigma_threshold={sigma_threshold})...")
+        
+        groups = metadata[group_col].unique()
+        group_sample_map = {
+            group: [s for s in metadata[metadata[group_col] == group]['unique_group'].tolist()
+                   if s in data.columns]
+            for group in groups
+        }
+        valid_groups = {k: v for k, v in group_sample_map.items() if len(v) >= 2}
+        
+        if not valid_groups:
+            log.info("No groups with sufficient replicates (>=2) found. Keeping all features.")
+            replicable_data = data
+        else:
+            keep_mask = pd.Series(True, index=data.index)
+            
+            for group, samples in valid_groups.items():
+                group_data = data[samples]
+                group_mean = group_data.mean(axis=1)
+                group_std = group_data.std(axis=1, ddof=1)
+                
+                # Avoid division by zero for constant features
+                group_std_safe = group_std.replace(0, np.nan)
+                
+                # Z-score each replicate relative to the group mean
+                z_scores = group_data.subtract(group_mean, axis=0).divide(group_std_safe, axis=0).abs()
+                
+                # Flag features where ANY replicate exceeds sigma_threshold
+                has_outlier = (z_scores > sigma_threshold).any(axis=1)
+                keep_mask = keep_mask & (~has_outlier)
+            
+            replicable_data = data.loc[keep_mask]
+        
+        log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - replicable_data.shape[0]} to keep {replicable_data.shape[0]}.")
+    
     else:
-        raise ValueError("Currently only 'variance' or 'none' methods are supported for removing low replicable features.")
+        raise ValueError("Currently only 'variance', 'sigma', or 'none' methods are supported for removing low replicable features.")
 
     log.info(f"Saving replicable data for {dataset_name}...")
     write_integration_file(replicable_data, output_dir, output_filename, indexing=True)
     return replicable_data
+
+
+def normalize_integrated_data(
+    data: pd.DataFrame,
+    method: str,
+    metadata: pd.DataFrame,
+    output_filename: str,
+    output_dir: str,
+    log2: bool = True,
+    group_col: str = "group",
+    sample_col: str = "unique_group",
+    pseudocount: float = 1.0,
+    lfc_pairs: list = None,
+) -> pd.DataFrame:
+    """
+    Normalize the integrated feature matrix (features × samples, all datasets combined)
+    after integration.
+
+    This is the post-integration normalization step that replaces the old per-dataset
+    ``scale_data()`` step. It operates on the combined matrix so that all features
+    are normalized on the same scale.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Integrated feature matrix (features × samples). Rows = features, columns = samples.
+        Should be the replicate-filtered devarianced data concatenated across datasets.
+    method : str
+        Normalization method:
+        - ``"lfc"``            : log2 fold-change of group medians vs. all-group median.
+                                 Produces a features × contrasts matrix where each column
+                                 is a pairwise group comparison (groupA_vs_groupB).
+        - ``"vst"``            : variance-stabilizing transformation (arcsinh(sqrt(x))) + z-score.
+        - ``"zscore"``         : log2(x+1) then z-score per sample (column-wise).
+        - ``"modified_zscore"``: log2(x+1) then modified z-score (median-based) per sample.
+        - ``"rank_normal"``    : rank-based inverse normal transformation per sample.
+    metadata : pd.DataFrame
+        Sample metadata. Required for ``"lfc"`` method (needs ``group_col`` and ``sample_col``).
+        For other methods, pass the integrated metadata for reference.
+    output_filename : str
+        Output filename (without extension).
+    output_dir : str
+        Output directory.
+    log2 : bool, default True
+        Whether to log2-transform before scaling. Used by vst/zscore/modified_zscore methods.
+        Ignored for lfc (which computes its own log2 ratios).
+    group_col : str, default "group"
+        Metadata column containing group labels. Used by ``"lfc"`` method.
+    sample_col : str, default "unique_group"
+        Metadata column containing sample identifiers matching data columns. Used by ``"lfc"``.
+    pseudocount : float, default 1.0
+        Pseudocount added before log2 transformation in lfc mode to avoid log(0).
+    lfc_pairs : list of [str, str], optional
+        Specific pairwise contrasts to compute for ``"lfc"`` method.
+        Each element is [groupA, groupB] and the LFC is log2(median_A / median_B).
+        If None, all pairwise combinations are computed.
+
+    Returns
+    -------
+    pd.DataFrame
+        Normalized feature matrix. For ``"lfc"``, columns are contrast names
+        (e.g. ``"groupA_vs_groupB"``). For all other methods, columns are sample names.
+    """
+    valid_methods = {"lfc", "vst", "zscore", "modified_zscore", "rank_normal"}
+    if method not in valid_methods:
+        raise ValueError(f"method must be one of {valid_methods}, got '{method}'")
+
+    log.info(f"Normalizing integrated data using method='{method}' ({data.shape[0]} features × {data.shape[1]} samples)...")
+
+    if method == "lfc":
+        # Build group medians from the integrated matrix
+        if group_col not in metadata.columns:
+            raise ValueError(f"group_col '{group_col}' not found in metadata columns: {metadata.columns.tolist()}")
+
+        # Map sample → group
+        if sample_col in metadata.columns:
+            sample_to_group = metadata.set_index(sample_col)[group_col].to_dict()
+        else:
+            sample_to_group = metadata[group_col].to_dict()
+
+        # Restrict to samples present in data
+        common_samples = [s for s in data.columns if s in sample_to_group]
+        if not common_samples:
+            raise ValueError("No samples in data match the metadata index/sample_col.")
+
+        data_common = data[common_samples]
+        groups = sorted(set(sample_to_group[s] for s in common_samples))
+
+        # Compute per-group medians (features × groups)
+        group_medians = pd.DataFrame(index=data.index)
+        for grp in groups:
+            grp_samples = [s for s in common_samples if sample_to_group[s] == grp]
+            if grp_samples:
+                group_medians[grp] = data_common[grp_samples].median(axis=1)
+
+        # Determine contrasts
+        if lfc_pairs is None:
+            contrasts = list(combinations(groups, 2))
+        else:
+            contrasts = [tuple(p) for p in lfc_pairs]
+
+        # Compute log2 fold-changes
+        lfc_df = pd.DataFrame(index=data.index)
+        for grp_a, grp_b in contrasts:
+            col_name = f"{grp_a}_vs_{grp_b}"
+            med_a = group_medians[grp_a] + pseudocount
+            med_b = group_medians[grp_b] + pseudocount
+            lfc_df[col_name] = np.log2(med_a / med_b)
+
+        normalized = lfc_df
+        log.info(f"LFC normalization complete: {normalized.shape[0]} features × {normalized.shape[1]} contrasts")
+
+    else:
+        # Sample-wise scaling methods
+        df = data.copy().astype(float)
+
+        if log2 and method in {"vst", "zscore", "modified_zscore"}:
+            df = np.log2(df + 1)
+
+        if method == "vst":
+            # Variance-stabilizing transformation: arcsinh(sqrt(x)) then z-score per sample
+            df = np.arcsinh(np.sqrt(df.clip(lower=0)))
+            normalized = df.apply(lambda col: (col - col.mean()) / col.std() if col.std() > 0 else col, axis=0)
+
+        elif method == "zscore":
+            # Z-score per sample (column-wise)
+            normalized = df.apply(lambda col: (col - col.mean()) / col.std() if col.std() > 0 else col, axis=0)
+
+        elif method == "modified_zscore":
+            # Modified z-score (median-based) per sample
+            def _modified_zscore(col):
+                med = col.median()
+                mad = (col - med).abs().median()
+                if mad > 0:
+                    return 0.6745 * (col - med) / mad
+                return col - med
+            normalized = df.apply(_modified_zscore, axis=0)
+
+        elif method == "rank_normal":
+            # Rank-based inverse normal transformation per sample
+            arr = quantile_transform(df.values, n_quantiles=min(df.shape[0], 1000),
+                                     output_distribution='normal', random_state=0)
+            normalized = pd.DataFrame(arr, index=df.index, columns=df.columns)
+
+        log.info(f"{method} normalization complete: {normalized.shape[0]} features × {normalized.shape[1]} samples")
+
+    write_integration_file(normalized, output_dir, output_filename, indexing=True)
+    return normalized
+
 
 # ====================================
 # Plotting functions
