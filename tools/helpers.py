@@ -20,7 +20,7 @@ import logging
 import json
 import tempfile
 import requests
-from functools import reduce
+from functools import reduce, lru_cache
 from rapidfuzz import fuzz, process
 
 # --- Display and plotting ---
@@ -55,6 +55,7 @@ from matplotlib.cm import viridis
 from matplotlib.colors import to_hex
 from plotly.subplots import make_subplots
 from matplotlib.lines import Line2D
+from matplotlib.colors import PowerNorm
 
 # --- Machine learning & statistics ---
 from sklearn.decomposition import PCA
@@ -68,6 +69,9 @@ from sklearn.preprocessing import StandardScaler
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import multipletests
+from itertools import product
+from scipy.stats import hypergeom
+
 
 # --- MOFA2 & related ---
 # import mofax
@@ -2093,107 +2097,174 @@ def _assign_node_attributes(
                                          for col in annotation_columns))
         log.info(f"Nodes with at least one annotation: {nodes_with_annotations}")
 
+def _recursively_split_large_modules(
+    modules: List[Tuple[str, nx.Graph]],
+    method: str,
+    max_module_size: int,
+    max_depth: int = 5,
+    _depth: int = 0,
+    **kwargs,
+) -> List[Tuple[str, nx.Graph]]:
+    """Recursively re-cluster any module exceeding `max_module_size`.
+
+    Repeatedly applies `_detect_submodules(method, **kwargs)` to oversized
+    modules until every resulting module is at or below `max_module_size`,
+    the module can no longer be split (a single re-clustering pass returns
+    only 1 community, i.e. no further structure to find), or `max_depth`
+    recursive splits have been attempted (safety valve against pathological
+    cases, e.g. a dense clique that never subdivides).
+
+    Parameters
+    ----------
+    modules : list of (name, subgraph)
+        Output of `_detect_submodules`.
+    method : str
+        Same `_detect_submodules` method to use for re-splitting oversized
+        modules. Typically "louvain" or "leiden" (methods with a tunable
+        resolution/granularity knob); other methods will simply be
+        re-invoked with the same fixed behavior each time, which may not
+        produce a different split on retry.
+    max_module_size : int
+        Hard cap on the number of nodes allowed per final module.
+    max_depth : int
+        Maximum recursion depth per oversized module, to guarantee termination.
+    **kwargs
+        Forwarded to `_detect_submodules` on each re-clustering attempt
+        (e.g. `resolution=2.0` for louvain/leiden).
+
+    Returns
+    -------
+    list of (name, subgraph)
+        Final module list, re-numbered sequentially as "submodule_1", "submodule_2", ...
+    """
+    final_modules: List[Tuple[str, nx.Graph]] = []
+
+    for name, subgraph in modules:
+        if subgraph.number_of_nodes() <= max_module_size or _depth >= max_depth:
+            final_modules.append((name, subgraph))
+            continue
+
+        sub_result = _detect_submodules(subgraph, method=method, **kwargs)
+
+        if len(sub_result) <= 1:
+            # Method found no further structure to split on -- stop recursing
+            # on this branch even though it's still oversized.
+            log.warning(
+                f"Module '{name}' has {subgraph.number_of_nodes()} nodes "
+                f"(exceeds max_module_size={max_module_size}) but could not be "
+                f"split further by method='{method}' with the given kwargs."
+            )
+            final_modules.append((name, subgraph))
+            continue
+
+        # Recurse in case any of the newly split pieces are STILL too large
+        final_modules.extend(
+            _recursively_split_large_modules(
+                sub_result, method=method, max_module_size=max_module_size,
+                max_depth=max_depth, _depth=_depth + 1, **kwargs,
+            )
+        )
+
+    # Re-number sequentially for clean, final submodule names
+    return [(f"submodule_{i+1}", g) for i, (_, g) in enumerate(final_modules)]
+
 def _detect_submodules(
     G: nx.Graph,
     method: str,
+    max_module_size: int | None = None,
+    split_max_depth: int = 5,
     **kwargs,
 ) -> List[Tuple[str, nx.Graph]]:
     """
     Returns a list of (module_name, subgraph) tuples.
     Supported ``method`` values:
         * "subgraphs" - simple connected components
-        * "louvain" - python-louvain
-        * "leiden" - leidenalg (requires igraph)
+        * "louvain" - python-louvain (supports `resolution` kwarg; >1.0 = more, smaller modules)
+        * "leiden" - leidenalg (requires igraph; supports `resolution` kwarg via
+          RBConfigurationVertexPartition by default, or pass `partition_type` explicitly)
         * "k_clique" - k-clique communities
         * "greedy_modularity" - greedy modularity maximization
         * "label_propagation" - asynchronous label propagation
         * "girvan_newman" - Girvan-Newman method
+
     ``kwargs`` are forwarded to the specific implementation.
+
+    Parameters
+    ----------
+    max_module_size : int, optional
+        If set, any module larger than this is recursively re-clustered
+        (using the same `method`/`kwargs`) until every module is at or
+        below this size or can no longer be subdivided. Use this to enforce
+        a hard granularity cap when resolution tuning alone isn't enough
+        (e.g. due to modularity's resolution-limit on very large modules).
+    split_max_depth : int
+        Max recursion depth per oversized module when `max_module_size` is set.
     """
     if method == "subgraphs":
         comps = nx.connected_components(G)
-        return [(f"submodule_{i+1}", G.subgraph(c).copy())
-                for i, c in enumerate(comps)]
+        result = [(f"submodule_{i+1}", G.subgraph(c).copy())
+                  for i, c in enumerate(comps)]
 
     elif method == "louvain":
+        resolution = kwargs.get("resolution", 1.0)
         G_abs = G.copy()
         for u, v, data in G_abs.edges(data=True):
             if 'weight' in data:
                 data['weight'] = abs(data['weight'])
-        partition = community_louvain.best_partition(G_abs, weight="weight")
+        partition = community_louvain.best_partition(G_abs, weight="weight", resolution=resolution)
         modules: Dict[int, List[str]] = {}
         for node, comm in partition.items():
             modules.setdefault(comm, []).append(node)
-        
-        # Return subgraphs from ORIGINAL graph (preserves negative weights)
-        return [(f"submodule_{i+1}", G.subgraph(nodes).copy())
-                for i, (comm, nodes) in enumerate(sorted(modules.items()))]
+        result = [(f"submodule_{i+1}", G.subgraph(nodes).copy())
+                  for i, (comm, nodes) in enumerate(sorted(modules.items()))]
 
     elif method == "leiden":
-        # Convert to igraph (preserves node names)
+        resolution = kwargs.get("resolution", 1.0)
         ig_g = ig.Graph.from_networkx(G)
         node_names = list(G.nodes())
         ig_g.vs["name"] = node_names
-        
+        partition_type = kwargs.get("partition_type", leidenalg.RBConfigurationVertexPartition)
         partition = leidenalg.find_partition(
-            ig_g, leidenalg.ModularityVertexPartition, weights="weight"
+            ig_g, partition_type, weights="weight", resolution_parameter=resolution
         )
-        modules = []
+        result = []
         for i, community in enumerate(partition):
             nodes = [ig_g.vs[idx]["name"] for idx in community]
-            modules.append((f"submodule_{i+1}", G.subgraph(nodes).copy()))
-        return modules
+            result.append((f"submodule_{i+1}", G.subgraph(nodes).copy()))
 
     elif method == "k_clique":
-        # K-clique percolation
         k: int = kwargs.get("k", 3)
         communities = nx.community.k_clique_communities(G, k)
-        return [(f"submodule_{i+1}", G.subgraph(nodes).copy())
-                for i, nodes in enumerate(communities)]
+        result = [(f"submodule_{i+1}", G.subgraph(nodes).copy())
+                  for i, nodes in enumerate(communities)]
 
     elif method == "greedy_modularity":
-        # Greedy modularity maximization
         weight = kwargs.get("weight", "weight")
         resolution = kwargs.get("resolution", 1)
         cutoff = kwargs.get("cutoff", 1)
         best_n = kwargs.get("best_n", None)
-        
         communities = nx.community.greedy_modularity_communities(
-            G, 
-            weight=weight,
-            resolution=resolution,
-            cutoff=cutoff,
-            best_n=best_n
+            G, weight=weight, resolution=resolution, cutoff=cutoff, best_n=best_n
         )
-        return [(f"submodule_{i+1}", G.subgraph(nodes).copy())
-                for i, nodes in enumerate(communities)]
+        result = [(f"submodule_{i+1}", G.subgraph(nodes).copy())
+                  for i, nodes in enumerate(communities)]
 
     elif method == "label_propagation":
-        # Asynchronous label propagation
         weight = kwargs.get("weight", "weight")
         seed = kwargs.get("seed", None)
-        
         communities = nx.community.asyn_lpa_communities(G, weight=weight, seed=seed)
-        return [(f"submodule_{i+1}", G.subgraph(nodes).copy())
-                for i, nodes in enumerate(communities)]
+        result = [(f"submodule_{i+1}", G.subgraph(nodes).copy())
+                  for i, nodes in enumerate(communities)]
 
     elif method == "girvan_newman":
-        # Girvan-Newman method (divisive)
         level: int = kwargs.get("level", 0)
         most_valuable_edge = kwargs.get("most_valuable_edge", None)
-        
-        communities_generator = nx.community.girvan_newman(
-            G, 
-            most_valuable_edge=most_valuable_edge
-        )
-        
-        # Iterate to the specified level
+        communities_generator = nx.community.girvan_newman(G, most_valuable_edge=most_valuable_edge)
         for i, communities in enumerate(communities_generator):
             if i == level:
                 break
-        
-        return [(f"submodule_{i+1}", G.subgraph(nodes).copy())
-                for i, nodes in enumerate(communities)]
+        result = [(f"submodule_{i+1}", G.subgraph(nodes).copy())
+                  for i, nodes in enumerate(communities)]
 
     else:
         valid_methods = [
@@ -2206,6 +2277,14 @@ def _detect_submodules(
             f"Choose from: {', '.join(valid_methods)}"
         )
 
+    if max_module_size is not None:
+        result = _recursively_split_large_modules(
+            result, method=method, max_module_size=max_module_size,
+            max_depth=split_max_depth, **kwargs,
+        )
+
+    return result
+
 def plot_correlation_network(
     corr_table: pd.DataFrame,
     integrated_data: pd.DataFrame,
@@ -2215,6 +2294,8 @@ def plot_correlation_network(
     datasets: List = None,
     annotation_df: Optional[pd.DataFrame] = None,
     submodule_mode: str = "louvain",
+    module_resolution: float = 1.0,
+    max_module_size: int = 100,
     network_layout: str = None,
 ) -> None:
     """
@@ -2269,6 +2350,8 @@ def plot_correlation_network(
         submods = _detect_submodules(
             G,
             method=submodule_mode,
+            resolution=module_resolution,
+            max_module_size=max_module_size
         )
         
         # Always annotate nodes with submodule information, even if only one submodule
@@ -5786,57 +5869,6 @@ def get_tx_metadata(
 # Feature annotation functions
 # ====================================
 
-def generate_tx_annotation_table(
-    raw_data: pd.DataFrame,
-    raw_data_dir: str,
-    genome_type: str,
-    output_dir: str,
-    output_filename: str,
-) -> pd.DataFrame:
-    """
-    Generate a merged gene annotation table from multiple annotation files.
-    
-    Args:
-        raw_data (pd.DataFrame): Raw transcriptomics data with gene IDs as index
-        raw_data_dir (str): Directory containing annotation table files
-        genome_type (str): Type of genome - "microbe", "algal", "metagenome", or "plant"
-        output_dir (str): Output directory for saving the merged annotation table
-        output_filename (str): Filename for the output annotation table
-    
-    Returns:
-        pd.DataFrame: Merged annotation table with transcriptome_id and annotation columns
-    """
-    
-    if genome_type == "microbe":
-        annotation_df = _process_microbe_annotations(raw_data_dir, output_dir, output_filename)
-    elif genome_type == "algal":
-        annotation_df = _process_algal_annotations(raw_data_dir, output_dir, output_filename)
-    elif genome_type == "metagenome":
-        log.info(f"Annotation processing for '{genome_type}' genome type is not yet implemented.")
-        empty_df = pd.DataFrame(columns=['transcriptome_id'])
-        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
-        return empty_df
-    elif genome_type == "plant":
-        annotation_df = _process_plant_annotations(raw_data_dir, output_dir, output_filename)
-    else:
-        raise ValueError(f"Invalid genome_type '{genome_type}'. Must be one of: 'microbe', 'algal', 'metagenome', 'plant'")
-
-    if not raw_data.empty and not annotation_df.empty:
-        _validate_annotation_gene_ids(annotation_df, raw_data)
-    else:
-        raise ValueError("Either input raw_data or computed annotation_df is empty. Cannot validate gene IDs.")
-
-    annotation_df = annotation_df.set_index('transcriptome_id')
-    annotation_df = annotation_df.map(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
-
-    if not annotation_df.empty:
-        ec_to_rxn = _build_ec_to_rxn(cache_path=Path(output_dir) / "modelseed_reactions.tsv")
-        annotation_df['modelseed_rxn'] = annotation_df['kegg_ec'].map(ec_to_rxn)
-
-    write_integration_file(annotation_df, output_dir, output_filename, indexing=True)
-
-    return annotation_df
-
 def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.DataFrame) -> None:
     """
     Validate that gene IDs in annotation table match those in raw data.
@@ -6557,12 +6589,99 @@ def _compress_annotation_table(
     
     return compressed_df
 
+# =============================================================================
+# ModelSEED reactions: loading, placeholder pathways, EC/rxn lookup, pathway lookups
+# =============================================================================
+
+def _assign_placeholder_pathways(
+    reactions_df: pd.DataFrame,
+    rxn_id_col: str = "id",
+    pathway_col: str = "pathways",
+    compound_ids_col: str = "compound_ids",
+    placeholder_source: str = "NOPATHWAY",
+) -> pd.DataFrame:
+    """Assign a unique placeholder pathway ID to reactions that have compounds but no pathway.
+
+    ModelSEED reactions with a null `pathways` but a non-empty `compound_ids` list still
+    represent a real biochemical link between a reaction (transcript, via EC -> rxn) and
+    its compounds (metabolites, via cpd IDs). To preserve that link without inventing a
+    false biological pathway name, this assigns each such reaction its own unique,
+    non-descriptive pathway ID derived from the reaction ID.
+
+    The placeholder is written in the same `"Source: id1;id2"` format used by real
+    ModelSEED pathway data (see `_parse_pipe_field`), e.g. `"NOPATHWAY: NOPATHWAY_rxn40535"`,
+    so it round-trips correctly through the same parsing logic as real pathway sources.
+
+    Parameters
+    ----------
+    reactions_df : pd.DataFrame
+        ModelSEED reactions table (e.g., loaded from modelseed_reactions.tsv).
+    rxn_id_col : str
+        Column containing the reaction ID (e.g. 'rxn40535').
+    pathway_col : str
+        Column containing pathway annotation; may contain null/'null'/'' for many rows.
+    compound_ids_col : str
+        Column containing a ';'-joined list of compound IDs participating in the reaction.
+    placeholder_source : str
+        Synthetic "source" name used for the placeholder pathway entries, so these rows
+        are easy to identify/filter downstream (e.g., to exclude from biological pathway
+        enrichment, or to explicitly opt in via `pathway_sources=(..., "NOPATHWAY")`).
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of `reactions_df` with `pathway_col` updated: rows that had no pathway but
+        do have compounds get a unique placeholder entry. All other rows are left
+        untouched (including rows that have neither a pathway nor compounds, which
+        remain null since there's nothing to link).
+    """
+    df = reactions_df.copy()
+
+    # Normalize literal "null"/empty strings to true NaN so .isna() catches them
+    df[pathway_col] = df[pathway_col].replace(
+        to_replace=["null", "NULL", "None", ""], value=pd.NA
+    )
+
+    has_no_pathway = df[pathway_col].isna()
+    has_compounds = (
+        df[compound_ids_col].notna()
+        & (df[compound_ids_col].astype(str).str.strip() != "")
+        & (df[compound_ids_col].astype(str).str.strip().str.lower() != "null")
+    )
+
+    needs_placeholder = has_no_pathway & has_compounds
+
+    df.loc[needs_placeholder, pathway_col] = (
+        placeholder_source + ": " + placeholder_source + "_"
+        + df.loc[needs_placeholder, rxn_id_col].astype(str)
+    )
+
+    n_assigned = int(needs_placeholder.sum())
+    if n_assigned:
+        log.info(
+            "Assigned %d unique placeholder pathway IDs (source='%s') to reactions "
+            "with compounds but no annotated pathway.",
+            n_assigned, placeholder_source,
+        )
+
+    return df
+
+
+@lru_cache(maxsize=1)
 def _get_modelseed_reactions(cache_path: Path) -> pd.DataFrame:
-    """Load the ModelSEED reactions table, fetching and caching it if needed."""
+    """Load the ModelSEED reactions table, fetching and caching it if needed.
+
+    Result is memoized (per `cache_path`) since this is called from several
+    independent lookup builders (`_build_ec_to_rxn`, `_build_rxn_to_pathways`,
+    `_build_cpd_to_pathways`, `_build_ec_to_pathways`) that would otherwise
+    each re-read and re-process the same TSV from disk.
+    """
+
     _MODELSEED_REACTIONS_URL = (
         "https://raw.githubusercontent.com/ModelSEED/ModelSEEDDatabase/"
         "master/Biochemistry/reactions.tsv"
     )
+
     if cache_path.exists():
         log.info(f"Loading ModelSEED reactions from local cache: {cache_path}")
     else:
@@ -6573,35 +6692,50 @@ def _get_modelseed_reactions(cache_path: Path) -> pd.DataFrame:
         cache_path.write_text(resp.text, encoding="utf-8")
         log.info(f"Saved ModelSEED reactions cache to {cache_path}")
 
-    return pd.read_csv(cache_path, sep="\t", low_memory=False)
+    reactions_df = pd.read_csv(cache_path, sep="\t", low_memory=False)
+    reactions_df = _assign_placeholder_pathways(reactions_df)
 
-def _get_modelseed_compounds(cache_path: Path) -> pd.DataFrame:
-    """Load the ModelSEED compounds table, fetching and caching it if needed.
+    return reactions_df
+
+
+def _parse_pipe_field(value) -> dict[str, list[str]]:
+    """Parse a ModelSEED 'aliases' or 'pathways' style field.
+
+    Format: "Source1: id1;id2|Source2: id3;id4"
+    Returns {source: [ids, ...]}.
     """
+    result: dict[str, list[str]] = {}
+    if not isinstance(value, str) or not value.strip():
+        return result
 
-    _MODELSEED_COMPOUNDS_URL = (
-        "https://raw.githubusercontent.com/ModelSEED/ModelSEEDDatabase/"
-        "master/Biochemistry/compounds.tsv"
-    )
-    if cache_path.exists():
-        log.info(f"Loading ModelSEED compounds from local cache: {cache_path}")
-    else:
-        log.info(f"Fetching ModelSEED compounds table from {_MODELSEED_COMPOUNDS_URL}")
-        resp = requests.get(_MODELSEED_COMPOUNDS_URL, timeout=30)
-        resp.raise_for_status()
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(resp.text, encoding="utf-8")
-        log.info(f"Saved ModelSEED compounds cache to {cache_path}")
+    for entry in value.split("|"):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        source, ids = entry.split(":", 1)
+        source = source.strip()
+        id_list = [i.strip() for i in ids.split(";") if i.strip()]
+        if id_list:
+            result.setdefault(source, []).extend(id_list)
+    return result
 
-    return pd.read_csv(cache_path, sep="\t", low_memory=False)
 
-def _inchikey_prefix(inchikey: str, n_chars: int = 25) -> str:
-    """Return the first two dash-separated sections of an InChIKey.
+def _parse_stoichiometry(stoich) -> list[str]:
+    """Extract compound IDs referenced in a ModelSEED stoichiometry string.
 
-    Standard InChIKey: 14-char skeleton + '-' + 10-char stereo layer + '-' + 1-char flag.
-    The first two sections together = 25 chars (14 + 1 + 10).
+    Format: "coeff:cpdid:compartment_index:compartment_id:cpd_name;coeff:cpdid:...".
+    Kept as a fallback for cases where a `compound_ids` column isn't available;
+    prefer the `compound_ids` column directly when present (see `_build_cpd_to_pathways`).
     """
-    return inchikey.strip()[:n_chars]
+    cpd_ids: list[str] = []
+    if not isinstance(stoich, str):
+        return cpd_ids
+    for term in stoich.split(";"):
+        parts = term.split(":")
+        if len(parts) >= 2:
+            cpd_ids.append(parts[1].strip())
+    return cpd_ids
+
 
 def _build_ec_to_rxn(cache_path: Path) -> dict[str, str]:
     """Return a mapping of EC Number to semicolon-joined ModelSEED rxn IDs.
@@ -6629,6 +6763,152 @@ def _build_ec_to_rxn(cache_path: Path) -> dict[str, str]:
 
     return {ec: ";".join(sorted(rxns)) for ec, rxns in ec_map.items()}
 
+
+def _build_rxn_to_pathways(cache_path: Path) -> dict[str, dict[str, set[str]]]:
+    """Return rxn_id -> {pathway_source: {pathway_ids}}.
+
+    Includes placeholder entries under source "NOPATHWAY" for reactions that
+    have compounds but no real pathway annotation (see `_assign_placeholder_pathways`).
+    """
+    df = _get_modelseed_reactions(cache_path)
+    if "pathways" not in df.columns or "id" not in df.columns:
+        log.error(
+            "ModelSEED reactions TSV missing 'pathways' column. Available: %s",
+            list(df.columns),
+        )
+        return {}
+
+    result: dict[str, dict[str, set[str]]] = {}
+    for rxn_id, pw_field in zip(df["id"], df["pathways"]):
+        parsed = _parse_pipe_field(pw_field)
+        if parsed:
+            result[rxn_id] = {src: set(ids) for src, ids in parsed.items()}
+    return result
+
+
+def _build_cpd_to_pathways(cache_path: Path) -> dict[str, dict[str, set[str]]]:
+    """Return cpd_id -> {pathway_source: {pathway_ids}}.
+
+    Derived by walking through every reaction a compound participates in
+    and unioning the pathway annotations of those reactions. Uses the
+    `compound_ids` column directly when available (simpler and avoids
+    stoichiometry-string parsing edge cases); falls back to parsing
+    `stoichiometry` otherwise.
+    """
+    df = _get_modelseed_reactions(cache_path)
+    if "pathways" not in df.columns:
+        log.error(
+            "ModelSEED reactions TSV missing 'pathways' column. Available: %s",
+            list(df.columns),
+        )
+        return {}
+
+    use_compound_ids_col = "compound_ids" in df.columns
+
+    if not use_compound_ids_col and "stoichiometry" not in df.columns:
+        log.error(
+            "ModelSEED reactions TSV missing both 'compound_ids' and 'stoichiometry' "
+            "columns; cannot determine compound membership. Available: %s",
+            list(df.columns),
+        )
+        return {}
+
+    cpd_pathways: dict[str, dict[str, set[str]]] = {}
+    cpd_source_col = df["compound_ids"] if use_compound_ids_col else df["stoichiometry"]
+
+    for cpd_source_val, pw_field in zip(cpd_source_col, df["pathways"]):
+        pathways = _parse_pipe_field(pw_field)
+        if not pathways:
+            continue
+
+        if use_compound_ids_col:
+            cpd_ids = (
+                [c.strip() for c in cpd_source_val.split(";") if c.strip()]
+                if isinstance(cpd_source_val, str)
+                else []
+            )
+        else:
+            cpd_ids = _parse_stoichiometry(cpd_source_val)
+
+        for cpd_id in cpd_ids:
+            entry = cpd_pathways.setdefault(cpd_id, {})
+            for source, ids in pathways.items():
+                entry.setdefault(source, set()).update(ids)
+
+    return cpd_pathways
+
+
+# def _build_ec_to_pathways(cache_path: Path) -> dict[str, dict[str, set[str]]]:
+#     """Return ec_number -> {pathway_source: {pathway_ids}} directly.
+
+#     Shortcut that skips the intermediate rxn_id; equivalent to composing
+#     `_build_ec_to_rxn` with `_build_rxn_to_pathways`. Currently not called by
+#     `add_modelseed_pathway_column` (which goes through the rxn column instead)
+#     but kept as a documented, ready-to-use alternative entry point.
+#     """
+#     df = _get_modelseed_reactions(cache_path)
+#     if "ec_numbers" not in df.columns or "pathways" not in df.columns:
+#         log.error(
+#             "ModelSEED reactions TSV missing 'ec_numbers'/'pathways' columns. "
+#             "Available: %s", list(df.columns),
+#         )
+#         return {}
+
+#     ec_pathways: dict[str, dict[str, set[str]]] = {}
+#     for ec_field, pw_field in zip(df["ec_numbers"], df["pathways"]):
+#         if not isinstance(ec_field, str) or not ec_field.strip():
+#             continue
+#         pathways = _parse_pipe_field(pw_field)
+#         if not pathways:
+#             continue
+#         for ec in ec_field.split("|"):
+#             ec = ec.strip()
+#             if not ec:
+#                 continue
+#             entry = ec_pathways.setdefault(ec, {})
+#             for source, ids in pathways.items():
+#                 entry.setdefault(source, set()).update(ids)
+#     return ec_pathways
+
+
+# =============================================================================
+# ModelSEED compounds: loading, InChIKey lookup (exact/prefix), fuzzy name fallback
+# =============================================================================
+
+@lru_cache(maxsize=1)
+def _get_modelseed_compounds(cache_path: Path) -> pd.DataFrame:
+    """Load the ModelSEED compounds table, fetching and caching it if needed.
+
+    Result is memoized (per `cache_path`) since this is called from several
+    independent lookup builders (`_build_inchikey_to_cpd`, `_build_inchikey_prefix_to_cpd`,
+    `_build_fuzzy_name_candidates`).
+    """
+    _MODELSEED_COMPOUNDS_URL = (
+        "https://raw.githubusercontent.com/ModelSEED/ModelSEEDDatabase/"
+        "master/Biochemistry/compounds.tsv"
+    )
+    if cache_path.exists():
+        log.info(f"Loading ModelSEED compounds from local cache: {cache_path}")
+    else:
+        log.info(f"Fetching ModelSEED compounds table from {_MODELSEED_COMPOUNDS_URL}")
+        resp = requests.get(_MODELSEED_COMPOUNDS_URL, timeout=30)
+        resp.raise_for_status()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(resp.text, encoding="utf-8")
+        log.info(f"Saved ModelSEED compounds cache to {cache_path}")
+
+    return pd.read_csv(cache_path, sep="\t", low_memory=False)
+
+
+def _inchikey_prefix(inchikey: str, n_chars: int = 25) -> str:
+    """Return the first two dash-separated sections of an InChIKey.
+
+    Standard InChIKey: 14-char skeleton + '-' + 10-char stereo layer + '-' + 1-char flag.
+    The first two sections together = 25 chars (14 + 1 + 10).
+    """
+    return inchikey.strip()[:n_chars]
+
+
 def _build_inchikey_to_cpd(cache_path: Path) -> dict[str, str]:
     """Return a mapping of exact InChIKey to semicolon-joined ModelSEED CPD IDs."""
     df = _get_modelseed_compounds(cache_path)
@@ -6644,6 +6924,7 @@ def _build_inchikey_to_cpd(cache_path: Path) -> dict[str, str]:
     df = df[df["inchikey"].str.strip() != ""]
 
     return df.groupby("inchikey")["id"].agg(lambda ids: ";".join(ids)).to_dict()
+
 
 def _build_inchikey_prefix_to_cpd(cache_path: Path) -> dict[str, str]:
     """Return a mapping of 25-char InChIKey prefix to semicolon-joined ModelSEED CPD IDs."""
@@ -6666,6 +6947,7 @@ def _build_inchikey_prefix_to_cpd(cache_path: Path) -> dict[str, str]:
         .to_dict()
     )
 
+
 def _build_fuzzy_name_candidates(cache_path: Path) -> tuple[list[str], list[str]]:
     """Return parallel lists of (name+aliases text, cpd id) for fuzzy matching."""
     df = _get_modelseed_compounds(cache_path)
@@ -6681,6 +6963,7 @@ def _build_fuzzy_name_candidates(cache_path: Path) -> tuple[list[str], list[str]
     combined_text = df["name"].fillna("") + " " + df.get("aliases", pd.Series("", index=df.index)).fillna("")
 
     return combined_text.tolist(), df["id"].tolist()
+
 
 def match_inchikey(
     inchikey: str,
@@ -6698,7 +6981,7 @@ def match_name_fuzzy(
     name: str,
     fuzzy_texts: list[str],
     fuzzy_cpds: list[str],
-    score_cutoff: float = 85.0,
+    score_cutoff: float = 90.0,
 ) -> str | None:
     """Fuzzy substring match of `name` against ModelSEED name/aliases text.
 
@@ -6765,152 +7048,122 @@ def resolve_modelseed_ids(
 
     return val_sep.join(sorted(cpds)) if cpds else pd.NA
 
-def _parse_stoichiometry(stoich) -> list[str]:
-    """Extract compound IDs referenced in a ModelSEED stoichiometry string.
 
-    Format: "coeff:cpdid:compartment_index:compartment_id:cpd_name;coeff:cpdid:...".
-    """
-    cpd_ids: list[str] = []
-    if not isinstance(stoich, str):
-        return cpd_ids
-    for term in stoich.split(";"):
-        parts = term.split(":")
-        if len(parts) >= 2:
-            cpd_ids.append(parts[1].strip())
-    return cpd_ids
+# =============================================================================
+# Generic multi-value lookup merge helper (replaces the old `_merge_modelseed_ids`)
+# =============================================================================
 
-
-def _build_rxn_to_pathways(cache_path: Path) -> dict[str, dict[str, set[str]]]:
-    """Return rxn_id -> {pathway_source: {pathway_ids}}."""
-    df = _get_modelseed_reactions(cache_path)
-    if "pathways" not in df.columns or "id" not in df.columns:
-        log.error(
-            "ModelSEED reactions TSV missing 'pathways' column. Available: %s",
-            list(df.columns),
-        )
-        return {}
-
-    result: dict[str, dict[str, set[str]]] = {}
-    for rxn_id, pw_field in zip(df["id"], df["pathways"]):
-        parsed = _parse_pipe_field(pw_field)
-        if parsed:
-            result[rxn_id] = {src: set(ids) for src, ids in parsed.items()}
-    return result
-
-
-def _build_cpd_to_pathways(cache_path: Path) -> dict[str, dict[str, set[str]]]:
-    """Return cpd_id -> {pathway_source: {pathway_ids}}.
-
-    Derived by walking through every reaction a compound participates in
-    and unioning the pathway annotations of those reactions.
-    """
-    df = _get_modelseed_reactions(cache_path)
-    if "stoichiometry" not in df.columns or "pathways" not in df.columns:
-        log.error(
-            "ModelSEED reactions TSV missing 'stoichiometry'/'pathways' columns. "
-            "Available: %s", list(df.columns),
-        )
-        return {}
-
-    cpd_pathways: dict[str, dict[str, set[str]]] = {}
-    for stoich, pw_field in zip(df["stoichiometry"], df["pathways"]):
-        pathways = _parse_pipe_field(pw_field)
-        if not pathways:
-            continue
-        for cpd_id in _parse_stoichiometry(stoich):
-            entry = cpd_pathways.setdefault(cpd_id, {})
-            for source, ids in pathways.items():
-                entry.setdefault(source, set()).update(ids)
-    return cpd_pathways
-
-
-def _build_ec_to_pathways(cache_path: Path) -> dict[str, dict[str, set[str]]]:
-    """Return ec_number -> {pathway_source: {pathway_ids}} directly (shortcut
-    that skips the intermediate rxn_id, but is equivalent to composing
-    _build_ec_to_rxn with _build_rxn_to_pathways).
-    """
-    df = _get_modelseed_reactions(cache_path)
-    if "ec_numbers" not in df.columns or "pathways" not in df.columns:
-        log.error(
-            "ModelSEED reactions TSV missing 'ec_numbers'/'pathways' columns. "
-            "Available: %s", list(df.columns),
-        )
-        return {}
-
-    ec_pathways: dict[str, dict[str, set[str]]] = {}
-    for ec_field, pw_field in zip(df["ec_numbers"], df["pathways"]):
-        if not isinstance(ec_field, str) or not ec_field.strip():
-            continue
-        pathways = _parse_pipe_field(pw_field)
-        if not pathways:
-            continue
-        for ec in ec_field.split("|"):
-            ec = ec.strip()
-            if not ec:
-                continue
-            entry = ec_pathways.setdefault(ec, {})
-            for source, ids in pathways.items():
-                entry.setdefault(source, set()).update(ids)
-    return ec_pathways
-
-def _parse_pipe_field(value) -> dict[str, list[str]]:
-    """Parse a ModelSEED 'aliases' or 'pathways' style field.
-
-    Format: "Source1: id1;id2|Source2: id3;id4"
-    Returns {source: [ids, ...]}.
-    """
-    result: dict[str, list[str]] = {}
-    if not isinstance(value, str) or not value.strip():
-        return result
-
-    for entry in value.split("|"):
-        entry = entry.strip()
-        if not entry or ":" not in entry:
-            continue
-        source, ids = entry.split(":", 1)
-        source = source.strip()
-        id_list = [i.strip() for i in ids.split(";") if i.strip()]
-        if id_list:
-            result.setdefault(source, []).extend(id_list)
-    return result
-
-def _merge_modelseed_ids(
-    annotation_df: pd.DataFrame,
+def _merge_multivalue_lookup(
+    series: pd.Series,
     lookup: dict[str, str],
-    inchikey_col: str = "InChiKey",
     key_sep: str = ";;",
     val_sep: str = ";",
 ) -> pd.Series:
-    """Vectorized resolution of multi-InChIKey column to unique ModelSEED cpd IDs."""
+    """Vectorized resolution of a (possibly multi-value) column via a str->str lookup dict.
 
-    # Split multi-inchikey strings into long format, keeping original index
-    exploded = (
-        annotation_df[inchikey_col]
-        .str.split(key_sep)
-        .explode()
-        .str.strip()
+    Splits each cell on `key_sep`, looks up each individual key, splits each hit's
+    `val_sep`-joined value, and re-aggregates unique results per original row.
+    Used for both InChIKey -> cpd and EC number -> rxn resolution wherever an
+    exact/prefix-only lookup (no fuzzy fallback needed) is sufficient.
+
+    Rows where every key misses the lookup are returned as NaN.
+    """
+    exploded = series.str.split(key_sep).explode().str.strip()
+    mapped = exploded.map(lookup).str.split(val_sep).explode()
+    result = mapped.dropna().groupby(level=0).agg(lambda s: val_sep.join(sorted(set(s))))
+    return result.reindex(series.index)
+
+
+# =============================================================================
+# Unified pathway column for integrated transcript + metabolite features
+# =============================================================================
+
+def build_pathway_feature_table(
+    annotation_df: pd.DataFrame,
+    feature_id_col: str = "feature_id",
+    pathway_col: str = "modelseed_pathway",
+    pathway_sep: str = ";",
+    feature_sep: str = ";;",
+    missing_token: str = "Unassigned",
+) -> tuple[pd.DataFrame, dict[str, list[str]]]:
+    """Pivot a feature-indexed annotation table into a pathway-indexed table.
+
+    Takes the integrated feature annotation table (one row per feature, with a
+    `pathway_col` containing a `pathway_sep`-joined list of ModelSEED pathway IDs)
+    and inverts it into one row per unique pathway, listing all features that
+    belong to it.
+
+    Parameters
+    ----------
+    annotation_df : pd.DataFrame
+        Integrated feature annotation table. Must contain `feature_id_col` and
+        `pathway_col`. If `feature_id_col` is not present as a column, the
+        DataFrame's index is used instead (e.g. if it hasn't been reset yet).
+    feature_id_col : str
+        Column identifying each feature (transcript or metabolite).
+    pathway_col : str
+        Column containing `pathway_sep`-joined pathway IDs for each feature.
+    pathway_sep : str
+        Delimiter between multiple pathway IDs within a single row's `pathway_col`.
+    feature_sep : str
+        Delimiter used to join multiple feature IDs in the output table's
+        "features" column.
+    missing_token : str
+        Sentinel value indicating "no pathway assigned"; rows with this value
+        (or null) are excluded from the output entirely, since they don't
+        represent a real pathway grouping.
+
+    Returns
+    -------
+    pathway_df : pd.DataFrame
+        Columns: "pathway", "features" (feature_sep-joined string), "n_features".
+        One row per unique pathway, sorted alphabetically by pathway.
+    pathway_to_features : dict[str, list[str]]
+        Mapping of pathway ID -> sorted list of unique feature IDs belonging to it.
+    """
+    df = annotation_df.copy()
+
+    # Use feature_id_col if present as a column, else fall back to the index
+    if feature_id_col not in df.columns:
+        df = df.reset_index().rename(columns={df.index.name or "index": feature_id_col})
+
+    df = df[[feature_id_col, pathway_col]].dropna(subset=[pathway_col])
+    df = df[df[pathway_col].astype(str).str.strip() != ""]
+    df = df[df[pathway_col] != missing_token]
+
+    # Explode the ';'-joined pathway list into long format: one row per (feature, pathway)
+    exploded = df.assign(
+        **{pathway_col: df[pathway_col].str.split(pathway_sep)}
+    ).explode(pathway_col)
+    exploded[pathway_col] = exploded[pathway_col].str.strip()
+    exploded = exploded[exploded[pathway_col] != ""]
+    exploded = exploded[exploded[pathway_col] != missing_token]
+
+    # Group by pathway, collect unique sorted feature IDs
+    grouped = (
+        exploded.groupby(pathway_col)[feature_id_col]
+        .agg(lambda ids: sorted(set(ids)))
     )
 
-    # Map each single inchikey -> its ';'-joined cpd string, then split & explode again
-    mapped = (
-        exploded.map(lookup)
-        .str.split(val_sep)
-        .explode()
+    pathway_to_features: dict[str, list[str]] = grouped.to_dict()
+
+    pathway_df = pd.DataFrame({
+        "pathway": grouped.index,
+        "features": grouped.apply(lambda ids: feature_sep.join(ids)),
+        "n_features": grouped.apply(len),
+    }).reset_index(drop=True).sort_values("pathway").reset_index(drop=True)
+
+    log.info(
+        f"Built pathway-feature table: {len(pathway_df)} unique pathways "
+        f"from {df[feature_id_col].nunique()} features with pathway annotations."
     )
 
-    # Drop misses, dedupe + join per original row
-    result = (
-        mapped.dropna()
-        .groupby(level=0)
-        .agg(lambda s: val_sep.join(sorted(set(s))))
-    )
-
-    return result.reindex(annotation_df.index)
+    return pathway_df, pathway_to_features
 
 def add_modelseed_pathway_column(
     df: pd.DataFrame,
     cache_path: Path,
-    pathway_sources: tuple[str, ...] = ("KEGG", "MetaCyc", "PlantCyc"),
+    pathway_sources: tuple[str, ...] = ("KEGG", "MetaCyc", "PlantCyc", "NOPATHWAY"),
     rxn_col: str = "tx_modelseed_rxn",
     cpd_col: str = "mx_modelseed_id",
     out_col: str = "modelseed_pathway",
@@ -6926,12 +7179,23 @@ def add_modelseed_pathway_column(
     that land in the same pathway get an identical value in `out_col` --
     that shared string is your cross-data-type join key.
 
+    Reactions with compounds but no real pathway get a unique placeholder
+    pathway under source "NOPATHWAY" (see `_assign_placeholder_pathways`).
+    Include "NOPATHWAY" in `pathway_sources` (the default) to preserve these
+    transcript<->metabolite links even when no biological pathway is known;
+    exclude it if you only want real, named pathways.
+
     Parameters
     ----------
     pathway_sources:
         Pathway annotation source(s) from the ModelSEED reactions `pathways`
-        field to pull from, e.g. "KEGG", "MetaCyc", "PlantCyc". Multiple
-        sources are unioned per row.
+        field to pull from, e.g. "KEGG", "MetaCyc", "PlantCyc", "NOPATHWAY".
+        Multiple sources are unioned per row.
+    rxn_col, cpd_col:
+        Column names to look for. If not present in `df` as given, this function
+        also tries to auto-detect columns ending in "_modelseed_rxn" / "_modelseed_id"
+        (useful since `annotate_integrated_features` prefixes columns by dataset name,
+        e.g. "transcriptome_1_modelseed_rxn" rather than the assumed "tx_modelseed_rxn").
     sep:
         Delimiter for multi-valued IDs in `rxn_col`/`cpd_col`, and also used
         to join multiple resolved pathway IDs in `out_col`.
@@ -6941,6 +7205,22 @@ def add_modelseed_pathway_column(
     """
     rxn_to_pathways = _build_rxn_to_pathways(cache_path)
     cpd_to_pathways = _build_cpd_to_pathways(cache_path)
+
+    if rxn_col not in df.columns:
+        candidates = [c for c in df.columns if c.endswith("_modelseed_rxn") or c == "modelseed_rxn"]
+        if candidates:
+            log.info(f"'{rxn_col}' not found; auto-detected transcript rxn column(s): {candidates}")
+            rxn_col = candidates[0]
+        else:
+            rxn_col = None
+
+    if cpd_col not in df.columns:
+        candidates = [c for c in df.columns if c.endswith("_modelseed_id") or c == "modelseed_id"]
+        if candidates:
+            log.info(f"'{cpd_col}' not found; auto-detected metabolite cpd column(s): {candidates}")
+            cpd_col = candidates[0]
+        else:
+            cpd_col = None
 
     def _is_missing(val: object) -> bool:
         return (
@@ -6965,9 +7245,9 @@ def add_modelseed_pathway_column(
 
     def _row_pathway(row: pd.Series) -> str:
         pathways: set[str] = set()
-        if rxn_col in row.index:
+        if rxn_col is not None:
             pathways |= _resolve(row[rxn_col], rxn_to_pathways)
-        if cpd_col in row.index:
+        if cpd_col is not None:
             pathways |= _resolve(row[cpd_col], cpd_to_pathways)
         return sep.join(sorted(pathways)) if pathways else missing_token
 
@@ -6975,8 +7255,15 @@ def add_modelseed_pathway_column(
     out[out_col] = out.apply(_row_pathway, axis=1)
 
     n_mapped = (out[out_col] != missing_token).sum()
-    n_tx_mapped = (~out[rxn_col].apply(_is_missing) & (out[out_col] != missing_token)).sum()
-    n_mx_mapped = (~out[cpd_col].apply(_is_missing) & (out[out_col] != missing_token)).sum()
+
+    n_tx_mapped = (
+        (~out[rxn_col].apply(_is_missing) & (out[out_col] != missing_token)).sum()
+        if rxn_col is not None else 0
+    )
+    n_mx_mapped = (
+        (~out[cpd_col].apply(_is_missing) & (out[out_col] != missing_token)).sum()
+        if cpd_col is not None else 0
+    )
     log.info(
         f"Assigned {out_col} for {n_mapped}/{len(out)} rows "
         f"(transcripts: {n_tx_mapped}, metabolites: {n_mx_mapped}; "
@@ -6984,17 +7271,78 @@ def add_modelseed_pathway_column(
     )
     return out
 
+
+# =============================================================================
+# Validation helpers
+# =============================================================================
+
+def _validate_annotation_metabolite_ids(annotation_df: pd.DataFrame, raw_data: pd.DataFrame) -> None:
+    """
+    Validate that metabolite IDs in annotation table match those in raw data.
+
+    Args:
+        annotation_df (pd.DataFrame): Annotation table with metabolome_id as index
+        raw_data (pd.DataFrame): Raw metabolomics data with CompoundID column or metabolite IDs as index
+    """
+
+    # Get metabolite IDs from raw data
+    if not raw_data.empty:
+        if 'CompoundID' in raw_data.columns:
+            raw_data_metabolites = set(raw_data['CompoundID'].tolist())
+        else:
+            raw_data_metabolites = set(raw_data.index.tolist())
+    else:
+        raw_data_metabolites = set()
+
+    # Get metabolite IDs from annotation table (should be in index as metabolome_id)
+    if hasattr(annotation_df.index, 'name') and annotation_df.index.name == 'metabolome_id':
+        annotation_metabolites = set(annotation_df.index.tolist())
+    elif 'metabolome_id' in annotation_df.columns:
+        annotation_metabolites = set(annotation_df['metabolome_id'].tolist())
+    else:
+        # Fallback to index if no metabolome_id column
+        annotation_metabolites = set(annotation_df.index.tolist())
+
+    # Calculate overlap statistics
+    common_metabolites = raw_data_metabolites.intersection(annotation_metabolites)
+    raw_only = raw_data_metabolites - annotation_metabolites
+    annotation_only = annotation_metabolites - raw_data_metabolites
+
+    overlap_pct = (
+        len(common_metabolites) / len(raw_data_metabolites) * 100
+        if len(raw_data_metabolites) > 0 else 0
+    )
+
+    log.info(f"Metabolite ID Validation Results:")
+    log.info(f"  Raw data metabolites: {len(raw_data_metabolites)}")
+    log.info(f"  Annotation metabolites: {len(annotation_metabolites)}")
+    log.info(f"  Common metabolites: {len(common_metabolites)} ({overlap_pct:.1f}% of raw data)")
+
+    if overlap_pct < 50:
+        log.warning(f"Low metabolite ID overlap ({overlap_pct:.1f}%) between raw data and annotations")
+    if overlap_pct == 0:
+        log.info("Raw data metabolite IDs (first 10):")
+        log.info(list(raw_data_metabolites)[:10])
+        log.info("Annotation metabolite IDs (first 10):")
+        log.info(list(annotation_metabolites)[:10])
+        raise ValueError("No matching metabolite IDs found between raw data and annotations, something is wrong.")
+
+
+# =============================================================================
+# Annotation table generators
+# =============================================================================
+
 def generate_mx_annotation_table(
-    raw_data: pd.DataFrame, 
-    dataset_raw_dir: str, 
-    polarity: str, 
-    output_dir: str, 
+    raw_data: pd.DataFrame,
+    dataset_raw_dir: str,
+    polarity: str,
+    output_dir: str,
     output_filename: str,
     overwrite: bool = False
 ) -> pd.DataFrame:
     """
     Generate metabolite ID to annotation mapping table for metabolomics data.
-    
+
     Args:
         raw_data: Raw metabolomics data DataFrame
         dataset_raw_dir: Directory containing raw dataset files
@@ -7002,11 +7350,11 @@ def generate_mx_annotation_table(
         output_dir: Output directory for saving annotation map
         output_filename: Filename for saving the annotation map
         overwrite: Overwrite existing output if True
-    
+
     Returns:
         pd.DataFrame: annotation_table DataFrame
     """
-    
+
     # Get metabolite IDs from raw data
     if not raw_data.empty:
         if 'CompoundID' in raw_data.columns:
@@ -7015,22 +7363,21 @@ def generate_mx_annotation_table(
             metabolite_ids = set(raw_data.index.tolist())
     else:
         metabolite_ids = set()
-    
+
     log.info(f"Found {len(metabolite_ids)} metabolites in raw data")
-    
+
     # Find and process FBMN library-results files
     log.info(f"Looking for FBMN library-results files in {dataset_raw_dir}")
-    
+
     fbmn_data = pd.DataFrame()
     try:
         if polarity == "multipolarity":
             compound_files = glob.glob(os.path.expanduser(f"{dataset_raw_dir}/*/*library-results.tsv"))
             if len(compound_files) > 1:
-                # Process multiple files
                 all_fbmn_data = []
                 for file_path in compound_files:
-                    file_polarity = ("positive" if "positive" in file_path 
-                                else "negative" if "negative" in file_path 
+                    file_polarity = ("positive" if "positive" in file_path
+                                else "negative" if "negative" in file_path
                                 else "unknown")
                     df = pd.read_csv(file_path, sep='\t')
                     df['metabolite_id'] = 'mx_' + df['#Scan#'].astype(str) + '_' + file_polarity
@@ -7040,7 +7387,7 @@ def generate_mx_annotation_table(
                 log.warning("Only single compound file found with multipolarity setting.")
                 fbmn_data = pd.read_csv(compound_files[0], sep='\t')
                 fbmn_data['metabolite_id'] = 'mx_' + fbmn_data['#Scan#'].astype(str) + '_unknown'
-                
+
         elif polarity in ["positive", "negative"]:
             compound_files = glob.glob(os.path.expanduser(f"{dataset_raw_dir}/*/*{polarity}*library-results.tsv"))
             if len(compound_files) == 1:
@@ -7055,35 +7402,32 @@ def generate_mx_annotation_table(
                 log.warning(f"No compound files found for {polarity} polarity.")
         else:
             log.warning(f"Unknown polarity: {polarity}")
-                
+
     except Exception as e:
         log.warning(f"Error reading compound files: {e}")
-    
+
     # Create annotation mapping for all metabolites
     log.info("Creating metabolite annotation mapping...")
     mapping_data = []
-    
+
     for met_id in tqdm(sorted(metabolite_ids), desc="Processing metabolites", unit="metabolite"):
         if not fbmn_data.empty:
-            # Find ALL matching annotations for this metabolite ID
             matches = fbmn_data[fbmn_data['metabolite_id'] == met_id]
             if len(matches) > 0:
-                # Helper function to concatenate unique values
                 def concat_unique_values(series):
                     """Concatenate unique non-null values with ;;"""
                     unique_vals = sorted({
-                        str(val).strip() for val in series.dropna() 
+                        str(val).strip() for val in series.dropna()
                         if str(val).strip() and str(val).strip().lower() not in ['nan', 'none', '']
                     })
                     return ';;'.join(unique_vals) if unique_vals else None
-                
-                # Handle InChiKey variations and concatenate all values
+
                 inchikey_cols = ['InChiKey', 'InChIKey', 'inchikey', 'INCHIKEY']
                 inchikey_values = []
                 for col in inchikey_cols:
                     if col in matches.columns:
                         inchikey_values.extend(matches[col].dropna().tolist())
-                
+
                 mapping_data.append({
                     'metabolite_id': met_id,
                     'molecular_formula': concat_unique_values(matches.get('molecular_formula', pd.Series())),
@@ -7100,8 +7444,7 @@ def generate_mx_annotation_table(
                     'library_usi': concat_unique_values(matches.get('library_usi', pd.Series()))
                 })
                 continue
-        
-        # No annotation found
+
         mapping_data.append({
             'metabolite_id': met_id,
             'molecular_formula': None,
@@ -7117,20 +7460,19 @@ def generate_mx_annotation_table(
             'npclassifier_pathway': None,
             'library_usi': None
         })
-    
-    # Create and save annotation DataFrame
+
     mapping_df = pd.DataFrame(mapping_data)
     mapping_df.rename(columns={'metabolite_id': 'metabolome_id'}, inplace=True)
     mapping_df = mapping_df.set_index('metabolome_id')
     mapping_df = mapping_df.map(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
     mapping_df['display_name'] = mapping_df['Compound_Name']
 
-    # add modelSeed ID based on inchikey
+    # Add ModelSEED cpd ID based on InChIKey (exact -> prefix -> fuzzy name fallback)
     if not mapping_df.empty:
-        cache_path = Path(output_dir) / "modelseed_compounds.tsv"
-        exact_lookup = _build_inchikey_to_cpd(cache_path)
-        prefix_lookup = _build_inchikey_prefix_to_cpd(cache_path)
-        fuzzy_texts, fuzzy_cpds = _build_fuzzy_name_candidates(cache_path)
+        compounds_cache_path = Path(output_dir) / "modelseed_compounds.tsv"
+        exact_lookup = _build_inchikey_to_cpd(compounds_cache_path)
+        prefix_lookup = _build_inchikey_prefix_to_cpd(compounds_cache_path)
+        fuzzy_texts, fuzzy_cpds = _build_fuzzy_name_candidates(compounds_cache_path)
 
         mapping_df["modelseed_id"] = mapping_df.apply(
             lambda row: resolve_modelseed_ids(
@@ -7144,7 +7486,6 @@ def generate_mx_annotation_table(
             axis=1,
         )
 
-    # Validate annotation IDs against raw data before saving
     if not raw_data.empty and not mapping_df.empty:
         _validate_annotation_metabolite_ids(mapping_df, raw_data)
     else:
@@ -7152,78 +7493,81 @@ def generate_mx_annotation_table(
             log.warning("Raw data is empty, skipping validation")
         if mapping_df.empty:
             log.warning("Annotation table is empty, skipping validation")
-    
+
     os.makedirs(output_dir, exist_ok=True)
     write_integration_file(data=mapping_df, output_dir=output_dir, filename=output_filename, indexing=True)
-    
-    # Summary statistics for annotation
+
     total_rows = len(mapping_df)
     annotated_count = mapping_df.dropna(subset=['INCHI', 'InChiKey'], how='all').shape[0]
-    
-    # Count metabolites with multiple annotations
+
     multi_annotation_count = 0
     for col in ['Compound_Name', 'superclass', 'class', 'subclass']:
         if col in mapping_df.columns:
             multi_count = mapping_df[col].str.contains(';;', na=False).sum()
             if multi_count > 0:
-                #log.info(f"Metabolites with multiple {col} annotations: {multi_count}")
                 multi_annotation_count = max(multi_annotation_count, multi_count)
-    
+
     log.info(f"Created annotation mapping with {total_rows} rows")
     log.info(f"Metabolites with annotations: {annotated_count}")
     log.info(f"Metabolites without annotations: {total_rows - annotated_count}")
     log.info(f"Metabolites with multiple annotations: {multi_annotation_count}")
-    
+
     return mapping_df
 
-def _validate_annotation_metabolite_ids(annotation_df: pd.DataFrame, raw_data: pd.DataFrame) -> None:
+
+def generate_tx_annotation_table(
+    raw_data: pd.DataFrame,
+    raw_data_dir: str,
+    genome_type: str,
+    output_dir: str,
+    output_filename: str,
+) -> pd.DataFrame:
     """
-    Validate that metabolite IDs in annotation table match those in raw data.
-    
+    Generate a merged gene annotation table from multiple annotation files.
+
     Args:
-        annotation_df (pd.DataFrame): Annotation table with metabolome_id as index
-        raw_data (pd.DataFrame): Raw metabolomics data with CompoundID column or metabolite IDs as index
+        raw_data (pd.DataFrame): Raw transcriptomics data with gene IDs as index
+        raw_data_dir (str): Directory containing annotation table files
+        genome_type (str): Type of genome - "microbe", "algal", "metagenome", or "plant"
+        output_dir (str): Output directory for saving the merged annotation table
+        output_filename (str): Filename for the output annotation table
+
+    Returns:
+        pd.DataFrame: Merged annotation table with transcriptome_id and annotation columns
     """
-    
-    # Get metabolite IDs from raw data
-    if not raw_data.empty:
-        if 'CompoundID' in raw_data.columns:
-            raw_data_metabolites = set(raw_data['CompoundID'].tolist())
-        else:
-            raw_data_metabolites = set(raw_data.index.tolist())
+
+    if genome_type == "microbe":
+        annotation_df = _process_microbe_annotations(raw_data_dir, output_dir, output_filename)
+    elif genome_type == "algal":
+        annotation_df = _process_algal_annotations(raw_data_dir, output_dir, output_filename)
+    elif genome_type == "metagenome":
+        log.info(f"Annotation processing for '{genome_type}' genome type is not yet implemented.")
+        empty_df = pd.DataFrame(columns=['transcriptome_id'])
+        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
+        return empty_df
+    elif genome_type == "plant":
+        annotation_df = _process_plant_annotations(raw_data_dir, output_dir, output_filename)
     else:
-        raw_data_metabolites = set()
-    
-    # Get metabolite IDs from annotation table (should be in index as metabolome_id)
-    if hasattr(annotation_df.index, 'name') and annotation_df.index.name == 'metabolome_id':
-        annotation_metabolites = set(annotation_df.index.tolist())
-    elif 'metabolome_id' in annotation_df.columns:
-        annotation_metabolites = set(annotation_df['metabolome_id'].tolist())
+        raise ValueError(f"Invalid genome_type '{genome_type}'. Must be one of: 'microbe', 'algal', 'metagenome', 'plant'")
+
+    if not raw_data.empty and not annotation_df.empty:
+        _validate_annotation_gene_ids(annotation_df, raw_data)
     else:
-        # Fallback to index if no metabolome_id column
-        annotation_metabolites = set(annotation_df.index.tolist())
-    
-    # Calculate overlap statistics
-    common_metabolites = raw_data_metabolites.intersection(annotation_metabolites)
-    raw_only = raw_data_metabolites - annotation_metabolites
-    annotation_only = annotation_metabolites - raw_data_metabolites
-    
-    # Log validation results
-    log.info(f"Metabolite ID Validation Results:")
-    log.info(f"  Raw data metabolites: {len(raw_data_metabolites)}")
-    log.info(f"  Annotation metabolites: {len(annotation_metabolites)}")
-    log.info(f"  Common metabolites: {len(common_metabolites)} ({len(common_metabolites)/len(raw_data_metabolites)*100:.1f}% of raw data)")
-    
-    # Warn if low overlap
-    overlap_pct = len(common_metabolites) / len(raw_data_metabolites) * 100 if len(raw_data_metabolites) > 0 else 0
-    if overlap_pct < 50:
-        log.warning(f"Low metabolite ID overlap ({overlap_pct:.1f}%) between raw data and annotations")
-    if overlap_pct == 0:
-        log.info("Raw data metabolite IDs (first 10):")
-        log.info(list(raw_data_metabolites)[:10])
-        log.info("Annotation metabolite IDs (first 10):")
-        log.info(list(annotation_metabolites)[:10])
-        raise ValueError("No matching metabolite IDs found between raw data and annotations, something is wrong.")
+        raise ValueError("Either input raw_data or computed annotation_df is empty. Cannot validate gene IDs.")
+
+    annotation_df = annotation_df.set_index('transcriptome_id')
+    annotation_df = annotation_df.map(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
+
+    if not annotation_df.empty:
+        ec_to_rxn = _build_ec_to_rxn(cache_path=Path(output_dir) / "modelseed_reactions.tsv")
+        annotation_df['modelseed_rxn'] = _merge_multivalue_lookup(
+            annotation_df['kegg_ec'], ec_to_rxn, key_sep=";;", val_sep=";"
+        )
+
+    write_integration_file(annotation_df, output_dir, output_filename, indexing=True)
+
+    return annotation_df
+
 
 def annotate_integrated_features(
     integrated_data: pd.DataFrame,
@@ -7233,7 +7577,7 @@ def annotate_integrated_features(
 ) -> pd.DataFrame:
     """
     Build a combined annotation dataframe for integrated features from multiple datasets.
-    
+
     Parameters
     ----------
     integrated_data : pd.DataFrame
@@ -7244,128 +7588,110 @@ def annotate_integrated_features(
         Directory to save the annotation results
     output_filename : str, default "integrated_features_annotated"
         Filename for the output annotation table
-        
+
     Returns
     -------
     pd.DataFrame
         Combined annotation dataframe with columns for each annotation type
         and one row per feature from integrated_data
     """
-    
-    # Get all unique features from integrated data
+
     all_features = integrated_data.index.tolist()
     log.info(f"Annotating {len(all_features)} features from integrated data")
-    
-    # Start with a base dataframe containing all features
+
     final_annotation_df = pd.DataFrame(index=all_features)
     final_annotation_df.index.name = 'feature_id'
-    
-    # Track dataset-specific statistics
+
     dataset_stats = {}
-    
-    # Build combined annotation dataframe from datasets if provided
+
     if datasets is not None:
         for dataset in datasets:
             if hasattr(dataset, 'annotation_table') and dataset.annotation_table is not None:
                 log.info(f"Processing annotation table for {dataset.dataset_name}")
-                
+
                 ann_table = dataset.annotation_table.copy()
-                
-                # Find potential ID columns in the annotation table
+
                 potential_id_cols = []
                 for col in ann_table.columns:
                     if 'id' in col.lower() or col == ann_table.index.name:
                         potential_id_cols.append(col)
-                
-                # Add dataset prefix to annotation columns to avoid conflicts
+
                 ann_table.columns = [f"{dataset.dataset_name}_{col}" for col in ann_table.columns]
-                
-                # Count matches for this dataset
+
                 matches = ann_table.index.intersection(all_features)
-                
-                # Count features from this dataset in integrated data
+
                 dataset_features = [f for f in all_features if f.startswith(f"{dataset.dataset_name}_")]
-                
-                # Store dataset statistics
+
                 dataset_stats[dataset.dataset_name] = {
                     'total_features_in_integrated': len(dataset_features),
                     'total_annotations_available': len(ann_table),
                     'features_with_annotations': len(matches),
                     'annotation_columns': len(ann_table.columns)
                 }
-                
-                # Merge with the main annotation dataframe
-                # Use left join to keep all features from integrated_data
+
                 final_annotation_df = final_annotation_df.join(ann_table, how='left')
-                
+
                 log.info(f"  Dataset features in integrated data: {len(dataset_features)}")
                 log.info(f"  Annotation records available: {len(ann_table)}")
                 log.info(f"  Features with annotations: {len(matches)}")
                 log.info(f"  Annotation columns added: {len(ann_table.columns)}")
-    
-    # Add ModelSEED pathway column
-    final_annotation_df = add_modelseed_pathway_column(final_annotation_df, cache_path=Path(output_dir) / "modelseed_reactions.tsv")
 
-    # Fill NaN values with 'Unassigned'
+    # Add ModelSEED pathway column (auto-detects dataset-prefixed rxn/cpd columns
+    # if the "tx_"/"mx_" naming convention isn't exactly followed)
+    final_annotation_df = add_modelseed_pathway_column(
+        final_annotation_df, cache_path=Path(output_dir) / "modelseed_reactions.tsv"
+    )
+
     final_annotation_df = final_annotation_df.fillna('Unassigned')
-    
-    # Reset index to make feature_id a column for easier handling
+
     final_annotation_df = final_annotation_df.reset_index()
-    
-    # Overall summary statistics
+
     n_features = len(final_annotation_df)
-    n_annotation_cols = len(final_annotation_df.columns) - 1  # Exclude feature_id column
-    
-    # Count features with at least one non-"Unassigned" annotation
+    n_annotation_cols = len(final_annotation_df.columns) - 1
+
     non_unassigned_mask = (final_annotation_df.iloc[:, 1:] != 'Unassigned').any(axis=1)
     n_annotated_features = non_unassigned_mask.sum()
-    
+
     log.info(f"Overall annotation summary:")
     log.info(f"  Total features: {n_features}")
     log.info(f"  Features with annotations: {n_annotated_features}")
     log.info(f"  Features without annotations: {n_features - n_annotated_features}")
     log.info(f"  Total annotation columns: {n_annotation_cols}")
-    
-    # Dataset-specific annotation summaries
+
     if dataset_stats:
         log.info(f"Dataset-specific annotation summaries:")
         for dataset_name, stats in dataset_stats.items():
-            # Count features from this dataset that have annotations
             dataset_features = [f for f in all_features if f.startswith(f"{dataset_name}_")]
             if dataset_features:
                 dataset_feature_indices = final_annotation_df[
                     final_annotation_df['feature_id'].isin(dataset_features)
                 ].index
-                
-                # Check which of these features have annotations from any source
-                dataset_annotation_cols = [col for col in final_annotation_df.columns 
+
+                dataset_annotation_cols = [col for col in final_annotation_df.columns
                                          if col.startswith(f"{dataset_name}_")]
-                
+
                 if dataset_annotation_cols:
-                    # Count features with dataset-specific annotations
                     dataset_annotated_mask = (
                         final_annotation_df.loc[dataset_feature_indices, dataset_annotation_cols] != 'Unassigned'
                     ).any(axis=1)
                     dataset_annotated_count = dataset_annotated_mask.sum()
                 else:
                     dataset_annotated_count = 0
-                
-                # Count features with any annotations (from any dataset)
+
                 any_annotation_mask = (
-                    final_annotation_df.loc[dataset_feature_indices, 
+                    final_annotation_df.loc[dataset_feature_indices,
                                           final_annotation_df.columns[1:]] != 'Unassigned'
                 ).any(axis=1)
                 any_annotated_count = any_annotation_mask.sum()
-                
+
                 annotation_rate = (dataset_annotated_count / len(dataset_features)) * 100 if dataset_features else 0
-                
+
                 log.info(f"  {dataset_name}:")
                 log.info(f"    Features in integrated data: {len(dataset_features)}")
                 log.info(f"    Features with {dataset_name} annotations: {dataset_annotated_count} ({annotation_rate:.1f}%)")
                 log.info(f"    Features with any annotations: {any_annotated_count}")
                 log.info(f"    Annotation columns for {dataset_name}: {len(dataset_annotation_cols)}")
-    
-    # Save results if output directory provided
+
     if output_dir:
         write_integration_file(
             data=final_annotation_df,
@@ -7373,262 +7699,8 @@ def annotate_integrated_features(
             filename=output_filename,
             indexing=False
         )
-    
+
     return final_annotation_df
-
-# def parse_gff3_proteinid_to_id(gff3_path: str) -> dict:
-#     """
-#     Parse a GFF3 file to map protein IDs to gene IDs.
-
-#     Args:
-#         gff3_path (str): Path to GFF3 file.
-
-#     Returns:
-#         dict: Mapping from proteinId to geneId.
-#     """
-
-#     open_func = gzip.open if gff3_path.endswith('.gz') else open
-#     proteinid_to_id = {}
-#     with open_func(gff3_path, 'rt') as f:
-#         for line in f:
-#             if line.startswith('#'):
-#                 continue
-#             fields = line.strip().split('\t')
-#             if len(fields) < 9 or fields[2] != 'gene':
-#                 continue
-#             attrs = {kv.split('=')[0]: kv.split('=')[1] for kv in fields[8].split(';') if '=' in kv}
-#             protein_id = attrs.get('proteinId')
-#             gene_id = attrs.get('ID')
-#             if protein_id and gene_id:
-#                 proteinid_to_id[protein_id.strip()] = gene_id.strip()
-#     return proteinid_to_id
-
-# def parse_annotation_file(annotation_path: str, tx_id_col: str, tx_annotation_col: str) -> dict:
-#     """
-#     Parse an annotation file to map IDs to annotation values.
-
-#     Args:
-#         annotation_path (str): Path to annotation file.
-#         tx_id_col (str): Column name for IDs.
-#         tx_annotation_col (str): Column name for annotation.
-
-#     Returns:
-#         dict: Mapping from ID to annotation.
-#     """
-    
-#     df = pd.read_csv(annotation_path)
-#     if tx_id_col not in df.columns or tx_annotation_col not in df.columns:
-#         raise ValueError(f"Required columns {tx_id_col} or {tx_annotation_col} not found in annotation file.")
-#     df = df.dropna(subset=[tx_id_col, tx_annotation_col])
-#     annotation_table = dict(zip(df[tx_id_col].astype(str).str.strip(), df[tx_annotation_col].astype(int).astype(str).str.strip()))
-#     return annotation_table
-
-# def map_ids_to_annotations(
-#     gff3_path: str,
-#     annotation_path: str,
-#     tx_id_col: str,
-#     tx_annotation_col: str
-# ) -> dict:
-#     """
-#     Map gene IDs from a GFF3 file to annotation values using an annotation file.
-
-#     Args:
-#         gff3_path (str): Path to GFF3 file.
-#         annotation_path (str): Path to annotation file.
-#         tx_id_col (str): ID column name.
-#         tx_annotation_col (str): Annotation column name.
-
-#     Returns:
-#         dict: Mapping from gene ID to annotation.
-#     """
-    
-#     proteinid_to_id = parse_gff3_proteinid_to_id(gff3_path)
-#     annotation_table = parse_annotation_file(annotation_path, tx_id_col, tx_annotation_col)
-#     id_to_annotation = {}
-#     for protein_id, gene_id in proteinid_to_id.items():
-#         for annot_key in annotation_table:
-#             if protein_id in annot_key:
-#                 id_to_annotation[gene_id] = annotation_table[annot_key]
-#                 break
-#     return id_to_annotation
-
-# def annotate_genes_to_rhea(
-#     gff3_path: str,
-#     annotation_path: str,
-#     tx_id_col: str,
-#     tx_annotation_col: str
-# ) -> pd.DataFrame:
-#     """
-#     Annotate gene IDs with Rhea IDs using GFF3 and annotation files.
-
-#     Args:
-#         gff3_path (str): Path to GFF3 file.
-#         annotation_path (str): Path to annotation file.
-#         tx_id_col (str): ID column name.
-#         tx_annotation_col (str): Annotation column name.
-
-#     Returns:
-#         pd.DataFrame: DataFrame mapping gene IDs to Rhea IDs.
-#     """
-
-#     id_to_annotation = map_ids_to_annotations(gff3_path, annotation_path, tx_id_col, tx_annotation_col)
-#     id_to_annotation = pd.DataFrame.from_dict(id_to_annotation, orient='index')
-#     id_to_annotation.index.name = tx_id_col
-#     id_to_annotation.rename(columns={0: tx_annotation_col}, inplace=True)
-#     id_to_annotation[tx_id_col] = id_to_annotation.index
-#     return id_to_annotation
-
-# def check_annotation_ids(
-#     annotated_data: pd.DataFrame,
-#     dtype: str,
-#     id_col: str,
-#     method: str
-# ) -> pd.DataFrame:
-#     """
-#     Ensure annotation DataFrame has correct index format and matches integrated data.
-
-#     Args:
-#         annotated_data (pd.DataFrame): Annotation DataFrame.
-#         dtype (str): Data type prefix ('tx' or 'mx').
-#         id_col (str): ID column name.
-#         method (str): Annotation method.
-
-#     Returns:
-#         pd.DataFrame: Checked annotation DataFrame.
-#     """
-
-#     if dtype+"_" in annotated_data[id_col].astype(str).values[0]:
-#         annotated_data.index = annotated_data[id_col].astype(str)
-#     else:
-#         annotated_data.index = dtype+"_" + annotated_data[id_col].astype(str)
-#     if len(annotated_data.index.intersection(annotated_data.index)) == 0:
-#         log.info(f"Warning! No matching indexes between integrated_data and annotation done with {method}. Please check the annotation file.")
-#         return None
-#     return annotated_data
-
-# def annotate_integrated_data(
-#     integrated_data: pd.DataFrame,
-#     output_dir: str,
-#     project_name: str,
-#     tx_dir: str,
-#     mx_dir: str,
-#     magi2_dir: str,
-#     tx_annotation_file: str,
-#     mx_annotation_file: str,
-#     tx_annotation_method: str,
-#     mx_annotation_method: str,
-#     tx_id_col: str,
-#     mx_id_col: str,
-#     tx_annotation_col: str,
-#     mx_annotation_col: str,
-#     overwrite: bool = False
-# ) -> pd.DataFrame:
-#     """
-#     Annotate integrated data features with functional information from transcriptomics and metabolomics.
-
-#     Args:
-#         integrated_data (pd.DataFrame): Integrated feature matrix.
-#         output_dir (str): Output directory.
-#         project_name (str): Project name.
-#         tx_dir (str): Transcriptomics data directory.
-#         mx_dir (str): Metabolomics data directory.
-#         magi2_dir (str): MAGI2 results directory.
-#         tx_annotation_file (str): Transcriptomics annotation file.
-#         mx_annotation_file (str): Metabolomics annotation file.
-#         tx_annotation_method (str): Annotation method for transcriptomics.
-#         mx_annotation_method (str): Annotation method for metabolomics.
-#         tx_id_col (str): Transcriptomics ID column.
-#         mx_id_col (str): Metabolomics ID column.
-#         tx_annotation_col (str): Transcriptomics annotation column.
-#         mx_annotation_col (str): Metabolomics annotation column.
-#         overwrite (bool): Overwrite existing results.
-
-#     Returns:
-#         pd.DataFrame: DataFrame with feature annotations.
-#     """
-    
-#     annotated_data_filename = f"integrated_data_annotated"
-#     if os.path.exists(f"{output_dir}/{annotated_data_filename}.csv") and overwrite is False:
-#         log.info(f"Integrated data already annotated: {output_dir}/{annotated_data_filename}.csv")
-#         annotated_data = pd.read_csv(f"{output_dir}/{annotated_data_filename}.csv", index_col=0)
-#         return annotated_data
-
-#     if tx_annotation_method == "custom":
-#         if tx_id_col is None or tx_annotation_col is None:
-#             raise ValueError("Please provide tx_id_col and tx_annotation_col for custom annotation.")
-#         sep = "\t" if tx_annotation_file.endswith((".txt", ".tsv", ".tab")) else ","
-#         tx_annotation = pd.read_csv(glob.glob(os.path.expanduser(tx_annotation_file))[0], sep=sep)
-#         tx_annotation = tx_annotation.drop_duplicates(subset=[tx_id_col])
-#         tx_annotation[tx_annotation_col] = tx_annotation[tx_annotation_col].astype(str)
-#         tx_annotation = check_annotation_ids(tx_annotation, "tx", tx_id_col, tx_annotation_method)
-
-#     elif tx_annotation_method == "jgi":
-#         log.info("JGI annotation method not yet implemented!!")
-#         return None
-
-#     elif tx_annotation_method == "magi2":
-#         tx_id_col = "gene_ID"
-#         tx_annotation_col = "rhea_ID_g2r"
-
-#         gff_filename = glob.glob(f"{tx_dir}/*gff3*")
-#         if len(gff_filename) == 0:
-#             raise ValueError(f"No GFF3 file found in {tx_dir}.")
-#         elif len(gff_filename) > 1:
-#             raise ValueError(f"Multiple GFF3 files found in the specified directory: {gff_filename}. \nPlease specify one.")
-#         elif len(gff_filename) == 1:
-#             gff_filename = gff_filename[0]
-
-#         magi_genes = f"{magi2_dir}/{project_name}/output_{project_name}/magi_gene_results.csv"
-        
-#         tx_annotation = annotate_genes_to_rhea(gff_filename, magi_genes, tx_id_col, tx_annotation_col)
-#         tx_annotation = check_annotation_ids(tx_annotation, "tx", tx_id_col, tx_annotation_method)
-
-#     else:
-#         raise ValueError("Please select a valid tx_annotation_method: custom, jgi, or magi2.")
-
-#     if mx_annotation_method == "fbmn":
-#         mx_id_col = "#Scan#"
-#         mx_annotation_col = "Compound_Name"
-#         mx_annotation = pd.read_csv(f"{mx_dir}/fbmn_compounds.csv")
-#         mx_annotation = mx_annotation.drop_duplicates(subset=[mx_id_col], keep='first')
-#         mx_annotation = check_annotation_ids(mx_annotation, "mx", mx_id_col, mx_annotation_method)
-
-#     elif mx_annotation_method == "custom":
-#         if mx_id_col is None or mx_annotation_col is None:
-#             raise ValueError("Please provide mx_id_col and mx_annotation_col for custom annotation.")
-#         sep = "\t" if mx_annotation_file.endswith((".txt", ".tsv", ".tab")) else ","
-#         mx_annotation = pd.read_csv(glob.glob(os.path.expanduser(mx_annotation_file))[0], sep=sep)
-#         mx_annotation = mx_annotation.drop_duplicates(subset=[mx_id_col])
-#         mx_annotation = check_annotation_ids(mx_annotation, "mx", mx_id_col, mx_annotation_method)
-        
-#     elif mx_annotation_method == "magi2":
-#         mx_id_col = "#Scan#"
-#         mx_annotation_col = "rhea_ID_r2g"
-#         magi_compounds = pd.read_csv(f"{magi2_dir}/{project_name}/output_{project_name}/magi_compound_results.csv")
-#         fbmn_compounds = pd.read_csv(f"{mx_dir}/fbmn_compounds.csv")
-#         mx_annotation = fbmn_compounds.merge(magi_compounds[['original_compound', mx_annotation_col, 'MAGI_score']],on='original_compound',how='left')
-#         mx_annotation = mx_annotation.sort_values(by='MAGI_score', ascending=False).drop_duplicates(subset=[mx_id_col], keep='first')
-#         mx_annotation = check_annotation_ids(mx_annotation, "mx", mx_id_col, mx_annotation_method)
-
-#     else:
-#         raise ValueError("Please select a valid mx_annotation_method: fbmn, custom, or magi2.")
-
-#     log.info("Annotating features in integrated data...")
-#     tx_annotation = tx_annotation.dropna(subset=[tx_id_col])
-#     mx_annotation = mx_annotation.dropna(subset=[mx_id_col])
-#     tx_annotation[tx_annotation_col] = tx_annotation[tx_annotation_col].replace("<NA>","Unassigned").fillna("Unassigned")
-#     mx_annotation[mx_annotation_col] = mx_annotation[mx_annotation_col].replace("<NA>","Unassigned").fillna("Unassigned")
-
-#     annotated_data = integrated_data[[]]
-#     annotated_data['tx_annotation'] = integrated_data.index.map(tx_annotation[tx_annotation_col])
-#     annotated_data['mx_annotation'] = integrated_data.index.map(mx_annotation[mx_annotation_col])
-    
-#     annotated_data['annotation'] = annotated_data['tx_annotation'].combine_first(annotated_data['mx_annotation'])
-    
-#     result = annotated_data[['annotation']]
-#     log.info("Writing annotated data to file...")
-#     write_integration_file(data=result, output_dir=output_dir, filename=annotated_data_filename, indexing=True)
-#     return result
 
 # ====================================
 # Data linking and integration functions
@@ -9110,7 +9182,7 @@ def plot_replicate_correlation(
         group = data[group_column].iloc[0]
         samples_in_group = metadata_filtered[metadata_filtered[group_column] == group].index
         subset_corr_matrix = corr_matrix.loc[samples_in_group, samples_in_group]
-        ax = sns.heatmap(subset_corr_matrix, annot=True, cmap='coolwarm', cbar_ax=cbar_ax, vmin=vmin, vmax=vmax, **kwargs)
+        ax = sns.heatmap(subset_corr_matrix, annot=False, cmap='coolwarm', cbar_ax=cbar_ax, vmin=vmin, vmax=vmax, **kwargs)
         ax.set_title(group)
         ax.set_xlabel('')
         ax.set_ylabel('')
@@ -9561,6 +9633,660 @@ def perform_functional_enrichment(
         )
     
     return results_df
+
+
+# ===================================
+# Pathway-module relatedness
+# ===================================
+
+def compute_feature_lfc_scores(quant_df: pd.DataFrame) -> pd.Series:
+    """Compute a robust per-feature magnitude-of-change score.
+
+    For each feature (row), takes the median of the absolute value across all
+    pairwise comparison columns, ignoring NaNs. Using the median (rather than
+    sum or mean) makes this robust to outlier contrasts and avoids biasing
+    toward features/pathways with more populated comparison columns.
+
+    Parameters
+    ----------
+    quant_df : pd.DataFrame
+        Feature x comparison table of log fold changes, indexed by feature id.
+
+    Returns
+    -------
+    pd.Series
+        Index: feature id. Values: median(|LFC|) across all comparisons.
+    """
+    return quant_df.abs().median(axis=1, skipna=True)
+
+def _explode_node_pathways(
+    node_df: pd.DataFrame,
+    feature_id_col: str | None = None,
+    pathway_col: str = "modelseed_pathway",
+    submodule_col: str = "submodule",
+    pathway_sep: str = ";",
+    missing_token: str = "Unassigned",
+    exclude_nopathway: bool = False,
+    nopathway_prefix: str = "NOPATHWAY_",
+) -> pd.DataFrame:
+    """Explode node_df's pathway_sep-joined pathway column into long format.
+
+    Returns one row per (feature, pathway) pair, each carrying its submodule.
+    Rows with a missing/"Unassigned" pathway or submodule are dropped, since
+    they don't contribute to a pathway x submodule grouping.
+
+    This is the single source of truth for (feature, pathway, submodule)
+    membership -- both `build_pathway_submodule_matrices` (counts/heatmaps)
+    and `compute_pathway_submodule_enrichment` (hypergeometric stats) call
+    this same function with the same arguments, guaranteeing the plotted
+    matrix and the significance test always agree on what "belongs" where.
+    """
+    df = node_df.copy()
+
+    if feature_id_col is None:
+        df = df.reset_index().rename(columns={df.index.name or "index": "feature_id"})
+        feature_id_col = "feature_id"
+    elif feature_id_col not in df.columns:
+        raise KeyError(f"feature_id_col '{feature_id_col}' not found in node_df columns or index.")
+
+    df = df[[feature_id_col, pathway_col, submodule_col]].dropna(subset=[pathway_col, submodule_col])
+    df = df[df[pathway_col].astype(str).str.strip() != ""]
+    df = df[df[pathway_col] != missing_token]
+    df = df[df[submodule_col] != missing_token]
+
+    exploded = df.assign(
+        **{pathway_col: df[pathway_col].str.split(pathway_sep)}
+    ).explode(pathway_col)
+    exploded[pathway_col] = exploded[pathway_col].str.strip()
+    exploded = exploded[exploded[pathway_col] != ""]
+
+    if exclude_nopathway:
+        n_before = exploded[pathway_col].nunique()
+        exploded = exploded[~exploded[pathway_col].str.startswith(nopathway_prefix)]
+        n_after = exploded[pathway_col].nunique()
+        log.info(
+            f"Excluded {n_before - n_after} placeholder '{nopathway_prefix}*' pathways "
+            f"({n_after} real pathways remain)."
+        )
+
+    return exploded.rename(
+        columns={feature_id_col: "feature_id", pathway_col: "pathway", submodule_col: "submodule"}
+    )
+
+
+def compute_submodule_sizes(
+    node_df: pd.DataFrame,
+    feature_id_col: str | None = None,
+    submodule_col: str = "submodule",
+    missing_token: str = "Unassigned",
+) -> pd.Series:
+    """Count unique features assigned to each submodule.
+
+    Uses each feature's single `submodule_col` assignment directly (not the
+    exploded pathway table), since submodule membership is 1:1 per feature --
+    counting via the exploded table would inflate sizes for features that
+    belong to multiple pathways.
+
+    Parameters
+    ----------
+    node_df : pd.DataFrame
+        Node table with `submodule_col`. Feature id may be the index or a
+        named column (see `feature_id_col`).
+    feature_id_col : str, optional
+        Column name for feature id. If None, uses `node_df.index`.
+    missing_token : str
+        Sentinel value indicating "no submodule assigned"; excluded from counts.
+
+    Returns
+    -------
+    pd.Series
+        Index: submodule name. Values: number of unique features, sorted descending.
+    """
+    df = node_df.copy()
+
+    if feature_id_col is None:
+        df = df.reset_index().rename(columns={df.index.name or "index": "feature_id"})
+        feature_id_col = "feature_id"
+    elif feature_id_col not in df.columns:
+        raise KeyError(f"feature_id_col '{feature_id_col}' not found in node_df columns or index.")
+
+    df = df.dropna(subset=[submodule_col])
+    df = df[df[submodule_col] != missing_token]
+
+    return (
+        df.groupby(submodule_col)[feature_id_col]
+        .nunique()
+        .sort_values(ascending=False)
+        .rename("n_features")
+    )
+
+
+def _resolve_qualifying_submodules(
+    node_df: pd.DataFrame,
+    feature_id_col: str | None,
+    submodule_col: str,
+    missing_token: str,
+    min_submodule_size: int,
+) -> list[str] | None:
+    """Shared min_submodule_size resolution used by both the matrix builder
+    and the enrichment test, so both apply the identical submodule filter.
+
+    Returns None if min_submodule_size <= 0 (no filtering).
+    """
+    if min_submodule_size <= 0:
+        return None
+
+    submodule_sizes = compute_submodule_sizes(
+        node_df, feature_id_col=feature_id_col, submodule_col=submodule_col, missing_token=missing_token
+    )
+    qualifying = submodule_sizes[submodule_sizes >= min_submodule_size].index.tolist()
+    n_dropped = submodule_sizes.shape[0] - len(qualifying)
+    if n_dropped:
+        log.info(
+            f"Dropped {n_dropped} submodule(s) with fewer than {min_submodule_size} features "
+            f"({len(qualifying)} submodule(s) remain)."
+        )
+    if not qualifying:
+        raise ValueError(
+            f"No submodules meet min_submodule_size={min_submodule_size}; "
+            f"largest submodule has {submodule_sizes.max() if not submodule_sizes.empty else 0} features."
+        )
+    return qualifying
+
+
+def build_pathway_submodule_matrices(
+    node_df: pd.DataFrame,
+    quant_df: pd.DataFrame | None = None,
+    feature_id_col: str | None = None,
+    pathway_col: str = "modelseed_pathway",
+    submodule_col: str = "submodule",
+    pathway_sep: str = ";",
+    missing_token: str = "Unassigned",
+    exclude_nopathway: bool = False,
+    nopathway_prefix: str = "NOPATHWAY_",
+    top_n: int = 50,
+    rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
+    min_submodule_size: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build pathway x submodule count matrices, restricted to the top-N pathways.
+
+    Parameters
+    ----------
+    node_df : pd.DataFrame
+        Feature-level table with pathway and submodule columns.
+    quant_df : pd.DataFrame, optional
+        Feature x comparison LFC table, required when `rank_by="cumulative_abs_lfc"`.
+    feature_id_col, pathway_col, submodule_col, pathway_sep, missing_token,
+    exclude_nopathway, nopathway_prefix : see `_explode_node_pathways`.
+    top_n : int
+        Number of top-ranked pathways to keep in the returned matrices.
+    rank_by : {"n_features", "cumulative_abs_lfc"}
+        Ranking metric for pathway selection.
+    min_submodule_size : int
+        Minimum number of unique features a submodule must contain (across the
+        whole `node_df`, independent of pathway membership) to be included in
+        the output matrices. Submodules below this threshold are dropped
+        entirely -- both their columns AND any features belonging to them --
+        before pathway ranking/top-N selection, so the reported pathway stats
+        and heatmap are self-consistent. Set to 0 (default) to disable.
+
+    Returns
+    -------
+    counts_df : pd.DataFrame
+        Top-N pathways (rows) x qualifying submodules (columns), raw feature counts.
+    row_normalized_df : pd.DataFrame
+        Same shape, each row divided by its row sum.
+    pathway_stats_df : pd.DataFrame
+        Full (pre-top_n-filter) per-pathway stats table, computed only from
+        features in qualifying submodules.
+    """
+    if rank_by == "cumulative_abs_lfc" and quant_df is None:
+        raise ValueError("quant_df is required when rank_by='cumulative_abs_lfc'.")
+
+    exploded = _explode_node_pathways(
+        node_df,
+        feature_id_col=feature_id_col,
+        pathway_col=pathway_col,
+        submodule_col=submodule_col,
+        pathway_sep=pathway_sep,
+        missing_token=missing_token,
+        exclude_nopathway=exclude_nopathway,
+        nopathway_prefix=nopathway_prefix,
+    )
+
+    if exploded.empty:
+        raise ValueError("No (feature, pathway, submodule) rows remain after filtering; check inputs.")
+
+    qualifying_submodules = _resolve_qualifying_submodules(
+        node_df, feature_id_col, submodule_col, missing_token, min_submodule_size
+    )
+    if qualifying_submodules is not None:
+        exploded = exploded[exploded["submodule"].isin(qualifying_submodules)]
+        if exploded.empty:
+            raise ValueError(
+                "No (feature, pathway, submodule) rows remain after applying min_submodule_size filter."
+            )
+
+    # --- Per-pathway stats (computed only from features in qualifying submodules) ---
+    stats = exploded.groupby("pathway")["feature_id"].nunique().rename("n_features").to_frame()
+
+    if rank_by == "cumulative_abs_lfc" or quant_df is not None:
+        feature_scores = compute_feature_lfc_scores(quant_df)
+        missing_features = set(exploded["feature_id"]) - set(feature_scores.index)
+        if missing_features:
+            log.warning(
+                f"{len(missing_features)} features in node_df are missing from quant_df "
+                f"and will be scored as 0 for cumulative_abs_lfc ranking "
+                f"(e.g. {sorted(missing_features)[:5]})."
+            )
+        exploded = exploded.assign(
+            feature_lfc_score=exploded["feature_id"].map(feature_scores).fillna(0.0)
+        )
+        cum_lfc = exploded.groupby("pathway")["feature_lfc_score"].sum().rename("cumulative_abs_lfc")
+        stats = stats.join(cum_lfc, how="left")
+
+    pathway_stats_df = stats.reset_index().sort_values(rank_by, ascending=False).reset_index(drop=True)
+
+    # --- Select top N pathways, then build the crosstab ---
+    top_pathways = pathway_stats_df.head(top_n)["pathway"].tolist()
+    exploded_top = exploded[exploded["pathway"].isin(top_pathways)]
+
+    counts_df = pd.crosstab(exploded_top["pathway"], exploded_top["submodule"])
+    counts_df = counts_df.reindex(index=top_pathways)  # preserve rank order
+
+    row_normalized_df = counts_df.div(counts_df.sum(axis=1), axis=0)
+
+    log.info(
+        f"Built pathway x submodule matrix: {counts_df.shape[0]} pathways "
+        f"(top {top_n} by {rank_by}) x {counts_df.shape[1]} submodules "
+        f"(min_submodule_size={min_submodule_size})."
+    )
+
+    return counts_df, row_normalized_df, pathway_stats_df
+
+
+def compute_pathway_submodule_enrichment(
+    node_df: pd.DataFrame,
+    counts_df: pd.DataFrame,
+    feature_id_col: str | None = None,
+    pathway_col: str = "modelseed_pathway",
+    submodule_col: str = "submodule",
+    pathway_sep: str = ";",
+    missing_token: str = "Unassigned",
+    exclude_nopathway: bool = False,
+    nopathway_prefix: str = "NOPATHWAY_",
+    min_submodule_size: int = 0,
+    fdr_method: str = "fdr_bh",
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """Hypergeometric over-representation test for the pathway x submodule
+    pairs in `counts_df`.
+
+    Tests whether a pathway's features are enriched within a given submodule
+    more than expected by chance, given the pathway size, module size, and
+    background universe -- correcting for the size confounds that a raw
+    concentration heatmap cannot account for.
+
+    Re-derives the same exploded (feature, pathway, submodule) table and
+    min_submodule_size filtering as `build_pathway_submodule_matrices`, so
+    background sizes (M, n, N) are computed on an identical universe to
+    whatever produced `counts_df`. Pass the SAME feature_id_col/pathway_col/
+    submodule_col/pathway_sep/missing_token/exclude_nopathway/nopathway_prefix/
+    min_submodule_size arguments you used to build `counts_df`, or the two
+    will silently diverge.
+
+    Parameters
+    ----------
+    node_df : pd.DataFrame
+        The same raw node table passed to `build_pathway_submodule_matrices`.
+    counts_df : pd.DataFrame
+        Output of `build_pathway_submodule_matrices` -- top-N pathways (rows)
+        x qualifying submodules (columns). Enrichment is computed only for
+        these cells; `k` (overlap) is read directly from `counts_df` rather
+        than recomputed, guaranteeing exact agreement with the plotted matrix.
+    fdr_method : str
+        Passed to `statsmodels.stats.multitest.multipletests` (default
+        Benjamini-Hochberg FDR).
+    alpha : float
+        Significance threshold used to populate the `significant` column.
+
+    Returns
+    -------
+    pd.DataFrame with columns: pathway, submodule, k, n, N, M, expected,
+    fold_enrichment, pvalue, padj, significant -- one row per (pathway,
+    submodule) cell in `counts_df`. FDR correction is applied across exactly
+    these cells (not the full, untested pathway universe).
+    """
+    exploded = _explode_node_pathways(
+        node_df,
+        feature_id_col=feature_id_col,
+        pathway_col=pathway_col,
+        submodule_col=submodule_col,
+        pathway_sep=pathway_sep,
+        missing_token=missing_token,
+        exclude_nopathway=exclude_nopathway,
+        nopathway_prefix=nopathway_prefix,
+    )
+
+    qualifying_submodules = _resolve_qualifying_submodules(
+        node_df, feature_id_col, submodule_col, missing_token, min_submodule_size
+    )
+    if qualifying_submodules is not None:
+        exploded = exploded[exploded["submodule"].isin(qualifying_submodules)]
+
+    universe = exploded[["feature_id", "submodule"]].drop_duplicates()
+    M = universe["feature_id"].nunique()
+    module_sizes = universe.groupby("submodule")["feature_id"].nunique()
+    pathway_sizes = exploded.groupby("pathway")["feature_id"].nunique()
+
+    records = []
+    for pathway in counts_df.index:
+        n = pathway_sizes.get(pathway, 0)
+        for submodule in counts_df.columns:
+            N = module_sizes.get(submodule, 0)
+            if n == 0 or N == 0:
+                continue
+            k = int(counts_df.loc[pathway, submodule])
+            # P(X >= k): survival function is P(X > x), so use sf(k - 1)
+            pval = hypergeom.sf(k - 1, M, n, N)
+            expected = n * N / M
+            records.append({
+                "pathway": pathway,
+                "submodule": submodule,
+                "k": k, "n": n, "N": N, "M": M,
+                "expected": expected,
+                "fold_enrichment": (k / expected) if expected > 0 else np.nan,
+                "pvalue": pval,
+            })
+
+    result = pd.DataFrame.from_records(records)
+    reject, padj, _, _ = multipletests(result["pvalue"], alpha=alpha, method=fdr_method)
+    result["padj"] = padj
+    result["significant"] = reject
+
+    log.info(
+        f"Computed hypergeometric enrichment for {len(result)} pathway x submodule "
+        f"pairs; {result['significant'].sum()} significant at padj<{alpha} ({fdr_method})."
+    )
+
+    return result.sort_values("padj").reset_index(drop=True)
+
+def add_significance_annotations(
+    clustergrid: sns.matrix.ClusterGrid,
+    matrix_df: pd.DataFrame,
+    enrichment_df: pd.DataFrame,
+    cluster_rows: bool,
+    cluster_cols: bool,
+    alpha_stars: dict[float, str] | None = None,
+) -> None:
+    """Overlay hypergeometric significance stars on a ClusterGrid's heatmap Axes.
+
+    Must be called BEFORE the ClusterGrid's `.figure` is extracted/returned --
+    dendrogram reordering (`reordered_ind`) only exists on the ClusterGrid
+    object itself, not on the plain Figure.
+
+    Parameters
+    ----------
+    clustergrid : sns.matrix.ClusterGrid
+        Object returned directly by `sns.clustermap(...)`, before `.figure`
+        is accessed.
+    matrix_df : pd.DataFrame
+        The exact dataframe passed into that `sns.clustermap` call
+        (`counts_df` or `row_normalized_df`) -- used to map reordered
+        positions back to (pathway, submodule) labels.
+    enrichment_df : pd.DataFrame
+        Output of `compute_pathway_submodule_enrichment`.
+    cluster_rows, cluster_cols : bool
+        Whether clustering was enabled for this call. When False,
+        `clustergrid.dendrogram_row`/`dendrogram_col` is None, so the
+        original (unreordered) index/column order is used instead.
+    alpha_stars : dict[float, str], optional
+        Mapping of padj thresholds to marker strings, checked tightest-first.
+        Defaults to {0.001: "***", 0.01: "**", 0.05: "*"}.
+    """
+    if alpha_stars is None:
+        alpha_stars = {0.001: "***", 0.01: "**", 0.05: "*"}
+
+    padj_lookup = enrichment_df.set_index(["pathway", "submodule"])["padj"]
+
+    row_order = (
+        clustergrid.dendrogram_row.reordered_ind if cluster_rows else range(len(matrix_df.index))
+    )
+    col_order = (
+        clustergrid.dendrogram_col.reordered_ind if cluster_cols else range(len(matrix_df.columns))
+    )
+
+    ordered_rows = matrix_df.index[list(row_order)]
+    ordered_cols = matrix_df.columns[list(col_order)]
+
+    ax = clustergrid.ax_heatmap
+    stroke = [pe.withStroke(linewidth=1.5, foreground="black")]
+
+    for i, pathway in enumerate(ordered_rows):
+        for j, submodule in enumerate(ordered_cols):
+            padj = padj_lookup.get((pathway, submodule), np.nan)
+            if pd.isna(padj):
+                continue
+            for thresh, stars in sorted(alpha_stars.items()):
+                if padj < thresh:
+                    ax.text(
+                        j + 0.5, i + 0.7, stars,
+                        ha="center", va="center",
+                        color="white", fontsize=8, fontweight="bold",
+                        path_effects=stroke,
+                    )
+                    break
+
+
+def plot_pathway_submodule_clustermaps(
+    counts_df: pd.DataFrame,
+    row_normalized_df: pd.DataFrame,
+    cluster_rows: bool = True,
+    cluster_cols: bool = True,
+    method: str = "average",
+    metric: str = "euclidean",
+    counts_cmap: str = "viridis",
+    normalized_cmap: str = "magma",
+    normalized_vmax: float | Literal["auto"] = "auto",
+    normalized_gamma: float | None = None,
+    figsize: tuple[float, float] = (16, 14),
+    output_dir: str | Path | None = None,
+    counts_filename: str = "pathway_submodule_heatmap_counts.png",
+    normalized_filename: str = "pathway_submodule_heatmap_normalized.png",
+    dpi: int = 300,
+    enrichment_df: pd.DataFrame | None = None,
+    alpha_stars: dict[float, str] | None = None,
+) -> tuple[plt.Figure, plt.Figure]:
+    """Plot raw-count and row-normalized pathway x submodule heatmaps with shared clustering.
+
+    Parameters
+    ----------
+    counts_df, row_normalized_df : pd.DataFrame
+        Outputs of `build_pathway_submodule_matrices`.
+    cluster_rows, cluster_cols : bool
+        Whether to hierarchically cluster rows/columns (shared linkage
+        computed from `row_normalized_df`, applied to both panels so pathway/
+        submodule ordering is identical across the two figures).
+    method, metric : str
+        Passed to `scipy.cluster.hierarchy.linkage`.
+    counts_cmap, normalized_cmap : str
+        Colormaps for each panel.
+    normalized_vmax : float or "auto"
+        Upper bound of the color scale for the row-normalized heatmap.
+        "auto" (default) uses the actual maximum value in `row_normalized_df`,
+        so the color range reflects your real data spread instead of the full
+        theoretical 0-1 range (which is misleading when most cells are small,
+        e.g. <0.1, and only a few approach 1.0). Pass a fixed float instead if
+        you want a stable scale across multiple runs/comparisons.
+    normalized_gamma : float, optional
+        If set, applies a `matplotlib.colors.PowerNorm(gamma=normalized_gamma)`
+        to the color mapping instead of a plain linear scale. Values < 1
+        (e.g. 0.3-0.5) compress the high end and stretch the low end, making
+        small proportions visually distinguishable instead of all reading as
+        "dark/near-zero" under a linear scale dominated by a handful of large
+        values. Leave as None for a standard linear scale.
+    output_dir, counts_filename, normalized_filename, dpi :
+        Figure-saving options. If `output_dir` is None, figures are not saved.
+    enrichment_df : pd.DataFrame, optional
+        Output of `compute_pathway_submodule_enrichment`. If provided,
+        significance stars are overlaid on both panels (annotation happens
+        while each ClusterGrid is still live, before `.figure` is extracted).
+    alpha_stars : dict[float, str], optional
+        padj threshold -> marker string for the significance overlay. Only
+        used if `enrichment_df` is provided.
+
+    Returns
+    -------
+    (fig_counts, fig_normalized) : tuple[plt.Figure, plt.Figure]
+    """
+    row_linkage = linkage(row_normalized_df.values, method=method, metric=metric) if cluster_rows else None
+    col_linkage = linkage(row_normalized_df.values.T, method=method, metric=metric) if cluster_cols else None
+
+    common_kwargs = dict(
+        row_linkage=row_linkage,
+        col_linkage=col_linkage,
+        row_cluster=cluster_rows,
+        col_cluster=cluster_cols,
+        figsize=figsize,
+        dendrogram_ratio=(0.15, 0.1),
+        cbar_pos=(0.02, 0.83, 0.03, 0.15),
+    )
+
+    # --- Counts panel ---
+    g_counts = sns.clustermap(
+        counts_df,
+        cmap=counts_cmap,
+        annot=False,
+        fmt="d",
+        **common_kwargs,
+    )
+    g_counts.ax_heatmap.set_xlabel("Submodule")
+    g_counts.ax_heatmap.set_ylabel("Pathway")
+
+    counts_title = "Feature count per pathway x submodule"
+    if enrichment_df is not None:
+        # Annotate while g_counts is still a ClusterGrid -- reordered_ind
+        # is unavailable once only `.figure` is kept.
+        add_significance_annotations(
+            g_counts, counts_df, enrichment_df, cluster_rows, cluster_cols, alpha_stars
+        )
+        counts_title += "\n* padj<0.05  ** padj<0.01  *** padj<0.001 (hypergeometric, BH-FDR)"
+    g_counts.figure.suptitle(counts_title, y=1.04 if enrichment_df is not None else 1.02, fontsize=10)
+
+    # --- Row-normalized panel ---
+    resolved_vmax = row_normalized_df.values.max() if normalized_vmax == "auto" else normalized_vmax
+
+    norm_kwargs: dict = {}
+    if normalized_gamma is not None:
+        # PowerNorm handles vmin/vmax itself; don't pass them separately alongside `norm`
+        norm_kwargs["norm"] = PowerNorm(gamma=normalized_gamma, vmin=0, vmax=resolved_vmax)
+    else:
+        norm_kwargs["vmin"] = 0
+        norm_kwargs["vmax"] = resolved_vmax
+
+    g_norm = sns.clustermap(
+        row_normalized_df,
+        cmap=normalized_cmap,
+        annot=False,
+        fmt=".2f",
+        **norm_kwargs,
+        **common_kwargs,
+    )
+    g_norm.ax_heatmap.set_xlabel("Submodule")
+    g_norm.ax_heatmap.set_ylabel("Pathway")
+
+    if enrichment_df is not None:
+        add_significance_annotations(
+            g_norm, row_normalized_df, enrichment_df, cluster_rows, cluster_cols, alpha_stars
+        )
+
+    g_norm.figure.suptitle(
+        f"Row-normalized fraction of pathway's features per submodule "
+        f"(scale: 0-{resolved_vmax:.2f})",
+        y=1.02,
+    )
+
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        g_counts.figure.savefig(output_dir / counts_filename, dpi=dpi, bbox_inches="tight")
+        g_norm.figure.savefig(output_dir / normalized_filename, dpi=dpi, bbox_inches="tight")
+        log.info(f"Saved heatmaps to {output_dir / counts_filename} and {output_dir / normalized_filename}")
+
+    return g_counts.figure, g_norm.figure
+
+def generate_pathway_submodule_heatmap(
+    node_df: pd.DataFrame,
+    quant_df: pd.DataFrame | None = None,
+    top_n: int = 50,
+    rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
+    exclude_nopathway: bool = False,
+    min_submodule_size: int = 0,
+    normalized_vmax: float | Literal["auto"] = "auto",
+    normalized_gamma: float | None = None,
+    output_dir: str | Path | None = None,
+    fdr_method: str = "fdr_bh",
+    alpha: float = 0.05,
+    **plot_kwargs,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, plt.Figure, plt.Figure]:
+    """End-to-end: build pathway x submodule matrices, run hypergeometric
+    enrichment, and plot both heatmap panels with significance stars overlaid.
+
+    See `build_pathway_submodule_matrices`, `compute_pathway_submodule_enrichment`,
+    and `plot_pathway_submodule_clustermaps` for parameter details.
+
+    Parameters
+    ----------
+    node_df, quant_df, top_n, rank_by, exclude_nopathway, min_submodule_size :
+        See `build_pathway_submodule_matrices`.
+    normalized_vmax, normalized_gamma :
+        See `plot_pathway_submodule_clustermaps`.
+    output_dir :
+        Directory to save figures to. If None, figures are not saved to disk.
+    fdr_method : str
+        Multiple-testing correction method for `compute_pathway_submodule_enrichment`
+        (default Benjamini-Hochberg FDR).
+    alpha : float
+        Significance threshold used to populate `enrichment_df["significant"]`
+        and the star overlay.
+    **plot_kwargs
+        Any additional keyword arguments forwarded to
+        `plot_pathway_submodule_clustermaps` (e.g. `method`, `metric`,
+        `counts_cmap`, `figsize`, `counts_filename`, `dpi`, `alpha_stars`, etc.).
+
+    Returns
+    -------
+    (counts_df, row_normalized_df, pathway_stats_df, enrichment_df, fig_counts, fig_normalized)
+    """
+    counts_df, row_normalized_df, pathway_stats_df = build_pathway_submodule_matrices(
+        node_df,
+        quant_df=quant_df,
+        top_n=top_n,
+        rank_by=rank_by,
+        exclude_nopathway=exclude_nopathway,
+        min_submodule_size=min_submodule_size,
+    )
+
+    enrichment_df = compute_pathway_submodule_enrichment(
+        node_df,
+        counts_df,
+        exclude_nopathway=exclude_nopathway,
+        min_submodule_size=min_submodule_size,
+        fdr_method=fdr_method,
+        alpha=alpha,
+    )
+
+    fig_counts, fig_normalized = plot_pathway_submodule_clustermaps(
+        counts_df,
+        row_normalized_df,
+        normalized_vmax=normalized_vmax,
+        normalized_gamma=normalized_gamma,
+        output_dir=output_dir,
+        enrichment_df=enrichment_df,
+        **plot_kwargs,
+    )
+
+    return counts_df, row_normalized_df, pathway_stats_df, enrichment_df, fig_counts, fig_normalized
 
 # ====================================
 # MOFA functions
