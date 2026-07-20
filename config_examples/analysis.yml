@@ -1,8 +1,14 @@
 # NOTE: Parameters with XXX should not be changed
 
 analysis:
-  integration_parameters:
-    method: lfc # replicate_matched
+  normalization:
+    method: lfc  # lfc, vst, zscore, modified_zscore, rank_normal
+    log2: true   # log2-transform before scaling (used by vst/zscore/modified_zscore methods)
+    lfc:
+      group_col: group
+      sample_col: unique_group
+      pseudocount: 1.0
+      lfc_pairs: null  # null = all pairwise group contrasts; or a list of [groupA, groupB] pairs
   analysis_parameters:
     feature_selection:
       selected_method: lfc
@@ -28,9 +34,6 @@ analysis:
         category:
       mutual_info:
         category:
-    # selected_method controls which grouping approach is used to cluster features after
-    # integration. All methods produce a `group` column in the output node table
-    # (replacing the old `submodule` column).
     feature_grouping:
       selected_method: network_modules # network_modules, hierarchical_clustering, hdbscan
       network_modules:

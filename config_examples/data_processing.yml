@@ -10,12 +10,10 @@ datasets:
       devariancing:
         method: percent
         value: 5
-      scaling:
-        log2: true
-        method: vst
       replicate_handling:
-        method: variance
+        method: sigma
         group: group
+        sigma_threshold: 3.0
         value: 0.5
   mx:
     dataset_dir: metabolomics # XXX
@@ -29,10 +27,8 @@ datasets:
       devariancing:
         method: percent
         value: 5
-      scaling:
-        log2: true
-        method: vst
       replicate_handling:
-        method: variance
+        method: sigma
         group: group
+        sigma_threshold: 3.0
         value: 0.5
