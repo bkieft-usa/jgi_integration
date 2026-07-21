@@ -1637,15 +1637,23 @@ class Analysis(DataAwareBaseHandler):
 
         self._setup_analysis_filenames()
 
-        self.analysis_parameters = self.analysis_config.get('analysis_parameters', {})
-        self.integration_parameters = self.analysis_config.get('integration_parameters', {})
+        # analysis_config is now the flat 'analysis:' block.
+        # Branch is detected by which top-level keys are present:
+        #   lfc branch:                analysis_config has 'lfc' key
+        #   replicate_matched branch:  analysis_config has 'scaling' key
         self.datasets = datasets or []
 
-        # Set integration_mode from config so it is available even before integrate_data() runs.
-        # It is updated again (with the same value) inside integrate_data() for clarity.
-        # Possible values: "replicate_matched" | "lfc"
-        normalization_params = self.analysis_parameters.get('normalization', {})
-        self._integration_mode: str = normalization_params.get('mode', 'lfc')
+        # Detect integration mode from config structure
+        if 'lfc' in self.analysis_config:
+            self._integration_mode: str = 'lfc'
+        elif 'scaling' in self.analysis_config:
+            self._integration_mode: str = 'replicate_matched'
+        else:
+            # Fallback: check old normalization.mode key for backward compat
+            norm = self.analysis_config.get('normalization', {})
+            self._integration_mode: str = norm.get('mode', 'lfc')
+
+        log.info(f"integration_mode detected as '{self._integration_mode}' from analysis config")
     
         log.info(f"Created analysis with {len(self.datasets)} datasets.")
         for ds in self.datasets:
@@ -1654,9 +1662,21 @@ class Analysis(DataAwareBaseHandler):
         self._complete_tracking('create_analysis')
 
     @property
+    def analysis_parameters(self) -> dict:
+        """
+        Returns the flat analysis config dict directly.
+
+        The new config layout (analysis_lfc.yml / analysis_replicate_matched.yml) is flat —
+        top-level keys are 'lfc', 'scaling', 'feature_selection', 'feature_grouping', etc.
+        This property makes all existing ``self.analysis_parameters.get(...)`` calls work
+        without modification by returning ``self.analysis_config`` directly.
+        """
+        return self.analysis_config
+
+    @property
     def integration_mode(self) -> str:
         """
-        The integration mode read from ``analysis.yml`` under ``normalization.mode``.
+        The integration mode detected from the analysis config structure.
 
         * ``"replicate_matched"`` — replicates are paired across data types.
           Per-dataset scaling (``scale_all_datasets()``) is applied first, then
@@ -1784,27 +1804,40 @@ class Analysis(DataAwareBaseHandler):
         In **replicate_matched** mode, each dataset is scaled independently before
         concatenation so that different data types (e.g. RNA counts vs metabolite
         peak heights) are brought to a comparable scale.  The scaling method and
-        parameters are read from each dataset's ``data_processing.yml`` config under
-        ``normalization_parameters.scaling``.
+        parameters are read from the analysis config (``analysis_replicate_matched.yml``)
+        under the top-level ``scaling`` block, which is shared across all datasets.
 
         In **lfc** mode this step is skipped automatically because LFC computation
         is scale-invariant — absolute differences between data types cancel out when
         computing log2 ratios of group medians.
         """
-        normalization_params = self.analysis_parameters.get('normalization', {})
-        mode = normalization_params.get('mode', 'lfc')
-
         def _scale_method():
-            if mode == 'lfc':
+            if self.integration_mode == 'lfc':
                 log.info(
-                    "Skipping per-dataset scaling (normalization.mode='lfc'). "
+                    "Skipping per-dataset scaling (integration_mode='lfc'). "
                     "LFC is scale-invariant; scaling is not needed before integration."
                 )
                 return
-            log.info("Scaling individual datasets before integration (replicate_matched mode)...")
+
+            # Read scaling config from analysis config (analysis_replicate_matched.yml → scaling block)
+            scaling_cfg = self.analysis_config.get('scaling', {})
+            scaling_p = scaling_cfg.get('params', scaling_cfg)
+            norm_method = scaling_cfg.get('method', 'vst')
+            log2 = scaling_p.get('log2', True)
+
+            log.info(
+                f"Scaling individual datasets before integration "
+                f"(replicate_matched mode, method='{norm_method}')..."
+            )
             for ds in self.datasets:
                 log.info(f"  Scaling {ds.dataset_name}...")
-                ds.scale_data(overwrite=overwrite, show_progress=False, **kwargs)
+                ds.scale_data(
+                    overwrite=overwrite,
+                    show_progress=False,
+                    norm_method=norm_method,
+                    log2=log2,
+                    **kwargs
+                )
 
         if show_progress:
             self.workflow_tracker.set_current_step('scale_dataset_features')
@@ -1952,11 +1985,8 @@ class Analysis(DataAwareBaseHandler):
     ) -> None:
         """Hybrid: Class validation + external hlp.integrate_metadata function."""
         def _integrate_metadata_method():
-            # Read mode from normalization.mode in analysis.yml
-            normalization_params = self.analysis_parameters.get('normalization', {})
-            mode = normalization_params.get('mode', 'lfc')
-
-            log.info(f"Integrating metadata across data types (normalization.mode='{mode}')")
+            mode = self.integration_mode
+            log.info(f"Integrating metadata across data types (integration_mode='{mode}')")
 
             # Avoid stale cache/file reuse when switching modes
             can_reuse_cached = (
@@ -1976,8 +2006,8 @@ class Analysis(DataAwareBaseHandler):
 
             # For lfc mode, pass lfc_pairs from config if not provided as argument
             if mode == 'lfc' and lfc_pairs is None:
-                lfc_params = normalization_params.get('lfc', {})
-                lfc_pairs_resolved = lfc_params.get('lfc_pairs', None)
+                lfc_cfg = self.analysis_config.get('lfc', {})
+                lfc_pairs_resolved = lfc_cfg.get('lfc_pairs', None)
             else:
                 lfc_pairs_resolved = lfc_pairs
 
@@ -2041,16 +2071,15 @@ class Analysis(DataAwareBaseHandler):
           ``normalize_integrated_data()``.
         """
         def _integrate_data_method():
-            normalization_params = self.analysis_parameters.get('normalization', {})
-            mode = normalization_params.get('mode', 'lfc')
+            mode = self.integration_mode
 
             # Resolve lfc_pairs from config if not passed as argument
             if lfc_pairs is None:
-                lfc_params = normalization_params.get('lfc', {})
-                lfc_pairs_resolved = lfc_params.get('lfc_pairs', None)
-                group_col_resolved = lfc_params.get('group_col', group_col)
-                sample_col_resolved = lfc_params.get('sample_col', sample_col)
-                pseudocount_resolved = lfc_params.get('pseudocount', pseudocount)
+                lfc_cfg = self.analysis_config.get('lfc', {})
+                lfc_pairs_resolved = lfc_cfg.get('lfc_pairs', None)
+                group_col_resolved = lfc_cfg.get('group_col', group_col)
+                sample_col_resolved = lfc_cfg.get('sample_col', sample_col)
+                pseudocount_resolved = lfc_cfg.get('pseudocount', pseudocount)
             else:
                 lfc_pairs_resolved = lfc_pairs
                 group_col_resolved = group_col
@@ -2164,28 +2193,28 @@ class Analysis(DataAwareBaseHandler):
                 )
                 return
 
-            normalization_params = self.analysis_parameters.get('normalization', {})
-            mode = normalization_params.get('mode', 'lfc')
+            mode = self.integration_mode
 
             if mode == 'lfc':
                 # LFC data is already in the correct space — pass through
                 log.info(
-                    "normalization.mode='lfc': integrated_data is already in LFC space. "
+                    "integration_mode='lfc': integrated_data is already in LFC space. "
                     "Copying to integrated_data_selected without further transformation."
                 )
                 result = self.integrated_data.copy()
-                write_integration_file = hlp.write_integration_file
-                write_integration_file(result, self.output_dir, self._integrated_data_selected_filename, indexing=True)
+                hlp.write_integration_file(result, self.output_dir, self._integrated_data_selected_filename, indexing=True)
 
             else:
                 # replicate_matched: optional post-integration pass
-                post_params = normalization_params.get('post_integration', {})
-                post_method = post_params.get('method', None)
-                log2 = post_params.get('log2', False)
+                # Read from flat analysis config: analysis_replicate_matched.yml → post_integration block
+                post_cfg = self.analysis_config.get('post_integration', {})
+                post_p = post_cfg.get('params', post_cfg)
+                post_method = post_cfg.get('method', None)
+                log2 = post_p.get('log2', False)
 
                 if post_method is None or str(post_method).lower() in ('null', 'none', ''):
                     log.info(
-                        "normalization.post_integration.method=null: "
+                        "post_integration.method=null: "
                         "Copying integrated_data to integrated_data_selected without post-integration scaling."
                     )
                     result = self.integrated_data.copy()

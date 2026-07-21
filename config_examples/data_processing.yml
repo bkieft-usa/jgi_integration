@@ -1,3 +1,18 @@
+# data_processing.yml
+#
+# Per-dataset processing steps shared by BOTH analysis branches (lfc and replicate_matched).
+# These steps are applied to each dataset independently before any integration.
+#
+# Steps applied in order:
+#   linked_data  →  filter_data  →  filtered_data
+#                →  devariance_data  →  devarianced_data
+#                →  remove_low_replicable_features  →  replicate_filtered_data
+#
+# Per-dataset scaling (vst/zscore/etc.) is NOT configured here.
+# It belongs in analysis_replicate_matched.yml under 'scaling' and is skipped in lfc mode.
+#
+# NOTE: Parameters with XXX should not be changed
+
 datasets:
   tx:
     dataset_dir: transcriptomics # XXX
@@ -5,20 +20,18 @@ datasets:
       filtering:
         method: minimum          # minimum | percent_present | none
         params:
-          value: 200             # minimum: minimum count threshold; percent_present: fraction of samples (0-1)
+          value: 200             # minimum: minimum count threshold
+                                 # percent_present: minimum fraction of samples with non-zero value (0–1)
       devariancing:
         method: percent          # percent | iqr | none
         params:
-          value: 5               # percent: bottom N% of variance removed; iqr: IQR multiplier threshold
-      scaling: # Skipped automatically in lfc mode.
-        method: vst              # vst | zscore | modified_zscore | rank_normal | quantile | none
-        params:
-          log2: true             # log2-transform before scaling (used by zscore/modified_zscore)
+          value: 5               # percent: bottom N% of variance removed
+                                 # iqr: IQR multiplier threshold
       replicate_handling:
         method: sigma            # sigma | correlation | none
         params:
           group: group           # metadata column containing group/condition labels
-          sigma_threshold: 3.0   # sigma: number of std deviations from group mean to flag as outlier
+          sigma_threshold: 3.0   # sigma: std deviations from group mean to flag as outlier
           value: 0.5             # correlation: minimum Spearman r to keep a replicate
 
   mx:
@@ -35,10 +48,6 @@ datasets:
         method: percent          # percent | iqr | none
         params:
           value: 5
-      scaling:
-        method: vst              # vst | zscore | modified_zscore | rank_normal | quantile | none
-        params:
-          log2: true
       replicate_handling:
         method: sigma            # sigma | correlation | none
         params:
