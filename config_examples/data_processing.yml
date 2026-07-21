@@ -1,20 +1,26 @@
-# NOTE: Parameters with XXX should not be changed
-
 datasets:
   tx:
     dataset_dir: transcriptomics # XXX
     normalization_parameters:
       filtering:
-        method: minimum
-        value: 200
+        method: minimum          # minimum | percent_present | none
+        params:
+          value: 200             # minimum: minimum count threshold; percent_present: fraction of samples (0-1)
       devariancing:
-        method: percent
-        value: 5
+        method: percent          # percent | iqr | none
+        params:
+          value: 5               # percent: bottom N% of variance removed; iqr: IQR multiplier threshold
+      scaling: # Skipped automatically in lfc mode.
+        method: vst              # vst | zscore | modified_zscore | rank_normal | quantile | none
+        params:
+          log2: true             # log2-transform before scaling (used by zscore/modified_zscore)
       replicate_handling:
-        method: sigma
-        group: group
-        sigma_threshold: 3.0
-        value: 0.5
+        method: sigma            # sigma | correlation | none
+        params:
+          group: group           # metadata column containing group/condition labels
+          sigma_threshold: 3.0   # sigma: number of std deviations from group mean to flag as outlier
+          value: 0.5             # correlation: minimum Spearman r to keep a replicate
+
   mx:
     dataset_dir: metabolomics # XXX
     chromatography: HILIC
@@ -22,13 +28,20 @@ datasets:
     metabolite_fraction: cells
     normalization_parameters:
       filtering:
-        method: minimum
-        value: 2000
+        method: minimum          # minimum | percent_present | none
+        params:
+          value: 2000
       devariancing:
-        method: percent
-        value: 5
+        method: percent          # percent | iqr | none
+        params:
+          value: 5
+      scaling:
+        method: vst              # vst | zscore | modified_zscore | rank_normal | quantile | none
+        params:
+          log2: true
       replicate_handling:
-        method: sigma
-        group: group
-        sigma_threshold: 3.0
-        value: 0.5
+        method: sigma            # sigma | correlation | none
+        params:
+          group: group
+          sigma_threshold: 3.0
+          value: 0.5

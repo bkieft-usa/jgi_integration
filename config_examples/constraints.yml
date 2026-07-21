@@ -1,0 +1,444 @@
+# constraints.yml
+#
+# Machine-readable rules for the web UI (and runtime validation in objects.py).
+# Each entry defines which option values are valid given the current state of other options.
+#
+# Structure:
+#   constraints:
+#     <config_path>:           # dot-separated path to the option being constrained
+#       options:               # all possible values for this option
+#         <value>:
+#           label: str         # human-readable label shown in the UI
+#           requires:          # conditions that must be true for this option to be enabled
+#             <other_path>: <required_value>   # other option must equal this value
+#           incompatible_with: # conditions that disable this option (grayed out)
+#             <other_path>: <disabling_value>
+#           description: str   # tooltip text shown in the UI
+
+constraints:
+
+  # ============================================================
+  # normalization.mode
+  # ============================================================
+  normalization.mode:
+    options:
+      lfc:
+        label: "LFC (log2 fold-change of group medians)"
+        description: >
+          Replicates are unpaired. LFC of group medians is computed per dataset and
+          concatenated. Per-dataset scaling is skipped (LFC is scale-invariant).
+          The integrated matrix has one column per pairwise group contrast.
+      replicate_matched:
+        label: "Replicate-matched (paired samples)"
+        description: >
+          Replicates are paired across data types. Per-dataset scaling is applied first
+          (data_processing.yml → scaling), then datasets are concatenated.
+          The integrated matrix has one column per sample.
+
+  # ============================================================
+  # normalization.post_integration.method
+  # ============================================================
+  normalization.post_integration.method:
+    options:
+      null:
+        label: "None (skip post-integration normalization)"
+        description: Data is already per-dataset scaled; no further transformation applied.
+      zscore:
+        label: "Z-score (per sample)"
+        requires:
+          normalization.mode: replicate_matched
+        incompatible_with:
+          normalization.mode: lfc
+        description: log2(x+1) then z-score each sample column.
+      modified_zscore:
+        label: "Modified z-score (median-based, per sample)"
+        requires:
+          normalization.mode: replicate_matched
+        incompatible_with:
+          normalization.mode: lfc
+        description: log2(x+1) then median-based z-score each sample column.
+      rank_normal:
+        label: "Rank-based inverse normal transformation"
+        requires:
+          normalization.mode: replicate_matched
+        incompatible_with:
+          normalization.mode: lfc
+        description: Rank-based inverse normal transformation per sample column.
+
+  # ============================================================
+  # analysis_parameters.feature_selection.method
+  # ============================================================
+  analysis_parameters.feature_selection.method:
+    options:
+      lfc:
+        label: "LFC cutoff"
+        description: >
+          Retain features whose |log2 fold-change| exceeds log2fc_cutoff in at least
+          one pairwise contrast. Valid for both lfc and replicate_matched modes.
+        params:
+          log2fc_cutoff:
+            type: float
+            default: 1.25
+            label: "Minimum |log2FC|"
+          max_features:
+            type: int
+            default: 10000
+            label: "Maximum features (hard cap)"
+      variance:
+        label: "Top-N variance"
+        description: >
+          Retain the top N most variable features (by inter-sample variance).
+          Valid for both lfc and replicate_matched modes.
+        params:
+          top_n:
+            type: int
+            default: 5000
+            label: "Number of top-variance features to keep"
+          max_features:
+            type: int
+            default: 10000
+            label: "Maximum features (hard cap)"
+      feature_list:
+        label: "User-supplied feature list"
+        description: >
+          Retain only features present in a user-supplied text file (one feature ID per line).
+          Valid for both lfc and replicate_matched modes.
+        params:
+          feature_list_file:
+            type: filepath
+            default: null
+            label: "Path to feature list file"
+      glm:
+        label: "Generalized linear model (GLM)"
+        requires:
+          normalization.mode: replicate_matched
+        incompatible_with:
+          normalization.mode: lfc
+        description: >
+          Fit a GLM per feature; retain features with significant group effect.
+          Requires sample-level metadata — not valid in lfc mode.
+        params:
+          category:
+            type: string
+            default: null
+            label: "Metadata column (grouping variable)"
+          reference:
+            type: string
+            default: null
+            label: "Reference level for contrast"
+          significance_level:
+            type: float
+            default: 0.05
+            label: "FDR significance threshold"
+          log2fc_cutoff:
+            type: float
+            default: 0.25
+            label: "Minimum |log2FC|"
+          max_features:
+            type: int
+            default: 10000
+            label: "Maximum features (hard cap)"
+      kruskalwallis:
+        label: "Kruskal-Wallis test"
+        requires:
+          normalization.mode: replicate_matched
+        incompatible_with:
+          normalization.mode: lfc
+        description: >
+          Non-parametric one-way ANOVA across groups; retain significant features.
+          Requires sample-level metadata — not valid in lfc mode.
+        params:
+          category:
+            type: string
+            default: group
+            label: "Metadata column (grouping variable)"
+          significance_level:
+            type: float
+            default: 0.05
+            label: "FDR significance threshold"
+          lfc_cutoff:
+            type: float
+            default: 0.25
+            label: "Minimum |LFC| (secondary filter)"
+          max_features:
+            type: int
+            default: 10000
+            label: "Maximum features (hard cap)"
+      lasso:
+        label: "LASSO regularization"
+        requires:
+          normalization.mode: replicate_matched
+        incompatible_with:
+          normalization.mode: lfc
+        description: >
+          L1-regularized regression; retain features with non-zero coefficients.
+          Requires sample-level metadata — not valid in lfc mode.
+        params:
+          category:
+            type: string
+            default: null
+            label: "Metadata column (response variable)"
+          max_features:
+            type: int
+            default: 10000
+            label: "Maximum features (hard cap)"
+      random_forest:
+        label: "Random forest feature importance"
+        requires:
+          normalization.mode: replicate_matched
+        incompatible_with:
+          normalization.mode: lfc
+        description: >
+          Random forest classifier/regressor; retain top-importance features.
+          Requires sample-level metadata — not valid in lfc mode.
+        params:
+          category:
+            type: string
+            default: null
+            label: "Metadata column (response variable)"
+          max_features:
+            type: int
+            default: 10000
+            label: "Maximum features (hard cap)"
+      mutual_info:
+        label: "Mutual information"
+        requires:
+          normalization.mode: replicate_matched
+        incompatible_with:
+          normalization.mode: lfc
+        description: >
+          Mutual information between each feature and the response variable.
+          Requires sample-level metadata — not valid in lfc mode.
+        params:
+          category:
+            type: string
+            default: null
+            label: "Metadata column (response variable)"
+          max_features:
+            type: int
+            default: 10000
+            label: "Maximum features (hard cap)"
+
+  # ============================================================
+  # analysis_parameters.feature_grouping.method
+  # ============================================================
+  analysis_parameters.feature_grouping.method:
+    options:
+      network_modules:
+        label: "Network modules (correlation graph + community detection)"
+        description: >
+          Build a pairwise correlation graph; detect communities (Louvain/Leiden).
+          Requires calculate_correlated_features() to be run first.
+        params:
+          corr_method:
+            type: enum
+            values: [spearman, pearson, dcor]
+            default: spearman
+            label: "Correlation method"
+          corr_cutoff:
+            type: float
+            default: 0.9
+            label: "Minimum |correlation| to draw an edge"
+          keep_negative:
+            type: bool
+            default: false
+            label: "Include anti-correlated edges"
+          block_size:
+            type: int
+            default: 500
+            label: "Features per block (block-wise correlation)"
+          cores:
+            type: int
+            default: -1
+            label: "Parallel workers (-1 = all available)"
+          corr_mode:
+            type: enum
+            values: [bipartite, full]
+            default: bipartite
+            label: "Correlation mode"
+          submodule_mode:
+            type: enum
+            values: [louvain, leiden]
+            default: louvain
+            label: "Community detection algorithm"
+          interactive_plot:
+            type: bool
+            default: false
+            label: "Generate interactive network plot"
+          network_layout:
+            type: enum
+            values: [spring, kamada_kawai, circular]
+            default: spring
+            label: "Network layout algorithm"
+      hierarchical_clustering:
+        label: "Hierarchical clustering (fcluster)"
+        description: >
+          Agglomerative hierarchical clustering; cut dendrogram at height_cutoff.
+          Does not require a pre-computed correlation table.
+        params:
+          distance_metric:
+            type: string
+            default: correlation
+            label: "scipy pdist distance metric ('correlation' = 1 − Pearson r)"
+          linkage_method:
+            type: enum
+            values: [single, complete, average, ward]
+            default: average
+            label: "Linkage method"
+          height_cutoff:
+            type: float
+            default: 0.3
+            label: "Dendrogram cut height (analogous to 1 − corr_cutoff)"
+      hdbscan:
+        label: "HDBSCAN density clustering"
+        description: >
+          Density-based clustering; automatically determines the number of groups.
+          Noise points (label = -1) are assigned to a singleton 'noise' group.
+        params:
+          metric:
+            type: string
+            default: correlation
+            label: "Distance metric"
+          min_cluster_size:
+            type: int
+            default: 5
+            label: "Minimum features per cluster"
+          min_samples:
+            type: int
+            default: 3
+            label: "Core point threshold"
+
+  # ============================================================
+  # data_processing: per-dataset steps
+  # ============================================================
+  datasets.*.normalization_parameters.filtering.method:
+    options:
+      minimum:
+        label: "Minimum value threshold"
+        description: Remove features whose maximum observed value is below the threshold.
+        params:
+          value:
+            type: float
+            default: 200
+            label: "Minimum count / intensity threshold"
+      percent_present:
+        label: "Percent present"
+        description: Remove features observed in fewer than X% of samples.
+        params:
+          value:
+            type: float
+            default: 0.5
+            label: "Minimum fraction of samples with non-zero value (0–1)"
+      none:
+        label: "No filtering"
+        description: Skip the filtering step.
+
+  datasets.*.normalization_parameters.devariancing.method:
+    options:
+      percent:
+        label: "Bottom-N% variance removal"
+        description: Remove the bottom N% of features by inter-sample variance.
+        params:
+          value:
+            type: float
+            default: 5
+            label: "Percent of lowest-variance features to remove"
+      iqr:
+        label: "IQR-based variance filter"
+        description: Remove features with variance below IQR × threshold.
+        params:
+          value:
+            type: float
+            default: 1.5
+            label: "IQR multiplier threshold"
+      none:
+        label: "No devariancing"
+        description: Skip the devariancing step.
+
+  datasets.*.normalization_parameters.scaling.method:
+    options:
+      vst:
+        label: "VST (variance-stabilising transformation)"
+        description: arcsinh(sqrt(x)) then z-score per sample. Good for count data.
+        params:
+          log2:
+            type: bool
+            default: true
+            label: "log2-transform before VST"
+      zscore:
+        label: "Z-score (per sample)"
+        description: log2(x+1) then z-score each sample column.
+        params:
+          log2:
+            type: bool
+            default: true
+            label: "log2-transform before z-scoring"
+      modified_zscore:
+        label: "Modified z-score (median-based)"
+        description: log2(x+1) then median-based z-score each sample column.
+        params:
+          log2:
+            type: bool
+            default: true
+            label: "log2-transform before modified z-scoring"
+      rank_normal:
+        label: "Rank-based inverse normal transformation"
+        description: Rank-based inverse normal transformation per sample column.
+        params:
+          log2:
+            type: bool
+            default: false
+            label: "log2-transform before rank normalisation"
+      quantile:
+        label: "Quantile normalisation"
+        description: Force identical distributions across all samples.
+        params:
+          log2:
+            type: bool
+            default: false
+            label: "log2-transform before quantile normalisation"
+      none:
+        label: "No per-dataset scaling"
+        description: >
+          Skip per-dataset scaling. Only valid in lfc mode (LFC is scale-invariant).
+          In replicate_matched mode, scaling is required to make data types comparable.
+        incompatible_with:
+          normalization.mode: replicate_matched
+
+  datasets.*.normalization_parameters.replicate_handling.method:
+    options:
+      sigma:
+        label: "Sigma outlier detection"
+        description: >
+          Flag replicates whose value deviates more than sigma_threshold standard
+          deviations from the group mean and remove them.
+        params:
+          group:
+            type: string
+            default: group
+            label: "Metadata column containing group/condition labels"
+          sigma_threshold:
+            type: float
+            default: 3.0
+            label: "Number of std deviations from group mean to flag as outlier"
+          value:
+            type: float
+            default: 0.5
+            label: "Minimum fraction of features that must pass (secondary guard)"
+      correlation:
+        label: "Replicate correlation filter"
+        description: >
+          Remove replicates whose Spearman correlation with other replicates in the
+          same group falls below the threshold.
+        params:
+          group:
+            type: string
+            default: group
+            label: "Metadata column containing group/condition labels"
+          value:
+            type: float
+            default: 0.5
+            label: "Minimum Spearman r to keep a replicate"
+      none:
+        label: "No replicate filtering"
+        description: Skip the replicability filtering step.

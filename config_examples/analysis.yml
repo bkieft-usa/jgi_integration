@@ -1,61 +1,95 @@
 # NOTE: Parameters with XXX should not be changed
+#
+# Structure: each analysis step has a top-level 'method' key (the dropdown selection)
+# and a 'params' sub-block containing only the parameters for that method.
+# This maps directly to a web UI: method = dropdown, params = form fields shown for that selection.
+# Cross-step constraints (e.g., which feature_selection methods are valid for each normalization mode)
+# are defined in config_examples/constraints.yml.
 
 analysis:
   normalization:
-    method: lfc  # lfc, vst, zscore, modified_zscore, rank_normal
-    log2: true   # log2-transform before scaling (used by vst/zscore/modified_zscore methods)
+    # Top-level mode: 'lfc' or 'replicate_matched'
+    #   lfc              — replicates are unpaired; LFC of group medians is computed during
+    #                      integration. Per-dataset scaling (data_processing.yml → scaling) is
+    #                      skipped. The integrated matrix is already in LFC space.
+    #   replicate_matched — replicates are paired across data types. Per-dataset scaling is
+    #                      applied first (data_processing.yml → scaling), then datasets are
+    #                      concatenated. An optional post-integration pass can be applied.
+    mode: lfc  # lfc | replicate_matched
+
+    # Parameters used when mode: lfc
     lfc:
       group_col: group
       sample_col: unique_group
       pseudocount: 1.0
-      lfc_pairs: null  # null = all pairwise group contrasts; or a list of [groupA, groupB] pairs
+      lfc_pairs: null  # null = all pairwise contrasts; or list of [groupA, groupB] pairs
+
+    # Optional post-integration normalization (mode: replicate_matched only).
+    # method: null skips this step (data is already per-dataset scaled).
+    post_integration:
+      method: null   # null | zscore | modified_zscore | rank_normal
+      params:
+        log2: false  # log2-transform before post-integration scaling (usually false; already scaled)
+
   analysis_parameters:
+
     feature_selection:
-      selected_method: lfc
-      max_features: 10000
-      variance:
-        top_n: 5000
-      lfc:
-        log2fc_cutoff: 1.25
-      glm:
-        category:
-        reference:
-        significance_level: 0.05
-        log2fc_cutoff: 0.25
-      kruskalwallis:
-        category: group
-        significance_level: 0.05
-        lfc_cutoff: 0.25
-      feature_list:
-        feature_list_file:
-      lasso:
-        category:
-      random_forest:
-        category:
-      mutual_info:
-        category:
+      method: lfc    # lfc | variance | glm | kruskalwallis | feature_list | lasso | random_forest | mutual_info
+                     # Note: glm, kruskalwallis, lasso, random_forest, mutual_info require
+                     # normalization.mode = replicate_matched (grayed out when mode = lfc).
+      params:
+        # --- lfc ---
+        log2fc_cutoff: 1.25   # minimum |log2 fold-change| to retain a feature
+        max_features: 10000   # hard cap on features passed to grouping/network steps
+
+        # --- variance (uncomment and set when method: variance) ---
+        # top_n: 5000         # keep top N most variable features
+
+        # --- glm (uncomment and set when method: glm) ---
+        # category:           # metadata column containing the grouping variable
+        # reference:          # reference level for the GLM contrast
+        # significance_level: 0.05
+        # log2fc_cutoff: 0.25
+
+        # --- kruskalwallis (uncomment and set when method: kruskalwallis) ---
+        # category: group
+        # significance_level: 0.05
+        # lfc_cutoff: 0.25
+
+        # --- feature_list (uncomment and set when method: feature_list) ---
+        # feature_list_file:  # path to a plain-text file with one feature ID per line
+
+        # --- lasso / random_forest / mutual_info (uncomment and set when using these) ---
+        # category:           # metadata column to use as the response variable
+
     feature_grouping:
-      selected_method: network_modules # network_modules, hierarchical_clustering, hdbscan
-      network_modules:
-        corr_method: spearman
-        corr_cutoff: 0.9
-        keep_negative: false
-        block_size: 500
-        cores: -1
-        corr_mode: bipartite
-        submodule_mode: louvain
+      method: network_modules  # network_modules | hierarchical_clustering | hdbscan
+      params:
+        # --- network_modules ---
+        corr_method: spearman       # spearman | pearson | dcor
+        corr_cutoff: 0.9            # minimum |correlation| to draw an edge
+        keep_negative: false        # include anti-correlated edges
+        block_size: 500             # features per block for block-wise correlation
+        cores: -1                   # parallel workers (-1 = all available)
+        corr_mode: bipartite        # bipartite | full
+        submodule_mode: louvain     # louvain | leiden
         interactive_plot: false
-        network_layout: spring
-      hierarchical_clustering:
-        distance_metric: correlation  # scipy pdist metric; 'correlation' = 1 - pearson
-        linkage_method: average       # scipy linkage method
-        height_cutoff: 0.3            # fcluster distance threshold; analogous to corr_cutoff
-      hdbscan:
-        metric: correlation           # distance metric for HDBSCAN
-        min_cluster_size: 5           # minimum features per group
-        min_samples: 3                # core point threshold
+        network_layout: spring      # spring | kamada_kawai | circular
+
+        # --- hierarchical_clustering (uncomment and set when method: hierarchical_clustering) ---
+        # distance_metric: correlation  # scipy pdist metric; 'correlation' = 1 - pearson
+        # linkage_method: average       # single | complete | average | ward
+        # height_cutoff: 0.3            # fcluster distance threshold (analogous to 1 - corr_cutoff)
+
+        # --- hdbscan (uncomment and set when method: hdbscan) ---
+        # metric: correlation           # distance metric for HDBSCAN
+        # min_cluster_size: 5           # minimum features per group
+        # min_samples: 3                # core point threshold
+
     functional_enrichment:
-      annotation_column: GO
-      pvalue_cutoff: 0.05
-      min_genes_per_term: 1
-      correction_method: fdr_bh
+      method: hypergeometric   # hypergeometric (only option currently)
+      params:
+        annotation_column: GO
+        pvalue_cutoff: 0.05
+        min_genes_per_term: 1
+        correction_method: fdr_bh  # fdr_bh | bonferroni | none
