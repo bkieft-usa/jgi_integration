@@ -794,15 +794,26 @@ def perform_feature_selection(
 
     """
 
-    method = config.get("selected_method")
-    max_features = config.get("max_features", 5000)
+    # Support both old multi-block layout and new flat method+params layout.
+    # Old: config = {selected_method: 'lfc', lfc: {log2fc_cutoff: 1.25}, variance: {top_n: 5000}, ...}
+    # New: config = {method: 'lfc', params: {log2fc_cutoff: 1.25, max_features: 10000}}
+    method = config.get("method") or config.get("selected_method")
     if method is None:
         return data
-    if method == "variance":
-        max_features = config["variance"].get("top_n", max_features)
-    if not method:
-        raise ValueError("'selected_method' not defined in config.")
     method = method.lower().strip()
+
+    # Resolve params block: new layout uses config['params'], old layout uses config[method_name]
+    params_block = config.get("params", None)
+    if params_block is None:
+        # Old layout: gather params from the method-named sub-block
+        params_block = config.get(method, {})
+
+    max_features = params_block.get("max_features", config.get("max_features", 5000))
+    if method == "variance":
+        max_features = params_block.get("top_n", max_features)
+
+    if not method:
+        raise ValueError("'method' (or 'selected_method') not defined in feature_selection config.")
 
     # Check that data and metadata have the same samples and subset accordingly
     common_samples = data.columns.intersection(metadata.index)
@@ -817,38 +828,31 @@ def perform_feature_selection(
                   f"but metadata has {metadata.shape[0]} samples. Subsetting metadata.")
         metadata = metadata.loc[common_samples]
 
-    # Map method name to function and its required keys
-    method_map: Dict[str, Tuple[Callable, List[str]]] = {
-        "lfc": (lfc_selection, ["lfc"]),
-        "variance": (variance_selection, ["variance"]),
-        "glm": (glm_selection, ["glm"]),
-        "kruskalwallis": (kruskal_selection, ["kruskalwallis"]),
-        "feature_list": (feature_list_selection, ["feature_list"]),
-        "lasso": (lasso_selection, ["lasso"]),
-        "random_forest": (random_forest_selection, ["random_forest"]),
-        "mutual_info": (mutual_info_selection, ["mutual_info"]),
+    # Map method name to selection function
+    method_map: Dict[str, Callable] = {
+        "lfc": lfc_selection,
+        "variance": variance_selection,
+        "glm": glm_selection,
+        "kruskalwallis": kruskal_selection,
+        "feature_list": feature_list_selection,
+        "lasso": lasso_selection,
+        "random_forest": random_forest_selection,
+        "mutual_info": mutual_info_selection,
     }
 
     if method not in method_map:
         raise ValueError(f"Unsupported feature-selection method '{method}'. "
-                                   f"Supported: {list(method_map)}")
+                         f"Supported: {list(method_map)}")
 
-    selection_function, selection_parameters = method_map[method]
+    selection_function = method_map[method]
 
-    kwargs: Dict[str, Any] = {}
-    for block in selection_parameters:
-        block_cfg = config.get(block, {})
-        if not isinstance(block_cfg, dict):
-            raise ValueError(f"Configuration for '{block}' must be a mapping.")
-        kwargs.update(block_cfg)
-    
+    # Build kwargs from the resolved params block
+    kwargs: Dict[str, Any] = dict(params_block)
     kwargs["max_features"] = max_features
     kwargs["data"] = data
-    if selection_function is not feature_list_selection and \
-       selection_function is not variance_selection and \
-       selection_function is not lfc_selection:
+    if selection_function not in (feature_list_selection, variance_selection, lfc_selection):
         kwargs["metadata"] = metadata
-    
+
     # Add output_dir for glm_selection and kruskal_selection
     if selection_function in (glm_selection, kruskal_selection):
         kwargs["output_dir"] = output_dir
@@ -8471,23 +8475,25 @@ def integrate_data(
 
     # Original behavior
     if method == "replicate_matched":
-        log.info("Creating a single integrated feature matrix across datasets...")
+        log.info(f"Creating a single integrated feature matrix across datasets (data_attr='{data_attr}')...")
 
         dataset_data = {}
         sample_sets = {}
 
         for ds in datasets:
-            if hasattr(ds, "replicate_filtered_data") and ds.replicate_filtered_data is not None and not ds.replicate_filtered_data.empty:
-                data_copy = ds.replicate_filtered_data.copy()
+            source_df = getattr(ds, data_attr, None)
+            if source_df is not None and not source_df.empty:
+                data_copy = source_df.copy()
                 if not data_copy.index.astype(str).str.startswith(f"{ds.dataset_name}_").all():
                     data_copy.index = [f"{ds.dataset_name}_{idx}" for idx in data_copy.index]
 
                 dataset_data[ds.dataset_name] = data_copy
                 sample_sets[ds.dataset_name] = set(data_copy.columns.astype(str))
-                log.info(f"\tAdding {data_copy.shape[0]} features from {ds.dataset_name}")
+                log.info(f"\tAdding {data_copy.shape[0]} features from {ds.dataset_name} (source: {data_attr})")
             else:
                 raise ValueError(
-                    f"Dataset {ds.dataset_name} missing replicate_filtered_data. Run processing pipeline first."
+                    f"Dataset '{ds.dataset_name}' missing attribute '{data_attr}'. "
+                    f"Run the appropriate processing step first."
                 )
 
         if overlap_only and len(dataset_data) > 1:
