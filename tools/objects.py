@@ -379,8 +379,8 @@ class WorkflowProgressTracker:
             {'id': 'link_data', 'label': 'Link Data', 'category': 'data_processing'},
             {'id': 'filter_dataset_features', 'label': 'Filter Rare Features', 'category': 'data_processing'},
             {'id': 'devariance_dataset_features', 'label': 'Remove Low-Variance Features', 'category': 'data_processing'},
-            {'id': 'scale_dataset_features', 'label': 'Scale Features', 'category': 'data_processing'},
             {'id': 'replicability_test_dataset_features', 'label': 'Replicability Filtering', 'category': 'data_processing'},
+            {'id': 'normalize_integrated_data', 'label': 'Normalize Integrated Data', 'category': 'analysis'},
             {'id': 'integrate_metadata', 'label': 'Integrate Metadata', 'category': 'analysis'},
             {'id': 'integrate_data', 'label': 'Integrate Data', 'category': 'analysis'},
             {'id': 'feature_selection', 'label': 'Feature Selection', 'category': 'analysis'},
@@ -1895,10 +1895,21 @@ class Analysis(DataAwareBaseHandler):
     ) -> None:
         """Hybrid: Class validation + external hlp.integrate_metadata function."""
         def _integrate_metadata_method():
+            # Read normalization method from the new config key; fall back to old key for compat
+            normalization_params = self.analysis_parameters.get('normalization', {})
+            norm_method = normalization_params.get('method',
+                          self.integration_parameters.get('method', 'replicate_matched'))
 
-            method = self.integration_parameters.get('method', 'replicate_matched')
+            # integrate_metadata uses 'replicate_matched' or 'lfc' — map all scaling methods
+            # (vst, zscore, etc.) to 'replicate_matched' since they produce sample-level data
+            if norm_method in {'vst', 'zscore', 'modified_zscore', 'rank_normal'}:
+                method = 'replicate_matched'
+            elif norm_method == 'lfc':
+                method = 'lfc'
+            else:
+                method = 'replicate_matched'
 
-            log.info(f"Integrating metadata across data types (method={method})")
+            log.info(f"Integrating metadata across data types (normalization={norm_method}, metadata_method={method})")
 
             # Avoid stale cache/file reuse when switching modes
             can_reuse_cached = (
@@ -1916,6 +1927,13 @@ class Analysis(DataAwareBaseHandler):
                 )
                 return
 
+            # For lfc mode, pass lfc_pairs from config if not provided as argument
+            if method == 'lfc' and lfc_pairs is None:
+                lfc_params = normalization_params.get('lfc', {})
+                lfc_pairs_resolved = lfc_params.get('lfc_pairs', None)
+            else:
+                lfc_pairs_resolved = lfc_pairs
+
             result = hlp.integrate_metadata(
                 datasets=self.datasets,
                 metadata_vars=self.project.study_variables,
@@ -1925,7 +1943,7 @@ class Analysis(DataAwareBaseHandler):
                 method=method,
                 group_col=group_col,
                 overlap_only=overlap_only,
-                lfc_pairs=lfc_pairs,
+                lfc_pairs=lfc_pairs_resolved,
             )
 
             if result.empty:
@@ -1962,36 +1980,24 @@ class Analysis(DataAwareBaseHandler):
     ) -> None:
         """Hybrid: Class validation + external hlp.integrate_data function."""
         def _integrate_data_method():
-            normalization_params = self.analysis_parameters.get('normalization', {})
-            method = normalization_params.get('method',
-                     self.integration_parameters.get('method', 'replicate_matched'))
-            # For lfc normalization, integrate_data always uses replicate_matched mode
-            # (concatenate raw counts across datasets); lfc is applied post-integration
-            # by normalize_integrated_data()
-            if method == 'lfc':
-                method = 'replicate_matched'
+            # integrate_data always concatenates replicate_filtered_data across datasets
+            # using replicate_matched mode. The normalization method (lfc/vst/zscore/etc.)
+            # is applied post-integration by normalize_integrated_data().
+            log.info("Integrating data matrices across data types (concatenating replicate_filtered_data)")
 
-            log.info(f"Integrating data matrices across data types (method={method})")
-
-            # Avoid stale cache/file reuse when switching modes
-            can_reuse_cached = (
-                method == "replicate_matched"
-                and self.check_and_load_attribute(
-                    "integrated_data",
-                    self._integrated_data_filename,
-                    overwrite or self.overwrite
-                )
-            )
-            if can_reuse_cached:
+            if self.check_and_load_attribute(
+                "integrated_data",
+                self._integrated_data_filename,
+                overwrite or self.overwrite
+            ):
                 log.info(
                     f"\tIntegrated data object 'integrated_data' with "
                     f"{self.integrated_data.shape[0]} features and {self.integrated_data.shape[1]} columns."
                 )
-                # Store the original normalization method (lfc/vst/zscore/etc.) not the integration mode
+                # Set integration_mode from config even on cache hit
                 normalization_params = self.analysis_parameters.get('normalization', {})
-                original_method = normalization_params.get('method',
-                                  self.integration_parameters.get('method', 'replicate_matched'))
-                self.integration_mode = original_method if original_method in {'lfc', 'vst', 'zscore', 'modified_zscore', 'rank_normal'} else 'replicate_matched'
+                self.integration_mode = normalization_params.get('method',
+                    self.integration_parameters.get('method', 'replicate_matched'))
                 return
 
             result = hlp.integrate_data(
@@ -1999,7 +2005,7 @@ class Analysis(DataAwareBaseHandler):
                 overlap_only=overlap_only,
                 output_filename=self._integrated_data_filename,
                 output_dir=self.output_dir,
-                method=method,
+                method='replicate_matched',   # always concatenate; normalization happens later
                 group_col=group_col,
                 sample_col=sample_col,
                 data_attr=data_attr,
@@ -2012,11 +2018,10 @@ class Analysis(DataAwareBaseHandler):
                 sys.exit(1)
 
             self.integrated_data = result
-            # Store the original normalization method (lfc/vst/zscore/etc.) not the integration mode
+            # Record the normalization method that will be applied by normalize_integrated_data()
             normalization_params = self.analysis_parameters.get('normalization', {})
-            original_method = normalization_params.get('method',
-                              self.integration_parameters.get('method', 'replicate_matched'))
-            self.integration_mode = original_method if original_method in {'lfc', 'vst', 'zscore', 'modified_zscore', 'rank_normal'} else 'replicate_matched'
+            self.integration_mode = normalization_params.get('method',
+                self.integration_parameters.get('method', 'replicate_matched'))
             log.info(
                 f"Created integrated data table with {self.integrated_data.shape[0]} features "
                 f"and {self.integrated_data.shape[1]} columns."
@@ -2169,12 +2174,26 @@ class Analysis(DataAwareBaseHandler):
             if self.check_and_load_attribute('integrated_data_selected', self._integrated_data_selected_filename, self.overwrite):
                 log.info(f"\tFeature selection data object 'integrated_data_selected' with {self.integrated_data_selected.shape[0]} features and {self.integrated_data_selected.shape[1]} samples.")
                 return
-            
+
             feature_selection_params = self.analysis_parameters.get('feature_selection', {})
+
+            # Guard: for lfc mode, only lfc and variance selection are valid because
+            # other methods (glm, kruskal, lasso, random_forest, mutual_info) require
+            # a sample-level metadata table, but lfc mode produces a contrast-level matrix.
+            selected_method = feature_selection_params.get('selected_method', '')
+            lfc_incompatible = {'glm', 'kruskalwallis', 'lasso', 'random_forest', 'mutual_info'}
+            if self.integration_mode == 'lfc' and selected_method.lower() in lfc_incompatible:
+                raise ValueError(
+                    f"Feature selection method '{selected_method}' requires sample-level metadata "
+                    f"but integration_mode is 'lfc' (contrast-level matrix). "
+                    f"Use 'lfc' or 'variance' as the selected_method in analysis.yml "
+                    f"when normalization.method is 'lfc'."
+                )
+
             call_params = {
                 'data': self.integrated_data,
                 'metadata': self.integrated_metadata,
-                'config': feature_selection_params, 
+                'config': feature_selection_params,
                 'output_dir': self.output_dir,
                 'output_filename': self._integrated_data_selected_filename,
             }
