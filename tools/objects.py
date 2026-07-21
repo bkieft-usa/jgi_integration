@@ -17,8 +17,6 @@ import inspect
 import re
 import time
 import hashlib
-import duckdb
-import openai
 import json
 from pathlib import Path
 
@@ -57,16 +55,16 @@ class ConfigManager:
         Detect which analysis config file is present in the config directory.
 
         Checks in order:
-        1. ``analysis_lfc.yml``              — LFC branch
-        2. ``analysis_replicate_matched.yml`` — replicate-matched branch
-        3. ``analysis.yml``                  — legacy single-file config
+        1. ``analysis.yml``                  — unified config (current)
+        2. ``analysis_lfc.yml``              — legacy LFC branch
+        3. ``analysis_replicate_matched.yml`` — legacy replicate-matched branch
 
         Raises ``FileNotFoundError`` if none are found.
         """
         candidates = [
+            self.config_dir / "analysis.yml",
             self.config_dir / "analysis_lfc.yml",
             self.config_dir / "analysis_replicate_matched.yml",
-            self.config_dir / "analysis.yml",
         ]
         for candidate in candidates:
             if candidate.exists():
@@ -74,7 +72,7 @@ class ConfigManager:
                 return candidate
         raise FileNotFoundError(
             f"No analysis config file found in {self.config_dir}. "
-            "Expected one of: analysis_lfc.yml, analysis_replicate_matched.yml, analysis.yml"
+            "Expected: analysis.yml"
         )
 
     def _standard_configs_exist(self) -> bool:
@@ -212,191 +210,7 @@ class ConfigManager:
             'data_processing_hash': data_hash,
             'analysis_hash': analysis_hash
         }
-
-class DataRegistry:
-    """Registry that automatically syncs DataFrames to DuckDB for AI querying."""
     
-    def __init__(self, db_path: str = ":memory:"):
-        self.conn = duckdb.connect(db_path)
-        self.table_metadata = {}
-        self._setup_schema()
-    
-    def _setup_schema(self):
-        """Create metadata tables for tracking datasets and analyses."""
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS data_catalog (
-                table_name VARCHAR PRIMARY KEY,
-                object_type VARCHAR,  -- 'dataset' or 'analysis'
-                object_name VARCHAR,  -- dataset_name or analysis identifier
-                attribute_name VARCHAR,
-                description VARCHAR,
-                shape_rows INTEGER,
-                shape_cols INTEGER,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-    
-    def register_dataframe(self, df: pd.DataFrame, table_name: str, 
-                        object_type: str, object_name: str, 
-                        attribute_name: str, description: str = ""):
-        """Register a DataFrame in DuckDB with metadata."""
-        if df.empty:
-            return
-        
-        # Check if the index contains meaningful data (not just default numeric index)
-        has_meaningful_index = not df.index.equals(pd.RangeIndex(len(df)))
-        
-        # Store the DataFrame with index preserved if meaningful
-        if has_meaningful_index:
-            # Reset index to make it a column, then register
-            df_with_index = df.reset_index()
-            self.conn.register(table_name, df_with_index)
-        else:
-            # Store DataFrame as-is
-            self.conn.register(table_name, df)
-        
-        # Update catalog with index information
-        self.conn.execute("""
-            INSERT OR REPLACE INTO data_catalog 
-            (table_name, object_type, object_name, attribute_name, description, shape_rows, shape_cols)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (table_name, object_type, object_name, attribute_name, description, len(df), len(df.columns)))
-        
-        self.table_metadata[table_name] = {
-            'object_type': object_type,
-            'object_name': object_name,
-            'attribute_name': attribute_name,
-            'columns': list(df_with_index.columns if has_meaningful_index else df.columns),
-            'dtypes': {col: str(dtype) for col, dtype in (df_with_index.dtypes if has_meaningful_index else df.dtypes).items()},
-            'has_meaningful_index': has_meaningful_index,
-            'index_name': df.index.name if has_meaningful_index else None
-        }
-    
-    def get_schema_info(self) -> str:
-        """Get human-readable schema information for the AI agent."""
-        catalog_df = self.conn.execute("SELECT * FROM data_catalog ORDER BY object_type, object_name").df()
-        
-        schema_info = "Available Tables:\n\n"
-        for _, row in catalog_df.iterrows():
-            table_name = row['table_name']
-            metadata = self.table_metadata.get(table_name, {})
-            
-            schema_info += f"Table: {table_name}\n"
-            schema_info += f"  - Type: {row['object_type']} ({row['object_name']})\n"
-            schema_info += f"  - Attribute: {row['attribute_name']}\n"
-            schema_info += f"  - Shape: {row['shape_rows']} rows by {row['shape_cols']} columns\n"
-            schema_info += f"  - Description: {row['description']}\n"
-            
-            if 'columns' in metadata:
-                schema_info += f"  - Columns: {', '.join(metadata['columns'])}\n"
-            schema_info += "\n"
-        
-        return schema_info
-
-class AIQueryAgent:
-    """AI agent that converts natural language to SQL queries."""
-    
-    def __init__(self, data_registry: DataRegistry, openai_api_key: str = None):
-        self.data_registry = data_registry
-        self.client = None
-        if openai_api_key:
-            # Initialize the OpenAI client for CBorg with the new API
-            self.client = openai.OpenAI(api_key=openai_api_key, base_url="https://api.cborg.lbl.gov")
-    
-    def query(self, natural_language_query: str, limit: int = 500) -> pd.DataFrame:
-        """Convert natural language to SQL and execute."""
-        try:
-            sql_query = self._generate_sql(natural_language_query)
-            print(f"Generated SQL: {sql_query}")
-            
-            # Add safety limit
-            if "LIMIT" not in sql_query.upper():
-                sql_query += f" LIMIT {limit}"
-            
-            result = self.data_registry.conn.execute(sql_query).df()
-            return result
-            
-        except Exception as e:
-            print(f"Query failed: {e}")
-            return pd.DataFrame()
-    
-    def _generate_sql(self, query: str) -> str:
-        """Generate SQL from natural language using AI."""
-        schema_info = self.data_registry.get_schema_info()
-        
-        prompt = f"""
-You are a SQL expert. Convert the following natural language query to SQL using DuckDB syntax.
-
-Database Schema:
-{schema_info}
-
-User Query: "{query}"
-
-Rules:
-1. Use exact table and column names from the schema
-2. Return only the SQL query, no explanations
-3. Use proper DuckDB syntax
-4. Handle common variations in natural language input appropriately
-5. If filtering by numeric values, use appropriate comparison operators
-6. IMPORTANT: Submodule values are stored as strings like 'submodule_1', 'submodule_15', etc. When filtering by submodule number, use the format 'submodule_X' where X is the number
-7. Do NOT wrap the response in markdown code blocks or backticks
-8. For p-value or statistical significance queries, look for columns containing 'pvalue', 'p_value', 'corrected_pvalue', or similar
-9. When filtering by text content "containing" or "with phrase", use LIKE operator with wildcards (e.g., column LIKE '%text%')
-10. For "not equal" conditions like "not 'Unassigned'", use != or <> operator
-11. When querying correlation data, look for columns like 'correlation', 'corr_score', or similar numerical correlation measures
-12. For network/node queries, prioritize tables with 'node' in the name over 'edge' tables
-13. When filtering by annotation classes or categories, look for columns ending in '_class', '_category', '_annotation', or '_superclass'
-14. Handle case-insensitive text matching when appropriate using UPPER() or LOWER() functions
-
-Common Query Patterns:
-- "submodule X" → WHERE submodule = 'submodule_X'
-- "correlation > 0.7" → WHERE correlation > 0.7 (or similar correlation column)
-- "p value < 0.05" → WHERE pvalue < 0.05 (or corrected_pvalue, etc.)
-- "contains 'text'" → WHERE column LIKE '%text%'
-- "not 'value'" → WHERE column != 'value'
-
-SQL Query:
-"""
-
-        if self.client:
-            try:
-                response = self.client.chat.completions.create(
-                    model="anthropic/claude-sonnet",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0
-                )
-                sql_query = response.choices[0].message.content.strip()
-                
-                # Clean up any markdown formatting that might still appear
-                sql_query = self._clean_sql_response(sql_query)
-                
-                return sql_query
-            except Exception as e:
-                raise ValueError(f"OpenAI API call failed: {e}")
-    
-    def _clean_sql_response(self, sql_response: str) -> str:
-        """Clean up SQL response from AI to remove markdown formatting."""
-        # Remove markdown code blocks
-        if sql_response.startswith('```sql'):
-            sql_response = sql_response[6:]
-        elif sql_response.startswith('```'):
-            sql_response = sql_response[3:]
-        
-        if sql_response.endswith('```'):
-            sql_response = sql_response[:-3]
-        
-        # Remove any remaining backticks
-        sql_response = sql_response.replace('`', '')
-        
-        # Clean up whitespace
-        sql_response = sql_response.strip()
-        
-        # Remove trailing semicolon to prevent syntax errors when adding LIMIT
-        if sql_response.endswith(';'):
-            sql_response = sql_response[:-1]
-        
-        return sql_response
-
 class WorkflowProgressTracker:
     """Class to track and visualize workflow progress."""
     
@@ -428,7 +242,6 @@ class WorkflowProgressTracker:
             {'id': 'calculate_correlations', 'label': 'Calculate Correlations', 'category': 'analysis'},
             {'id': 'plot_correlation_network', 'label': 'Plot Correlation Network', 'category': 'analysis'},
             {'id': 'group_features', 'label': 'Group Features', 'category': 'analysis'},
-            #{'id': 'run_mofa2', 'label': 'Run MOFA2 Analysis', 'category': 'analysis'}
         ]
         
         # Add step numbers and status
@@ -930,58 +743,7 @@ class BaseDataHandler:
             del self._cache[key]
 
 
-class DataAwareBaseHandler(BaseDataHandler):
-    """Enhanced base class with automatic data registry integration."""
-    
-    def __init__(self, output_dir: str, data_registry: Optional['DataRegistry'] = None):
-        super().__init__(output_dir)
-        self.data_registry = data_registry
-        self._auto_register_enabled = data_registry is not None
-    
-    def _set_df(self, key, filename, df):
-        """Enhanced setter that also registers with data registry."""
-        super()._set_df(key, filename, df)
-        
-        if self._auto_register_enabled and not df.empty:
-            self._register_dataframe(key, df)
-    
-    def _register_dataframe(self, attribute_name: str, df: pd.DataFrame):
-        """Register DataFrame with the data registry."""
-        if not self.data_registry:
-            return
-        
-        object_type = "dataset" if hasattr(self, 'dataset_name') else "analysis"
-        object_name = getattr(self, 'dataset_name', '')
-        table_name = f"{object_type}_{object_name}_{attribute_name}"
-        
-        # Get description from attribute docstring or config
-        description = self._get_attribute_description(attribute_name)
-        
-        self.data_registry.register_dataframe(
-            df=df,
-            table_name=table_name,
-            object_type=object_type,
-            object_name=object_name,
-            attribute_name=attribute_name,
-            description=description
-        )
-    
-    def _get_attribute_description(self, attribute_name: str) -> str:
-        """Get human-readable description for the attribute."""
-        descriptions = {
-            'raw_data': 'Raw unprocessed data matrix',
-            'filtered_data': 'Data after filtering rare features',
-            'replicate_filtered_data': 'Devarianced data after replicate outlier filtering',
-            'linked_metadata': 'Metadata linked across samples',
-            'feature_network_node_table': 'Network nodes with submodule assignments',
-            'feature_correlation_table': 'Pairwise feature correlations',
-            'feature_correlation_table_magi': 'Pairwise feature correlations with MAGI results',
-            'integrated_data': 'Combined data from multiple datasets',
-            # Add more as needed
-        }
-        return descriptions.get(attribute_name, f"Data attribute: {attribute_name}")
-
-class Dataset(DataAwareBaseHandler):
+class Dataset(BaseDataHandler):
     """Simplified Dataset class using hash-based tagging."""
 
     def __init__(self, dataset_name: str, project: Project, overwrite: bool = False, superuser: bool = False):
@@ -1007,8 +769,7 @@ class Dataset(DataAwareBaseHandler):
         log.info(f"Processing tag: {self.data_processing_tag}")
         log.info(f"Output directory: {self.output_dir}")
         
-        # Initialize with data registry support (will be set later by Analysis)
-        super().__init__(self.output_dir, data_registry=None)
+        super().__init__(self.output_dir)
 
         # Set up filename attributes
         self._setup_dataset_filenames()
@@ -1640,8 +1401,8 @@ class TX(Dataset):
             _generate_annotation_method()
             return
 
-class Analysis(DataAwareBaseHandler):
-    """Enhanced Analysis class with hash-based tagging and AI query capabilities."""
+class Analysis(BaseDataHandler):
+    """Analysis class with hash-based tagging."""
     
     def __init__(self, project: Project, datasets: list = None, overwrite: bool = False):
         self.project = project
@@ -1667,33 +1428,49 @@ class Analysis(DataAwareBaseHandler):
         log.info(f"Analysis tag: {self.analysis_tag}")
         log.info(f"Output directory: {self.output_dir}")
 
-        # Initialize data registry
-        self.data_registry = DataRegistry(db_path=os.path.join(self.output_dir, "analysis_data.db"))
-        super().__init__(self.output_dir, self.data_registry)
-        
-        # Initialize AI agent
-        api_key = hlp.load_openai_api_key()
-        self.ai_agent = AIQueryAgent(self.data_registry, openai_api_key=api_key)
-
+        super().__init__(self.output_dir)
         self._setup_analysis_filenames()
 
-        # analysis_config is now the flat 'analysis:' block.
-        # Branch is detected by which top-level keys are present:
-        #   lfc branch:                analysis_config has 'lfc' key
-        #   replicate_matched branch:  analysis_config has 'scaling' key
+        # analysis_config is the flat 'analysis:' block from analysis.yml.
+        # The track is read from the 'track' key (new unified config).
+        # Legacy configs (analysis_lfc.yml / analysis_replicate_matched.yml) are
+        # mapped to the new track names for backward compatibility.
         self.datasets = datasets or []
 
-        # Detect integration mode from config structure
-        if 'lfc' in self.analysis_config:
-            self._integration_mode: str = 'lfc'
+        # Detect track from config
+        if 'track' in self.analysis_config:
+            # New unified analysis.yml
+            self._integration_mode: str = self.analysis_config['track']
+        elif 'lfc' in self.analysis_config:
+            # Legacy analysis_lfc.yml
+            self._integration_mode: str = 'condition_resolution'
+            log.warning(
+                "Legacy analysis_lfc.yml detected — mapping to track='condition_resolution'. "
+                "Please migrate to analysis.yml."
+            )
         elif 'scaling' in self.analysis_config:
-            self._integration_mode: str = 'replicate_matched'
+            # Legacy analysis_replicate_matched.yml
+            self._integration_mode: str = 'sample_resolution'
+            log.warning(
+                "Legacy analysis_replicate_matched.yml detected — mapping to track='sample_resolution'. "
+                "Please migrate to analysis.yml."
+            )
         else:
-            # Fallback: check old normalization.mode key for backward compat
+            # Fallback
             norm = self.analysis_config.get('normalization', {})
-            self._integration_mode: str = norm.get('mode', 'lfc')
+            legacy_mode = norm.get('mode', 'condition_resolution')
+            self._integration_mode: str = (
+                'sample_resolution' if legacy_mode == 'replicate_matched' else 'condition_resolution'
+            )
 
-        log.info(f"integration_mode detected as '{self._integration_mode}' from analysis config")
+        valid_tracks = {'sample_resolution', 'condition_resolution'}
+        if self._integration_mode not in valid_tracks:
+            raise ValueError(
+                f"analysis.track must be one of {valid_tracks}, got '{self._integration_mode}'. "
+                "Check your analysis.yml."
+            )
+
+        log.info(f"Track detected as '{self._integration_mode}' from analysis config")
     
         log.info(f"Created analysis with {len(self.datasets)} datasets.")
         for ds in self.datasets:
@@ -1704,35 +1481,32 @@ class Analysis(DataAwareBaseHandler):
     @property
     def analysis_parameters(self) -> dict:
         """
-        Returns the flat analysis config dict directly.
-
-        The new config layout (analysis_lfc.yml / analysis_replicate_matched.yml) is flat —
-        top-level keys are 'lfc', 'scaling', 'feature_selection', 'feature_grouping', etc.
-        This property makes all existing ``self.analysis_parameters.get(...)`` calls work
-        without modification by returning ``self.analysis_config`` directly.
+        Returns the flat analysis config dict directly so that all
+        ``self.analysis_parameters.get(...)`` calls work without modification.
         """
         return self.analysis_config
 
     @property
     def integration_mode(self) -> str:
         """
-        The integration mode detected from the analysis config structure.
+        The workflow track detected from analysis.yml → analysis.track.
 
-        * ``"replicate_matched"`` — replicates are paired across data types.
-          Per-dataset scaling (``scale_all_datasets()``) is applied first, then
-          datasets are concatenated.  An optional post-integration z-score pass
-          can be applied via ``normalize_integrated_data()``.
-        * ``"lfc"`` — replicates are not paired; LFC of group medians is computed
-          during ``integrate_data()``.  Per-dataset scaling is skipped.
+        * ``"sample_resolution"``    — replicates are paired across data types.
+          Columns are aligned by Sample ID, row-wise Z-score is applied per
+          dataset, matrices are concatenated, and Pearson/Spearman correlation
+          followed by HDBSCAN or network clustering identifies co-varying modules.
+        * ``"condition_resolution"`` — replicates are not paired.  Replicates are
+          collapsed to per-condition means (centroid or LFC sub-approach), then
+          row-wise Z-score, concatenation, and clustering are applied.
 
         All downstream methods use ``self.integrated_data_selected`` as their
-        quantitative input regardless of which mode is active.
+        quantitative input regardless of which track is active.
         """
         return self._integration_mode
 
     @integration_mode.setter
     def integration_mode(self, value: str) -> None:
-        valid = {"replicate_matched", "lfc"}
+        valid = {"sample_resolution", "condition_resolution"}
         if value not in valid:
             raise ValueError(f"integration_mode must be one of {valid}, got '{value}'")
         self._integration_mode = value
@@ -1765,8 +1539,6 @@ class Analysis(DataAwareBaseHandler):
             'feature_network_graph': 'feature_network_graph.graphml',
             'feature_network_edge_table': 'feature_network_edge_table.csv',
             'feature_network_node_table': 'feature_network_node_table.csv',
-            'functional_enrichment_table': 'functional_enrichment_table.csv',
-            #'mofa_data': 'mofa_data.csv',
         }
         for attr, filename in manual_file_storage.items():
             setattr(self, f"_{attr}_filename", filename)
@@ -1839,43 +1611,35 @@ class Analysis(DataAwareBaseHandler):
 
     def scale_all_datasets(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
         """
-        Apply per-dataset scaling to all datasets (replicate_matched mode only).
+        Apply per-dataset log2 + row-wise Z-score scaling (sample_resolution track only).
 
-        In **replicate_matched** mode, each dataset is scaled independently before
-        concatenation so that different data types (e.g. RNA counts vs metabolite
-        peak heights) are brought to a comparable scale.  The scaling method and
-        parameters are read from the analysis config (``analysis_replicate_matched.yml``)
-        under the top-level ``scaling`` block, which is shared across all datasets.
+        In **sample_resolution** track, each dataset is log2-transformed and then
+        row-wise Z-scored independently before concatenation so that different data
+        types (RNA counts, metabolite peak heights) are brought to a comparable scale.
 
-        In **lfc** mode this step is skipped automatically because LFC computation
-        is scale-invariant — absolute differences between data types cancel out when
-        computing log2 ratios of group medians.
+        In **condition_resolution** track this step is skipped — condition means and
+        optional LFC subtraction are handled inside ``integrate_data()``.
         """
         def _scale_method():
-            if self.integration_mode == 'lfc':
+            if self.integration_mode == 'condition_resolution':
                 log.info(
-                    "Skipping per-dataset scaling (integration_mode='lfc'). "
-                    "LFC is scale-invariant; scaling is not needed before integration."
+                    "Skipping per-dataset scaling (track='condition_resolution'). "
+                    "Condition collapsing and Z-scoring are handled in integrate_data()."
                 )
                 return
 
-            # Read scaling config from analysis config (analysis_replicate_matched.yml → scaling block)
-            scaling_cfg = self.analysis_config.get('scaling', {})
-            scaling_p = scaling_cfg.get('params', scaling_cfg)
-            norm_method = scaling_cfg.get('method', 'vst')
-            log2 = scaling_p.get('log2', True)
-
+            # sample_resolution: log2 + row-wise zscore per dataset
             log.info(
-                f"Scaling individual datasets before integration "
-                f"(replicate_matched mode, method='{norm_method}')..."
+                "Scaling individual datasets before integration "
+                "(sample_resolution track: log2 → row-wise Z-score per dataset)..."
             )
             for ds in self.datasets:
                 log.info(f"  Scaling {ds.dataset_name}...")
                 ds.scale_data(
                     overwrite=overwrite,
                     show_progress=False,
-                    norm_method=norm_method,
-                    log2=log2,
+                    norm_method='zscore',
+                    log2=True,
                     **kwargs
                 )
 
@@ -2019,18 +1783,17 @@ class Analysis(DataAwareBaseHandler):
         self,
         group_col: str = "group",
         overlap_only: bool = True,
-        lfc_pairs: Optional[List[Any]] = None,
         overwrite: bool = False,
         show_progress: bool = True
     ) -> None:
         """Hybrid: Class validation + external hlp.integrate_metadata function."""
         def _integrate_metadata_method():
-            mode = self.integration_mode
-            log.info(f"Integrating metadata across data types (integration_mode='{mode}')")
+            track = self.integration_mode
+            log.info(f"Integrating metadata across data types (track='{track}')")
 
-            # Avoid stale cache/file reuse when switching modes
+            # sample_resolution produces sample-level metadata; reuse cache safely
             can_reuse_cached = (
-                mode == "replicate_matched"
+                track == "sample_resolution"
                 and self.check_and_load_attribute(
                     "integrated_metadata",
                     self._integrated_metadata_filename,
@@ -2044,12 +1807,8 @@ class Analysis(DataAwareBaseHandler):
                 )
                 return
 
-            # For lfc mode, pass lfc_pairs from config if not provided as argument
-            if mode == 'lfc' and lfc_pairs is None:
-                lfc_cfg = self.analysis_config.get('lfc', {})
-                lfc_pairs_resolved = lfc_cfg.get('lfc_pairs', None)
-            else:
-                lfc_pairs_resolved = lfc_pairs
+            # Map new track names to the helper's method parameter
+            helper_method = 'replicate_matched' if track == 'sample_resolution' else 'lfc'
 
             result = hlp.integrate_metadata(
                 datasets=self.datasets,
@@ -2057,10 +1816,10 @@ class Analysis(DataAwareBaseHandler):
                 unifying_col="unique_group",
                 output_filename=self._integrated_metadata_filename,
                 output_dir=self.output_dir,
-                method=mode,
+                method=helper_method,
                 group_col=group_col,
                 overlap_only=overlap_only,
-                lfc_pairs=lfc_pairs_resolved,
+                lfc_pairs=None,
             )
 
             if result.empty:
@@ -2089,43 +1848,25 @@ class Analysis(DataAwareBaseHandler):
         overlap_only: bool = True,
         group_col: str = "group",
         sample_col: str = "unique_group",
-        pseudocount: float = 1.0,
-        lfc_pairs: Optional[List[Any]] = None,
         overwrite: bool = False,
         show_progress: bool = True
     ) -> None:
         """
         Integrate datasets into a single feature matrix.
 
-        Branches on ``integration_mode`` detected from the analysis config
-        (``analysis_lfc.yml`` or ``analysis_replicate_matched.yml``):
+        Dispatches on ``integration_mode`` (``analysis.track`` in analysis.yml):
 
-        * **lfc** mode — LFC of group medians is computed per dataset and the
-          resulting contrast matrices are concatenated.  Input is
-          ``replicate_filtered_data`` (raw counts / peak heights).  The output
-          ``integrated_data`` is already in LFC space; ``normalize_integrated_data()``
-          is a no-op in this mode.
+        * **sample_resolution** — ``scaled_data`` (log2 + row-wise Z-score, produced by
+          ``scale_all_datasets()``) is concatenated across datasets.  The output is a
+          features × samples matrix ready for Pearson/Spearman correlation.
 
-        * **replicate_matched** mode — ``scaled_data`` (produced by
-          ``scale_all_datasets()``) is concatenated across datasets.  An optional
-          post-integration z-score pass can be applied via
-          ``normalize_integrated_data()``.
+        * **condition_resolution** — ``replicate_filtered_data`` is used.  Replicates
+          are collapsed to per-condition means (centroid), then optionally the control
+          group mean is subtracted (LFC sub-approach), followed by row-wise Z-score
+          across conditions.  The output is a features × conditions matrix.
         """
         def _integrate_data_method():
-            mode = self.integration_mode
-
-            # Resolve lfc_pairs from config if not passed as argument
-            if lfc_pairs is None:
-                lfc_cfg = self.analysis_config.get('lfc', {})
-                lfc_pairs_resolved = lfc_cfg.get('lfc_pairs', None)
-                group_col_resolved = lfc_cfg.get('group_col', group_col)
-                sample_col_resolved = lfc_cfg.get('sample_col', sample_col)
-                pseudocount_resolved = lfc_cfg.get('pseudocount', pseudocount)
-            else:
-                lfc_pairs_resolved = lfc_pairs
-                group_col_resolved = group_col
-                sample_col_resolved = sample_col
-                pseudocount_resolved = pseudocount
+            track = self.integration_mode
 
             if self.check_and_load_attribute(
                 "integrated_data",
@@ -2136,32 +1877,20 @@ class Analysis(DataAwareBaseHandler):
                     f"\tIntegrated data object 'integrated_data' with "
                     f"{self.integrated_data.shape[0]} features and {self.integrated_data.shape[1]} columns."
                 )
-                self.integration_mode = mode
+                self.integration_mode = track
                 return
 
-            if mode == 'lfc':
-                log.info("Integrating data matrices in LFC mode (log2 fold-change of group medians)...")
-                result = hlp.integrate_data(
-                    datasets=self.datasets,
-                    overlap_only=overlap_only,
-                    output_filename=self._integrated_data_filename,
-                    output_dir=self.output_dir,
-                    method='lfc',
-                    group_col=group_col_resolved,
-                    sample_col=sample_col_resolved,
-                    data_attr='replicate_filtered_data',
-                    pseudocount=pseudocount_resolved,
-                    lfc_pairs=lfc_pairs_resolved,
+            if track == 'sample_resolution':
+                log.info(
+                    "Integrating data matrices in sample_resolution track "
+                    "(concatenating log2 + row-wise Z-scored data)..."
                 )
-            else:
-                # replicate_matched: concatenate per-dataset scaled data
-                log.info("Integrating data matrices in replicate_matched mode (concatenating scaled_data)...")
-                # Verify scaled_data exists on each dataset
                 for ds in self.datasets:
                     if not hasattr(ds, 'scaled_data') or ds.scaled_data is None or ds.scaled_data.empty:
                         raise RuntimeError(
                             f"Dataset '{ds.dataset_name}' has no scaled_data. "
-                            "Run analysis.scale_all_datasets() before integrate_data() in replicate_matched mode."
+                            "Run analysis.scale_all_datasets() before integrate_data() "
+                            "in sample_resolution track."
                         )
                 result = hlp.integrate_data(
                     datasets=self.datasets,
@@ -2169,11 +1898,29 @@ class Analysis(DataAwareBaseHandler):
                     output_filename=self._integrated_data_filename,
                     output_dir=self.output_dir,
                     method='replicate_matched',
-                    group_col=group_col_resolved,
-                    sample_col=sample_col_resolved,
+                    group_col=group_col,
+                    sample_col=sample_col,
                     data_attr='scaled_data',
-                    pseudocount=pseudocount_resolved,
-                    lfc_pairs=lfc_pairs_resolved,
+                    pseudocount=1.0,
+                    lfc_pairs=None,
+                )
+            else:
+                # condition_resolution: collapse replicates → centroid or LFC → row-wise zscore
+                condition_approach = self.analysis_config.get('condition_approach', 'centroid')
+                control_group = self.analysis_config.get('lfc', {}).get('control_group', None)
+                log.info(
+                    f"Integrating data matrices in condition_resolution track "
+                    f"(approach='{condition_approach}')..."
+                )
+                result = hlp.integrate_data_condition_resolution(
+                    datasets=self.datasets,
+                    overlap_only=overlap_only,
+                    output_filename=self._integrated_data_filename,
+                    output_dir=self.output_dir,
+                    group_col=group_col,
+                    sample_col=sample_col,
+                    condition_approach=condition_approach,
+                    control_group=control_group,
                 )
 
             if result.empty:
@@ -2181,12 +1928,12 @@ class Analysis(DataAwareBaseHandler):
                 sys.exit(1)
 
             self.integrated_data = result
-            self.integration_mode = mode
+            self.integration_mode = track
             log.info(
                 f"Created integrated data table with {self.integrated_data.shape[0]} features "
                 f"and {self.integrated_data.shape[1]} columns."
             )
-            log.info(f"integration_mode set to '{self.integration_mode}'")
+            log.info(f"track set to '{self.integration_mode}'")
             log.info(f"Created table: {self._integrated_data_filename}")
             log.info("Created attribute: integrated_data")
 
@@ -2200,101 +1947,26 @@ class Analysis(DataAwareBaseHandler):
 
     def normalize_integrated_data(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
         """
-        Post-integration normalization step.
+        Post-integration verification step (no-op in the unified workflow).
 
-        Behaviour depends on ``integration_mode`` detected from the analysis config
-        (``analysis_lfc.yml`` or ``analysis_replicate_matched.yml``):
+        Both tracks produce a fully normalized matrix directly from ``integrate_data()``:
 
-        **lfc mode**
-            ``integrated_data`` is already in LFC space (produced by
-            ``integrate_data()``).  This method simply copies it to
-            ``integrated_data_selected`` with no further transformation.
+        * **sample_resolution** — concatenated log2 + row-wise Z-scored data.
+        * **condition_resolution** — condition means (centroid or LFC) + row-wise Z-score.
 
-        **replicate_matched mode**
-            Applies an optional second-pass normalization to the concatenated
-            scaled matrix.  The method is read from
-            ``normalization.post_integration.method``:
+        This method is kept for backward compatibility and workflow clarity, but does
+        **not** write ``integrated_data_selected`` to disk (that would cause
+        ``perform_feature_selection()`` to skip due to a cache hit on the same filename).
 
-            - ``null`` / ``None`` — skip; copy ``integrated_data`` as-is.
-            - ``"zscore"``         — z-score per sample (column-wise).
-            - ``"modified_zscore"``— modified z-score (median-based) per sample.
-            - ``"rank_normal"``    — rank-based inverse normal transformation.
-
-        The result is stored as ``self.integrated_data_selected`` and written to disk.
+        ``perform_feature_selection()`` reads directly from ``integrated_data`` and
+        writes the final ``integrated_data_selected``.
         """
         def _normalize_method():
-            log.info("Normalizing Integrated Data")
-            if self.check_and_load_attribute(
-                'integrated_data_selected',
-                self._integrated_data_selected_filename,
-                overwrite or self.overwrite
-            ):
-                log.info(
-                    f"\tNormalized integrated data already exists with "
-                    f"{self.integrated_data_selected.shape[0]} features."
-                )
-                return
-
-            mode = self.integration_mode
-
-            if mode == 'lfc':
-                # LFC data is already in the correct space — pass through
-                log.info(
-                    "integration_mode='lfc': integrated_data is already in LFC space. "
-                    "Copying to integrated_data_selected without further transformation."
-                )
-                result = self.integrated_data.copy()
-                hlp.write_integration_file(result, self.output_dir, self._integrated_data_selected_filename, indexing=True)
-
-            else:
-                # replicate_matched: optional post-integration pass
-                # Read from flat analysis config: analysis_replicate_matched.yml → post_integration block
-                post_cfg = self.analysis_config.get('post_integration', {})
-                post_p = post_cfg.get('params', post_cfg)
-                post_method = post_cfg.get('method', None)
-                log2 = post_p.get('log2', False)
-
-                if post_method is None or str(post_method).lower() in ('null', 'none', ''):
-                    log.info(
-                        "post_integration.method=null: "
-                        "Copying integrated_data to integrated_data_selected without post-integration scaling."
-                    )
-                    result = self.integrated_data.copy()
-                    hlp.write_integration_file(result, self.output_dir, self._integrated_data_selected_filename, indexing=True)
-                else:
-                    log.info(
-                        f"Applying post-integration normalization: method='{post_method}' "
-                        f"to {self.integrated_data.shape[0]} features × {self.integrated_data.shape[1]} samples..."
-                    )
-                    call_params = {
-                        'data': self.integrated_data,
-                        'method': post_method,
-                        'metadata': self.integrated_metadata,
-                        'output_filename': self._integrated_data_selected_filename,
-                        'output_dir': self.output_dir,
-                        'log2': log2,
-                        'group_col': 'group',
-                        'sample_col': 'unique_group',
-                        'pseudocount': 1.0,
-                        'lfc_pairs': None,
-                    }
-                    call_params.update(kwargs)
-                    result = hlp.normalize_integrated_data(**call_params)
-
-            if result is None or result.empty:
-                log.error(
-                    "normalize_integrated_data resulted in an empty table. "
-                    "Check your data and normalization parameters."
-                )
-                sys.exit(1)
-
-            self.integrated_data_selected = result
             log.info(
-                f"integrated_data_selected: {result.shape[0]} features × {result.shape[1]} "
-                f"{'contrasts' if mode == 'lfc' else 'samples'}"
+                "normalize_integrated_data: integrated_data is already fully normalized "
+                f"(track='{self.integration_mode}'). No further transformation applied. "
+                "Proceeding to perform_feature_selection()."
             )
-            log.info(f"Created table: {self._integrated_data_selected_filename}")
-            log.info("Created attribute: integrated_data_selected")
 
         if show_progress:
             self.workflow_tracker.set_current_step('normalize_integrated_data')
@@ -2370,18 +2042,17 @@ class Analysis(DataAwareBaseHandler):
 
             feature_selection_params = self.analysis_parameters.get('feature_selection', {})
 
-            # Guard: for lfc mode, only lfc and variance selection are valid because
-            # other methods (glm, kruskal, lasso, random_forest, mutual_info) require
-            # a sample-level metadata table, but lfc mode produces a contrast-level matrix.
-            # Support both new layout (method) and old layout (selected_method)
+            # Both tracks support only 'variance' and 'feature_list' — sample-level
+            # statistical tests (glm, kruskal, lasso, etc.) are not valid because the
+            # integrated matrix is already Z-scored and condition/sample-level metadata
+            # is not meaningful for those tests at this stage.
             selected_method = (feature_selection_params.get('method')
                                or feature_selection_params.get('selected_method', ''))
-            lfc_incompatible = {'glm', 'kruskalwallis', 'lasso', 'random_forest', 'mutual_info'}
-            if self.integration_mode == 'lfc' and selected_method.lower() in lfc_incompatible:
+            unsupported = {'glm', 'kruskalwallis', 'lasso', 'random_forest', 'mutual_info', 'lfc'}
+            if selected_method.lower() in unsupported:
                 raise ValueError(
-                    f"Feature selection method '{selected_method}' requires sample-level metadata "
-                    f"but integration_mode is 'lfc' (contrast-level matrix). "
-                    f"Use 'lfc' or 'variance' as the selected_method in analysis_lfc.yml."
+                    f"Feature selection method '{selected_method}' is not supported in the "
+                    f"unified workflow. Use 'variance' or 'feature_list' in analysis.yml."
                 )
 
             call_params = {
@@ -2435,10 +2106,15 @@ class Analysis(DataAwareBaseHandler):
         def _correlation_method():
             log.info("Calculating Correlated Features")
 
-            # Support both old 'correlation' key and new 'feature_grouping.network_modules' key
+            # Bug fix: read 'method' key (new config) with 'selected_method' as legacy fallback.
+            # Bug fix: read correlation params from 'params' flat block (new config layout),
+            #          falling back to the old 'network_modules' sub-key or top-level 'correlation'.
             feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
-            selected_method = feature_grouping_params.get('selected_method', 'network_modules')
-            correlation_params = feature_grouping_params.get('network_modules', self.analysis_parameters.get('correlation', {}))
+            selected_method = (feature_grouping_params.get('method')
+                               or feature_grouping_params.get('selected_method', 'network_modules'))
+            correlation_params = (feature_grouping_params.get('params')
+                                  or feature_grouping_params.get('network_modules')
+                                  or self.analysis_parameters.get('correlation', {}))
 
             if selected_method != 'network_modules':
                 log.info(f"Selected feature grouping method is '{selected_method}'; skipping correlation computation (not required).")
@@ -2562,22 +2238,26 @@ class Analysis(DataAwareBaseHandler):
             submodule_subdir = "submodules"
             submodule_dir = os.path.join(self.output_dir, submodule_subdir)
             os.makedirs(submodule_dir, exist_ok=True)
-            
+
+            # Bug fix: read from feature_grouping.params (new config) instead of
+            # the stale 'networking' key that no longer exists in analysis.yml.
+            feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
+            grouping_params = (feature_grouping_params.get('params')
+                               or feature_grouping_params.get('network_modules', {}))
+
             if self.check_and_load_attribute('feature_network_node_table', self._feature_network_node_table_filename, self.overwrite) and \
                 self.check_and_load_attribute('feature_network_edge_table', self._feature_network_edge_table_filename, self.overwrite):
-                networking_params = self.analysis_parameters.get('networking', {})
                 log.info("Displaying existing network visualization...")
                 hlp.display_existing_network(
                     graph_file=self._feature_network_graph_filename,
                     node_table=self.feature_network_node_table,
                     edge_table=self.feature_network_edge_table,
-                    network_layout=networking_params.get('network_layout', None)
+                    network_layout=grouping_params.get('network_layout', None)
                 )
                 return
             else: # necessary to clear carryover from previous analyses
                 hlp.clear_directory(submodule_dir)
 
-            networking_params = self.analysis_parameters.get('networking', {})
             output_filenames = {
                 'graph': self._feature_network_graph_filename,
                 'node_table': self._feature_network_node_table_filename,
@@ -2593,8 +2273,8 @@ class Analysis(DataAwareBaseHandler):
                 'output_dir': self.output_dir,
                 'output_filenames': output_filenames,
                 'annotation_df': self.feature_annotation_table,
-                'submodule_mode': networking_params.get('submodule_mode', 'community'),
-                'network_layout': networking_params.get('network_layout', None),
+                'submodule_mode': grouping_params.get('submodule_mode', 'louvain'),
+                'network_layout': grouping_params.get('network_layout', 'spring'),
             }
             call_params.update(kwargs)
             
@@ -2711,13 +2391,13 @@ class Analysis(DataAwareBaseHandler):
         """
         Public entry point for feature grouping.
 
-        Reads ``feature_grouping.selected_method`` from the analysis config and
-        dispatches to the appropriate grouping backend:
+        Reads ``feature_grouping.method`` from the analysis config and dispatches
+        to the appropriate grouping backend:
 
         * ``network_modules``        – pairwise correlation → graph → community detection
           (requires ``calculate_correlated_features()`` to have been run first)
-        * ``hierarchical_clustering`` – scipy hierarchical clustering on LFC vectors
-        * ``hdbscan``                – HDBSCAN density-based clustering on LFC vectors
+        * ``hierarchical_clustering`` – scipy hierarchical clustering on Z-scored vectors
+        * ``hdbscan``                – HDBSCAN density-based clustering on Z-scored vectors
 
         All methods write a node table (``feature_network_node_table``) with a
         unified ``group`` column and an edge table (``feature_network_edge_table``)
@@ -2727,7 +2407,9 @@ class Analysis(DataAwareBaseHandler):
         ``feature_correlation_table`` is not yet present.
         """
         feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
-        selected_method = feature_grouping_params.get('selected_method', 'network_modules')
+        # Bug fix: read 'method' key (new config) with 'selected_method' as legacy fallback
+        selected_method = (feature_grouping_params.get('method')
+                           or feature_grouping_params.get('selected_method', 'network_modules'))
 
         # For network_modules, run the correlation step first if needed
         if selected_method == 'network_modules':
@@ -2787,177 +2469,6 @@ class Analysis(DataAwareBaseHandler):
             **plot_kwargs,
         )
 
-    def perform_functional_enrichment(self, overwrite: bool = False, show_progress: bool = False, **kwargs) -> None:
-        """Hybrid: Class parameter setup + external hlp.perform_functional_enrichment function."""
-        def _enrichment_method():
-            log.info("Performing functional enrichment test on network submodules")
-            if self.check_and_load_attribute('functional_enrichment_table', self._functional_enrichment_table_filename, self.overwrite):
-                log.info(f"\tFunctional enrichment table object 'functional_enrichment_table' with {self.functional_enrichment_table.shape[0]} functional categories.")
-                return
-
-            feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
-            # Support both new layout (method + params) and old layout (selected_method + <method_name> block)
-            selected_method = (feature_grouping_params.get('method')
-                               or feature_grouping_params.get('selected_method', 'network_modules'))
-            if selected_method == 'network_modules':
-                method_params = (feature_grouping_params.get('params')
-                                 or feature_grouping_params.get('network_modules',
-                                    self.analysis_parameters.get('networking', {})))
-                if method_params.get('submodule_mode', 'louvain') == 'none':
-                    log.warning("Submodule mode is set to 'none'; skipping functional enrichment analysis.")
-                    return
-
-            functional_enrichment_params = self.analysis_parameters.get('functional_enrichment', {})
-            # Support both new layout (params sub-block) and old layout (flat keys)
-            fe_p = functional_enrichment_params.get('params', functional_enrichment_params)
-
-            # Ensure node_table has a 'submodule' column (synthesize from 'group' if needed)
-            node_table_for_enrichment = self.feature_network_node_table.copy()
-            if 'submodule' not in node_table_for_enrichment.columns and 'group' in node_table_for_enrichment.columns:
-                node_table_for_enrichment['submodule'] = node_table_for_enrichment['group']
-
-            call_params = {
-                'node_table': node_table_for_enrichment,
-                'annotation_column': fe_p.get('annotation_column', None),
-                'p_value_threshold': fe_p.get('pvalue_cutoff', 0.05),
-                'correction_method': fe_p.get('correction_method', 'fdr_bh'),
-                'min_annotation_count': fe_p.get('min_genes_per_term', 1),
-                'output_dir': self.output_dir,
-                'output_filename': self._functional_enrichment_table_filename,
-            }
-            call_params.update(kwargs)
-            
-            enrichment_table = hlp.perform_functional_enrichment(**call_params)
-
-            if enrichment_table.empty:
-                log.error(f"Performing functional enrichment resulted in empty table. Please check your node table and enrichment parameters.")
-                sys.exit(1)
-            self.functional_enrichment_table = enrichment_table
-            log.info(f"Created table: {self._functional_enrichment_table_filename}")
-            log.info("Created attribute: functional_enrichment_table")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('functional_enrichment')
-            _enrichment_method()
-            self._complete_tracking('functional_enrichment')
-            return
-        else:
-            _enrichment_method()
-            return
-
-    # def run_mofa2_analysis(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
-    #     """Hybrid: Class parameter setup + external hlp.run_full_mofa2_analysis function."""
-    #     def _mofa_method():
-    #         mofa_subdir = "mofa"
-    #         mofa_dir = os.path.join(self.output_dir, mofa_subdir)
-    #         os.makedirs(mofa_dir, exist_ok=True)
-    #         log.info("Running MOFA2 Analysis")
-            
-    #         # Check with subdirectory path
-    #         mofa_data_path = os.path.join(mofa_subdir, self._mofa_data_filename)
-    #         if self.check_and_load_attribute('mofa_data', mofa_data_path, self.overwrite):
-    #             log.info(f"MOFA2 model already exists. Using existing data.")
-    #             return
-
-    #         mofa2_params = self.analysis_parameters.get('mofa', {})
-    #         call_params = {
-    #             'integrated_data': self.integrated_data_selected,
-    #             'mofa2_views': [ds.dataset_name for ds in self.datasets],
-    #             'metadata': self.integrated_metadata,
-    #             'output_dir': mofa_dir,
-    #             'output_filename': self._mofa_data_filename,
-    #             'num_factors': mofa2_params.get('num_mofa_factors', 5),
-    #             'num_features': 10,
-    #             'num_iterations': mofa2_params.get('num_mofa_iterations', 100),
-    #             'training_seed': mofa2_params.get('seed_for_training', 555),
-    #             'overwrite': self.overwrite
-    #         }
-    #         call_params.update(kwargs)
-            
-    #         mofa_data = hlp.run_full_mofa2_analysis(**call_params)
-
-    #         if mofa_data.empty:
-    #             log.error(f"Running MOFA2 analysis resulted in empty model. Please check your integrated data and MOFA2 parameters.")
-    #             sys.exit(1)
-            
-    #         # Temporarily update filename to include subdirectory
-    #         original_filename = self._mofa_data_filename
-    #         self._mofa_data_filename = mofa_data_path
-            
-    #         # Set the attribute (saves to subdirectory)
-    #         self.mofa_data = mofa_data
-            
-    #         # Restore original filename
-    #         self._mofa_data_filename = original_filename
-
-    #         log.info(f"Created table: {self._mofa_data_filename}")
-    #         log.info("Created attribute: mofa_data")
-
-    #     if show_progress:
-    #         self.workflow_tracker.set_current_step('run_mofa2')
-    #         _mofa_method()
-    #         self._complete_tracking('run_mofa2')
-    #         return
-    #     else:
-    #         _mofa_method()
-    #         return
-
-    def query(self, text_query: str, limit: int = 500) -> pd.DataFrame:
-        """Natural language interface to query analysis data."""
-        return self.ai_agent.query(text_query, limit)
-    
-    def register_all_existing_data(self):
-        """Register all existing DataFrames with the registry."""
-        # Register analysis data
-        log.info("Registering data for the analysis object:")
-        for attr_name in ['integrated_data', 'integrated_metadata', 'feature_network_node_table', 
-                         'feature_correlation_table', 'feature_correlation_table_magi','feature_annotation_table', 'functional_enrichment_table']:
-            if hasattr(self, attr_name):
-                df = getattr(self, attr_name)
-                if not df.empty:
-                    log.info(f"Registering analysis attribute '{attr_name}'...")
-                    self._register_dataframe(attr_name, df)
-        
-        # Register dataset data
-        for dataset in self.datasets:
-            log.info(f"Registering data for the dataset object {dataset.dataset_name}:")
-            # Enable data registry for datasets
-            dataset.data_registry = self.data_registry
-            dataset._auto_register_enabled = True
-            
-            # Register dataset attributes
-            for attr_name in ['raw_data', 'replicate_filtered_data', 'linked_metadata', 'linked_data',
-                             'filtered_data', 'annotation_table']:
-                if hasattr(dataset, attr_name):
-                    df = getattr(dataset, attr_name)
-                    if not df.empty:
-                        # Check if method exists before calling
-                        if hasattr(dataset, '_register_dataframe'):
-                            log.info(f"Registering dataset attribute '{attr_name}'...")
-                            dataset._register_dataframe(attr_name, df)
-                        else:
-                            # Fallback: register directly through analysis
-                            self._register_dataset_dataframe(dataset, attr_name, df)
-        
-        log.info("Completed registering all existing data.")
-    
-    def _register_dataset_dataframe(self, dataset, attribute_name: str, df: pd.DataFrame):
-        """Helper method to register dataset DataFrames when dataset doesn't have the method."""
-        if not self.data_registry or df.empty:
-            return
-        
-        table_name = f"dataset_{dataset.dataset_name}_{attribute_name}"
-        description = self._get_attribute_description(attribute_name)
-        
-        self.data_registry.register_dataframe(
-            df=df,
-            table_name=table_name,
-            object_type="dataset",
-            object_name=dataset.dataset_name,
-            attribute_name=attribute_name,
-            description=description
-        )
-
 # Create properties for Analysis class
 manual_file_storage = {
     'integrated_metadata': 'integrated_metadata.csv',
@@ -2970,8 +2481,6 @@ manual_file_storage = {
     'feature_network_graph': 'feature_network_graph.graphml',
     'feature_network_edge_table': 'feature_network_edge_table.csv',
     'feature_network_node_table': 'feature_network_node_table.csv',
-    'functional_enrichment_table': 'functional_enrichment_table.csv',
-    #'mofa_data': 'mofa_data.csv'
 }
 #for attr in config['analysis']['file_storage']:
 for attr, filename in manual_file_storage.items():

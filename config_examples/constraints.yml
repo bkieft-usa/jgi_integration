@@ -18,77 +18,70 @@
 constraints:
 
   # ============================================================
-  # normalization.mode
+  # analysis.track
   # ============================================================
-  normalization.mode:
+  analysis.track:
     options:
-      lfc:
-        label: "LFC (log2 fold-change of group medians)"
+      sample_resolution:
+        label: "Sample-resolution (paired replicates)"
         description: >
-          Replicates are unpaired. LFC of group medians is computed per dataset and
-          concatenated. Per-dataset scaling is skipped (LFC is scale-invariant).
-          The integrated matrix has one column per pairwise group contrast.
-      replicate_matched:
-        label: "Replicate-matched (paired samples)"
+          Replicates are paired across data types (same biological material, matching
+          sample IDs). Columns are aligned by Sample ID, row-wise Z-score is applied
+          per dataset, matrices are concatenated, and Pearson/Spearman correlation
+          followed by HDBSCAN or network clustering identifies co-varying modules.
+      condition_resolution:
+        label: "Condition-resolution (unpaired replicates)"
         description: >
-          Replicates are paired across data types. Per-dataset scaling is applied first
-          (data_processing.yml → scaling), then datasets are concatenated.
-          The integrated matrix has one column per sample.
+          Replicates are not paired. Replicates are collapsed to per-condition means,
+          then either the Centroid or LFC sub-approach is applied before row-wise
+          Z-score, concatenation, and hierarchical/HDBSCAN/network clustering.
 
   # ============================================================
-  # normalization.post_integration.method
+  # analysis.condition_approach
   # ============================================================
-  normalization.post_integration.method:
+  analysis.condition_approach:
     options:
-      null:
-        label: "None (skip post-integration normalization)"
-        description: Data is already per-dataset scaled; no further transformation applied.
-      zscore:
-        label: "Z-score (per sample)"
+      centroid:
+        label: "Centroid (condition means)"
         requires:
-          normalization.mode: replicate_matched
+          analysis.track: condition_resolution
         incompatible_with:
-          normalization.mode: lfc
-        description: log2(x+1) then z-score each sample column.
-      modified_zscore:
-        label: "Modified z-score (median-based, per sample)"
+          analysis.track: sample_resolution
+        description: >
+          Use per-condition means directly to find features with similar overall
+          abundance trends across conditions.
+      lfc:
+        label: "Log-Fold-Change (response to treatment)"
         requires:
-          normalization.mode: replicate_matched
+          analysis.track: condition_resolution
         incompatible_with:
-          normalization.mode: lfc
-        description: log2(x+1) then median-based z-score each sample column.
-      rank_normal:
-        label: "Rank-based inverse normal transformation"
-        requires:
-          normalization.mode: replicate_matched
-        incompatible_with:
-          normalization.mode: lfc
-        description: Rank-based inverse normal transformation per sample column.
+          analysis.track: sample_resolution
+        description: >
+          Subtract the control group mean from all other condition means to focus
+          strictly on the response to treatment.
 
   # ============================================================
-  # analysis_parameters.feature_selection.method
+  # analysis.correlation.method
   # ============================================================
-  analysis_parameters.feature_selection.method:
+  analysis.correlation.method:
     options:
-      lfc:
-        label: "LFC cutoff"
-        description: >
-          Retain features whose |log2 fold-change| exceeds log2fc_cutoff in at least
-          one pairwise contrast. Valid for both lfc and replicate_matched modes.
-        params:
-          log2fc_cutoff:
-            type: float
-            default: 1.25
-            label: "Minimum |log2FC|"
-          max_features:
-            type: int
-            default: 10000
-            label: "Maximum features (hard cap)"
+      pearson:
+        label: "Pearson correlation"
+        description: Linear correlation coefficient computed on the Z-scored matrix.
+      spearman:
+        label: "Spearman correlation"
+        description: Rank-based correlation coefficient computed on the Z-scored matrix.
+
+  # ============================================================
+  # analysis.feature_selection.method
+  # ============================================================
+  analysis.feature_selection.method:
+    options:
       variance:
         label: "Top-N variance"
         description: >
-          Retain the top N most variable features (by inter-sample variance).
-          Valid for both lfc and replicate_matched modes.
+          Retain the top N most variable features (by inter-condition/sample variance)
+          after Z-scoring. Valid for both tracks.
         params:
           top_n:
             type: int
@@ -102,127 +95,17 @@ constraints:
         label: "User-supplied feature list"
         description: >
           Retain only features present in a user-supplied text file (one feature ID per line).
-          Valid for both lfc and replicate_matched modes.
+          Valid for both tracks.
         params:
           feature_list_file:
             type: filepath
             default: null
             label: "Path to feature list file"
-      glm:
-        label: "Generalized linear model (GLM)"
-        requires:
-          normalization.mode: replicate_matched
-        incompatible_with:
-          normalization.mode: lfc
-        description: >
-          Fit a GLM per feature; retain features with significant group effect.
-          Requires sample-level metadata — not valid in lfc mode.
-        params:
-          category:
-            type: string
-            default: null
-            label: "Metadata column (grouping variable)"
-          reference:
-            type: string
-            default: null
-            label: "Reference level for contrast"
-          significance_level:
-            type: float
-            default: 0.05
-            label: "FDR significance threshold"
-          log2fc_cutoff:
-            type: float
-            default: 0.25
-            label: "Minimum |log2FC|"
-          max_features:
-            type: int
-            default: 10000
-            label: "Maximum features (hard cap)"
-      kruskalwallis:
-        label: "Kruskal-Wallis test"
-        requires:
-          normalization.mode: replicate_matched
-        incompatible_with:
-          normalization.mode: lfc
-        description: >
-          Non-parametric one-way ANOVA across groups; retain significant features.
-          Requires sample-level metadata — not valid in lfc mode.
-        params:
-          category:
-            type: string
-            default: group
-            label: "Metadata column (grouping variable)"
-          significance_level:
-            type: float
-            default: 0.05
-            label: "FDR significance threshold"
-          lfc_cutoff:
-            type: float
-            default: 0.25
-            label: "Minimum |LFC| (secondary filter)"
-          max_features:
-            type: int
-            default: 10000
-            label: "Maximum features (hard cap)"
-      lasso:
-        label: "LASSO regularization"
-        requires:
-          normalization.mode: replicate_matched
-        incompatible_with:
-          normalization.mode: lfc
-        description: >
-          L1-regularized regression; retain features with non-zero coefficients.
-          Requires sample-level metadata — not valid in lfc mode.
-        params:
-          category:
-            type: string
-            default: null
-            label: "Metadata column (response variable)"
-          max_features:
-            type: int
-            default: 10000
-            label: "Maximum features (hard cap)"
-      random_forest:
-        label: "Random forest feature importance"
-        requires:
-          normalization.mode: replicate_matched
-        incompatible_with:
-          normalization.mode: lfc
-        description: >
-          Random forest classifier/regressor; retain top-importance features.
-          Requires sample-level metadata — not valid in lfc mode.
-        params:
-          category:
-            type: string
-            default: null
-            label: "Metadata column (response variable)"
-          max_features:
-            type: int
-            default: 10000
-            label: "Maximum features (hard cap)"
-      mutual_info:
-        label: "Mutual information"
-        requires:
-          normalization.mode: replicate_matched
-        incompatible_with:
-          normalization.mode: lfc
-        description: >
-          Mutual information between each feature and the response variable.
-          Requires sample-level metadata — not valid in lfc mode.
-        params:
-          category:
-            type: string
-            default: null
-            label: "Metadata column (response variable)"
-          max_features:
-            type: int
-            default: 10000
-            label: "Maximum features (hard cap)"
 
   # ============================================================
-  # analysis_parameters.feature_grouping.method
+  # analysis.feature_grouping.method
   # ============================================================
-  analysis_parameters.feature_grouping.method:
+  analysis.feature_grouping.method:
     options:
       network_modules:
         label: "Network modules (correlation graph + community detection)"
@@ -232,8 +115,8 @@ constraints:
         params:
           corr_method:
             type: enum
-            values: [spearman, pearson, dcor]
-            default: spearman
+            values: [pearson, spearman]
+            default: pearson
             label: "Correlation method"
           corr_cutoff:
             type: float
@@ -354,56 +237,6 @@ constraints:
       none:
         label: "No devariancing"
         description: Skip the devariancing step.
-
-  datasets.*.normalization_parameters.scaling.method:
-    options:
-      vst:
-        label: "VST (variance-stabilising transformation)"
-        description: arcsinh(sqrt(x)) then z-score per sample. Good for count data.
-        params:
-          log2:
-            type: bool
-            default: true
-            label: "log2-transform before VST"
-      zscore:
-        label: "Z-score (per sample)"
-        description: log2(x+1) then z-score each sample column.
-        params:
-          log2:
-            type: bool
-            default: true
-            label: "log2-transform before z-scoring"
-      modified_zscore:
-        label: "Modified z-score (median-based)"
-        description: log2(x+1) then median-based z-score each sample column.
-        params:
-          log2:
-            type: bool
-            default: true
-            label: "log2-transform before modified z-scoring"
-      rank_normal:
-        label: "Rank-based inverse normal transformation"
-        description: Rank-based inverse normal transformation per sample column.
-        params:
-          log2:
-            type: bool
-            default: false
-            label: "log2-transform before rank normalisation"
-      quantile:
-        label: "Quantile normalisation"
-        description: Force identical distributions across all samples.
-        params:
-          log2:
-            type: bool
-            default: false
-            label: "log2-transform before quantile normalisation"
-      none:
-        label: "No per-dataset scaling"
-        description: >
-          Skip per-dataset scaling. Only valid in lfc mode (LFC is scale-invariant).
-          In replicate_matched mode, scaling is required to make data types comparable.
-        incompatible_with:
-          normalization.mode: replicate_matched
 
   datasets.*.normalization_parameters.replicate_handling.method:
     options:
