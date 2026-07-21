@@ -37,106 +37,146 @@ class ConfigManager:
         self.config_dir = Path(glob.glob(config_dir)[0])
         self.target_data_hash = data_processing_hash
         self.target_analysis_hash = analysis_hash
-        
+
         # Set up config file paths
         self.project_config_file = self.config_dir / "project.yml"
         self.data_processing_config_file = self.config_dir / "data_processing.yml"
-        self.analysis_config_file = self.config_dir / "analysis.yml"
-        
+
+        # Analysis config: detect which branch file is present.
+        # Priority: analysis_lfc.yml > analysis_replicate_matched.yml > analysis.yml (legacy)
+        self.analysis_config_file = self._detect_analysis_config_file()
+
         # If hashes are specified, try to load from persistent configs
         if self.target_data_hash and self.target_analysis_hash:
             self._load_from_persistent_configs()
         elif not self._standard_configs_exist():
             log.warning("Standard config files not found and no hashes specified.")
-    
+
+    def _detect_analysis_config_file(self) -> Path:
+        """
+        Detect which analysis config file is present in the config directory.
+
+        Checks in order:
+        1. ``analysis_lfc.yml``              — LFC branch
+        2. ``analysis_replicate_matched.yml`` — replicate-matched branch
+        3. ``analysis.yml``                  — legacy single-file config
+
+        Raises ``FileNotFoundError`` if none are found.
+        """
+        candidates = [
+            self.config_dir / "analysis_lfc.yml",
+            self.config_dir / "analysis_replicate_matched.yml",
+            self.config_dir / "analysis.yml",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                log.info(f"Using analysis config: {candidate.name}")
+                return candidate
+        raise FileNotFoundError(
+            f"No analysis config file found in {self.config_dir}. "
+            "Expected one of: analysis_lfc.yml, analysis_replicate_matched.yml, analysis.yml"
+        )
+
     def _standard_configs_exist(self) -> bool:
         """Check if standard config files exist."""
         return all([
             self.project_config_file.exists(),
             self.data_processing_config_file.exists(),
-            self.analysis_config_file.exists()
+            self.analysis_config_file.exists(),
         ])
-    
+
     def _load_from_persistent_configs(self):
         """Load from persistent config files with specified hashes."""
         log.info(f"Loading persistent configs for hashes: {self.target_data_hash}, {self.target_analysis_hash}")
-        
+
         # Look for persistent config files with the exact hash pattern
         pattern = f"Dataset_Processing--{self.target_data_hash}_Analysis--{self.target_analysis_hash}_*_config.yml"
         config_files = list(self.config_dir.glob(pattern))
-        
+
         if not config_files:
             log.error(f"No persistent config files found for pattern: {pattern}")
             raise FileNotFoundError(f"Cannot find configs for the specified hashes in {self.config_dir}")
-        
+
         # Group by config type
         config_mapping = {
             'project': self.project_config_file,
             'data': self.data_processing_config_file,
-            'analysis': self.analysis_config_file
+            'analysis': self.analysis_config_file,
         }
-        
+
         found_configs = {}
         for config_file in config_files:
             name_parts = config_file.stem.split('_')
             if len(name_parts) >= 3:
                 config_type = name_parts[-2]  # e.g., 'project', 'data', 'analysis'
-                
+
                 # Handle both 'data' and 'data_processing' naming
-                if config_type == 'data':
+                if config_type in ('data', 'processing'):
                     config_type = 'data'
-                elif config_type == 'processing':
-                    config_type = 'data'
-                
+
                 if config_type in config_mapping:
                     found_configs[config_type] = config_file
-        
+
         # Check if we have all required configs
         required_types = ['project', 'data', 'analysis']
         missing_types = [t for t in required_types if t not in found_configs]
-        
+
         if missing_types:
             log.error(f"Missing config types: {missing_types}")
             raise FileNotFoundError(f"Cannot find all required config types for specified hashes")
-        
+
         # Copy persistent configs to standard names
         for config_type, target_file in config_mapping.items():
             if config_type in found_configs:
                 source_file = found_configs[config_type]
                 shutil.copy2(source_file, target_file)
                 log.info(f"Loaded {config_type} config from: {source_file.name}")
-    
+
     def load_configs(self) -> Tuple[Dict[str, Any], str, str]:
-        """Load all config files and generate hashes."""
-        
+        """
+        Load all config files and generate hashes.
+
+        The analysis config (analysis_lfc.yml / analysis_replicate_matched.yml) has a
+        top-level ``analysis:`` key.  This method extracts that sub-dict so that
+        ``combined_config['analysis']`` contains the flat branch config that
+        ``Analysis.__init__`` reads via ``self.project.config['analysis']``.
+        """
         # Load project config
         with open(self.project_config_file, 'r') as f:
             project_config = yaml.safe_load(f)
-        
+
         # Load data processing config and generate hash
         with open(self.data_processing_config_file, 'r') as f:
             data_processing_config = yaml.safe_load(f)
         data_processing_hash = self._generate_config_hash(data_processing_config)
-        
+
         # Load analysis config and generate hash
         with open(self.analysis_config_file, 'r') as f:
-            analysis_config = yaml.safe_load(f)
-        analysis_hash = self._generate_config_hash(analysis_config)
-        
+            raw_analysis_config = yaml.safe_load(f)
+        analysis_hash = self._generate_config_hash(raw_analysis_config)
+
+        # Extract the flat 'analysis' sub-dict if present (new branch configs wrap
+        # everything under a top-level 'analysis:' key).
+        if isinstance(raw_analysis_config, dict) and 'analysis' in raw_analysis_config:
+            analysis_config = raw_analysis_config['analysis']
+        else:
+            # Legacy analysis.yml had no wrapper — use as-is
+            analysis_config = raw_analysis_config or {}
+
         # Verify hashes match if they were specified
         if self.target_data_hash and data_processing_hash != self.target_data_hash:
             log.warning(f"Data processing hash mismatch! Expected: {self.target_data_hash}, Got: {data_processing_hash}")
 
         if self.target_analysis_hash and analysis_hash != self.target_analysis_hash:
             log.warning(f"Analysis hash mismatch! Expected: {self.target_analysis_hash}, Got: {analysis_hash}")
-        
-        # Combine all configs for backward compatibility
+
+        # Combine all configs; 'analysis' key holds the flat branch config dict
         combined_config = {
             **project_config,
             **data_processing_config,
-            **analysis_config
+            'analysis': analysis_config,
         }
-        
+
         return combined_config, data_processing_hash, analysis_hash
     
     def _generate_config_hash(self, config: Dict[str, Any], length: int = 8) -> str:
@@ -2057,7 +2097,8 @@ class Analysis(DataAwareBaseHandler):
         """
         Integrate datasets into a single feature matrix.
 
-        Branches on ``normalization.mode`` from ``analysis.yml``:
+        Branches on ``integration_mode`` detected from the analysis config
+        (``analysis_lfc.yml`` or ``analysis_replicate_matched.yml``):
 
         * **lfc** mode — LFC of group medians is computed per dataset and the
           resulting contrast matrices are concatenated.  Input is
@@ -2161,7 +2202,8 @@ class Analysis(DataAwareBaseHandler):
         """
         Post-integration normalization step.
 
-        Behaviour depends on ``normalization.mode`` in ``analysis.yml``:
+        Behaviour depends on ``integration_mode`` detected from the analysis config
+        (``analysis_lfc.yml`` or ``analysis_replicate_matched.yml``):
 
         **lfc mode**
             ``integrated_data`` is already in LFC space (produced by
@@ -2339,8 +2381,7 @@ class Analysis(DataAwareBaseHandler):
                 raise ValueError(
                     f"Feature selection method '{selected_method}' requires sample-level metadata "
                     f"but integration_mode is 'lfc' (contrast-level matrix). "
-                    f"Use 'lfc' or 'variance' as the selected_method in analysis.yml "
-                    f"when normalization.mode is 'lfc'."
+                    f"Use 'lfc' or 'variance' as the selected_method in analysis_lfc.yml."
                 )
 
             call_params = {
