@@ -9149,7 +9149,7 @@ def _draw_pca(ax, pca_df: pd.DataFrame, hue_col: str,
 def plot_simple_pca(
     df: pd.DataFrame,
     metadata: pd.DataFrame,
-    metadata_variables: List[str],
+    metadata_variables: List[str] = ["group"],
     title: str = "PCA Plot",
     output_dir: str = None,):
     """
