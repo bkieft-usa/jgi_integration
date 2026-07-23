@@ -1,56 +1,48 @@
-# data_processing.yml
-#
-# Per-dataset processing steps shared by BOTH analysis branches (lfc and replicate_matched).
-# These steps are applied to each dataset independently before any integration.
-#
-# Steps applied in order:
-#   linked_data  →  filter_data  →  filtered_data
-#                →  devariance_data  →  devarianced_data
-#                →  remove_low_replicable_features  →  replicate_filtered_data
-#
-# Per-dataset scaling (vst/zscore/etc.) is NOT configured here.
-# It belongs in analysis_replicate_matched.yml under 'scaling' and is skipped in lfc mode.
-#
-# NOTE: Parameters with XXX should not be changed
-
 datasets:
   tx:
-    dataset_dir: transcriptomics # XXX
+    dataset_dir: transcriptomics # Do not change
     normalization_parameters:
       filtering:
-        method: minimum          # minimum | percent_present | none
+        method: minimum          # minimum | proportion | none
         params:
-          value: 200             # minimum: minimum count threshold
-                                 # percent_present: minimum fraction of samples with non-zero value (0–1)
+          value: 100             # minimum: minimum count threshold; proportion: minimum fraction of samples with non-zero value (0–1)
       devariancing:
-        method: percent          # percent | iqr | none
+        method: percent          # percent | none
         params:
-          value: 5               # percent: bottom N% of variance removed
-                                 # iqr: IQR multiplier threshold
+          value: 10              # percent: bottom N% of variance removed
       replicate_handling:
-        method: sigma            # sigma | correlation | none
+        method: variance         # variance | none
         params:
-          group: group           # metadata column containing group/condition labels
-          sigma_threshold: 3.0   # sigma: std deviations from group mean to flag as outlier
-          value: 0.5             # correlation: minimum Spearman r to keep a replicate
+          value: 1.0                # variance: max allowed coefficient of variation (std/mean) within a group before flagging as unreliable
+      scaling:
+        method: modified_zscore                # lfc | moderated_lfc | zscore | vst | vsn | rank_normal | modified_zscore | none
+        # For sample_resolution track:
+        #   zscore          — log2(x+1) then column-wise Z-score
+        #   modified_zscore — log2(x+1) then median/MAD Z-score (robust to outliers)
+        #   vst             — arcsinh(sqrt(x)) + Z-score; better for counts near zero
+        #   vsn             — parametric variance-stabilizing normalization
+        #   rank_normal     — rank-based inverse normal; distribution-agnostic
+        #   none            — pass-through (no scaling)
+        # For condition_resolution track:
+        #   lfc             — log2(x+1) → group medians → all-pairwise LFC
+        #   moderated_lfc   — same as lfc but applies empirical-Bayes shrinkage to reduce noise for low-replicate features
 
   mx:
-    dataset_dir: metabolomics # XXX
+    dataset_dir: metabolomics # Do not change
     chromatography: HILIC
     polarity: multipolarity
-    metabolite_fraction: cells
     normalization_parameters:
       filtering:
-        method: minimum          # minimum | percent_present | none
+        method: minimum          # minimum | proportion | none
         params:
-          value: 2000
+          value: 1000
       devariancing:
-        method: percent          # percent | iqr | none
+        method: percent          # percent | none
         params:
-          value: 5
+          value: 10
       replicate_handling:
-        method: sigma            # sigma | correlation | none
+        method: variance         # variance | none
         params:
-          group: group
-          sigma_threshold: 3.0
-          value: 0.5
+          value: 1.0
+      scaling:
+        method: vst                   # lfc | moderated_lfc | zscore | vst | vsn | rank_normal | modified_zscore | none

@@ -52,24 +52,14 @@ class ConfigManager:
 
     def _detect_analysis_config_file(self) -> Path:
         """
-        Detect which analysis config file is present in the config directory.
+        Detect the analysis config file in the config directory.
 
-        Checks in order:
-        1. ``analysis.yml``                  — unified config (current)
-        2. ``analysis_lfc.yml``              — legacy LFC branch
-        3. ``analysis_replicate_matched.yml`` — legacy replicate-matched branch
-
-        Raises ``FileNotFoundError`` if none are found.
+        Raises ``FileNotFoundError`` if ``analysis.yml`` is not found.
         """
-        candidates = [
-            self.config_dir / "analysis.yml",
-            self.config_dir / "analysis_lfc.yml",
-            self.config_dir / "analysis_replicate_matched.yml",
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                log.info(f"Using analysis config: {candidate.name}")
-                return candidate
+        candidate = self.config_dir / "analysis.yml"
+        if candidate.exists():
+            log.info(f"Using analysis config: {candidate.name}")
+            return candidate
         raise FileNotFoundError(
             f"No analysis config file found in {self.config_dir}. "
             "Expected: analysis.yml"
@@ -134,10 +124,9 @@ class ConfigManager:
         """
         Load all config files and generate hashes.
 
-        The analysis config (analysis_lfc.yml / analysis_replicate_matched.yml) has a
-        top-level ``analysis:`` key.  This method extracts that sub-dict so that
-        ``combined_config['analysis']`` contains the flat branch config that
-        ``Analysis.__init__`` reads via ``self.project.config['analysis']``.
+        ``analysis.yml`` must have a top-level ``analysis:`` key.  The sub-dict
+        is extracted so that ``combined_config['analysis']`` contains the flat
+        config that ``Analysis.__init__`` reads via ``self.project.config['analysis']``.
         """
         # Load project config
         with open(self.project_config_file, 'r') as f:
@@ -153,13 +142,13 @@ class ConfigManager:
             raw_analysis_config = yaml.safe_load(f)
         analysis_hash = self._generate_config_hash(raw_analysis_config)
 
-        # Extract the flat 'analysis' sub-dict if present (new branch configs wrap
-        # everything under a top-level 'analysis:' key).
-        if isinstance(raw_analysis_config, dict) and 'analysis' in raw_analysis_config:
-            analysis_config = raw_analysis_config['analysis']
-        else:
-            # Legacy analysis.yml had no wrapper — use as-is
-            analysis_config = raw_analysis_config or {}
+        # Extract the flat 'analysis' sub-dict
+        if not (isinstance(raw_analysis_config, dict) and 'analysis' in raw_analysis_config):
+            raise ValueError(
+                f"analysis.yml must have a top-level 'analysis:' key. "
+                f"Check {self.analysis_config_file}."
+            )
+        analysis_config = raw_analysis_config['analysis']
 
         # Verify hashes match if they were specified
         if self.target_data_hash and data_processing_hash != self.target_data_hash:
@@ -237,7 +226,6 @@ class WorkflowProgressTracker:
             {'id': 'scale_dataset_features', 'label': 'Scale Dataset Features', 'category': 'data_processing'},
             {'id': 'integrate_metadata', 'label': 'Integrate Metadata', 'category': 'analysis'},
             {'id': 'integrate_data', 'label': 'Integrate Data', 'category': 'analysis'},
-            {'id': 'normalize_integrated_data', 'label': 'Normalize Integrated Data', 'category': 'analysis'},
             {'id': 'feature_selection', 'label': 'Feature Selection', 'category': 'analysis'},
             {'id': 'calculate_correlations', 'label': 'Calculate Correlations', 'category': 'analysis'},
             {'id': 'plot_correlation_network', 'label': 'Plot Correlation Network', 'category': 'analysis'},
@@ -946,7 +934,7 @@ class Dataset(BaseDataHandler):
             step = self.normalization_params.get('scaling', {})
             p = step.get('params', step)   # new layout: step['params']; old layout: step itself
             norm_method = step.get('method', 'vst')
-            log2 = p.get('log2', True)
+            log2 = True
 
             log.info(f"Scaling {self.dataset_name} data using method='{norm_method}'...")
 
@@ -984,17 +972,19 @@ class Dataset(BaseDataHandler):
                 return
             
             step = self.normalization_params.get('replicate_handling', {})
-            p = step.get('params', step)   # new layout: step['params']; old layout: step itself
+            p = step.get('params', step)
             call_params = {
-                'data': self.devarianced_data,          # reads devarianced_data, not scaled_data
+                'data': self.devarianced_data,
                 'metadata': self.linked_metadata,
                 'dataset_name': self.dataset_name,
                 'output_filename': self._replicate_filtered_data_filename,
                 'output_dir': self.output_dir,
-                'method': step.get('method', 'sigma'),
-                'group_col': p.get('group', 'group'),
+                'method': step.get('method', 'variance'),
+                'group_col': 'group',
                 'threshold': p.get('value', 0.5),
-                'sigma_threshold': p.get('sigma_threshold', 2.0),
+                'normalize': True,
+                'normalization_scale': 1000000,
+                'min_replicates': 2,
             }
             call_params.update(kwargs)
             
@@ -1417,7 +1407,6 @@ class Analysis(BaseDataHandler):
         # Use hash-based tags for output directory
         self.data_processing_tag = project.data_processing_hash
         self.analysis_tag = project.analysis_hash
-        self.magi_raw_dir = os.path.join(self.project.raw_data_dir, 'magi')
         analysis_outdir = self._set_up_analysis_outdir(self.project, self.data_processing_tag, 
                                                       self.analysis_tag, overwrite=self.overwrite)
         self.output_dir = analysis_outdir
@@ -1432,51 +1421,87 @@ class Analysis(BaseDataHandler):
         self._setup_analysis_filenames()
 
         # analysis_config is the flat 'analysis:' block from analysis.yml.
-        # The track is read from the 'track' key (new unified config).
-        # Legacy configs (analysis_lfc.yml / analysis_replicate_matched.yml) are
-        # mapped to the new track names for backward compatibility.
         self.datasets = datasets or []
 
-        # Detect track from config
-        if 'track' in self.analysis_config:
-            # New unified analysis.yml
-            self._integration_mode: str = self.analysis_config['track']
-        elif 'lfc' in self.analysis_config:
-            # Legacy analysis_lfc.yml
-            self._integration_mode: str = 'condition_resolution'
-            log.warning(
-                "Legacy analysis_lfc.yml detected — mapping to track='condition_resolution'. "
-                "Please migrate to analysis.yml."
-            )
-        elif 'scaling' in self.analysis_config:
-            # Legacy analysis_replicate_matched.yml
-            self._integration_mode: str = 'sample_resolution'
-            log.warning(
-                "Legacy analysis_replicate_matched.yml detected — mapping to track='sample_resolution'. "
-                "Please migrate to analysis.yml."
-            )
-        else:
-            # Fallback
-            norm = self.analysis_config.get('normalization', {})
-            legacy_mode = norm.get('mode', 'condition_resolution')
-            self._integration_mode: str = (
-                'sample_resolution' if legacy_mode == 'replicate_matched' else 'condition_resolution'
-            )
+        # Derive integration_mode from the scaling.method configured for each dataset
+        # in data_processing.yml.  lfc / moderated_lfc → condition_resolution;
+        # everything else → sample_resolution.
+        self._integration_mode: str = self._infer_integration_mode(self.datasets, self.datasets_config)
 
-        valid_tracks = {'sample_resolution', 'condition_resolution'}
-        if self._integration_mode not in valid_tracks:
-            raise ValueError(
-                f"analysis.track must be one of {valid_tracks}, got '{self._integration_mode}'. "
-                "Check your analysis.yml."
-            )
-
-        log.info(f"Track detected as '{self._integration_mode}' from analysis config")
+        log.info(f"Track inferred as '{self._integration_mode}' from data_processing.yml scaling.method")
     
         log.info(f"Created analysis with {len(self.datasets)} datasets.")
         for ds in self.datasets:
             log.info(f"\t- {ds.dataset_name} with output directory: {ds.output_dir}")
         
         self._complete_tracking('create_analysis')
+
+    # ── LFC scaling methods that imply condition_resolution ──────────────────
+    _LFC_METHODS: frozenset = frozenset({"lfc", "moderated_lfc"})
+
+    @staticmethod
+    def _infer_integration_mode(datasets: list, datasets_config: dict) -> str:
+        """Infer the integration track from each dataset's ``scaling.method``.
+
+        Rules
+        -----
+        * If **all** datasets use ``lfc`` or ``moderated_lfc`` → ``"condition_resolution"``
+        * If **all** datasets use any other method → ``"sample_resolution"``
+        * If datasets are **mixed** (some LFC, some not) → ``ValueError``
+        * If no datasets are present yet (empty list) → fall back to
+          ``"sample_resolution"`` (safe default; will be re-evaluated once
+          datasets are attached).
+
+        Parameters
+        ----------
+        datasets : list
+            Dataset objects already attached to the Analysis.
+        datasets_config : dict
+            The ``datasets`` sub-dict from the project config (used as fallback
+            when a dataset object is not yet fully initialised).
+        """
+        lfc_methods = Analysis._LFC_METHODS
+
+        if not datasets:
+            # No datasets attached yet — cannot infer; default to sample_resolution
+            log.warning(
+                "No datasets attached to Analysis — defaulting to 'sample_resolution'. "
+                "Call Analysis again with datasets= to infer the correct track."
+            )
+            return "sample_resolution"
+
+        modes: list[str] = []
+        for ds in datasets:
+            # Read scaling.method from the dataset's normalization_params
+            scaling_method = (
+                ds.normalization_params.get("scaling", {}).get("method", "zscore")
+                if hasattr(ds, "normalization_params")
+                else datasets_config.get(ds.dataset_name, {})
+                    .get("normalization_parameters", {})
+                    .get("scaling", {})
+                    .get("method", "zscore")
+            )
+            mode = "condition_resolution" if scaling_method in lfc_methods else "sample_resolution"
+            modes.append(mode)
+
+        unique_modes = set(modes)
+        if len(unique_modes) > 1:
+            details = {
+                ds.dataset_name: (
+                    ds.normalization_params.get("scaling", {}).get("method", "zscore")
+                    if hasattr(ds, "normalization_params") else "unknown"
+                )
+                for ds in datasets
+            }
+            raise ValueError(
+                "Inconsistent scaling methods across datasets — all datasets must use "
+                "either LFC-based methods (lfc, moderated_lfc) for condition_resolution "
+                "or non-LFC methods for sample_resolution. "
+                f"Found: {details}. "
+                "Fix data_processing.yml so all datasets use the same scaling family."
+            )
+
+        return unique_modes.pop()
 
     @property
     def analysis_parameters(self) -> dict:
@@ -1534,8 +1559,6 @@ class Analysis(BaseDataHandler):
             'feature_annotation_table': 'feature_annotation_table.csv',
             'integrated_data_selected': 'integrated_data_selected.csv',
             'feature_correlation_table': 'feature_correlation_table.csv',
-            'feature_correlation_table_magi': 'feature_correlation_table_magi.csv',
-            'magi_results_table': 'magi_results_table.csv',
             'feature_network_graph': 'feature_network_graph.graphml',
             'feature_network_edge_table': 'feature_network_edge_table.csv',
             'feature_network_node_table': 'feature_network_node_table.csv',
@@ -1609,39 +1632,112 @@ class Analysis(BaseDataHandler):
             _devariance_method()
             return
 
-    def scale_all_datasets(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+    def scale_all_datasets(
+        self,
+        overwrite: bool = False,
+        show_progress: bool = True,
+        group_col: str = "group",
+        sample_col: str = "unique_group",
+        min_reps_for_se: int = 2,
+        **kwargs,
+    ) -> None:
         """
-        Apply per-dataset log2 + row-wise Z-score scaling (sample_resolution track only).
+        Apply per-dataset scaling — the transformation step before concatenation.
 
-        In **sample_resolution** track, each dataset is log2-transformed and then
-        row-wise Z-scored independently before concatenation so that different data
-        types (RNA counts, metabolite peak heights) are brought to a comparable scale.
+        Both tracks are handled here symmetrically:
 
-        In **condition_resolution** track this step is skipped — condition means and
-        optional LFC subtraction are handled inside ``integrate_data()``.
+        * **sample_resolution** — each dataset is log2-transformed and row-wise
+          Z-scored independently → ``ds.scaled_data`` (features x samples).
+
+        * **condition_resolution** — each dataset is log2-transformed, replicates
+          are collapsed to per-condition medians, and all unique pairwise LFC
+          contrasts are computed → ``ds.scaled_data`` (features x contrasts).
+
+        After this step, ``integrate_data()`` simply concatenates the appropriate
+        per-dataset attribute across all datasets.
         """
         def _scale_method():
-            if self.integration_mode == 'condition_resolution':
-                log.info(
-                    "Skipping per-dataset scaling (track='condition_resolution'). "
-                    "Condition collapsing and Z-scoring are handled in integrate_data()."
-                )
-                return
-
-            # sample_resolution: log2 + row-wise zscore per dataset
-            log.info(
-                "Scaling individual datasets before integration "
-                "(sample_resolution track: log2 → row-wise Z-score per dataset)..."
-            )
             for ds in self.datasets:
-                log.info(f"  Scaling {ds.dataset_name}...")
-                ds.scale_data(
-                    overwrite=overwrite,
-                    show_progress=False,
-                    norm_method='zscore',
-                    log2=True,
-                    **kwargs
-                )
+                if ds.check_and_load_attribute(
+                    'scaled_data', ds._scaled_data_filename, overwrite or self.overwrite
+                ):
+                    log.info(
+                        f"  [{ds.dataset_name}] scaled_data already exists "
+                        f"({ds.scaled_data.shape[0]} features x {ds.scaled_data.shape[1]} contrasts). "
+                        "Skipping."
+                    )
+                    continue
+                if not hasattr(ds, 'replicate_filtered_data') or ds.replicate_filtered_data.empty:
+                    raise RuntimeError(
+                        f"Dataset '{ds.dataset_name}' has no replicate_filtered_data. "
+                        "Run replicability_test_all_datasets() first."
+                    )
+                if not hasattr(ds, 'linked_metadata') or ds.linked_metadata is None or ds.linked_metadata.empty:
+                    raise RuntimeError(
+                        f"Dataset '{ds.dataset_name}' has no linked_metadata. "
+                        "Run link_metadata() first."
+                    )
+
+                step = ds.normalization_params.get('scaling', {})
+                method = step.get('method', 'zscore')
+                params = step.get('params', {})
+
+                if method == 'lfc':
+                    log.info(f"  [{ds.dataset_name}] Scaling: log2 → group medians → pairwise LFC...")
+                    result = hlp.scale_data_lfc(
+                        data=ds.replicate_filtered_data,
+                        metadata=ds.linked_metadata,
+                        dataset_name=ds.dataset_name,
+                        output_filename=ds._scaled_data_filename,
+                        output_dir=ds.output_dir,
+                        group_col=group_col,
+                        sample_col=sample_col,
+                    )
+                    if result is None or result.empty:
+                        raise RuntimeError(
+                            f"LFC scaling produced an empty result for '{ds.dataset_name}'."
+                        )
+                    ds.scaled_data = result
+                    log.info(
+                        f"  [{ds.dataset_name}] scaled_data: "
+                        f"{result.shape[0]} features × {result.shape[1]} contrasts"
+                    )
+
+                elif method == 'moderated_lfc':
+                    log.info(
+                        f"  [{ds.dataset_name}] Scaling: log2 → group medians → "
+                        "moderated (shrinkage) pairwise LFC..."
+                    )
+                    result = hlp.scale_data_moderated_lfc(
+                        data=ds.replicate_filtered_data,
+                        metadata=ds.linked_metadata,
+                        dataset_name=ds.dataset_name,
+                        output_filename=ds._scaled_data_filename,
+                        output_dir=ds.output_dir,
+                        group_col=group_col,
+                        sample_col=sample_col,
+                        min_reps_for_se=min_reps_for_se
+                    )
+                    if result is None or result.empty:
+                        raise RuntimeError(
+                            f"Moderated LFC scaling produced an empty result for '{ds.dataset_name}'."
+                        )
+                    ds.scaled_data = result
+                    log.info(
+                        f"  [{ds.dataset_name}] scaled_data: "
+                        f"{result.shape[0]} features × {result.shape[1]} contrasts (moderated)"
+                    )
+
+                else:
+                    # sample_resolution methods: zscore, vst, vsn, rank_normal, modified_zscore, none
+                    log.info(f"  [{ds.dataset_name}] Scaling: method='{method}'...")
+                    ds.scale_data(
+                        overwrite=overwrite,
+                        show_progress=False,
+                        norm_method=method,
+                        log2=True,
+                        **kwargs
+                    )
 
         if show_progress:
             self.workflow_tracker.set_current_step('scale_dataset_features')
@@ -1761,22 +1857,44 @@ class Analysis(BaseDataHandler):
             _link_data_method()
             return
 
-    def plot_dataset_distributions(self, datatype: str = "normalized", show_progress: bool = True) -> None:
+    def plot_dataset_distributions(
+        self,
+        bins: int = 50,
+        transparency: float = 0.5,
+        xlog: bool = False, 
+        ylog: bool = False, 
+        show_progress: bool = True
+    ) -> None:
         """Plot histograms of feature values for each dataset in the analysis."""
         def _plot_distributions_method():
             log.info("Plotting feature value distributions for all datasets")
-            if datatype == "normalized":
-                dataframes = {ds.dataset_name: ds.replicate_filtered_data for ds in self.datasets if hasattr(ds, "replicate_filtered_data")}
-            elif datatype == "nonnormalized":
-                dataframes = {ds.dataset_name: ds.linked_data for ds in self.datasets if hasattr(ds, "linked_data")}
+            dataframes = {ds.dataset_name: ds.scaled_data for ds in self.datasets if hasattr(ds, "scaled_data")}
 
             hlp.plot_data_variance_histogram(
                 dataframes=dataframes,
-                datatype=datatype,
                 output_dir=self.output_dir,
+                bins=bins,
+                transparency=transparency,
+                xlog=xlog,
+                ylog=ylog
             )
 
         _plot_distributions_method()
+        return
+
+    def plot_integrated_pca(self, show_progress: bool = True) -> None:
+        """Plot histograms of feature values for each dataset in the analysis."""
+        def _plot_integrated_pca():
+            log.info("Plotting PCA of integrated features")
+
+            hlp.plot_simple_pca(
+                df=self.integrated_data_selected,
+                metadata=self.integrated_metadata,
+                title="Integrated Data PCA",
+                output_dir=self.output_dir,
+            )
+
+        _plot_integrated_pca()
         return
 
     def integrate_metadata(
@@ -1819,7 +1937,6 @@ class Analysis(BaseDataHandler):
                 method=helper_method,
                 group_col=group_col,
                 overlap_only=overlap_only,
-                lfc_pairs=None,
             )
 
             if result.empty:
@@ -1846,24 +1963,19 @@ class Analysis(BaseDataHandler):
     def integrate_data(
         self,
         overlap_only: bool = True,
-        group_col: str = "group",
-        sample_col: str = "unique_group",
         overwrite: bool = False,
         show_progress: bool = True
     ) -> None:
         """
-        Integrate datasets into a single feature matrix.
+        Concatenate per-dataset scaled matrices into a single integrated matrix.
 
-        Dispatches on ``integration_mode`` (``analysis.track`` in analysis.yml):
+        Both tracks are handled symmetrically — ``scale_all_datasets()`` performs
+        all transformation logic; this method only concatenates:
 
-        * **sample_resolution** — ``scaled_data`` (log2 + row-wise Z-score, produced by
-          ``scale_all_datasets()``) is concatenated across datasets.  The output is a
-          features × samples matrix ready for Pearson/Spearman correlation.
-
-        * **condition_resolution** — ``replicate_filtered_data`` is used.  Replicates
-          are collapsed to per-condition means (centroid), then optionally the control
-          group mean is subtracted (LFC sub-approach), followed by row-wise Z-score
-          across conditions.  The output is a features × conditions matrix.
+        * **sample_resolution** — concatenates ``ds.scaled_data``
+          (features x samples) across datasets.
+        * **condition_resolution** — concatenates ``ds.scaled_data``
+          (features x contrasts) across datasets.
         """
         def _integrate_data_method():
             track = self.integration_mode
@@ -1881,47 +1993,31 @@ class Analysis(BaseDataHandler):
                 return
 
             if track == 'sample_resolution':
-                log.info(
-                    "Integrating data matrices in sample_resolution track "
-                    "(concatenating log2 + row-wise Z-scored data)..."
-                )
+                data_attr = 'scaled_data'
+                log.info("Integrating data matrices (sample_resolution: concatenating scaled_data)...")
                 for ds in self.datasets:
                     if not hasattr(ds, 'scaled_data') or ds.scaled_data is None or ds.scaled_data.empty:
                         raise RuntimeError(
                             f"Dataset '{ds.dataset_name}' has no scaled_data. "
-                            "Run analysis.scale_all_datasets() before integrate_data() "
-                            "in sample_resolution track."
+                            "Run analysis.scale_all_datasets() before integrate_data()."
                         )
-                result = hlp.integrate_data(
-                    datasets=self.datasets,
-                    overlap_only=overlap_only,
-                    output_filename=self._integrated_data_filename,
-                    output_dir=self.output_dir,
-                    method='replicate_matched',
-                    group_col=group_col,
-                    sample_col=sample_col,
-                    data_attr='scaled_data',
-                    pseudocount=1.0,
-                    lfc_pairs=None,
-                )
             else:
-                # condition_resolution: collapse replicates → centroid or LFC → row-wise zscore
-                condition_approach = self.analysis_config.get('condition_approach', 'centroid')
-                control_group = self.analysis_config.get('lfc', {}).get('control_group', None)
-                log.info(
-                    f"Integrating data matrices in condition_resolution track "
-                    f"(approach='{condition_approach}')..."
-                )
-                result = hlp.integrate_data_condition_resolution(
-                    datasets=self.datasets,
-                    overlap_only=overlap_only,
-                    output_filename=self._integrated_data_filename,
-                    output_dir=self.output_dir,
-                    group_col=group_col,
-                    sample_col=sample_col,
-                    condition_approach=condition_approach,
-                    control_group=control_group,
-                )
+                data_attr = 'scaled_data'
+                log.info("Integrating data matrices (condition_resolution: concatenating scaled_data)...")
+                for ds in self.datasets:
+                    if not hasattr(ds, 'scaled_data') or ds.scaled_data is None or ds.scaled_data.empty:
+                        raise RuntimeError(
+                            f"Dataset '{ds.dataset_name}' has no scaled_data. "
+                            "Run analysis.scale_all_datasets() before integrate_data()."
+                        )
+
+            result = hlp.integrate_data(
+                datasets=self.datasets,
+                overlap_only=overlap_only,
+                output_filename=self._integrated_data_filename,
+                output_dir=self.output_dir,
+                data_attr=data_attr,
+            )
 
             if result.empty:
                 log.error("Integrating data resulted in empty table. Please check datasets and parameters.")
@@ -1944,38 +2040,6 @@ class Analysis(BaseDataHandler):
             return
         _integrate_data_method()
         return
-
-    def normalize_integrated_data(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
-        """
-        Post-integration verification step (no-op in the unified workflow).
-
-        Both tracks produce a fully normalized matrix directly from ``integrate_data()``:
-
-        * **sample_resolution** — concatenated log2 + row-wise Z-scored data.
-        * **condition_resolution** — condition means (centroid or LFC) + row-wise Z-score.
-
-        This method is kept for backward compatibility and workflow clarity, but does
-        **not** write ``integrated_data_selected`` to disk (that would cause
-        ``perform_feature_selection()`` to skip due to a cache hit on the same filename).
-
-        ``perform_feature_selection()`` reads directly from ``integrated_data`` and
-        writes the final ``integrated_data_selected``.
-        """
-        def _normalize_method():
-            log.info(
-                "normalize_integrated_data: integrated_data is already fully normalized "
-                f"(track='{self.integration_mode}'). No further transformation applied. "
-                "Proceeding to perform_feature_selection()."
-            )
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('normalize_integrated_data')
-            _normalize_method()
-            self._complete_tracking('normalize_integrated_data')
-            return
-        else:
-            _normalize_method()
-            return
 
     def annotate_integrated_features(self, overlap_only: bool = True, overwrite: bool = False, show_progress: bool = False) -> pd.DataFrame:
         """Hybrid: Class orchestration + external annotate_integrated_features function."""
@@ -2041,20 +2105,6 @@ class Analysis(BaseDataHandler):
                 return
 
             feature_selection_params = self.analysis_parameters.get('feature_selection', {})
-
-            # Both tracks support only 'variance' and 'feature_list' — sample-level
-            # statistical tests (glm, kruskal, lasso, etc.) are not valid because the
-            # integrated matrix is already Z-scored and condition/sample-level metadata
-            # is not meaningful for those tests at this stage.
-            selected_method = (feature_selection_params.get('method')
-                               or feature_selection_params.get('selected_method', ''))
-            unsupported = {'glm', 'kruskalwallis', 'lasso', 'random_forest', 'mutual_info', 'lfc'}
-            if selected_method.lower() in unsupported:
-                raise ValueError(
-                    f"Feature selection method '{selected_method}' is not supported in the "
-                    f"unified workflow. Use 'variance' or 'feature_list' in analysis.yml."
-                )
-
             call_params = {
                 'data': self.integrated_data,
                 'metadata': self.integrated_metadata,
@@ -2084,19 +2134,17 @@ class Analysis(BaseDataHandler):
             return
 
     def run_full_network_analyzer(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
-        
-        correlation_params = self.analysis_parameters.get('correlation', {})
-        networking_params = self.analysis_parameters.get('networking', {})
+        grouping_params = self.analysis_parameters.get('feature_grouping', {}).get('params', {})
         output_dir = os.path.join(self.output_dir, "network_analyzer_results")
         results = hlp.compare_network_topologies(
             integrated_data=self.integrated_data_selected,
             feature_prefixes=[ds.dataset_name + "_" for ds in self.datasets],
-            correlation_params=correlation_params,
-            network_params=networking_params,
+            correlation_params=grouping_params,
+            network_params=grouping_params,
             annotation_input=self.feature_annotation_table,
             output_dir=output_dir,
             overwrite=overwrite,
-            plot_interactive=networking_params.get('interactive_plot', False),
+            plot_interactive=grouping_params.get('show_network_plot', False),
         )
 
         return results
@@ -2106,15 +2154,9 @@ class Analysis(BaseDataHandler):
         def _correlation_method():
             log.info("Calculating Correlated Features")
 
-            # Bug fix: read 'method' key (new config) with 'selected_method' as legacy fallback.
-            # Bug fix: read correlation params from 'params' flat block (new config layout),
-            #          falling back to the old 'network_modules' sub-key or top-level 'correlation'.
             feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
-            selected_method = (feature_grouping_params.get('method')
-                               or feature_grouping_params.get('selected_method', 'network_modules'))
-            correlation_params = (feature_grouping_params.get('params')
-                                  or feature_grouping_params.get('network_modules')
-                                  or self.analysis_parameters.get('correlation', {}))
+            selected_method = feature_grouping_params.get('method', 'network_modules')
+            correlation_params = feature_grouping_params.get('params', {})
 
             if selected_method != 'network_modules':
                 log.info(f"Selected feature grouping method is '{selected_method}'; skipping correlation computation (not required).")
@@ -2158,153 +2200,8 @@ class Analysis(BaseDataHandler):
             _correlation_method()
             return
 
-    def analyze_magi_results(self, overwrite: bool = False, show_progress: bool = False, **kwargs) -> None:
-        """Hybrid: Class parameter setup + external hlp.analyze_magi_results function."""
-        def _magi_method():
-            log.info("Analyzing MAGI Results")
-            if self.check_and_load_attribute('magi_results_table', self._magi_results_table_filename, overwrite):
-                log.info(f"\tMAGI results table object 'magi_results_table' with {self.magi_results_table.shape[0]} reactions.")
-                return
-            
-            tx_dataset = next((dataset for dataset in self.datasets if dataset.dataset_name == 'tx'), None)
-            call_params = {
-                'annotation_table': self.feature_annotation_table,
-                'magi_raw_dir': self.magi_raw_dir,
-                'tx_raw_dir': tx_dataset.dataset_raw_dir if tx_dataset else None,
-                'score_cutoff': 0,
-                'output_dir': self.output_dir,
-                'output_filename': self._magi_results_table_filename,
-            }
-            call_params.update(kwargs)
-            
-            result = hlp.parse_magi_table(**call_params)
-
-            if result.empty:
-                log.error(f"Analyzing MAGI results resulted in empty table. Please check your MAGI raw data.")
-                sys.exit(1)
-            self.magi_results_table = result
-            log.info(f"Created a MAGI results table with {self.magi_results_table.shape[0]} reactions.")
-            log.info(f"Created table: {self._magi_results_table_filename}")
-            log.info("Created attribute: magi_results_table")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('analyze_magi_results')
-            _magi_method()
-            self._complete_tracking('analyze_magi_results')
-            return
-        else:
-            _magi_method()
-            return
-
-    def merge_magi_results(self, overwrite: bool = False, show_progress: bool = False, **kwargs) -> None:
-        """Hybrid: Class parameter setup + external hlp.analyze_magi_results function."""
-        def _magi_merge_method():
-            log.info("Merging MAGI Results with Correlation Table")
-            if self.check_and_load_attribute('feature_correlation_table_magi', self._feature_correlation_table_magi_filename, overwrite):
-                log.info(f"\tFeature correlation table with MAGI results object 'feature_correlation_table_magi' with {self.feature_correlation_table_magi.shape[0]} feature pairs.")
-                return
-            
-            call_params = {
-                'correlation_table': self.feature_correlation_table,
-                'scatter_correlation': "r_squared", # correlation, r_squared
-                'magi_df': self.magi_results_table,
-                'output_dir': self.output_dir,
-                'output_filename': self._feature_correlation_table_magi_filename,
-            }
-            call_params.update(kwargs)
-            
-            result = hlp.add_magi_scores_to_correlation_table(**call_params)
-
-            if result.empty:
-                log.error(f"Merging MAGI results with correlation table resulted in empty table.")
-                sys.exit(1)
-            self.feature_correlation_table_magi = result
-            log.info(f"Created a feature correlation table including MAGI results with {self.feature_correlation_table_magi.shape[0]} feature pairs.")
-            log.info(f"Created table: {self._feature_correlation_table_magi_filename}")
-            log.info("Created attribute: feature_correlation_table_magi")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('merge_magi_results')
-            _magi_merge_method()
-            self._complete_tracking('merge_magi_results')
-            return
-        else:
-            _magi_merge_method()
-            return
-
-    def plot_correlation_network(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
-        def _network_method():
-            log.info("Plotting Correlation Network")
-            submodule_subdir = "submodules"
-            submodule_dir = os.path.join(self.output_dir, submodule_subdir)
-            os.makedirs(submodule_dir, exist_ok=True)
-
-            # Bug fix: read from feature_grouping.params (new config) instead of
-            # the stale 'networking' key that no longer exists in analysis.yml.
-            feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
-            grouping_params = (feature_grouping_params.get('params')
-                               or feature_grouping_params.get('network_modules', {}))
-
-            if self.check_and_load_attribute('feature_network_node_table', self._feature_network_node_table_filename, self.overwrite) and \
-                self.check_and_load_attribute('feature_network_edge_table', self._feature_network_edge_table_filename, self.overwrite):
-                log.info("Displaying existing network visualization...")
-                hlp.display_existing_network(
-                    graph_file=self._feature_network_graph_filename,
-                    node_table=self.feature_network_node_table,
-                    edge_table=self.feature_network_edge_table,
-                    network_layout=grouping_params.get('network_layout', None)
-                )
-                return
-            else: # necessary to clear carryover from previous analyses
-                hlp.clear_directory(submodule_dir)
-
-            output_filenames = {
-                'graph': self._feature_network_graph_filename,
-                'node_table': self._feature_network_node_table_filename,
-                'edge_table': self._feature_network_edge_table_filename,
-                'submodule_path': submodule_dir
-            }
-
-            call_params = {
-                'corr_table': self.feature_correlation_table,
-                'datasets': self.datasets,
-                'integrated_data': self.integrated_data_selected,
-                'integrated_metadata': self.integrated_metadata,
-                'output_dir': self.output_dir,
-                'output_filenames': output_filenames,
-                'annotation_df': self.feature_annotation_table,
-                'submodule_mode': grouping_params.get('submodule_mode', 'louvain'),
-                'network_layout': grouping_params.get('network_layout', 'spring'),
-            }
-            call_params.update(kwargs)
-            
-            node_table, edge_table = hlp.plot_correlation_network(**call_params)
-
-            if node_table.empty or edge_table.empty:
-                log.error(f"Plotting correlation network resulted in empty node/edge tables. Please check your correlation table and networking parameters.")
-                sys.exit(1)
-            else:
-                log.info("Created correlation network graph and associated node/edge tables.")
-
-            self.feature_network_node_table = node_table
-            self.feature_network_edge_table = edge_table
-
-            log.info(f"Created table: {self._feature_network_node_table_filename}")
-            log.info("Created attribute: feature_network_node_table")
-            log.info(f"Created table: {self._feature_network_edge_table_filename}")
-            log.info("Created attribute: feature_network_edge_table")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('plot_correlation_network')
-            _network_method()
-            self._complete_tracking('plot_correlation_network')
-            return
-        else:
-            _network_method()
-            return
-
     def group_features_step(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
-        """Unified feature grouping dispatcher supporting network_modules, hierarchical_clustering, and hdbscan."""
+        """Unified feature grouping dispatcher supporting network_modules, hierarchical_clustering, hdbscan, nmf, leiden_knn."""
         def _group_method():
             log.info("Grouping Features")
             submodule_subdir = "submodules"
@@ -2312,11 +2209,8 @@ class Analysis(BaseDataHandler):
             os.makedirs(submodule_dir, exist_ok=True)
 
             feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
-            # Support both new layout (method + params) and old layout (selected_method + <method_name> block)
-            selected_method = (feature_grouping_params.get('method')
-                               or feature_grouping_params.get('selected_method', 'network_modules'))
-            method_params = (feature_grouping_params.get('params')
-                             or feature_grouping_params.get(selected_method, {}))
+            selected_method = feature_grouping_params.get('method', 'network_modules')
+            method_params = feature_grouping_params.get('params', {})
 
             # Check if outputs already exist
             if self.check_and_load_attribute('feature_network_node_table', self._feature_network_node_table_filename, self.overwrite) and \
@@ -2394,22 +2288,28 @@ class Analysis(BaseDataHandler):
         Reads ``feature_grouping.method`` from the analysis config and dispatches
         to the appropriate grouping backend:
 
-        * ``network_modules``        – pairwise correlation → graph → community detection
-          (requires ``calculate_correlated_features()`` to have been run first)
-        * ``hierarchical_clustering`` – scipy hierarchical clustering on Z-scored vectors
-        * ``hdbscan``                – HDBSCAN density-based clustering on Z-scored vectors
+        * ``network_modules``         - pairwise Pearson/Spearman correlation → graph →
+          Louvain/Leiden community detection.  Requires
+          ``calculate_correlated_features()`` to have been run first (called
+          automatically if not yet present).
+        * ``hierarchical_clustering`` - scipy agglomerative clustering on feature vectors.
+        * ``hdbscan``                 - HDBSCAN density-based clustering.
+        * ``nmf``                     - Non-negative Matrix Factorization with automatic
+          component count selection via reconstruction-error elbow.
+        * ``leiden_knn``              - Leiden community detection on an approximate
+          k-nearest-neighbor graph (pynndescent); resolution auto-selected by
+          maximising graph modularity.
 
         All methods write a node table (``feature_network_node_table``) with a
         unified ``group`` column and an edge table (``feature_network_edge_table``)
         to disk, and store them as attributes on the Analysis object.
 
         For ``network_modules`` the correlation step is run automatically if
-        ``feature_correlation_table`` is not yet present.
+        ``feature_correlation_table`` is not yet present.  For all other methods
+        the correlation step is skipped.
         """
         feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
-        # Bug fix: read 'method' key (new config) with 'selected_method' as legacy fallback
-        selected_method = (feature_grouping_params.get('method')
-                           or feature_grouping_params.get('selected_method', 'network_modules'))
+        selected_method = feature_grouping_params.get('method', 'network_modules')
 
         # For network_modules, run the correlation step first if needed
         if selected_method == 'network_modules':
@@ -2420,30 +2320,27 @@ class Analysis(BaseDataHandler):
 
         self.group_features_step(overwrite=overwrite, show_progress=show_progress, **kwargs)
 
-    def compare_groups_to_pathways(
-        self,
-        pathway_col: str = "modelseed_pathway",
-        top_n: int = 50,
-        rank_by: str = "n_features",
-        exclude_nopathway: bool = False,
-        min_group_size: int = 3,
-        fdr_method: str = "fdr_bh",
-        alpha: float = 0.05,
-        **plot_kwargs,
-    ) -> dict:
+    def compare_groups_to_pathways(self, **override_kwargs) -> dict:
         """
         Compare data-driven feature groups against knowledge-driven pathway annotations.
 
-        Calls ``hlp.compare_groups_to_pathways()`` using the node table from
-        ``group_features()`` and the feature annotation table from
-        ``annotate_integrated_features()``.
+        All parameters are read from the ``pathway_enrichment`` block in
+        ``analysis.yml``.  Any keyword arguments passed directly to this method
+        override the config values.
+
+        Config keys (under ``analysis.pathway_enrichment``):
+            ``top_n``              - number of top pathways to show (default 50)
+            ``rank_by``            - ``"n_features"`` or ``"cumulative_abs_lfc"``
+            ``exclude_nopathway``  - drop pathways with no canonical name (default False)
+            ``min_group_size``     - minimum features per group (default 3)
+            ``show_only_sig``      - show only significantly enriched pathways
+            ``bipartite_only``     - keep only pathways with features from every data type
+            ``alpha``              - FDR significance threshold (default 0.05)
 
         Returns a dict with keys:
             ``counts_df``, ``row_normalized_df``, ``pathway_stats_df``,
             ``enrichment_df``, ``fig_counts``, ``fig_normalized``,
             ``ari``, ``nmi``, ``n_features_compared``
-
-        See ``hlp.compare_groups_to_pathways()`` for full parameter documentation.
         """
         if not hasattr(self, 'feature_network_node_table') or self.feature_network_node_table.empty:
             raise RuntimeError(
@@ -2454,20 +2351,26 @@ class Analysis(BaseDataHandler):
                 "feature_annotation_table is empty. Run analysis.annotate_integrated_features() first."
             )
 
-        return hlp.compare_groups_to_pathways(
-            node_table=self.feature_network_node_table,
-            annotation_table=self.feature_annotation_table,
-            quant_df=self.integrated_data_selected,
-            pathway_col=pathway_col,
-            top_n=top_n,
-            rank_by=rank_by,
-            exclude_nopathway=exclude_nopathway,
-            min_group_size=min_group_size,
-            fdr_method=fdr_method,
-            alpha=alpha,
-            output_dir=self.output_dir,
-            **plot_kwargs,
-        )
+        pe = self.analysis_parameters.get('pathway_enrichment', {})
+
+        call_params = {
+            'node_table':        self.feature_network_node_table,
+            'annotation_table':  self.feature_annotation_table,
+            'quant_df':          self.integrated_data_selected,
+            'pathway_col':       pe.get('pathway_col', 'modelseed_pathway'),
+            'top_n':             pe.get('top_n', 50),
+            'rank_by':           pe.get('rank_by', 'n_features'),
+            'exclude_nopathway': pe.get('exclude_nopathway', False),
+            'min_group_size':    pe.get('min_group_size', 3),
+            'show_only_sig':     pe.get('show_only_sig', False),
+            'bipartite_only':    pe.get('bipartite_only', False),
+            'fdr_method':        pe.get('fdr_method', 'fdr_bh'),
+            'alpha':             pe.get('alpha', 0.05),
+            'output_dir':        self.output_dir,
+        }
+        call_params.update(override_kwargs)
+
+        return hlp.compare_groups_to_pathways(**call_params)
 
 # Create properties for Analysis class
 manual_file_storage = {
@@ -2476,8 +2379,6 @@ manual_file_storage = {
     'feature_annotation_table': 'feature_annotation_table.csv',
     'integrated_data_selected': 'integrated_data_selected.csv',
     'feature_correlation_table': 'feature_correlation_table.csv',
-    'feature_correlation_table_magi': 'feature_correlation_table_magi.csv',
-    'magi_results_table': 'magi_results_table.csv',
     'feature_network_graph': 'feature_network_graph.graphml',
     'feature_network_edge_table': 'feature_network_edge_table.csv',
     'feature_network_node_table': 'feature_network_node_table.csv',

@@ -55,6 +55,7 @@ from matplotlib.colors import to_hex
 from plotly.subplots import make_subplots
 from matplotlib.lines import Line2D
 from matplotlib.colors import PowerNorm
+import matplotlib.patheffects as pe
 
 # --- Machine learning & statistics ---
 from sklearn.decomposition import PCA
@@ -1597,6 +1598,7 @@ def plot_correlation_network(
     module_resolution: float = 1.0,
     max_module_size: int = 100,
     network_layout: str = None,
+    show_network_plot: bool = False,
 ) -> None:
     """
     Build a correlation graph from a long-format table, optionally
@@ -1605,9 +1607,13 @@ def plot_correlation_network(
 
     Parameters are identical to your original function; the only
     behavioural change is the expanded ``submodule_mode`` options.
-    
+
     datasets : List, optional
         List of dataset objects with annotation_table attributes
+    show_network_plot : bool, default False
+        If True, render the interactive Plotly network widget inline in the
+        notebook.  Set to False (default) to skip rendering and save time
+        when running the workflow programmatically.
     """
 
     # Get all unique features
@@ -1679,18 +1685,21 @@ def plot_correlation_network(
         write_integration_file(data=edge_table, output_dir=output_dir, filename=output_filenames["edge_table"], indexing=True, index_label="edge_index")
         log.info("\tMain graph updated with submodule annotations and written to disk.")
 
-    # interactive plot
-    log.info("Rendering interactive network in notebook…")
-    color_attr = "submodule_color" if submodule_mode != "none" else "datatype_color"
-    log.info("Pre-computing network layout...")
-    widget = _nx_to_plotly_widget(
-        G,
-        node_color_attr=color_attr,
-        node_size_attr="node_size",
-        layout=network_layout,
-        seed=1111,
-    )
-    display(widget)
+    # interactive plot (opt-in)
+    if show_network_plot:
+        log.info("Rendering interactive network in notebook…")
+        color_attr = "submodule_color" if submodule_mode != "none" else "datatype_color"
+        log.info("Pre-computing network layout...")
+        widget = _nx_to_plotly_widget(
+            G,
+            node_color_attr=color_attr,
+            node_size_attr="node_size",
+            layout=network_layout,
+            seed=1111,
+        )
+        display(widget)
+    else:
+        log.info("Network plot skipped (show_network_plot=False). Set show_network_plot=True to render inline.")
 
     # Add unified 'group' column as alias for 'submodule' for downstream compatibility
     if 'submodule' in node_table.columns:
@@ -1943,6 +1952,349 @@ def group_features_hdbscan(
     return node_table, empty_edge_table
 
 
+def group_features_nmf(
+    data: pd.DataFrame,
+    k_min: int = 2,
+    k_max: int = 50,
+    n_runs: int = 3,
+    max_iter: int = 500,
+    output_dir: str = None,
+    output_filenames: Dict[str, str] = None,
+    datasets: List = None,
+    annotation_df: Optional[pd.DataFrame] = None,
+    integrated_data: pd.DataFrame = None,
+    integrated_metadata: pd.DataFrame = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Group features using Non-negative Matrix Factorization (NMF) with automatic
+    component selection via reconstruction-error elbow detection.
+
+    The input matrix is shifted to be non-negative (``X − min(X)``) before
+    factorization so that LFC or Z-score values are handled correctly.
+
+    For each candidate k in ``[k_min, k_max]``, NMF is run ``n_runs`` times
+    and the median reconstruction error (Frobenius norm of ``X − WH``) is
+    recorded.  The optimal k is chosen at the elbow of the error curve using
+    the maximum-distance method (largest perpendicular distance from the line
+    connecting the first and last points).
+
+    Each feature is assigned to the component for which its W loading is
+    highest.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Feature matrix (features × columns).  Can contain negative values
+        (LFC or Z-score); a non-negative shift is applied internally.
+    k_min : int
+        Minimum number of NMF components to evaluate (default 2).
+    k_max : int
+        Maximum number of NMF components to evaluate (default 50).
+    n_runs : int
+        Number of random restarts per k for stability (default 3).
+    max_iter : int
+        Maximum NMF iterations per run (default 500).
+    output_dir : str
+        Directory to write output files.
+    output_filenames : Dict[str, str]
+        Dict with keys ``"node_table"`` and ``"edge_table"``.
+    datasets : List
+        Dataset objects with a ``.dataset_name`` attribute (used for coloring).
+    annotation_df : pd.DataFrame, optional
+        Feature annotation table; merged on feature ID if provided.
+    integrated_data : pd.DataFrame
+        Accepted for API consistency; not used.
+    integrated_metadata : pd.DataFrame
+        Accepted for API consistency; not used.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.DataFrame]
+        ``(node_table, edge_table)`` where ``node_table`` is indexed by
+        feature ID with a ``'group'`` column, and ``edge_table`` is empty.
+    """
+    from sklearn.decomposition import NMF as _NMF
+
+    log.info("Grouping features by NMF with automatic k selection (elbow method)...")
+
+    # Drop non-numeric / all-NaN rows
+    numeric_data = data.select_dtypes(include=[np.number]).fillna(0)
+    numeric_data = numeric_data.loc[~(numeric_data == 0).all(axis=1)]
+
+    # Shift to non-negative
+    X_min = numeric_data.values.min()
+    X = (numeric_data.values - X_min).astype(np.float64)
+
+    k_max_eff = min(k_max, X.shape[0] - 1, X.shape[1] - 1)
+    if k_max_eff < k_min:
+        raise ValueError(
+            f"k_max_eff={k_max_eff} < k_min={k_min}. "
+            "Reduce k_min or provide a larger feature matrix."
+        )
+
+    k_range = list(range(k_min, k_max_eff + 1))
+    errors: List[float] = []
+
+    log.info(f"  Evaluating k = {k_min}…{k_max_eff} ({n_runs} runs each)...")
+    for k in k_range:
+        run_errors = []
+        for _ in range(n_runs):
+            model = _NMF(
+                n_components=k,
+                init="nndsvda",
+                max_iter=max_iter,
+                random_state=None,
+            )
+            W = model.fit_transform(X)
+            H = model.components_
+            err = np.linalg.norm(X - W @ H, "fro")
+            run_errors.append(err)
+        errors.append(float(np.median(run_errors)))
+        log.info(f"    k={k}: median reconstruction error = {errors[-1]:.4f}")
+
+    # Elbow detection: maximum perpendicular distance from the line
+    # connecting (k_min, errors[0]) → (k_max_eff, errors[-1])
+    pts = np.array(list(zip(k_range, errors)), dtype=float)
+    p1, p2 = pts[0], pts[-1]
+    line_vec = p2 - p1
+    line_len = np.linalg.norm(line_vec)
+    if line_len == 0:
+        best_k = k_min
+    else:
+        unit = line_vec / line_len
+        dists = np.abs(np.cross(unit, pts - p1))
+        best_k = k_range[int(np.argmax(dists))]
+
+    log.info(f"  Elbow detected at k={best_k}. Fitting final NMF model...")
+
+    # Final fit with best_k (multiple restarts, keep lowest error)
+    best_err = np.inf
+    best_W: Optional[np.ndarray] = None
+    for _ in range(max(n_runs, 5)):
+        model = _NMF(
+            n_components=best_k,
+            init="nndsvda",
+            max_iter=max_iter,
+            random_state=None,
+        )
+        W = model.fit_transform(X)
+        H = model.components_
+        err = np.linalg.norm(X - W @ H, "fro")
+        if err < best_err:
+            best_err = err
+            best_W = W
+
+    # Assign each feature to its highest-loading component
+    component_assignments = np.argmax(best_W, axis=1)
+    group_labels = [f"group_{c + 1}" for c in component_assignments]
+
+    feature_ids = numeric_data.index.tolist()
+    all_prefixes = [ds.dataset_name + "_" for ds in (datasets or [])]
+    present_prefixes = [p for p in all_prefixes if any(f.startswith(p) for f in feature_ids)]
+    color_map, shape_map = _make_prefix_maps(present_prefixes)
+
+    def _get_color(fid):
+        for p in present_prefixes:
+            if fid.startswith(p):
+                return color_map.get(p, "gray")
+        return "gray"
+
+    def _get_shape(fid):
+        for p in present_prefixes:
+            if fid.startswith(p):
+                return shape_map.get(p, "circle")
+        return "circle"
+
+    node_table = pd.DataFrame({
+        "group": group_labels,
+        "datatype_color": [_get_color(f) for f in feature_ids],
+        "datatype_shape": [_get_shape(f) for f in feature_ids],
+    }, index=feature_ids)
+    node_table.index.name = "node_id"
+
+    if annotation_df is not None and not annotation_df.empty:
+        ann = annotation_df.copy()
+        if 'feature_id' in ann.columns:
+            ann = ann.set_index('feature_id')
+        ann_cols = [c for c in ann.columns if c not in node_table.columns]
+        node_table = node_table.join(ann[ann_cols], how='left')
+
+    n_groups = node_table['group'].nunique()
+    log.info(f"  NMF grouping complete: k={best_k}, {n_groups} groups across {len(node_table)} features.")
+
+    write_integration_file(data=node_table, output_dir=output_dir, filename=output_filenames["node_table"], indexing=True, index_label="node_id")
+    empty_edge_table = pd.DataFrame(columns=['source', 'target', 'weight'])
+    write_integration_file(data=empty_edge_table, output_dir=output_dir, filename=output_filenames["edge_table"], indexing=True, index_label="edge_index")
+
+    return node_table, empty_edge_table
+
+
+def group_features_leiden_knn(
+    data: pd.DataFrame,
+    n_neighbors: int = 15,
+    resolution_min: float = 0.1,
+    resolution_max: float = 2.0,
+    resolution_steps: int = 20,
+    output_dir: str = None,
+    output_filenames: Dict[str, str] = None,
+    datasets: List = None,
+    annotation_df: Optional[pd.DataFrame] = None,
+    integrated_data: pd.DataFrame = None,
+    integrated_metadata: pd.DataFrame = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Group features using Leiden community detection on an approximate
+    k-nearest-neighbor graph built from the feature row vectors.
+
+    The k-NN graph is constructed with ``pynndescent`` (O(n log n)) using
+    cosine distance, which is appropriate for both Z-scored and LFC vectors.
+    Leiden is then run over a sweep of resolution values; the resolution that
+    maximises graph modularity is selected automatically.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Feature matrix (features × columns).
+    n_neighbors : int
+        Number of nearest neighbors per feature (default 15).
+    resolution_min : float
+        Lower bound of the resolution sweep (default 0.1).
+    resolution_max : float
+        Upper bound of the resolution sweep (default 2.0).
+    resolution_steps : int
+        Number of resolution values to evaluate (default 20).
+    output_dir : str
+        Directory to write output files.
+    output_filenames : Dict[str, str]
+        Dict with keys ``"node_table"`` and ``"edge_table"``.
+    datasets : List
+        Dataset objects with a ``.dataset_name`` attribute.
+    annotation_df : pd.DataFrame, optional
+        Feature annotation table; merged on feature ID if provided.
+    integrated_data : pd.DataFrame
+        Accepted for API consistency; not used.
+    integrated_metadata : pd.DataFrame
+        Accepted for API consistency; not used.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.DataFrame]
+        ``(node_table, edge_table)`` where ``node_table`` is indexed by
+        feature ID with a ``'group'`` column, and ``edge_table`` is empty.
+    """
+    try:
+        from pynndescent import NNDescent
+    except ImportError:
+        raise ImportError(
+            "The 'pynndescent' package is required for group_features_leiden_knn(). "
+            "Install it with: pip install pynndescent"
+        )
+
+    log.info("Grouping features by Leiden community detection on k-NN graph...")
+
+    numeric_data = data.select_dtypes(include=[np.number]).fillna(0)
+    numeric_data = numeric_data.loc[~(numeric_data == 0).all(axis=1)]
+    X = numeric_data.values.astype(np.float64)
+    n_features = X.shape[0]
+
+    k_eff = min(n_neighbors, n_features - 1)
+    if k_eff < 2:
+        raise ValueError(
+            f"Need at least 3 features for k-NN graph; got {n_features}."
+        )
+
+    # Build approximate k-NN graph
+    log.info(f"  Building approximate k-NN graph (n_neighbors={k_eff}, metric='cosine')...")
+    index = NNDescent(X, metric="cosine", n_neighbors=k_eff + 1, random_state=42)
+    indices, distances = index.neighbor_graph  # shape (n, k+1); col 0 = self
+
+    # Convert to igraph for Leiden
+    edges: List[Tuple[int, int]] = []
+    weights: List[float] = []
+    for i in range(n_features):
+        for j_pos in range(1, indices.shape[1]):  # skip self (col 0)
+            j = int(indices[i, j_pos])
+            if j > i:  # upper triangle only → undirected
+                sim = max(0.0, 1.0 - float(distances[i, j_pos]))  # cosine similarity
+                edges.append((i, j))
+                weights.append(sim)
+
+    ig_g = ig.Graph(n=n_features, edges=edges, directed=False)
+    ig_g.es["weight"] = weights
+    log.info(f"  k-NN graph: {n_features} nodes, {len(edges)} edges.")
+
+    # Resolution sweep — maximise modularity
+    resolutions = np.linspace(resolution_min, resolution_max, resolution_steps)
+    best_resolution = float(resolutions[0])
+    best_modularity = -np.inf
+    best_partition = None
+
+    log.info(f"  Sweeping resolution {resolution_min}…{resolution_max} ({resolution_steps} steps)...")
+    for res in resolutions:
+        partition = leidenalg.find_partition(
+            ig_g,
+            leidenalg.RBConfigurationVertexPartition,
+            weights="weight",
+            resolution_parameter=float(res),
+            seed=42,
+        )
+        mod = partition.modularity
+        if mod > best_modularity:
+            best_modularity = mod
+            best_resolution = float(res)
+            best_partition = partition
+
+    n_communities = len(best_partition)
+    log.info(
+        f"  Best resolution={best_resolution:.3f} → "
+        f"{n_communities} communities (modularity={best_modularity:.4f})."
+    )
+
+    # Build group labels
+    membership = best_partition.membership  # list of community IDs per node
+    group_labels = [f"group_{m + 1}" for m in membership]
+
+    feature_ids = numeric_data.index.tolist()
+    all_prefixes = [ds.dataset_name + "_" for ds in (datasets or [])]
+    present_prefixes = [p for p in all_prefixes if any(f.startswith(p) for f in feature_ids)]
+    color_map, shape_map = _make_prefix_maps(present_prefixes)
+
+    def _get_color(fid):
+        for p in present_prefixes:
+            if fid.startswith(p):
+                return color_map.get(p, "gray")
+        return "gray"
+
+    def _get_shape(fid):
+        for p in present_prefixes:
+            if fid.startswith(p):
+                return shape_map.get(p, "circle")
+        return "circle"
+
+    node_table = pd.DataFrame({
+        "group": group_labels,
+        "datatype_color": [_get_color(f) for f in feature_ids],
+        "datatype_shape": [_get_shape(f) for f in feature_ids],
+    }, index=feature_ids)
+    node_table.index.name = "node_id"
+
+    if annotation_df is not None and not annotation_df.empty:
+        ann = annotation_df.copy()
+        if 'feature_id' in ann.columns:
+            ann = ann.set_index('feature_id')
+        ann_cols = [c for c in ann.columns if c not in node_table.columns]
+        node_table = node_table.join(ann[ann_cols], how='left')
+
+    n_groups = node_table['group'].nunique()
+    log.info(f"  Leiden k-NN grouping complete: {n_groups} groups across {len(node_table)} features.")
+
+    write_integration_file(data=node_table, output_dir=output_dir, filename=output_filenames["node_table"], indexing=True, index_label="node_id")
+    empty_edge_table = pd.DataFrame(columns=['source', 'target', 'weight'])
+    write_integration_file(data=empty_edge_table, output_dir=output_dir, filename=output_filenames["edge_table"], indexing=True, index_label="edge_index")
+
+    return node_table, empty_edge_table
+
+
 def group_features(
     data: pd.DataFrame,
     method: str,
@@ -1961,18 +2313,18 @@ def group_features(
     Parameters
     ----------
     data : pd.DataFrame
-        LFC matrix with features as rows and comparisons as columns.
+        Feature matrix (features × samples or features × contrasts).
     method : str
-        One of "network_modules", "hierarchical_clustering", "hdbscan".
+        One of ``"network_modules"``, ``"hierarchical_clustering"``,
+        ``"hdbscan"``, ``"nmf"``, ``"leiden_knn"``.
     method_params : Dict
-        Sub-block from config for the selected method (e.g. all keys under
-        ``network_modules:`` or ``hierarchical_clustering:``).
+        Sub-block from config for the selected method.
     output_dir : str
         Directory to write output files.
     output_filenames : Dict[str, str]
-        Dict with keys "node_table" and "edge_table".
+        Dict with keys ``"node_table"`` and ``"edge_table"``.
     datasets : List
-        List of dataset objects with a .dataset_name attribute.
+        List of dataset objects with a ``.dataset_name`` attribute.
     annotation_df : pd.DataFrame, optional
         Feature annotation table.
     integrated_data : pd.DataFrame
@@ -2003,6 +2355,7 @@ def group_features(
             annotation_df=annotation_df,
             submodule_mode=method_params.get('submodule_mode', 'louvain'),
             network_layout=method_params.get('network_layout', None),
+            show_network_plot=method_params.get('show_network_plot', False),
         )
         # Add 'group' column as alias for 'submodule' (plot_correlation_network
         # already does this, but guard here for safety)
@@ -2038,10 +2391,40 @@ def group_features(
             integrated_metadata=integrated_metadata,
         )
 
+    elif method == "nmf":
+        return group_features_nmf(
+            data=data,
+            k_min=method_params.get('k_min', 2),
+            k_max=method_params.get('k_max', 50),
+            n_runs=method_params.get('n_runs', 3),
+            max_iter=method_params.get('max_iter', 500),
+            output_dir=output_dir,
+            output_filenames=output_filenames,
+            datasets=datasets,
+            annotation_df=annotation_df,
+            integrated_data=integrated_data,
+            integrated_metadata=integrated_metadata,
+        )
+
+    elif method == "leiden_knn":
+        return group_features_leiden_knn(
+            data=data,
+            n_neighbors=method_params.get('n_neighbors', 15),
+            resolution_min=method_params.get('resolution_min', 0.1),
+            resolution_max=method_params.get('resolution_max', 2.0),
+            resolution_steps=method_params.get('resolution_steps', 20),
+            output_dir=output_dir,
+            output_filenames=output_filenames,
+            datasets=datasets,
+            annotation_df=annotation_df,
+            integrated_data=integrated_data,
+            integrated_metadata=integrated_metadata,
+        )
+
     else:
         raise ValueError(
             f"Unknown feature_grouping method '{method}'. "
-            "Choose from: network_modules, hierarchical_clustering, hdbscan"
+            "Choose from: network_modules, hierarchical_clustering, hdbscan, nmf, leiden_knn"
         )
 
 
@@ -2395,424 +2778,6 @@ def _annotate_and_save_submodules(
                 dpi=300,
             )
             plt.close()
-
-
-###################
-# Add MAGI2 evidence
-###################
-
-def parse_magi_table(
-    annotation_table: pd.DataFrame,
-    magi_raw_dir: str,
-    tx_raw_dir: str,
-    score_cutoff: float,
-    output_dir: str,
-    output_filename: str
-) -> pd.DataFrame:
-    """
-    Parse MAGI2 output files and return a DataFrame with metabolite and transcript IDs (names)
-    that match existing feature IDs in the integrated dataset.
-    
-    Handles multiple annotations per feature stored as ;;-separated strings.
-    Uses GFF file to map protein IDs to gene IDs for transcripts.
-    """
-
-    magi_df = pd.read_csv(os.path.join(magi_raw_dir, "magi_combined_results.csv"))
-    magi_df = magi_df[['original_compound', 'gene_ID', 'rhea_ID_r2g', 'rhea_ID_g2r', 'MAGI_score']]
-    
-    # Ensure all columns are strings except MAGI_score
-    for col in magi_df.columns:
-        if col != 'MAGI_score':
-            magi_df[col] = magi_df[col].astype(str)
-    
-    # Ensure MAGI_score is numeric
-    magi_df['MAGI_score'] = pd.to_numeric(magi_df['MAGI_score'], errors='coerce')
-    
-    # Filter by score cutoff
-    log.info(f"MAGI entries before score cutoff ({score_cutoff}): {len(magi_df)}")
-    magi_df = magi_df[magi_df['MAGI_score'] >= score_cutoff].reset_index(drop=True)
-    log.info(f"MAGI entries after score cutoff ({score_cutoff}): {len(magi_df)}")
-    
-    # Parse gene_ID to extract protein_id (3rd pipe-separated element)
-    log.info("Parsing gene_ID to extract protein IDs...")
-    magi_df['parsed_protein_id'] = magi_df['gene_ID'].str.split('|').str[2]
-    
-    # Find GFF file in the same directory structure as annotation table
-    gff_files = []
-    for pattern in ['*.gff3', '*.gff3.gz', '*.gff', '*.gff.gz']:
-        gff_files.extend(glob.glob(os.path.join(tx_raw_dir, '**', pattern), recursive=True))
-    if not gff_files:
-        raise ValueError(f"No GFF3 file found in {tx_raw_dir} or subdirectories. "
-                        "GFF file is required for mapping protein IDs to gene IDs.")
-    gff_file = gff_files[0]  # Use first GFF file found
-    log.info(f"Using GFF file: {os.path.basename(gff_file)}")
-    
-    # Parse GFF3 file to create protein_id -> gene_id mapping
-    log.info("Parsing GFF file to create protein ID to gene ID mappings...")
-    protein_to_gene = {}
-    
-    open_func = gzip.open if gff_file.endswith('.gz') else open
-    with open_func(gff_file, 'rt') as f:
-        for line in f:
-            if line.startswith('#') or line.strip() == '':
-                continue
-                
-            fields = line.strip().split('\t')
-            if len(fields) < 9:
-                continue
-            
-            # Only process 'gene' features
-            if fields[2] != 'gene':
-                continue
-            
-            attributes = fields[8]
-            
-            # Extract gene ID (the feature ID we want)
-            gene_match = re.search(r'ID=([^;]+)', attributes)
-            if not gene_match:
-                continue
-            gene_id = gene_match.group(1)
-            
-            # Extract protein ID
-            protein_match = re.search(r'proteinId=([^;]+)', attributes)
-            if not protein_match:
-                continue
-            protein_id = protein_match.group(1)
-            
-            # Store mapping
-            protein_to_gene[protein_id] = gene_id
-    
-    log.info(f"Found {len(protein_to_gene)} protein-to-gene mappings in GFF file")
-    
-    # Map protein IDs to gene IDs (feature IDs)
-    def map_protein_to_gene(protein_id):
-        if protein_id in protein_to_gene:
-            gene_id = protein_to_gene[protein_id]
-            # Add 'tx_' prefix if not already present
-            if not gene_id.startswith('tx_'):
-                return f'tx_{gene_id}'
-            return gene_id
-        return None
-    
-    log.info("Mapping MAGI protein IDs to transcript feature IDs...")
-    magi_df['gene_feature_id'] = magi_df['parsed_protein_id'].apply(map_protein_to_gene)
-    
-    # Now handle metabolite mapping using annotation table
-    log.info("Creating SMILES to feature ID mappings from annotation table...")
-    smiles_to_features = {}
-    
-    # Ensure annotation_table columns are strings
-    for col in annotation_table.columns:
-        if col not in ['feature_id']:
-            annotation_table[col] = annotation_table[col].astype(str)
-    
-    for idx, row in annotation_table.iterrows():
-        feature_id = str(row['feature_id'])
-        smiles_str = str(row.get('mx_Smiles', ''))
-        
-        # Skip if no SMILES data
-        if smiles_str in ['nan', 'Unassigned', 'NA', '', 'None']:
-            continue
-        
-        # Split on ;; and add each SMILES to the mapping
-        for smiles in smiles_str.split(';;'):
-            smiles = smiles.strip()
-            if smiles and smiles not in ['nan', 'Unassigned', 'NA', '']:
-                if smiles not in smiles_to_features:
-                    smiles_to_features[smiles] = []
-                smiles_to_features[smiles].append(feature_id)
-    
-    log.info(f"Created {len(smiles_to_features)} unique SMILES mappings")
-    
-    # Map SMILES to feature IDs (with ;;-separated values)
-    def map_smiles_to_features(smiles):
-        if smiles in smiles_to_features:
-            return ';;'.join(smiles_to_features[smiles])
-        return None
-    
-    log.info("Mapping MAGI SMILES to metabolite feature IDs...")
-    magi_df['compound_feature_id'] = magi_df['original_compound'].apply(map_smiles_to_features)
-    
-    # Drop the intermediate column
-    magi_df = magi_df.drop(columns=['parsed_protein_id'])
-    
-    # Reorder columns for clarity
-    cols = ['compound_feature_id', 'gene_feature_id', 'original_compound', 'gene_ID', 
-            'rhea_ID_r2g', 'rhea_ID_g2r', 'MAGI_score']
-    magi_df = magi_df[cols]
-    
-    # Final type check: ensure all columns are strings except MAGI_score
-    for col in magi_df.columns:
-        if col != 'MAGI_score':
-            magi_df[col] = magi_df[col].astype(str)
-    
-    # Log summary statistics
-    n_total = len(magi_df)
-    n_mapped_genes = magi_df['gene_feature_id'].notna().sum()
-    n_mapped_compounds = magi_df['compound_feature_id'].notna().sum()
-    n_both_mapped = ((magi_df['gene_feature_id'].notna()) & 
-                     (magi_df['compound_feature_id'].notna())).sum()
-    
-    # Count multiple mappings
-    n_multi_genes = magi_df['gene_feature_id'].str.contains(';;', na=False).sum()
-    n_multi_compounds = magi_df['compound_feature_id'].str.contains(';;', na=False).sum()
-    
-    log.info(f"MAGI mapping summary:")
-    log.info(f"  Total MAGI predictions: {n_total}")
-    log.info(f"  Genes mapped to features: {n_mapped_genes} ({n_mapped_genes/n_total*100:.1f}%)")
-    log.info(f"    With multiple mappings: {n_multi_genes}")
-    log.info(f"  Compounds mapped to features: {n_mapped_compounds} ({n_mapped_compounds/n_total*100:.1f}%)")
-    log.info(f"    With multiple mappings: {n_multi_compounds}")
-    log.info(f"  Both mapped: {n_both_mapped} ({n_both_mapped/n_total*100:.1f}%)")
-    
-    # Save the mapped table
-    write_integration_file(
-        data=magi_df,
-        output_dir=output_dir,
-        filename=output_filename,
-        indexing=True
-    )
-    
-    return magi_df
-
-def add_magi_scores_to_correlation_table(
-    correlation_table: pd.DataFrame,
-    scatter_correlation: str,
-    magi_df: pd.DataFrame,
-    output_dir: str = None,
-    output_filename: str = "correlation_table_with_magi_scores"
-) -> pd.DataFrame:
-    """
-    Add MAGI scores to a feature correlation table based on gene-compound pairs.
-    Only considers bipartite correlations (between different dataset types).
-    
-    For each correlated feature pair from different datasets, checks if they appear 
-    in the MAGI predictions and adds the MAGI_score if found. Handles multiple 
-    feature IDs stored as ;;-separated strings.
-    
-    Args:
-        correlation_table: DataFrame with columns ['feature_1', 'feature_2', 'correlation']
-        magi_df: DataFrame from parse_magi_table() with MAGI predictions and feature mappings
-        output_dir: Directory to save the output table
-        output_filename: Filename for the output table
-        
-    Returns:
-        DataFrame with only bipartite correlations and added 'MAGI_score' column
-    """
-    
-    log.info("Adding MAGI scores to correlation table...")
-    log.info(f"  Total correlation pairs: {len(correlation_table):,}")
-    log.info(f"  MAGI predictions: {len(magi_df):,}")
-    
-    # Create a copy to avoid modifying the original
-    result_df = correlation_table.copy()
-    
-    # Ensure correlation_table columns are strings except correlation
-    for col in result_df.columns:
-        if col not in ['correlation', 'MAGI_score']:
-            result_df[col] = result_df[col].astype(str)
-    
-    # Ensure correlation column is numeric
-    result_df['correlation'] = pd.to_numeric(result_df['correlation'], errors='coerce')
-    
-    # Filter for bipartite correlations only (different dataset prefixes)
-    # Extract dataset prefix (everything before the first underscore)
-    result_df['dataset_1'] = result_df['feature_1'].str.split('_').str[0]
-    result_df['dataset_2'] = result_df['feature_2'].str.split('_').str[0]
-    
-    # Keep only pairs where datasets differ
-    bipartite_mask = result_df['dataset_1'] != result_df['dataset_2']
-    result_df = result_df[bipartite_mask].copy()
-    
-    # Drop the temporary dataset columns
-    result_df = result_df.drop(columns=['dataset_1', 'dataset_2'])
-    
-    log.info(f"  Bipartite correlation pairs (different datasets): {len(result_df):,}")
-    
-    # Initialize MAGI_score column with NaN
-    result_df['MAGI_score'] = np.nan
-
-    # Ensure magi_df columns are strings except MAGI_score
-    for col in magi_df.columns:
-        if col != 'MAGI_score':
-            magi_df[col] = magi_df[col].astype(str)
-    
-    # Ensure MAGI_score is numeric
-    magi_df['MAGI_score'] = pd.to_numeric(magi_df['MAGI_score'], errors='coerce')
-    
-    # Build lookup dictionaries for efficient matching
-    # Key: (gene_feature_id, compound_feature_id) -> MAGI_score
-    magi_lookup = {}
-    
-    for idx, row in magi_df.iterrows():
-        gene_ids = row['gene_feature_id']
-        compound_ids = row['compound_feature_id']
-        magi_score = row['MAGI_score']
-        
-        # Skip if either mapping is missing
-        if pd.isna(gene_ids) or pd.isna(compound_ids) or gene_ids == 'nan' or compound_ids == 'nan':
-            continue
-        
-        # Handle ;;-separated multiple IDs
-        gene_id_list = [g.strip() for g in str(gene_ids).split(';;') if g.strip() and g.strip() != 'nan']
-        compound_id_list = [c.strip() for c in str(compound_ids).split(';;') if c.strip() and c.strip() != 'nan']
-        
-        # Create all possible gene-compound pairs
-        for gene_id in gene_id_list:
-            for compound_id in compound_id_list:
-                # Store both orderings since we don't know which feature is which
-                magi_lookup[(gene_id, compound_id)] = magi_score
-                magi_lookup[(compound_id, gene_id)] = magi_score
-    
-    log.info(f"  Built MAGI lookup with {len(magi_lookup):,} gene-compound pairs")
-    # Find only valid non-None pairs
-    valid_magi_lookup = {k: v for k, v in magi_lookup.items() if k[0] != 'None' and k[1] != 'None'}
-    log.info(f"  Valid MAGI lookup pairs (excluding 'None'): {len(valid_magi_lookup):,}")
-    magi_lookup = valid_magi_lookup
-    
-    # Match correlation pairs to MAGI predictions
-    matches_found = 0
-    
-    for idx, row in result_df.iterrows():
-        feature_1 = row['feature_1']
-        feature_2 = row['feature_2']
-        
-        # Check if pair exists in MAGI lookup (either ordering)
-        pair_key = (feature_1, feature_2)
-        
-        if pair_key in magi_lookup:
-            result_df.at[idx, 'MAGI_score'] = magi_lookup[pair_key]
-            matches_found += 1
-    
-    # Summary statistics
-    n_with_magi = result_df['MAGI_score'].notna().sum()
-    pct_with_magi = (n_with_magi / len(result_df) * 100) if len(result_df) > 0 else 0
-    
-    log.info(f"MAGI score matching summary (bipartite pairs only):")
-    log.info(f"  Bipartite correlation pairs with MAGI support: {n_with_magi:,} ({pct_with_magi:.1f}%)")
-    
-    if n_with_magi > 0:
-        # Show distribution of MAGI scores for matched pairs
-        magi_scores = result_df['MAGI_score'].dropna()
-        log.info(f"  MAGI score range: {magi_scores.min():.3f} - {magi_scores.max():.3f}")
-        log.info(f"  MAGI score mean: {magi_scores.mean():.3f}")
-        log.info(f"  MAGI score median: {magi_scores.median():.3f}")
-    
-    # Save results if output directory provided
-    if output_dir:
-        write_integration_file(
-            data=result_df,
-            output_dir=output_dir,
-            filename=output_filename,
-            indexing=True
-        )
-    
-    # Create scatter plot if requested
-    if n_with_magi > 0:
-        log.info("Creating MAGI vs. Correlation scatter plot...")
-        plot_magi_vs_correlation(
-            correlation_table=result_df,
-            corr_values=scatter_correlation,
-            output_dir=output_dir,
-            output_filename=f"{output_filename}_scatter",
-            show_plot=True
-        )
-    
-    return result_df
-
-def plot_magi_vs_correlation(
-    correlation_table: pd.DataFrame,
-    corr_values: str = "correlation",
-    output_dir: str = None,
-    output_filename: str = "magi_vs_correlation_scatter",
-    show_plot: bool = True
-) -> Dict[str, float]:
-    """
-    Plot MAGI scores vs correlation scores with a fitted regression line.
-    
-    Args:
-        correlation_table: DataFrame with 'correlation' and 'MAGI_score' columns
-        output_dir: Directory to save the plot
-        output_filename: Filename for the plot (without extension)
-        show_plot: Whether to display the plot inline
-        
-    Returns:
-        Dictionary with regression statistics (slope, intercept, r_squared, p_value)
-    """
-    
-    # Filter to only rows with MAGI scores
-    data_with_magi = correlation_table.dropna(subset=['MAGI_score'])
-    
-    if data_with_magi.empty:
-        log.warning("No MAGI scores found for plotting")
-        return {}
-    
-    log.info(f"Plotting {len(data_with_magi):,} correlations with MAGI scores")
-    
-    # Extract data
-    x = data_with_magi[corr_values].values
-    x = x.astype(float)
-    y = data_with_magi['MAGI_score'].values
-    y = y.astype(float)
-    
-    # Fit linear regression
-    from scipy.stats import linregress
-    slope, intercept, r_value, p_value, std_err = linregress(x, y)
-    r_squared = r_value ** 2
-    
-    # Create figure
-    fig, ax = plt.subplots(figsize=(10, 8))
-    
-    # Scatter plot
-    ax.scatter(x, y, alpha=0.5, s=20, c='#440154', edgecolors='none')
-    
-    # Fitted line
-    x_line = np.linspace(x.min(), x.max(), 100)
-    y_line = slope * x_line + intercept
-    ax.plot(x_line, y_line, 'r-', linewidth=2, 
-            label=f'y = {slope:.3f}x + {intercept:.3f}\nR² = {r_squared:.3f}, p = {p_value:.2e}')
-    
-    # Labels and styling
-    ax.set_xlabel('Correlation Score', fontsize=12)
-    ax.set_ylabel('MAGI Score', fontsize=12)
-    ax.set_title('MAGI Score vs. Correlation Score', fontsize=14, pad=20)
-    ax.legend(loc='best', fontsize=10, framealpha=0.9)
-    ax.grid(True, alpha=0.3)
-    
-    # Add density information using hexbin overlay
-    ax2 = ax.twinx()
-    ax2.set_yticks([])
-    
-    plt.tight_layout()
-    
-    # Save plot
-    if output_dir:
-        output_path = f"{output_dir}/{output_filename}.pdf"
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        log.info(f"Saved plot to {output_path}")
-    
-    # Display plot
-    if show_plot:
-        plt.show()
-    else:
-        plt.close(fig)
-    
-    # Log statistics
-    log.info(f"Regression statistics:")
-    log.info(f"  Slope: {slope:.4f}")
-    log.info(f"  Intercept: {intercept:.4f}")
-    log.info(f"  R²: {r_squared:.4f}")
-    log.info(f"  P-value: {p_value:.2e}")
-    log.info(f"  Std Error: {std_err:.4f}")
-    
-    return {
-        'slope': slope,
-        'intercept': intercept,
-        'r_squared': r_squared,
-        'p_value': p_value,
-        'std_err': std_err,
-        'n_points': len(data_with_magi)
-    }
 
 # ====================================
 # Dataset acquisition functions
@@ -4663,10 +4628,10 @@ def match_name_fuzzy(
 
     matched_text, score, idx = result
     cpd_id = fuzzy_cpds[idx]
-    log.warning(
-        "Fuzzy name match used: '%s' ~ ModelSEED '%s' (cpd=%s, score=%.1f)",
-        name, matched_text, cpd_id, score,
-    )
+    #log.warning(
+    #    "Fuzzy name match used: '%s' ~ ModelSEED '%s' (cpd=%s, score=%.1f)",
+    #    name, matched_text, cpd_id, score,
+    #)
     return cpd_id
 
 def resolve_modelseed_ids(
@@ -5252,15 +5217,14 @@ def annotate_integrated_features(
 
                 if dataset_annotation_cols:
                     dataset_annotated_mask = (
-                        final_annotation_df.loc[dataset_feature_indices, dataset_annotation_cols] != 'Unassigned'
+                        ~final_annotation_df.loc[dataset_feature_indices, dataset_annotation_cols].isin(["Unassigned", ""])
                     ).any(axis=1)
                     dataset_annotated_count = dataset_annotated_mask.sum()
                 else:
                     dataset_annotated_count = 0
 
                 any_annotation_mask = (
-                    final_annotation_df.loc[dataset_feature_indices,
-                                          final_annotation_df.columns[1:]] != 'Unassigned'
+                    ~final_annotation_df.loc[dataset_feature_indices, final_annotation_df.columns[1:]].isin(["Unassigned", ""])
                 ).any(axis=1)
                 any_annotated_count = any_annotation_mask.sum()
 
@@ -5463,63 +5427,26 @@ def integrate_metadata(
     method: Literal["replicate_matched", "lfc"] = "replicate_matched",
     group_col: str = "group",
     overlap_only: bool = True,
-    lfc_pairs: Optional[List[Union[str, Tuple[str, str]]]] = None,
 ) -> pd.DataFrame:
     """
-    Integrate metadata in one of two modes:
+    Integrate metadata across datasets.
 
-    - replicate_matched: original sample-level integration by unifying_col
-    - lfc: contrast-level integration where each row is a groupA_vs_groupB contrast
+    Parameters
+    ----------
+    method : ``"replicate_matched"`` (sample_resolution track)
+        Merges per-dataset linked_metadata on ``unifying_col`` to produce a
+        single sample-level metadata table.
+    method : ``"lfc"`` (condition_resolution track)
+        Builds a contrast-level metadata table where each row is a
+        ``groupA_vs_groupB`` contrast derived from all unique pairwise
+        combinations of condition labels.
     """
-
-    def _resolve_pairs(groups: List[str]) -> List[Tuple[str, str]]:
-        groups = sorted(list({str(g) for g in groups}))
-        if len(groups) < 2:
-            raise ValueError("At least 2 groups are required to build LFC contrasts.")
-
-        if lfc_pairs is None:
-            return list(combinations(groups, 2))
-
-        valid_groups = set(groups)
-        resolved: List[Tuple[str, str]] = []
-
-        for pair in lfc_pairs:
-            if isinstance(pair, str):
-                if "_vs_" not in pair:
-                    raise ValueError(
-                        f"Invalid lfc_pairs entry '{pair}'. Use 'A_vs_B' or ('A','B')."
-                    )
-                a, b = pair.split("_vs_", 1)
-            elif isinstance(pair, (tuple, list)) and len(pair) == 2:
-                a, b = str(pair[0]), str(pair[1])
-            else:
-                raise ValueError(
-                    f"Invalid lfc_pairs entry '{pair}'. Use 'A_vs_B' or ('A','B')."
-                )
-
-            if a == b:
-                raise ValueError(f"Invalid contrast {a}_vs_{b}: groups must differ.")
-            if a not in valid_groups or b not in valid_groups:
-                raise ValueError(
-                    f"Contrast {a}_vs_{b} contains unknown groups. Valid groups: {sorted(valid_groups)}"
-                )
-            resolved.append((a, b))
-
-        # Deduplicate while preserving order
-        deduped: List[Tuple[str, str]] = []
-        seen = set()
-        for p in resolved:
-            if p not in seen:
-                deduped.append(p)
-                seen.add(p)
-        return deduped
-
     if method not in {"replicate_matched", "lfc"}:
         raise ValueError("method must be 'replicate_matched' or 'lfc'.")
 
-    # Original behavior
+    # ── sample_resolution: sample-level metadata ──────────────────────────────
     if method == "replicate_matched":
-        log.info("Creating a single integrated (shared) metadata table across datasets...")
+        log.info("Creating integrated sample-level metadata table (sample_resolution)...")
 
         metadata_tables = [ds.linked_metadata for ds in datasets if hasattr(ds, "linked_metadata")]
         if not metadata_tables:
@@ -5535,12 +5462,10 @@ def integrate_metadata(
                 suffixes=(None, f"_{i}"),
                 how="outer",
             )
-
             for column in metadata_vars:
-                col1 = column
                 col2 = f"{column}_{i}"
                 if col2 in integrated_metadata.columns:
-                    integrated_metadata[column] = integrated_metadata[col1].combine_first(
+                    integrated_metadata[column] = integrated_metadata[column].combine_first(
                         integrated_metadata[col2]
                     )
                     integrated_metadata.drop(columns=[col2], inplace=True)
@@ -5552,16 +5477,12 @@ def integrate_metadata(
 
         if output_dir:
             log.info("Writing integrated metadata table...")
-            write_integration_file(
-                data=integrated_metadata,
-                output_dir=output_dir,
-                filename=output_filename,
-            )
+            write_integration_file(data=integrated_metadata, output_dir=output_dir, filename=output_filename)
 
         return integrated_metadata
 
-    # LFC mode
-    log.info("Creating integrated metadata table in LFC mode (contrast-level rows)...")
+    # ── condition_resolution: contrast-level metadata ─────────────────────────
+    log.info("Creating integrated contrast-level metadata table (condition_resolution)...")
 
     group_sets = []
     for ds in datasets:
@@ -5571,7 +5492,6 @@ def integrate_metadata(
             raise ValueError(
                 f"Dataset {ds.dataset_name} linked_metadata missing group column '{group_col}'."
             )
-
         ds_groups = set(ds.linked_metadata[group_col].dropna().astype(str).unique())
         if len(ds_groups) < 2:
             raise ValueError(
@@ -5580,45 +5500,29 @@ def integrate_metadata(
         group_sets.append(ds_groups)
 
     if not group_sets:
-        raise ValueError("No valid datasets available to build LFC metadata.")
+        raise ValueError("No valid datasets available to build contrast metadata.")
 
-    if overlap_only and len(group_sets) > 1:
-        groups = sorted(list(set.intersection(*group_sets)))
-    else:
-        groups = sorted(list(set.union(*group_sets)))
-
+    groups = sorted(list(
+        set.intersection(*group_sets) if overlap_only and len(group_sets) > 1
+        else set.union(*group_sets)
+    ))
     if len(groups) < 2:
-        raise ValueError("Not enough groups available to build LFC contrasts.")
+        raise ValueError("Not enough groups available to build pairwise contrasts.")
 
-    pairs = _resolve_pairs(groups)
-
-    rows = []
-    for a, b in pairs:
-        contrast = f"{a}_vs_{b}"
-        rows.append(
-            {
-                "sample": contrast,
-                "contrast": contrast,
-                "group_a": a,
-                "group_b": b,
-                group_col: contrast,
-            }
-        )
-
+    pairs = list(combinations(groups, 2))
+    rows = [
+        {"sample": f"{a}_vs_{b}", "contrast": f"{a}_vs_{b}", "group_a": a, "group_b": b, group_col: f"{a}_vs_{b}"}
+        for a, b in pairs
+    ]
     integrated_metadata = pd.DataFrame(rows).drop_duplicates(subset=["sample"]).set_index("sample")
 
-    # Keep expected columns present for downstream compatibility
     for col in metadata_vars:
         if col not in integrated_metadata.columns:
             integrated_metadata[col] = np.nan
 
     if output_dir:
         log.info("Writing integrated metadata table...")
-        write_integration_file(
-            data=integrated_metadata,
-            output_dir=output_dir,
-            filename=output_filename,
-        )
+        write_integration_file(data=integrated_metadata, output_dir=output_dir, filename=output_filename)
 
     return integrated_metadata
 
@@ -5628,189 +5532,81 @@ def integrate_data(
     overlap_only: bool = True,
     output_filename: str = "integrated_data",
     output_dir: str = None,
-    method: Literal["replicate_matched", "lfc"] = "replicate_matched",
-    group_col: str = "group",
-    sample_col: str = "unique_group",
-    data_attr: str = "devarianced_data",
-    pseudocount: float = 1.0,
-    lfc_pairs: Optional[List[Union[str, Tuple[str, str]]]] = None,
+    data_attr: str = "scaled_data",
 ) -> pd.DataFrame:
     """
-    Integrate datasets in one of two modes:
+    Concatenate per-dataset feature matrices into a single integrated matrix.
 
-    - replicate_matched: original behavior (feature x matched-sample matrix)
-    - lfc: feature x contrast matrix where columns are pairwise group log2 fold-change
+    Used by both tracks after per-dataset scaling is complete:
+
+    * **sample_resolution** — concatenates ``ds.scaled_data`` (features × samples)
+      across datasets.  Columns are sample IDs; overlapping samples are enforced
+      when ``overlap_only=True``.
+    * **condition_resolution** — concatenates ``ds.scaled_data`` (features × contrasts)
+      across datasets.  Columns are contrast names (``A_vs_B``); shared contrasts
+      are enforced when ``overlap_only=True``.
+
+    In both cases the function is purely a concatenation step — all transformation
+    logic lives in ``scale_all_datasets()`` / ``scale_data_lfc()``.
+
+    Parameters
+    ----------
+    datasets : list
+        Dataset objects.  Each must have a non-empty ``data_attr`` attribute.
+    overlap_only : bool
+        If True, restrict columns to those present in every dataset.
+    output_filename : str
+        Output CSV filename (without extension).
+    output_dir : str
+        Directory to write the output file.
+    data_attr : str
+        Per-dataset attribute to read.  Always ``"scaled_data"`` — both tracks
+        write their output to ``ds.scaled_data``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Integrated features × columns matrix.
     """
+    log.info(f"Concatenating per-dataset matrices (data_attr='{data_attr}')...")
 
-    def _resolve_pairs(groups: List[str]) -> List[Tuple[str, str]]:
-        groups = sorted(list({str(g) for g in groups}))
-        if len(groups) < 2:
-            raise ValueError("At least 2 groups are required to compute LFC.")
-
-        if lfc_pairs is None:
-            return list(combinations(groups, 2))
-
-        valid_groups = set(groups)
-        resolved: List[Tuple[str, str]] = []
-
-        for pair in lfc_pairs:
-            if isinstance(pair, str):
-                if "_vs_" not in pair:
-                    raise ValueError(
-                        f"Invalid lfc_pairs entry '{pair}'. Use 'A_vs_B' or ('A','B')."
-                    )
-                a, b = pair.split("_vs_", 1)
-            elif isinstance(pair, (tuple, list)) and len(pair) == 2:
-                a, b = str(pair[0]), str(pair[1])
-            else:
-                raise ValueError(
-                    f"Invalid lfc_pairs entry '{pair}'. Use 'A_vs_B' or ('A','B')."
-                )
-
-            if a == b:
-                raise ValueError(f"Invalid contrast {a}_vs_{b}: groups must differ.")
-            if a not in valid_groups or b not in valid_groups:
-                raise ValueError(
-                    f"Contrast {a}_vs_{b} contains unknown groups. Valid groups: {sorted(valid_groups)}"
-                )
-            resolved.append((a, b))
-
-        deduped: List[Tuple[str, str]] = []
-        seen = set()
-        for p in resolved:
-            if p not in seen:
-                deduped.append(p)
-                seen.add(p)
-        return deduped
-
-    if method not in {"replicate_matched", "lfc"}:
-        raise ValueError("method must be 'replicate_matched' or 'lfc'.")
-
-    # Original behavior
-    if method == "replicate_matched":
-        log.info(f"Creating a single integrated feature matrix across datasets (data_attr='{data_attr}')...")
-
-        dataset_data = {}
-        sample_sets = {}
-
-        for ds in datasets:
-            source_df = getattr(ds, data_attr, None)
-            if source_df is not None and not source_df.empty:
-                data_copy = source_df.copy()
-                if not data_copy.index.astype(str).str.startswith(f"{ds.dataset_name}_").all():
-                    data_copy.index = [f"{ds.dataset_name}_{idx}" for idx in data_copy.index]
-
-                dataset_data[ds.dataset_name] = data_copy
-                sample_sets[ds.dataset_name] = set(data_copy.columns.astype(str))
-                log.info(f"\tAdding {data_copy.shape[0]} features from {ds.dataset_name} (source: {data_attr})")
-            else:
-                raise ValueError(
-                    f"Dataset '{ds.dataset_name}' missing attribute '{data_attr}'. "
-                    f"Run the appropriate processing step first."
-                )
-
-        if overlap_only and len(dataset_data) > 1:
-            log.info("\tRestricting to overlapping samples across all datasets...")
-            overlapping_samples = set.intersection(*sample_sets.values())
-
-            if not overlapping_samples:
-                raise ValueError("No overlapping samples found across datasets.")
-
-            shared_cols = sorted(list(overlapping_samples))
-            for ds_name, data in dataset_data.items():
-                data.columns = data.columns.astype(str)
-                dataset_data[ds_name] = data[shared_cols]
-                log.info(f"\t{ds_name}: {len(shared_cols)} overlapping samples")
-
-        integrated_data = pd.concat(dataset_data.values(), axis=0)
-        integrated_data.index.name = "features"
-        integrated_data = integrated_data.fillna(0)
-
-        log.info(
-            f"Final integrated dataset: {integrated_data.shape[0]} features x {integrated_data.shape[1]} samples"
-        )
-
-        if output_dir:
-            log.info("Writing integrated data table...")
-            write_integration_file(integrated_data, output_dir, output_filename, indexing=True)
-
-        return integrated_data
-
-    # LFC mode
-    if pseudocount <= 0:
-        raise ValueError("pseudocount must be > 0 in LFC mode.")
-
-    log.info("Creating integrated feature matrix in LFC mode...")
-
-    dataset_data = {}
-    contrast_sets = {}
+    dataset_data: Dict[str, pd.DataFrame] = {}
+    sample_sets: Dict[str, set] = {}
 
     for ds in datasets:
-        if not hasattr(ds, data_attr):
-            raise ValueError(f"Dataset {ds.dataset_name} has no attribute '{data_attr}'.")
-
-        source_df = getattr(ds, data_attr)
+        source_df = getattr(ds, data_attr, None)
         if source_df is None or source_df.empty:
             raise ValueError(
-                f"Dataset {ds.dataset_name} attribute '{data_attr}' is empty."
+                f"Dataset '{ds.dataset_name}' missing attribute '{data_attr}'. "
+                "Run scale_all_datasets() before integrate_data() in sample_resolution track."
             )
-
-        if not hasattr(ds, "linked_metadata") or ds.linked_metadata is None or ds.linked_metadata.empty:
-            raise ValueError(f"Dataset {ds.dataset_name} missing linked_metadata for LFC mode.")
-
-        # Build group means from feature x sample matrix
-        group_means = _build_group_means(
-            data=source_df,
-            metadata=ds.linked_metadata,
-            sample_col=sample_col,
-            group_col=group_col,
-        )
-
-        pairs = _resolve_pairs(list(group_means.columns))
-
-        lfc_df = pd.DataFrame(index=group_means.index)
-        for a, b in pairs:
-            contrast = f"{a}_vs_{b}"
-            lfc_df[contrast] = np.log2(
-                (group_means[a].astype(float) + pseudocount)
-                / (group_means[b].astype(float) + pseudocount)
-            )
-
-        # Add dataset prefix to feature names
-        if not lfc_df.index.astype(str).str.startswith(f"{ds.dataset_name}_").all():
-            lfc_df.index = [f"{ds.dataset_name}_{idx}" for idx in lfc_df.index]
-
-        dataset_data[ds.dataset_name] = lfc_df
-        contrast_sets[ds.dataset_name] = set(lfc_df.columns.astype(str))
-
-        log.info(
-            f"\t{ds.dataset_name}: {lfc_df.shape[0]} features x {lfc_df.shape[1]} contrasts"
-        )
-
-    if not dataset_data:
-        raise ValueError("No datasets available for LFC integration.")
+        data_copy = source_df.copy()
+        if not data_copy.index.astype(str).str.startswith(f"{ds.dataset_name}_").all():
+            data_copy.index = [f"{ds.dataset_name}_{idx}" for idx in data_copy.index]
+        dataset_data[ds.dataset_name] = data_copy
+        sample_sets[ds.dataset_name] = set(data_copy.columns.astype(str))
+        log.info(f"\t{ds.dataset_name}: {data_copy.shape[0]} features")
 
     if overlap_only and len(dataset_data) > 1:
-        common_contrasts = set.intersection(*contrast_sets.values())
-        if not common_contrasts:
+        log.info("\tRestricting to overlapping columns across all datasets...")
+        overlapping_cols = set.intersection(*sample_sets.values())
+        if not overlapping_cols:
             raise ValueError(
-                "No shared LFC contrasts across datasets. Use overlap_only=False or align groups."
+                f"No overlapping columns found across datasets for attr='{data_attr}'."
             )
-        final_cols = sorted(list(common_contrasts))
-        log.info(f"\tRestricting to {len(final_cols)} shared contrasts.")
-    else:
-        final_cols = sorted(list(set.union(*contrast_sets.values())))
-        log.info(f"\tUsing union of contrasts ({len(final_cols)} total).")
-
-    for ds_name in dataset_data:
-        dataset_data[ds_name] = dataset_data[ds_name].reindex(columns=final_cols)
+        shared_cols = sorted(list(overlapping_cols))
+        for ds_name, data in dataset_data.items():
+            data.columns = data.columns.astype(str)
+            dataset_data[ds_name] = data[shared_cols]
+        log.info(f"\t{len(shared_cols)} overlapping columns retained.")
 
     integrated_data = pd.concat(dataset_data.values(), axis=0)
     integrated_data.index.name = "features"
     integrated_data = integrated_data.fillna(0)
 
     log.info(
-        f"Final LFC integrated dataset: {integrated_data.shape[0]} features x {integrated_data.shape[1]} contrasts"
+        f"Integrated dataset: {integrated_data.shape[0]} features × "
+        f"{integrated_data.shape[1]} columns"
     )
 
     if output_dir:
@@ -5819,41 +5615,41 @@ def integrate_data(
 
     return integrated_data
 
-def integrate_data_condition_resolution(
-    datasets: list,
-    overlap_only: bool = True,
-    output_filename: str = "integrated_data",
-    output_dir: str = None,
+
+def scale_data_lfc(
+    data: pd.DataFrame,
+    metadata: pd.DataFrame,
+    dataset_name: str,
+    output_filename: str,
+    output_dir: str,
     group_col: str = "group",
     sample_col: str = "unique_group",
-    condition_approach: str = "centroid",
-    control_group: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Condition-resolution integration workflow.
+    Per-dataset LFC scaling for the **condition_resolution** track.
 
-    Steps applied to each dataset independently, then concatenated:
+    Transforms a raw feature × sample matrix into a feature × contrasts matrix
+    by applying the following steps in order:
 
-    1. **log2 transform** — ``log2(x + 1)`` applied to ``replicate_filtered_data``.
-    2. **Variance filter** — features with near-zero variance across all samples are
-       dropped (prevents noise amplification during Z-scoring).
-    3. **Collapse replicates** — compute the per-condition mean (centroid) for each
-       experimental condition.
-    4. **Condition approach** (config choice):
-       - ``"centroid"`` — use the condition means directly.
-       - ``"lfc"``      — subtract the control group mean from all other condition
-                          means so that values represent the response to treatment.
-    5. **Row-wise Z-score** — standardise each feature across conditions so that
-       different data types are on the same scale.
-    6. **Vertical concatenation** — stack the per-dataset matrices into a single
-       features × conditions matrix.
+    1. **log2 transform** — ``log2(x + 1)``
+    2. **Low-variance filter** — drop features with zero variance across all
+       samples (prevents noise amplification).
+    3. **Collapse replicates to per-condition medians** — group samples by
+       condition label from ``metadata`` and compute the median per condition.
+    4. **All-pairwise LFC** — for every unique pair of conditions (A, B),
+       compute ``log2_median[A] − log2_median[B]``.  Each pair becomes one
+       column named ``A_vs_B``.
+
+    The result is written to disk and returned.
 
     Parameters
     ----------
-    datasets : list
-        Dataset objects with ``replicate_filtered_data`` and ``linked_metadata``.
-    overlap_only : bool
-        If True, restrict to conditions shared across all datasets.
+    data : pd.DataFrame
+        Raw feature × sample matrix (``replicate_filtered_data``).
+    metadata : pd.DataFrame
+        Sample metadata with at least ``sample_col`` and ``group_col`` columns.
+    dataset_name : str
+        Dataset name prefix (used for logging and feature-name prefixing).
     output_filename : str
         Output CSV filename (without extension).
     output_dir : str
@@ -5861,154 +5657,280 @@ def integrate_data_condition_resolution(
     group_col : str
         Metadata column containing condition/group labels.
     sample_col : str
-        Metadata column containing unique sample identifiers matching data columns.
-    condition_approach : str
-        ``"centroid"`` or ``"lfc"``.
-    control_group : str or None
-        Name of the control condition for LFC subtraction.  If None, the
-        alphabetically first condition is used.
+        Metadata column containing sample identifiers matching data columns.
 
     Returns
     -------
     pd.DataFrame
-        Integrated features × conditions matrix (row-wise Z-scored).
+        Feature × contrasts matrix.  Columns are contrast names of the form
+        ``"groupA_vs_groupB"``.
     """
-    if condition_approach not in {"centroid", "lfc"}:
-        raise ValueError(
-            f"condition_approach must be 'centroid' or 'lfc', got '{condition_approach}'."
-        )
+    # ── Step 1: log2 transform ────────────────────────────────────────────────
+    log.info(f"  [{dataset_name}] Applying log2(x+1) transform...")
+    log2_df = np.log2(data.astype(float) + 1)
 
-    dataset_matrices: Dict[str, pd.DataFrame] = {}
-    condition_sets: Dict[str, set] = {}
+    # ── Step 2: low-variance filter ───────────────────────────────────────────
+    row_var = log2_df.var(axis=1)
+    low_var_mask = row_var > 0.0
+    n_dropped = (~low_var_mask).sum()
+    if n_dropped:
+        log.info(f"  [{dataset_name}] Dropped {n_dropped} zero-variance features after log2.")
+    log2_df = log2_df.loc[low_var_mask]
 
-    for ds in datasets:
-        source_df = getattr(ds, 'replicate_filtered_data', None)
-        if source_df is None or source_df.empty:
-            raise ValueError(
-                f"Dataset '{ds.dataset_name}' has no replicate_filtered_data. "
-                "Run replicability_test_all_datasets() first."
-            )
-        if not hasattr(ds, 'linked_metadata') or ds.linked_metadata is None or ds.linked_metadata.empty:
-            raise ValueError(
-                f"Dataset '{ds.dataset_name}' missing linked_metadata."
-            )
-        if group_col not in ds.linked_metadata.columns:
-            raise ValueError(
-                f"Dataset '{ds.dataset_name}' linked_metadata missing column '{group_col}'."
-            )
-
-        # ── Step 1: log2 transform ────────────────────────────────────────────
-        log.info(f"  [{ds.dataset_name}] Applying log2(x+1) transform...")
-        log2_df = np.log2(source_df.astype(float) + 1)
-
-        # ── Step 2: variance filter ───────────────────────────────────────────
-        row_var = log2_df.var(axis=1)
-        low_var_mask = row_var > 0.0  # drop perfectly constant features
-        n_dropped = (~low_var_mask).sum()
-        if n_dropped:
-            log.info(f"  [{ds.dataset_name}] Dropped {n_dropped} zero-variance features after log2.")
-        log2_df = log2_df.loc[low_var_mask]
-
-        # ── Step 3: collapse replicates to condition means ────────────────────
-        meta = ds.linked_metadata
-        # Build sample → condition mapping using sample_col → group_col
-        if sample_col in meta.columns:
-            sample_to_group = meta.set_index(sample_col)[group_col].to_dict()
-        else:
-            # Fall back: index is already the sample identifier
-            sample_to_group = meta[group_col].to_dict()
-
-        # Align data columns to metadata
-        common_samples = [c for c in log2_df.columns if c in sample_to_group]
-        if not common_samples:
-            raise ValueError(
-                f"Dataset '{ds.dataset_name}': no overlap between data columns and "
-                f"metadata '{sample_col}' values."
-            )
-        log2_df = log2_df[common_samples]
-
-        # Group by condition and compute mean
-        condition_labels = pd.Series(
-            [sample_to_group[s] for s in common_samples],
-            index=common_samples,
-            name=group_col,
-        )
-        condition_means = log2_df.T.groupby(condition_labels).mean().T  # features × conditions
-
-        log.info(
-            f"  [{ds.dataset_name}] Collapsed {len(common_samples)} samples → "
-            f"{condition_means.shape[1]} conditions."
-        )
-
-        # ── Step 4: condition approach ────────────────────────────────────────
-        if condition_approach == "lfc":
-            conditions = sorted(condition_means.columns.tolist())
-            ctrl = control_group if control_group is not None else conditions[0]
-            if ctrl not in condition_means.columns:
-                raise ValueError(
-                    f"Dataset '{ds.dataset_name}': control_group '{ctrl}' not found in "
-                    f"conditions {conditions}."
-                )
-            log.info(
-                f"  [{ds.dataset_name}] LFC approach: subtracting control '{ctrl}' mean..."
-            )
-            ctrl_mean = condition_means[ctrl]
-            condition_means = condition_means.subtract(ctrl_mean, axis=0)
-            # Drop the control column (it becomes all zeros)
-            condition_means = condition_means.drop(columns=[ctrl])
-
-        # ── Step 5: row-wise Z-score across conditions ────────────────────────
-        log.info(f"  [{ds.dataset_name}] Applying row-wise Z-score across conditions...")
-        row_mean = condition_means.mean(axis=1)
-        row_std = condition_means.std(axis=1, ddof=1).replace(0, 1)  # avoid /0
-        zscore_df = condition_means.subtract(row_mean, axis=0).divide(row_std, axis=0)
-
-        # Add dataset prefix to feature names
-        if not zscore_df.index.astype(str).str.startswith(f"{ds.dataset_name}_").all():
-            zscore_df.index = [f"{ds.dataset_name}_{idx}" for idx in zscore_df.index]
-
-        dataset_matrices[ds.dataset_name] = zscore_df
-        condition_sets[ds.dataset_name] = set(zscore_df.columns.astype(str))
-
-        log.info(
-            f"  [{ds.dataset_name}]: {zscore_df.shape[0]} features × "
-            f"{zscore_df.shape[1]} conditions"
-        )
-
-    if not dataset_matrices:
-        raise ValueError("No datasets available for condition_resolution integration.")
-
-    # ── Step 6: align conditions and concatenate ──────────────────────────────
-    if overlap_only and len(dataset_matrices) > 1:
-        shared_conditions = set.intersection(*condition_sets.values())
-        if not shared_conditions:
-            raise ValueError(
-                "No shared conditions across datasets. Use overlap_only=False or align groups."
-            )
-        final_cols = sorted(list(shared_conditions))
-        log.info(f"Restricting to {len(final_cols)} shared conditions.")
+    # ── Step 3: collapse replicates to per-condition medians ──────────────────
+    if sample_col in metadata.columns:
+        sample_to_group = metadata.set_index(sample_col)[group_col].to_dict()
     else:
-        all_conditions = set.union(*condition_sets.values())
-        final_cols = sorted(list(all_conditions))
-        log.info(f"Using union of conditions ({len(final_cols)} total).")
+        sample_to_group = metadata[group_col].to_dict()
 
-    for ds_name in dataset_matrices:
-        dataset_matrices[ds_name] = dataset_matrices[ds_name].reindex(columns=final_cols, fill_value=0.0)
+    common_samples = [c for c in log2_df.columns if c in sample_to_group]
+    if not common_samples:
+        raise ValueError(
+            f"Dataset '{dataset_name}': no overlap between data columns and "
+            f"metadata '{sample_col}' values."
+        )
+    log2_df = log2_df[common_samples]
 
-    integrated_data = pd.concat(dataset_matrices.values(), axis=0)
-    integrated_data.index.name = "features"
-    integrated_data = integrated_data.fillna(0)
+    condition_labels = pd.Series(
+        [sample_to_group[s] for s in common_samples],
+        index=common_samples,
+        name=group_col,
+    )
+    condition_medians = log2_df.T.groupby(condition_labels).median().T  # features × conditions
+
+    n_conditions = condition_medians.shape[1]
+    log.info(
+        f"  [{dataset_name}] Collapsed {len(common_samples)} samples → "
+        f"{n_conditions} condition medians."
+    )
+    if n_conditions < 2:
+        raise ValueError(
+            f"Dataset '{dataset_name}': need at least 2 conditions for pairwise LFC, "
+            f"found {n_conditions}: {condition_medians.columns.tolist()}"
+        )
+
+    # ── Step 4: all-pairwise LFC ──────────────────────────────────────────────
+    pairs = list(combinations(condition_medians.columns.tolist(), 2))
+    log.info(f"  [{dataset_name}] Computing {len(pairs)} pairwise LFC contrasts...")
+
+    lfc_df = pd.DataFrame(index=condition_medians.index)
+    for a, b in pairs:
+        lfc_df[f"{a}_vs_{b}"] = condition_medians[a] - condition_medians[b]
+
+    # Prefix feature names with dataset name
+    if not lfc_df.index.astype(str).str.startswith(f"{dataset_name}_").all():
+        lfc_df.index = [f"{dataset_name}_{idx}" for idx in lfc_df.index]
 
     log.info(
-        f"Final condition_resolution integrated dataset: "
-        f"{integrated_data.shape[0]} features × {integrated_data.shape[1]} conditions"
+        f"  [{dataset_name}]: {lfc_df.shape[0]} features × {lfc_df.shape[1]} contrasts"
     )
 
-    if output_dir:
-        log.info("Writing integrated data table...")
-        write_integration_file(integrated_data, output_dir, output_filename, indexing=True)
+    write_integration_file(lfc_df, output_dir, output_filename, indexing=True)
+    return lfc_df
 
-    return integrated_data
+
+def scale_data_moderated_lfc(
+    data: pd.DataFrame,
+    metadata: pd.DataFrame,
+    dataset_name: str,
+    output_filename: str,
+    output_dir: str,
+    group_col: str = "group",
+    sample_col: str = "unique_group",
+    min_reps_for_se: int = 2,
+) -> pd.DataFrame:
+    """
+    Per-dataset **moderated** LFC scaling for the **condition_resolution** track.
+
+    Applies the same log2 → group-median → pairwise-LFC pipeline as
+    ``scale_data_lfc()``, but then shrinks each LFC estimate toward zero using
+    an empirical-Bayes normal-means model (James–Stein / limma-style shrinkage).
+
+    **Shrinkage rationale**
+    For each pairwise contrast ``A_vs_B`` and each feature, the raw LFC is
+    ``d = log2_median[A] - log2_median[B]``.  The standard error of ``d`` is
+    estimated from the within-group variance of the log2-transformed replicates:
+
+    .. code-block:: text
+
+        SE²(d) = Var_A / n_A + Var_B / n_B
+
+    where ``Var_k`` is the sample variance of log2(x+1) values within group k
+    and ``n_k`` is the number of replicates.  Features with fewer than
+    ``min_reps_for_se`` replicates in either group fall back to the global
+    median SE for that contrast.
+
+    The posterior (shrunken) LFC is computed as:
+
+    .. code-block:: text
+
+        d_shrunk = d × (τ² / (τ² + SE²))
+
+    where ``τ²`` is the empirical prior variance estimated as
+    ``max(0, mean(d²) − mean(SE²))`` across all features for that contrast
+    (method-of-moments estimator of the signal variance).  When ``τ² ≈ 0``
+    (all LFCs are noise), estimates are shrunk to zero.  When ``τ² >> SE²``
+    (strong signal), estimates are barely shrunk.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Raw feature × sample matrix (``replicate_filtered_data``).
+    metadata : pd.DataFrame
+        Sample metadata with at least ``sample_col`` and ``group_col`` columns.
+    dataset_name : str
+        Dataset name prefix (used for logging and feature-name prefixing).
+    output_filename : str
+        Output CSV filename (without extension).
+    output_dir : str
+        Directory to write the output file.
+    group_col : str
+        Metadata column containing condition/group labels.
+    sample_col : str
+        Metadata column containing sample identifiers matching data columns.
+    min_reps_for_se : int, default 2
+        Minimum replicates required in a group to compute a per-feature SE.
+        Features/groups below this threshold use the global median SE for
+        that contrast instead.
+
+    Returns
+    -------
+    pd.DataFrame
+        Feature × contrasts matrix of shrunken LFC values.  Columns are
+        contrast names of the form ``"groupA_vs_groupB"``.
+    """
+    # ── Step 1: log2 transform ────────────────────────────────────────────────
+    log.info(f"  [{dataset_name}] Applying log2(x+1) transform...")
+    log2_df = np.log2(data.astype(float) + 1)
+
+    # ── Step 2: low-variance filter ───────────────────────────────────────────
+    row_var = log2_df.var(axis=1)
+    low_var_mask = row_var > 0.0
+    n_dropped = (~low_var_mask).sum()
+    if n_dropped:
+        log.info(f"  [{dataset_name}] Dropped {n_dropped} zero-variance features after log2.")
+    log2_df = log2_df.loc[low_var_mask]
+
+    # ── Step 3: build group → sample mapping ─────────────────────────────────
+    if sample_col in metadata.columns:
+        sample_to_group = metadata.set_index(sample_col)[group_col].to_dict()
+    else:
+        sample_to_group = metadata[group_col].to_dict()
+
+    common_samples = [c for c in log2_df.columns if c in sample_to_group]
+    if not common_samples:
+        raise ValueError(
+            f"Dataset '{dataset_name}': no overlap between data columns and "
+            f"metadata '{sample_col}' values."
+        )
+    log2_df = log2_df[common_samples]
+
+    condition_labels = pd.Series(
+        [sample_to_group[s] for s in common_samples],
+        index=common_samples,
+        name=group_col,
+    )
+
+    # Build per-group sample lists
+    group_to_samples: Dict[str, List[str]] = {}
+    for s, g in condition_labels.items():
+        group_to_samples.setdefault(g, []).append(s)
+
+    conditions = sorted(group_to_samples.keys())
+    n_conditions = len(conditions)
+    if n_conditions < 2:
+        raise ValueError(
+            f"Dataset '{dataset_name}': need at least 2 conditions for pairwise LFC, "
+            f"found {n_conditions}: {conditions}"
+        )
+
+    # ── Step 4: per-group log2 medians and within-group variances ────────────
+    log.info(
+        f"  [{dataset_name}] Computing per-group medians and within-group variances "
+        f"({n_conditions} conditions)..."
+    )
+    group_medians: Dict[str, pd.Series] = {}
+    group_vars: Dict[str, pd.Series] = {}
+    group_n: Dict[str, int] = {}
+
+    for g, samples in group_to_samples.items():
+        g_data = log2_df[samples]
+        group_medians[g] = g_data.median(axis=1)
+        group_vars[g] = g_data.var(axis=1, ddof=1).fillna(0.0)
+        group_n[g] = len(samples)
+
+    # ── Step 5: all-pairwise moderated LFC ───────────────────────────────────
+    pairs = list(combinations(conditions, 2))
+    log.info(
+        f"  [{dataset_name}] Computing {len(pairs)} moderated pairwise LFC contrasts..."
+    )
+
+    lfc_df = pd.DataFrame(index=log2_df.index)
+
+    for a, b in pairs:
+        contrast = f"{a}_vs_{b}"
+
+        # Raw LFC
+        raw_lfc = group_medians[a] - group_medians[b]
+
+        # Per-feature SE²: Var_A/n_A + Var_B/n_B
+        n_a, n_b = group_n[a], group_n[b]
+        se2: pd.Series
+
+        if n_a >= min_reps_for_se and n_b >= min_reps_for_se:
+            se2 = group_vars[a] / n_a + group_vars[b] / n_b
+        elif n_a >= min_reps_for_se:
+            se2 = group_vars[a] / n_a
+        elif n_b >= min_reps_for_se:
+            se2 = group_vars[b] / n_b
+        else:
+            # No replicates in either group — SE is undefined; use raw LFC
+            log.warning(
+                f"  [{dataset_name}] Contrast {contrast}: both groups have < "
+                f"{min_reps_for_se} replicates. Using raw LFC (no shrinkage)."
+            )
+            lfc_df[contrast] = raw_lfc
+            continue
+
+        # Replace any negative SE² (numerical noise) with 0
+        se2 = se2.clip(lower=0.0)
+
+        # Fall back to global median SE² for features with 0 variance
+        median_se2 = float(se2[se2 > 0].median()) if (se2 > 0).any() else 0.0
+        se2 = se2.where(se2 > 0, other=median_se2)
+
+        # Empirical prior variance τ² (method-of-moments)
+        # τ² = max(0, E[d²] − E[SE²])
+        mean_d2 = float((raw_lfc ** 2).mean())
+        mean_se2 = float(se2.mean())
+        tau2 = max(0.0, mean_d2 - mean_se2)
+
+        # Posterior shrinkage factor: τ² / (τ² + SE²)
+        if tau2 == 0.0:
+            # All signal is noise — shrink everything to zero
+            shrinkage = pd.Series(0.0, index=raw_lfc.index)
+        else:
+            shrinkage = tau2 / (tau2 + se2)
+
+        shrunken_lfc = raw_lfc * shrinkage
+
+        log.info(
+            f"    {contrast}: τ²={tau2:.4f}, mean SE²={mean_se2:.4f}, "
+            f"mean shrinkage={float(shrinkage.mean()):.3f}"
+        )
+        lfc_df[contrast] = shrunken_lfc
+
+    # ── Step 6: prefix feature names ─────────────────────────────────────────
+    if not lfc_df.index.astype(str).str.startswith(f"{dataset_name}_").all():
+        lfc_df.index = [f"{dataset_name}_{idx}" for idx in lfc_df.index]
+
+    log.info(
+        f"  [{dataset_name}]: {lfc_df.shape[0]} features × {lfc_df.shape[1]} contrasts "
+        "(moderated LFC)"
+    )
+
+    write_integration_file(lfc_df, output_dir, output_filename, indexing=True)
+    return lfc_df
 
 
 # ====================================
@@ -6279,94 +6201,111 @@ def remove_low_replicable_features(
     output_dir: str,
     method: str = "variance",
     group_col: str = "group",
-    threshold: float = 0.6,
-    sigma_threshold: float = 2.0,
+    threshold: float = 0.5,
+    normalize: bool = True,
+    normalization_scale: float = 1_000_000.0,
+    min_replicates: int = 2,
 ):
     """
-    Remove features (rows) from `data` with high within-group variability.
-    Highly optimized version using vectorized pandas operations.
+    Remove features (rows) from `data` with high within-group variability
+    across replicates.
+
+    Variability is assessed on a column-normalized copy of `data` (each
+    sample column scaled to sum to `normalization_scale`, e.g. CPM-style
+    normalization) so that differences in sample magnitude/depth don't
+    drive apparent within-group variability. The *original* (unnormalized)
+    values are what get filtered and returned/written.
+
+    Parameters
+    ----------
+    method : {"none", "variance"}
+        - "none": no filtering, keep all features.
+        - "variance": flag a feature if its within-group coefficient of
+          variation (CV = std / mean) exceeds `threshold` in ANY group.
+    normalize : bool
+        If True (default), column-normalize samples before computing CV
+        (recommended when samples differ in scale / depth). Filtering is
+        still applied to the original `data`.
+    normalization_scale : float
+        Target sum for each sample column after normalization (default
+        1,000,000; use 1.0 for fractional/proportion scale, 100.0 for %).
+    min_replicates : int
+        Minimum number of samples a group must have to be evaluated
+        (groups with fewer are skipped / not used to flag features).
     """
 
+    def _normalize_columns(df: pd.DataFrame, scale: float) -> pd.DataFrame:
+        col_sums = df.sum(axis=0, skipna=True)
+        col_sums_safe = col_sums.replace(0, np.nan)
+        return df.divide(col_sums_safe, axis=1) * scale
+
+    def _build_group_sample_map(meta: pd.DataFrame, cols: pd.Index) -> dict:
+        groups = meta[group_col].unique()
+        return {
+            group: [
+                s for s in meta.loc[meta[group_col] == group, "unique_group"].tolist()
+                if s in cols
+            ]
+            for group in groups
+        }
+
     if method == "none":
-        log.info(f"\tNot removing any features based on replicability in {dataset_name}. Retaining all {data.shape[0]} features.")
+        log.info(
+            f"\tNot removing any features based on replicability in {dataset_name}. "
+            f"Retaining all {data.shape[0]} features."
+        )
         replicable_data = data
-    elif method == "variance":
-        if group_col not in metadata.columns:
-            raise ValueError(f"Column '{group_col}' not found in metadata.")
-        
-        log.info(f"Removing features with high within-group variability (threshold: {threshold})...")
-        
-        # Get groups and prepare sample mapping
-        groups = metadata[group_col].unique()
-        group_sample_map = {
-            group: [s for s in metadata[metadata[group_col] == group]['unique_group'].tolist()
-                   if s in data.columns]
-            for group in groups
-        }
-        
-        # Filter to groups with at least 2 samples
-        valid_groups = {k: v for k, v in group_sample_map.items() if len(v) >= 2}
-        
-        if not valid_groups:
-            log.info("No groups with sufficient replicates (>=2) found. Keeping all features.")
-            replicable_data = data
-        else:
-            # Vectorized approach: calculate all group variances at once
-            keep_mask = pd.Series(True, index=data.index)
-            
-            for group, samples in valid_groups.items():
-                # Calculate standard deviation for all features in this group
-                group_variances = data[samples].std(axis=1, skipna=True)
-                
-                # Mark features that exceed threshold in this group for removal
-                high_var_in_group = group_variances > threshold
-                keep_mask = keep_mask & (~high_var_in_group)
-            
-            replicable_data = data.loc[keep_mask]
-        
-        log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - replicable_data.shape[0]} to keep {replicable_data.shape[0]}.")
-    
-    elif method == "sigma":
-        if group_col not in metadata.columns:
-            raise ValueError(f"Column '{group_col}' not found in metadata.")
-        
-        log.info(f"Removing features with outlier replicates (sigma_threshold={sigma_threshold})...")
-        
-        groups = metadata[group_col].unique()
-        group_sample_map = {
-            group: [s for s in metadata[metadata[group_col] == group]['unique_group'].tolist()
-                   if s in data.columns]
-            for group in groups
-        }
-        valid_groups = {k: v for k, v in group_sample_map.items() if len(v) >= 2}
-        
-        if not valid_groups:
-            log.info("No groups with sufficient replicates (>=2) found. Keeping all features.")
-            replicable_data = data
-        else:
-            keep_mask = pd.Series(True, index=data.index)
-            
-            for group, samples in valid_groups.items():
-                group_data = data[samples]
-                group_mean = group_data.mean(axis=1)
-                group_std = group_data.std(axis=1, ddof=1)
-                
-                # Avoid division by zero for constant features
-                group_std_safe = group_std.replace(0, np.nan)
-                
-                # Z-score each replicate relative to the group mean
-                z_scores = group_data.subtract(group_mean, axis=0).divide(group_std_safe, axis=0).abs()
-                
-                # Flag features where ANY replicate exceeds sigma_threshold
-                has_outlier = (z_scores > sigma_threshold).any(axis=1)
-                keep_mask = keep_mask & (~has_outlier)
-            
-            replicable_data = data.loc[keep_mask]
-        
-        log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - replicable_data.shape[0]} to keep {replicable_data.shape[0]}.")
-    
+        log.info(f"Saving replicable data for {dataset_name}...")
+        write_integration_file(replicable_data, output_dir, output_filename, indexing=True)
+        return replicable_data
+
+    if method != "variance":
+        raise ValueError(
+            "Currently only 'variance' or 'none' methods are supported for "
+            "removing low replicable features."
+        )
+
+    if group_col not in metadata.columns:
+        raise ValueError(f"Column '{group_col}' not found in metadata.")
+
+    log.info(
+        f"Removing features with high within-group variability "
+        f"(threshold={threshold}, normalize={normalize})..."
+    )
+
+    group_sample_map = _build_group_sample_map(metadata, data.columns)
+    valid_groups = {k: v for k, v in group_sample_map.items() if len(v) >= min_replicates}
+
+    if not valid_groups:
+        log.info(
+            f"No groups with sufficient replicates (>={min_replicates}) found. "
+            f"Keeping all features."
+        )
+        replicable_data = data
     else:
-        raise ValueError("Currently only 'variance', 'sigma', or 'none' methods are supported for removing low replicable features.")
+        # Compute CV on normalized data so sample-level scale/depth
+        # differences don't drive apparent within-group variance.
+        stats_data = _normalize_columns(data, normalization_scale) if normalize else data
+
+        keep_mask = pd.Series(True, index=data.index)
+
+        for group, samples in valid_groups.items():
+            group_data = stats_data[samples]
+            group_mean = group_data.mean(axis=1, skipna=True)
+            group_std = group_data.std(axis=1, skipna=True, ddof=1)
+            group_mean_safe = group_mean.replace(0, np.nan)
+
+            cv = (group_std / group_mean_safe).abs()
+            high_var_in_group = cv > threshold
+
+            keep_mask = keep_mask & (~high_var_in_group)
+
+        replicable_data = data.loc[keep_mask]
+
+    log.info(
+        f"Started with {data.shape[0]} features; filtered out "
+        f"{data.shape[0] - replicable_data.shape[0]} to keep {replicable_data.shape[0]}."
+    )
 
     log.info(f"Saving replicable data for {dataset_name}...")
     write_integration_file(replicable_data, output_dir, output_filename, indexing=True)
@@ -6787,7 +6726,6 @@ def plot_simple_histogram(
 
 def plot_data_variance_histogram(
     dataframes: dict[str, pd.DataFrame],
-    datatype: str,
     bins: int = 50,
     transparency: float = 0.8,
     xlog: bool = False,
@@ -6799,7 +6737,6 @@ def plot_data_variance_histogram(
 
     Args:
         dataframes (dict of str: pd.DataFrame): Dictionary mapping labels to feature matrices.
-        datatype (str): Type of data being plotted.
         bins (int): Number of histogram bins.
         transparency (float): Alpha for bars.
         xlog (bool): Use log scale for x-axis.
@@ -6835,12 +6772,12 @@ def plot_data_variance_histogram(
         plt.yscale('log')
         plt.ylabel('Frequency (log)')
 
-    plt.title(f'Histogram of Integrated Datasets ({datatype})')
+    plt.title(f'Histogram of Integrated Datasets')
 
     plt.legend()
 
     # Save the plot if output_dir is specified
-    filename = f"distribution_of_{datatype}_datasets.pdf"
+    filename = f"distribution_of_integrated_datasets.pdf"
     log.info(f"Saving plot to {output_dir}/{filename}...")
     plt.savefig(f"{output_dir}/{filename}")
     
@@ -7522,7 +7459,7 @@ def build_pathway_submodule_matrices(
     top_n: int = 50,
     rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
     min_submodule_size: int = 0,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
     """Build pathway x submodule count matrices, restricted to the top-N pathways.
 
     Parameters
@@ -7554,6 +7491,10 @@ def build_pathway_submodule_matrices(
     pathway_stats_df : pd.DataFrame
         Full (pre-top_n-filter) per-pathway stats table, computed only from
         features in qualifying submodules.
+    submodule_datatype_labels : pd.Series
+        Index = submodule name, values = compact per-datatype feature count string
+        (e.g. ``"tx:42 mx:18"``).  Computed from all features in each qualifying
+        submodule (not just those with pathway annotations).
     """
     if rank_by == "cumulative_abs_lfc" and quant_df is None:
         raise ValueError("quant_df is required when rank_by='cumulative_abs_lfc'.")
@@ -7585,6 +7526,26 @@ def build_pathway_submodule_matrices(
     # --- Per-pathway stats (computed only from features in qualifying submodules) ---
     stats = exploded.groupby("pathway")["feature_id"].nunique().rename("n_features").to_frame()
 
+    # --- Per-pathway per-datatype feature counts ---
+    # Detect data-type prefixes from feature IDs (e.g. "tx_", "mx_", "px_")
+    all_feature_ids = exploded["feature_id"].astype(str)
+    detected_prefixes = sorted({fid.split("_")[0] + "_" for fid in all_feature_ids if "_" in fid})
+    if detected_prefixes:
+        exploded_copy = exploded.copy()
+        exploded_copy["_dtype"] = all_feature_ids.str.split("_").str[0]
+        dtype_counts = (
+            exploded_copy.groupby(["pathway", "_dtype"])["feature_id"]
+            .nunique()
+            .unstack(fill_value=0)
+        )
+        # Build compact label: "tx:12 mx:5" (only include types with >0 features)
+        def _make_label(row: pd.Series) -> str:
+            parts = [f"{dtype}:{int(row[dtype])}" for dtype in sorted(row.index) if row[dtype] > 0]
+            return " ".join(parts)
+        stats["datatype_label"] = dtype_counts.reindex(stats.index, fill_value=0).apply(_make_label, axis=1)
+    else:
+        stats["datatype_label"] = ""
+
     if rank_by == "cumulative_abs_lfc" or quant_df is not None:
         feature_scores = compute_feature_lfc_scores(quant_df)
         missing_features = set(exploded["feature_id"]) - set(feature_scores.index)
@@ -7611,13 +7572,49 @@ def build_pathway_submodule_matrices(
 
     row_normalized_df = counts_df.div(counts_df.sum(axis=1), axis=0)
 
+    # --- Per-submodule per-datatype feature counts (column labels) ---
+    # Use node_df directly so ALL features in each group are counted,
+    # not just those that have pathway annotations.
+    fid_col = feature_id_col if feature_id_col is not None else (
+        "feature_id" if "feature_id" in node_df.columns else node_df.index.name or "feature_id"
+    )
+    if fid_col in node_df.columns:
+        node_fids = node_df[fid_col].astype(str)
+    else:
+        node_fids = node_df.index.astype(str)
+
+    sub_col_name = submodule_col if submodule_col in node_df.columns else "submodule"
+    if sub_col_name not in node_df.columns:
+        submodule_datatype_labels = pd.Series(dtype=str)
+    else:
+        node_work = node_df[[sub_col_name]].copy()
+        node_work["_fid"] = node_fids.values
+        node_work["_dtype"] = node_work["_fid"].str.split("_").str[0]
+
+        # Restrict to qualifying submodules (same filter as the heatmap columns)
+        qualifying_cols = set(counts_df.columns)
+        node_work = node_work[node_work[sub_col_name].isin(qualifying_cols)]
+
+        sub_dtype_counts = (
+            node_work.groupby([sub_col_name, "_dtype"])["_fid"]
+            .nunique()
+            .unstack(fill_value=0)
+        )
+
+        def _make_col_label(row: pd.Series) -> str:
+            parts = [f"{dtype}:{int(row[dtype])}" for dtype in sorted(row.index) if row[dtype] > 0]
+            return " ".join(parts)
+
+        submodule_datatype_labels = sub_dtype_counts.apply(_make_col_label, axis=1)
+        submodule_datatype_labels.index.name = sub_col_name
+
     log.info(
         f"Built pathway x submodule matrix: {counts_df.shape[0]} pathways "
         f"(top {top_n} by {rank_by}) x {counts_df.shape[1]} submodules "
         f"(min_submodule_size={min_submodule_size})."
     )
 
-    return counts_df, row_normalized_df, pathway_stats_df
+    return counts_df, row_normalized_df, pathway_stats_df, submodule_datatype_labels
 
 
 def compute_pathway_submodule_enrichment(
@@ -7803,7 +7800,8 @@ def plot_pathway_submodule_clustermaps(
     counts_cmap: str = "viridis",
     normalized_cmap: str = "magma",
     normalized_vmax: float | Literal["auto"] = "auto",
-    normalized_gamma: float | None = None,
+    counts_gamma: float | None = 0.4,
+    normalized_gamma: float | None = 0.4,
     figsize: tuple[float, float] = (16, 14),
     output_dir: str | Path | None = None,
     counts_filename: str = "pathway_submodule_heatmap_counts.png",
@@ -7811,6 +7809,8 @@ def plot_pathway_submodule_clustermaps(
     dpi: int = 300,
     enrichment_df: pd.DataFrame | None = None,
     alpha_stars: dict[float, str] | None = None,
+    pathway_datatype_labels: pd.Series | None = None,
+    submodule_datatype_labels: pd.Series | None = None,
 ) -> tuple[plt.Figure, plt.Figure]:
     """Plot raw-count and row-normalized pathway x submodule heatmaps with shared clustering.
 
@@ -7828,27 +7828,31 @@ def plot_pathway_submodule_clustermaps(
         Colormaps for each panel.
     normalized_vmax : float or "auto"
         Upper bound of the color scale for the row-normalized heatmap.
-        "auto" (default) uses the actual maximum value in `row_normalized_df`,
-        so the color range reflects your real data spread instead of the full
-        theoretical 0-1 range (which is misleading when most cells are small,
-        e.g. <0.1, and only a few approach 1.0). Pass a fixed float instead if
-        you want a stable scale across multiple runs/comparisons.
-    normalized_gamma : float, optional
-        If set, applies a `matplotlib.colors.PowerNorm(gamma=normalized_gamma)`
-        to the color mapping instead of a plain linear scale. Values < 1
-        (e.g. 0.3-0.5) compress the high end and stretch the low end, making
-        small proportions visually distinguishable instead of all reading as
-        "dark/near-zero" under a linear scale dominated by a handful of large
-        values. Leave as None for a standard linear scale.
+        "auto" (default) uses the actual maximum value in `row_normalized_df`.
+    counts_gamma : float or None, default 0.4
+        PowerNorm gamma for the raw-count panel.  Values < 1 stretch the low
+        end of the color scale, making small counts visually distinguishable.
+        Set to None for a standard linear scale.
+    normalized_gamma : float or None, default 0.4
+        PowerNorm gamma for the row-normalized panel.  Same semantics as
+        ``counts_gamma``.  Set to None for a standard linear scale.
     output_dir, counts_filename, normalized_filename, dpi :
         Figure-saving options. If `output_dir` is None, figures are not saved.
     enrichment_df : pd.DataFrame, optional
         Output of `compute_pathway_submodule_enrichment`. If provided,
-        significance stars are overlaid on both panels (annotation happens
-        while each ClusterGrid is still live, before `.figure` is extracted).
+        significance stars are overlaid on both panels.
     alpha_stars : dict[float, str], optional
-        padj threshold -> marker string for the significance overlay. Only
-        used if `enrichment_df` is provided.
+        padj threshold -> marker string for the significance overlay.
+    pathway_datatype_labels : pd.Series, optional
+        Index = pathway name, values = compact label string (e.g. ``"tx:12 mx:5"``).
+        When provided, a narrow text column is rendered between the row
+        dendrogram and the heatmap on both panels, showing the per-datatype
+        feature breakdown for each pathway row in its clustered order.
+    submodule_datatype_labels : pd.Series, optional
+        Index = submodule name, values = compact label string (e.g. ``"tx:42 mx:18"``).
+        When provided, a narrow text row is rendered below the column dendrogram
+        on both panels, showing the per-datatype feature breakdown for each
+        submodule column in its clustered order.
 
     Returns
     -------
@@ -7868,32 +7872,47 @@ def plot_pathway_submodule_clustermaps(
     )
 
     # --- Counts panel ---
+    counts_vmax = counts_df.values.max() if counts_df.values.max() > 0 else 1
+    counts_norm_kwargs: dict = {}
+    if counts_gamma is not None:
+        counts_norm_kwargs["norm"] = PowerNorm(gamma=counts_gamma, vmin=0, vmax=counts_vmax)
+    else:
+        counts_norm_kwargs["vmin"] = 0
+        counts_norm_kwargs["vmax"] = counts_vmax
+
     g_counts = sns.clustermap(
         counts_df,
         cmap=counts_cmap,
         annot=False,
         fmt="d",
+        **counts_norm_kwargs,
         **common_kwargs,
     )
     g_counts.ax_heatmap.set_xlabel("Submodule")
     g_counts.ax_heatmap.set_ylabel("Pathway")
 
-    counts_title = "Feature count per pathway x submodule"
+    counts_title = "Feature count per pathway × submodule"
     if enrichment_df is not None:
-        # Annotate while g_counts is still a ClusterGrid -- reordered_ind
-        # is unavailable once only `.figure` is kept.
         add_significance_annotations(
             g_counts, counts_df, enrichment_df, cluster_rows, cluster_cols, alpha_stars
         )
         counts_title += "\n* padj<0.05  ** padj<0.01  *** padj<0.001 (hypergeometric, BH-FDR)"
     g_counts.figure.suptitle(counts_title, y=1.04 if enrichment_df is not None else 1.02, fontsize=10)
 
+    # --- Annotate row/column tick labels with datatype counts ---
+    _annotate_clustermap_tick_labels(
+        g_counts, counts_df,
+        row_labels=pathway_datatype_labels,
+        col_labels=submodule_datatype_labels,
+        cluster_rows=cluster_rows,
+        cluster_cols=cluster_cols,
+    )
+
     # --- Row-normalized panel ---
     resolved_vmax = row_normalized_df.values.max() if normalized_vmax == "auto" else normalized_vmax
 
     norm_kwargs: dict = {}
     if normalized_gamma is not None:
-        # PowerNorm handles vmin/vmax itself; don't pass them separately alongside `norm`
         norm_kwargs["norm"] = PowerNorm(gamma=normalized_gamma, vmin=0, vmax=resolved_vmax)
     else:
         norm_kwargs["vmin"] = 0
@@ -7915,10 +7934,14 @@ def plot_pathway_submodule_clustermaps(
             g_norm, row_normalized_df, enrichment_df, cluster_rows, cluster_cols, alpha_stars
         )
 
-    g_norm.figure.suptitle(
-        f"Row-normalized fraction of pathway's features per submodule "
-        f"(scale: 0-{resolved_vmax:.2f})",
-        y=1.02,
+    g_norm.figure.suptitle("Row-normalized fraction of pathway's features per submodule", y=1.02)
+
+    _annotate_clustermap_tick_labels(
+        g_norm, row_normalized_df,
+        row_labels=pathway_datatype_labels,
+        col_labels=submodule_datatype_labels,
+        cluster_rows=cluster_rows,
+        cluster_cols=cluster_cols,
     )
 
     if output_dir is not None:
@@ -7929,6 +7952,80 @@ def plot_pathway_submodule_clustermaps(
         log.info(f"Saved heatmaps to {output_dir / counts_filename} and {output_dir / normalized_filename}")
 
     return g_counts.figure, g_norm.figure
+
+
+def _annotate_clustermap_tick_labels(
+    clustergrid,
+    matrix_df: pd.DataFrame,
+    row_labels: "pd.Series | None" = None,
+    col_labels: "pd.Series | None" = None,
+    cluster_rows: bool = True,
+    cluster_cols: bool = True,
+) -> None:
+    """Embed per-datatype feature counts into the existing heatmap tick labels.
+
+    Row tick labels (y-axis, pathways) become:
+        ``"(mx:10, tx:30) PATHWAY NAME"``
+
+    Column tick labels (x-axis, submodules) become:
+        ``"group_X\\n(mx:5, tx:15)"``
+
+    Parameters
+    ----------
+    clustergrid : sns.matrix.ClusterGrid
+        Live ClusterGrid object (before ``.figure`` is extracted).
+    matrix_df : pd.DataFrame
+        The DataFrame passed to ``sns.clustermap`` for this panel.
+    row_labels : pd.Series, optional
+        Index = pathway name, values = compact datatype string (e.g. ``"tx:12 mx:5"``).
+        When provided, prepended as a parenthetical to each y-tick label.
+    col_labels : pd.Series, optional
+        Index = submodule name, values = compact datatype string (e.g. ``"tx:42 mx:18"``).
+        When provided, appended as a parenthetical on a new line to each x-tick label.
+    cluster_rows, cluster_cols : bool
+        Whether clustering was applied (determines tick order).
+    """
+    ax = clustergrid.ax_heatmap
+
+    def _fmt_parenthetical(raw: str) -> str:
+        """Convert 'tx:12 mx:5' → '(tx:12, mx:5)'."""
+        if not raw:
+            return ""
+        parts = raw.split()
+        return "(" + ", ".join(parts) + ")"
+
+    # ── Row tick labels (y-axis) ──────────────────────────────────────────────
+    if row_labels is not None:
+        # Determine clustered row order
+        if cluster_rows and clustergrid.dendrogram_row is not None:
+            row_order = list(clustergrid.dendrogram_row.reordered_ind)
+        else:
+            row_order = list(range(len(matrix_df.index)))
+        ordered_rows = matrix_df.index[row_order]
+
+        new_ylabels = []
+        for pathway in ordered_rows:
+            paren = _fmt_parenthetical(str(row_labels.get(pathway, "")))
+            new_ylabels.append(f"{paren} {pathway}" if paren else pathway)
+
+        ax.set_yticklabels(new_ylabels, fontsize=7)
+
+    # ── Column tick labels (x-axis) ───────────────────────────────────────────
+    if col_labels is not None:
+        # Determine clustered column order
+        if cluster_cols and clustergrid.dendrogram_col is not None:
+            col_order = list(clustergrid.dendrogram_col.reordered_ind)
+        else:
+            col_order = list(range(len(matrix_df.columns)))
+        ordered_cols = matrix_df.columns[col_order]
+
+        new_xlabels = []
+        for submodule in ordered_cols:
+            paren = _fmt_parenthetical(str(col_labels.get(submodule, "")))
+            new_xlabels.append(f"{submodule}\n{paren}" if paren else submodule)
+
+        ax.set_xticklabels(new_xlabels, rotation=90, ha="center", fontsize=7)
+
 
 def generate_pathway_submodule_heatmap(
     node_df: pd.DataFrame,
@@ -7973,7 +8070,7 @@ def generate_pathway_submodule_heatmap(
     -------
     (counts_df, row_normalized_df, pathway_stats_df, enrichment_df, fig_counts, fig_normalized)
     """
-    counts_df, row_normalized_df, pathway_stats_df = build_pathway_submodule_matrices(
+    counts_df, row_normalized_df, pathway_stats_df, submodule_datatype_labels = build_pathway_submodule_matrices(
         node_df,
         quant_df=quant_df,
         top_n=top_n,
@@ -7991,6 +8088,11 @@ def generate_pathway_submodule_heatmap(
         alpha=alpha,
     )
 
+    # Extract per-datatype labels from pathway_stats_df (row labels) and submodule_datatype_labels (column labels)
+    pathway_datatype_labels: pd.Series | None = None
+    if "datatype_label" in pathway_stats_df.columns:
+        pathway_datatype_labels = pathway_stats_df.set_index("pathway")["datatype_label"]
+
     fig_counts, fig_normalized = plot_pathway_submodule_clustermaps(
         counts_df,
         row_normalized_df,
@@ -7998,6 +8100,8 @@ def generate_pathway_submodule_heatmap(
         normalized_gamma=normalized_gamma,
         output_dir=output_dir,
         enrichment_df=enrichment_df,
+        pathway_datatype_labels=pathway_datatype_labels,
+        submodule_datatype_labels=submodule_datatype_labels if not submodule_datatype_labels.empty else None,
         **plot_kwargs,
     )
 
@@ -8014,6 +8118,8 @@ def compare_groups_to_pathways(
     rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
     exclude_nopathway: bool = False,
     min_group_size: int = 3,
+    show_only_sig: bool = False,
+    bipartite_only: bool = False,
     fdr_method: str = "fdr_bh",
     alpha: float = 0.05,
     output_dir: str | None = None,
@@ -8038,10 +8144,8 @@ def compare_groups_to_pathways(
     Parameters
     ----------
     node_table : pd.DataFrame
-        Feature-level node table produced by ``group_features()`` (or any of
-        the three grouping backends).  Must be indexed by feature ID and contain
-        a ``group`` column (and optionally a ``submodule`` column — both are
-        accepted).
+        Feature-level node table produced by ``group_features()``.  Must be
+        indexed by feature ID and contain a ``group`` column.
     annotation_table : pd.DataFrame
         Feature annotation table indexed by feature ID.  Must contain
         ``pathway_col`` (default ``"modelseed_pathway"``).
@@ -8049,13 +8153,10 @@ def compare_groups_to_pathways(
         Feature × comparison LFC matrix.  Required only when
         ``rank_by="cumulative_abs_lfc"``.
     pathway_col : str
-        Column in ``annotation_table`` that holds pathway labels.  Pathways may
-        be semicolon-separated; the first token is used as the primary pathway
-        for ARI/NMI.
+        Column in ``annotation_table`` that holds pathway labels.
     group_col : str
         Column in ``node_table`` that holds the data-driven group labels.
-        Defaults to ``"group"``.  Falls back to ``"submodule"`` if ``"group"``
-        is absent.
+        Falls back to ``"submodule"`` if ``"group"`` is absent.
     top_n : int
         Number of top-ranked pathways to show in the heatmap.
     rank_by : {"n_features", "cumulative_abs_lfc"}
@@ -8066,29 +8167,31 @@ def compare_groups_to_pathways(
     min_group_size : int
         Groups with fewer than this many features are dropped from both the
         heatmap and the ARI/NMI calculation.
+    show_only_sig : bool, default False
+        If True, restrict the heatmap rows to pathways that are significantly
+        enriched (``padj < alpha``) in at least one group.  Has no effect if
+        the enrichment table is empty.
+    bipartite_only : bool, default False
+        If True, restrict the enrichment/heatmap analysis to pathways that
+        have at least one feature from **each** data type present in the node
+        table (identified by the dataset-name prefix, e.g. ``"tx_"``,
+        ``"mx_"``).  Pathways represented by only a single data type are
+        dropped before the heatmap is built.
     fdr_method : str
         Multiple-testing correction method (default ``"fdr_bh"``).
     alpha : float
         Significance threshold for the enrichment test and star overlay.
     output_dir : str, optional
-        Directory to save heatmap PDFs.  If ``None``, figures are displayed
-        only.
+        Directory to save heatmap PDFs.
     **plot_kwargs
-        Forwarded to ``plot_pathway_submodule_clustermaps`` (e.g. ``figsize``,
-        ``counts_cmap``, ``dpi``).
+        Forwarded to ``plot_pathway_submodule_clustermaps``.
 
     Returns
     -------
     dict with keys:
-        ``counts_df``         – pathway × group raw-count matrix
-        ``row_normalized_df`` – row-normalised version of ``counts_df``
-        ``pathway_stats_df``  – per-pathway stats (n_features, optional LFC score)
-        ``enrichment_df``     – hypergeometric enrichment results
-        ``fig_counts``        – matplotlib Figure (raw counts)
-        ``fig_normalized``    – matplotlib Figure (row-normalised)
-        ``ari``               – Adjusted Rand Index (float)
-        ``nmi``               – Normalised Mutual Information (float)
-        ``n_features_compared`` – number of features used for ARI/NMI
+        ``counts_df``, ``row_normalized_df``, ``pathway_stats_df``,
+        ``enrichment_df``, ``fig_counts``, ``fig_normalized``,
+        ``ari``, ``nmi``, ``n_features_compared``
     """
     from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
     from sklearn.preprocessing import LabelEncoder
@@ -8133,6 +8236,44 @@ def compare_groups_to_pathways(
     )
 
     # ------------------------------------------------------------------ #
+    # 2b. Optional bipartite filter                                        #
+    # ------------------------------------------------------------------ #
+    if bipartite_only:
+        # Detect data-type prefixes from feature index (e.g. "tx_", "mx_", "px_")
+        feature_ids = node_df.index.astype(str)
+        detected_prefixes = sorted({fid.split("_")[0] + "_" for fid in feature_ids if "_" in fid})
+        if len(detected_prefixes) < 2:
+            log.warning(
+                "bipartite_only=True but fewer than 2 data-type prefixes detected "
+                f"({detected_prefixes}). Skipping bipartite filter."
+            )
+        else:
+            log.info(
+                f"bipartite_only=True: keeping pathways with features from all "
+                f"data types: {detected_prefixes}"
+            )
+            # For each pathway, check which prefixes are represented
+            node_df["_prefix"] = feature_ids.str.split("_").str[0] + "_"
+            pathway_prefix_counts = (
+                node_df[node_df[pathway_col].notna()]
+                .groupby(pathway_col)["_prefix"]
+                .nunique()
+            )
+            bipartite_pathways = pathway_prefix_counts[
+                pathway_prefix_counts >= len(detected_prefixes)
+            ].index
+            n_before = node_df[pathway_col].nunique()
+            node_df = node_df[
+                node_df[pathway_col].isna()
+                | node_df[pathway_col].isin(bipartite_pathways)
+            ]
+            node_df = node_df.drop(columns=["_prefix"])
+            log.info(
+                f"  Bipartite filter: {len(bipartite_pathways)} of {n_before} pathways "
+                "have features from all data types."
+            )
+
+    # ------------------------------------------------------------------ #
     # 3. Pathway × group heatmap + hypergeometric enrichment              #
     # ------------------------------------------------------------------ #
     log.info("Building pathway × group heatmap and running enrichment tests...")
@@ -8150,7 +8291,7 @@ def compare_groups_to_pathways(
         rank_by=rank_by,
         exclude_nopathway=exclude_nopathway,
         min_submodule_size=min_group_size,
-        output_dir=output_dir,
+        output_dir=None,          # defer saving until after optional sig filter
         fdr_method=fdr_method,
         alpha=alpha,
         **plot_kwargs,
@@ -8160,6 +8301,43 @@ def compare_groups_to_pathways(
     log.info(
         f"Significant pathway-group enrichments (padj < {alpha}): "
         f"{n_sig} of {len(enrichment_df)} tested pairs"
+    )
+
+    # ------------------------------------------------------------------ #
+    # 3b. Optional show_only_sig filter — rebuild heatmap on subset       #
+    # ------------------------------------------------------------------ #
+    if show_only_sig and not enrichment_df.empty and n_sig > 0:
+        sig_pathways = enrichment_df.loc[
+            enrichment_df["significant"], "pathway"
+        ].unique()
+        counts_df_plot = counts_df.loc[counts_df.index.isin(sig_pathways)]
+        row_normalized_df_plot = row_normalized_df.loc[row_normalized_df.index.isin(sig_pathways)]
+        log.info(
+            f"show_only_sig=True: restricting heatmap to {len(sig_pathways)} "
+            f"significantly enriched pathways (of {len(counts_df)} total)."
+        )
+        if counts_df_plot.empty:
+            log.warning("No significant pathways remain after filtering — using full heatmap.")
+            counts_df_plot = counts_df
+            row_normalized_df_plot = row_normalized_df
+    else:
+        counts_df_plot = counts_df
+        row_normalized_df_plot = row_normalized_df
+
+    # Re-render heatmaps on the (possibly filtered) matrices
+    from tools.helpers import plot_pathway_submodule_clustermaps as _plot_clustermaps
+    fig_counts, fig_normalized = _plot_clustermaps(
+        counts_df_plot,
+        row_normalized_df_plot,
+        output_dir=output_dir,
+        enrichment_df=enrichment_df,
+        **{k: v for k, v in plot_kwargs.items()
+           if k in {
+               "cluster_rows", "cluster_cols", "method", "metric",
+               "counts_cmap", "normalized_cmap", "normalized_vmax",
+               "counts_gamma", "normalized_gamma", "figsize",
+               "counts_filename", "normalized_filename", "dpi", "alpha_stars",
+           }},
     )
 
     # ------------------------------------------------------------------ #
@@ -8186,7 +8364,6 @@ def compare_groups_to_pathways(
     n_compared = len(comparison_df)
 
     if n_compared >= 2:
-        # Use primary pathway (first token if semicolon-separated)
         comparison_df = comparison_df.copy()
         comparison_df["_primary_pathway"] = (
             comparison_df[pathway_col].astype(str).str.split(";").str[0].str.strip()
@@ -8201,10 +8378,10 @@ def compare_groups_to_pathways(
         nmi = float(normalized_mutual_info_score(pathway_labels, group_labels))
 
         log.info(f"Features used for ARI/NMI comparison : {n_compared:,}")
-        log.info(f"Data-driven groups                   : {comparison_df[group_col].nunique()}")
-        log.info(f"Unique pathways (primary)             : {comparison_df['_primary_pathway'].nunique()}")
-        log.info(f"Adjusted Rand Index (ARI)             : {ari:.4f}  (1=perfect, 0=random)")
-        log.info(f"Normalised Mutual Info (NMI)          : {nmi:.4f}  (1=perfect, 0=none)")
+        log.info(f"Data-driven groups : {comparison_df[group_col].nunique()}")
+        log.info(f"Unique pathways (primary) : {comparison_df['_primary_pathway'].nunique()}")
+        log.info(f"Adjusted Rand Index (ARI) : {ari:.4f}  (1=perfect, 0=random)")
+        log.info(f"Normalised Mutual Info (NMI) : {nmi:.4f}  (1=perfect, 0=none)")
     else:
         log.warning(
             f"Only {n_compared} features remain after filtering for ARI/NMI — "

@@ -1,0 +1,64 @@
+# analysis.yml
+#
+# Unified analysis configuration for both workflow tracks.
+#
+# Choose ONE track by setting analysis.track:
+#
+#   sample_resolution   — replicates ARE paired across data types (same biological material,
+#                         matching sample IDs). Aligns columns by Sample ID, applies log2
+#                         transform + row-wise Z-score per dataset, concatenates, then
+#                         computes Pearson/Spearman correlation → HDBSCAN or network
+#                         clustering.
+#
+#   condition_resolution — replicates are NOT paired. Applies log2 transform, collapses
+#                          replicates to per-condition medians, then computes all unique
+#                          pairwise log-fold-changes (A_vs_B = log2_median[A] − log2_median[B])
+#                          across conditions. The resulting features × contrasts matrix is
+#                          used for hierarchical/HDBSCAN/network clustering.
+#
+# NOTE: Parameters marked XXX should not be changed.
+
+analysis:
+
+  # ── Track selection ──────────────────────────────────────────────────────────
+  track: sample_resolution   # sample_resolution | condition_resolution
+
+  # ── Shared: correlation method for the final correlation matrix ───────────────
+  correlation:
+    method: pearson          # pearson | spearman
+
+  # ── Feature grouping ─────────────────────────────────────────────────────────
+  feature_grouping:
+    method: network_modules  # network_modules | hierarchical_clustering | hdbscan
+    params:
+      # --- network_modules ---
+      corr_method: pearson        # pearson | spearman
+      corr_cutoff: 0.9            # minimum |correlation| to draw an edge
+      keep_negative: false        # include anti-correlated edges
+      block_size: 500             # features per block for block-wise correlation
+      cores: -1                   # parallel workers (-1 = all available)
+      corr_mode: bipartite        # bipartite | full
+      submodule_mode: louvain     # louvain | leiden
+      interactive_plot: false
+      network_layout: spring      # spring | kamada_kawai | circular
+
+      # --- hierarchical_clustering (set method above and uncomment) ---
+      # distance_metric: correlation  # scipy pdist metric; 'correlation' = 1 − Pearson r
+      # linkage_method: average       # single | complete | average | ward
+      # height_cutoff: 0.3
+
+      # --- hdbscan (set method above and uncomment) ---
+      # metric: correlation
+      # min_cluster_size: 5
+      # min_samples: 3
+
+  # ── Feature selection (applied to the integrated matrix before grouping) ──────
+  feature_selection:
+    method: variance         # variance | feature_list
+    params:
+      top_n: 5000            # number of top-variance features to keep
+      max_features: 10000    # hard cap on features passed to grouping step
+
+      # --- feature_list (set method above and uncomment) ---
+      # feature_list_file:
+

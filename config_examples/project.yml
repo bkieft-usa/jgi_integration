@@ -1,18 +1,16 @@
-# NOTE: Parameters with XXX should not be changed
-
 user_settings:
   project_name: Bartley_511319_Rice
   variable_list:
     - timepoint
-    - group # XXX
+    - group
 
 project:
   dataset_list:
-    - tx # XXX
-    - mx # XXX
-  genome_type: plant # XXX
-  PI_name: Bartley # XXX
-  proposal_ID: 511319 # XXX
-  results_path: /home/jovyan/work/output_data # XXX
-  raw_data_path: /home/jovyan/work/input_data/raw_data # XXX
-  metadata_link: /home/jovyan/work/input_data/link_script/metadata_link_script.py # XXX
+    - tx
+    - mx
+  genome_type: plant
+  PI_name: Bartley
+  proposal_ID: 511319
+  results_path: /home/jovyan/work/output_data
+  raw_data_path: /home/jovyan/work/input_data/raw_data
+  metadata_link: /home/jovyan/work/input_data/link_script/metadata_link_script.py
