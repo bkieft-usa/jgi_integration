@@ -1,0 +1,16 @@
+user_settings:
+  project_name: Bartley_511319_Rice
+  variable_list:
+    - timepoint
+    - group
+
+project:
+  dataset_list:
+    - tx
+    - mx
+  genome_type: plant
+  PI_name: Bartley
+  proposal_ID: 511319
+  results_path: /home/jovyan/work/output_data
+  raw_data_path: /home/jovyan/work/input_data/raw_data
+  metadata_link: /home/jovyan/work/input_data/link_script/metadata_link_script.py

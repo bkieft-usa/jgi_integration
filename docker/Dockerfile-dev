@@ -4,7 +4,10 @@ FROM jupyter/base-notebook:latest
 USER root
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        git curl && \
+        git \
+        curl \
+        build-essential \
+        python3-dev && \
     rm -rf /var/lib/apt/lists/*
 
 ######## Set up user environment

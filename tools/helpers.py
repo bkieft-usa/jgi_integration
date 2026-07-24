@@ -370,7 +370,7 @@ def perform_feature_selection(
     Parameters
     ----------
     data : pd.DataFrame
-        Integrated feature matrix (features × samples or features × conditions).
+        Integrated feature matrix (features x samples or features x conditions).
     metadata : pd.DataFrame
         Integrated metadata (not used for selection, kept for API consistency).
     config : dict
@@ -1984,7 +1984,7 @@ def group_features_nmf(
     Parameters
     ----------
     data : pd.DataFrame
-        Feature matrix (features × columns).  Can contain negative values
+        Feature matrix (features x columns).  Can contain negative values
         (LFC or Z-score); a non-negative shift is applied internally.
     k_min : int
         Minimum number of NMF components to evaluate (default 2).
@@ -2154,7 +2154,7 @@ def group_features_leiden_knn(
     Parameters
     ----------
     data : pd.DataFrame
-        Feature matrix (features × columns).
+        Feature matrix (features x columns).
     n_neighbors : int
         Number of nearest neighbors per feature (default 15).
     resolution_min : float
@@ -2313,7 +2313,7 @@ def group_features(
     Parameters
     ----------
     data : pd.DataFrame
-        Feature matrix (features × samples or features × contrasts).
+        Feature matrix (features x samples or features x contrasts).
     method : str
         One of ``"network_modules"``, ``"hierarchical_clustering"``,
         ``"hdbscan"``, ``"nmf"``, ``"leiden_knn"``.
@@ -5539,10 +5539,10 @@ def integrate_data(
 
     Used by both tracks after per-dataset scaling is complete:
 
-    * **sample_resolution** — concatenates ``ds.scaled_data`` (features × samples)
+    * **sample_resolution** — concatenates ``ds.scaled_data`` (features x samples)
       across datasets.  Columns are sample IDs; overlapping samples are enforced
       when ``overlap_only=True``.
-    * **condition_resolution** — concatenates ``ds.scaled_data`` (features × contrasts)
+    * **condition_resolution** — concatenates ``ds.scaled_data`` (features x contrasts)
       across datasets.  Columns are contrast names (``A_vs_B``); shared contrasts
       are enforced when ``overlap_only=True``.
 
@@ -5566,7 +5566,7 @@ def integrate_data(
     Returns
     -------
     pd.DataFrame
-        Integrated features × columns matrix.
+        Integrated features x columns matrix.
     """
     log.info(f"Concatenating per-dataset matrices (data_attr='{data_attr}')...")
 
@@ -5605,7 +5605,7 @@ def integrate_data(
     integrated_data = integrated_data.fillna(0)
 
     log.info(
-        f"Integrated dataset: {integrated_data.shape[0]} features × "
+        f"Integrated dataset: {integrated_data.shape[0]} features x "
         f"{integrated_data.shape[1]} columns"
     )
 
@@ -5628,7 +5628,7 @@ def scale_data_lfc(
     """
     Per-dataset LFC scaling for the **condition_resolution** track.
 
-    Transforms a raw feature × sample matrix into a feature × contrasts matrix
+    Transforms a raw feature x sample matrix into a feature x contrasts matrix
     by applying the following steps in order:
 
     1. **log2 transform** — ``log2(x + 1)``
@@ -5645,7 +5645,7 @@ def scale_data_lfc(
     Parameters
     ----------
     data : pd.DataFrame
-        Raw feature × sample matrix (``replicate_filtered_data``).
+        Raw feature x sample matrix (``replicate_filtered_data``).
     metadata : pd.DataFrame
         Sample metadata with at least ``sample_col`` and ``group_col`` columns.
     dataset_name : str
@@ -5662,7 +5662,7 @@ def scale_data_lfc(
     Returns
     -------
     pd.DataFrame
-        Feature × contrasts matrix.  Columns are contrast names of the form
+        Feature x contrasts matrix.  Columns are contrast names of the form
         ``"groupA_vs_groupB"``.
     """
     # ── Step 1: log2 transform ────────────────────────────────────────────────
@@ -5696,7 +5696,7 @@ def scale_data_lfc(
         index=common_samples,
         name=group_col,
     )
-    condition_medians = log2_df.T.groupby(condition_labels).median().T  # features × conditions
+    condition_medians = log2_df.T.groupby(condition_labels).median().T  # features x conditions
 
     n_conditions = condition_medians.shape[1]
     log.info(
@@ -5722,7 +5722,7 @@ def scale_data_lfc(
         lfc_df.index = [f"{dataset_name}_{idx}" for idx in lfc_df.index]
 
     log.info(
-        f"  [{dataset_name}]: {lfc_df.shape[0]} features × {lfc_df.shape[1]} contrasts"
+        f"  [{dataset_name}]: {lfc_df.shape[0]} features x {lfc_df.shape[1]} contrasts"
     )
 
     write_integration_file(lfc_df, output_dir, output_filename, indexing=True)
@@ -5764,7 +5764,7 @@ def scale_data_moderated_lfc(
 
     .. code-block:: text
 
-        d_shrunk = d × (τ² / (τ² + SE²))
+        d_shrunk = d x (τ² / (τ² + SE²))
 
     where ``τ²`` is the empirical prior variance estimated as
     ``max(0, mean(d²) − mean(SE²))`` across all features for that contrast
@@ -5775,7 +5775,7 @@ def scale_data_moderated_lfc(
     Parameters
     ----------
     data : pd.DataFrame
-        Raw feature × sample matrix (``replicate_filtered_data``).
+        Raw feature x sample matrix (``replicate_filtered_data``).
     metadata : pd.DataFrame
         Sample metadata with at least ``sample_col`` and ``group_col`` columns.
     dataset_name : str
@@ -5796,7 +5796,7 @@ def scale_data_moderated_lfc(
     Returns
     -------
     pd.DataFrame
-        Feature × contrasts matrix of shrunken LFC values.  Columns are
+        Feature x contrasts matrix of shrunken LFC values.  Columns are
         contrast names of the form ``"groupA_vs_groupB"``.
     """
     # ── Step 1: log2 transform ────────────────────────────────────────────────
@@ -5925,7 +5925,7 @@ def scale_data_moderated_lfc(
         lfc_df.index = [f"{dataset_name}_{idx}" for idx in lfc_df.index]
 
     log.info(
-        f"  [{dataset_name}]: {lfc_df.shape[0]} features × {lfc_df.shape[1]} contrasts "
+        f"  [{dataset_name}]: {lfc_df.shape[0]} features x {lfc_df.shape[1]} contrasts "
         "(moderated LFC)"
     )
 
@@ -6325,7 +6325,7 @@ def normalize_integrated_data(
     lfc_pairs: list = None,
 ) -> pd.DataFrame:
     """
-    Normalize the integrated feature matrix (features × samples, all datasets combined)
+    Normalize the integrated feature matrix (features x samples, all datasets combined)
     after integration.
 
     This is the post-integration normalization step that replaces the old per-dataset
@@ -6335,12 +6335,12 @@ def normalize_integrated_data(
     Parameters
     ----------
     data : pd.DataFrame
-        Integrated feature matrix (features × samples). Rows = features, columns = samples.
+        Integrated feature matrix (features x samples). Rows = features, columns = samples.
         Should be the replicate-filtered devarianced data concatenated across datasets.
     method : str
         Normalization method:
         - ``"lfc"``            : log2 fold-change of group medians vs. all-group median.
-                                 Produces a features × contrasts matrix where each column
+                                 Produces a features x contrasts matrix where each column
                                  is a pairwise group comparison (groupA_vs_groupB).
         - ``"vst"``            : variance-stabilizing transformation (arcsinh(sqrt(x))) + z-score.
         - ``"zscore"``         : log2(x+1) then z-score per sample (column-wise).
@@ -6377,7 +6377,7 @@ def normalize_integrated_data(
     if method not in valid_methods:
         raise ValueError(f"method must be one of {valid_methods}, got '{method}'")
 
-    log.info(f"Normalizing integrated data using method='{method}' ({data.shape[0]} features × {data.shape[1]} samples)...")
+    log.info(f"Normalizing integrated data using method='{method}' ({data.shape[0]} features x {data.shape[1]} samples)...")
 
     if method == "lfc":
         # Build group medians from the integrated matrix
@@ -6398,7 +6398,7 @@ def normalize_integrated_data(
         data_common = data[common_samples]
         groups = sorted(set(sample_to_group[s] for s in common_samples))
 
-        # Compute per-group medians (features × groups)
+        # Compute per-group medians (features x groups)
         group_medians = pd.DataFrame(index=data.index)
         for grp in groups:
             grp_samples = [s for s in common_samples if sample_to_group[s] == grp]
@@ -6420,7 +6420,7 @@ def normalize_integrated_data(
             lfc_df[col_name] = np.log2(med_a / med_b)
 
         normalized = lfc_df
-        log.info(f"LFC normalization complete: {normalized.shape[0]} features × {normalized.shape[1]} contrasts")
+        log.info(f"LFC normalization complete: {normalized.shape[0]} features x {normalized.shape[1]} contrasts")
 
     else:
         # Sample-wise scaling methods
@@ -6454,7 +6454,7 @@ def normalize_integrated_data(
                                      output_distribution='normal', random_state=0)
             normalized = pd.DataFrame(arr, index=df.index, columns=df.columns)
 
-        log.info(f"{method} normalization complete: {normalized.shape[0]} features × {normalized.shape[1]} samples")
+        log.info(f"{method} normalization complete: {normalized.shape[0]} features x {normalized.shape[1]} samples")
 
     write_integration_file(normalized, output_dir, output_filename, indexing=True)
     return normalized
@@ -7456,7 +7456,7 @@ def build_pathway_submodule_matrices(
     missing_token: str = "Unassigned",
     exclude_nopathway: bool = False,
     nopathway_prefix: str = "NOPATHWAY_",
-    top_n: int = 50,
+    top_n: int = 100,
     rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
     min_submodule_size: int = 0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
@@ -7802,7 +7802,7 @@ def plot_pathway_submodule_clustermaps(
     normalized_vmax: float | Literal["auto"] = "auto",
     counts_gamma: float | None = 0.4,
     normalized_gamma: float | None = 0.4,
-    figsize: tuple[float, float] = (16, 14),
+    figsize: tuple[float, float] = (20, 14),
     output_dir: str | Path | None = None,
     counts_filename: str = "pathway_submodule_heatmap_counts.png",
     normalized_filename: str = "pathway_submodule_heatmap_normalized.png",
@@ -7891,7 +7891,7 @@ def plot_pathway_submodule_clustermaps(
     g_counts.ax_heatmap.set_xlabel("Submodule")
     g_counts.ax_heatmap.set_ylabel("Pathway")
 
-    counts_title = "Feature count per pathway × submodule"
+    counts_title = "Feature count per pathway x submodule"
     if enrichment_df is not None:
         add_significance_annotations(
             g_counts, counts_df, enrichment_df, cluster_rows, cluster_cols, alpha_stars
@@ -8022,7 +8022,7 @@ def _annotate_clustermap_tick_labels(
         new_xlabels = []
         for submodule in ordered_cols:
             paren = _fmt_parenthetical(str(col_labels.get(submodule, "")))
-            new_xlabels.append(f"{submodule}\n{paren}" if paren else submodule)
+            new_xlabels.append(f"{submodule} {paren}" if paren else submodule)
 
         ax.set_xticklabels(new_xlabels, rotation=90, ha="center", fontsize=7)
 
@@ -8030,7 +8030,7 @@ def _annotate_clustermap_tick_labels(
 def generate_pathway_submodule_heatmap(
     node_df: pd.DataFrame,
     quant_df: pd.DataFrame | None = None,
-    top_n: int = 50,
+    top_n: int = 100,
     rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
     exclude_nopathway: bool = False,
     min_submodule_size: int = 0,
@@ -8114,7 +8114,7 @@ def compare_groups_to_pathways(
     quant_df: pd.DataFrame | None = None,
     pathway_col: str = "modelseed_pathway",
     group_col: str = "group",
-    top_n: int = 50,
+    top_n: int = 100,
     rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
     exclude_nopathway: bool = False,
     min_group_size: int = 3,
@@ -8130,7 +8130,7 @@ def compare_groups_to_pathways(
 
     Combines two complementary analyses into a single call:
 
-    1. **Pathway × group heatmap** — builds a pathway × group count matrix
+    1. **Pathway x group heatmap** — builds a pathway x group count matrix
        (top ``top_n`` pathways by feature count or cumulative |LFC|), runs
        hypergeometric over-representation tests (BH-FDR corrected), and plots
        both a raw-count and a row-normalised clustermap with significance stars.
@@ -8150,7 +8150,7 @@ def compare_groups_to_pathways(
         Feature annotation table indexed by feature ID.  Must contain
         ``pathway_col`` (default ``"modelseed_pathway"``).
     quant_df : pd.DataFrame, optional
-        Feature × comparison LFC matrix.  Required only when
+        Feature x comparison LFC matrix.  Required only when
         ``rank_by="cumulative_abs_lfc"``.
     pathway_col : str
         Column in ``annotation_table`` that holds pathway labels.
@@ -8274,9 +8274,9 @@ def compare_groups_to_pathways(
             )
 
     # ------------------------------------------------------------------ #
-    # 3. Pathway × group heatmap + hypergeometric enrichment              #
+    # 3. Pathway x group heatmap + hypergeometric enrichment              #
     # ------------------------------------------------------------------ #
-    log.info("Building pathway × group heatmap and running enrichment tests...")
+    log.info("Building pathway x group heatmap and running enrichment tests...")
     (
         counts_df,
         row_normalized_df,

@@ -1,0 +1,48 @@
+datasets:
+  tx:
+    dataset_dir: transcriptomics # Do not change
+    normalization_parameters:
+      filtering:
+        method: minimum          # minimum | proportion | none
+        params:
+          value: 100             # minimum: minimum count threshold; proportion: minimum fraction of samples with non-zero value (0–1)
+      devariancing:
+        method: percent          # percent | none
+        params:
+          value: 10              # percent: bottom N% of variance removed
+      replicate_handling:
+        method: variance         # variance | none
+        params:
+          value: 1.0                # variance: max allowed coefficient of variation (std/mean) within a group before flagging as unreliable
+      scaling:
+        method: modified_zscore                # lfc | moderated_lfc | zscore | vst | vsn | rank_normal | modified_zscore | none
+        # For sample_resolution track:
+        #   zscore          — log2(x+1) then column-wise Z-score
+        #   modified_zscore — log2(x+1) then median/MAD Z-score (robust to outliers)
+        #   vst             — arcsinh(sqrt(x)) + Z-score; better for counts near zero
+        #   vsn             — parametric variance-stabilizing normalization
+        #   rank_normal     — rank-based inverse normal; distribution-agnostic
+        #   none            — pass-through (no scaling)
+        # For condition_resolution track:
+        #   lfc             — log2(x+1) → group medians → all-pairwise LFC
+        #   moderated_lfc   — same as lfc but applies empirical-Bayes shrinkage to reduce noise for low-replicate features
+
+  mx:
+    dataset_dir: metabolomics # Do not change
+    chromatography: HILIC
+    polarity: multipolarity
+    normalization_parameters:
+      filtering:
+        method: minimum          # minimum | proportion | none
+        params:
+          value: 1000
+      devariancing:
+        method: percent          # percent | none
+        params:
+          value: 10
+      replicate_handling:
+        method: variance         # variance | none
+        params:
+          value: 1.0
+      scaling:
+        method: vst                   # lfc | moderated_lfc | zscore | vst | vsn | rank_normal | modified_zscore | none
