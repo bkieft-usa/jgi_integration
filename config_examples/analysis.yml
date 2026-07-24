@@ -1,7 +1,7 @@
 analysis:
 
   feature_grouping:
-    method: hierarchical_clustering  # network_modules | hierarchical_clustering | hdbscan | nmf | leiden_knn
+    method: hierarchical_clustering  # network_modules | hierarchical_clustering | hdbscan | nmf | leiden_knn | wgcna
     params:
 
       ###   network_modules         # Pearson/Spearman correlation → graph → Louvain/Leiden community detection.
@@ -36,6 +36,15 @@ analysis:
       resolution_min: 0.1           # lower bound of resolution sweep
       resolution_max: 3.0           # upper bound of resolution sweep
       resolution_steps: 20          # number of resolution values to evaluate
+
+      ###   wgcna                     # Weighted Gene Co-expression Network Analysis
+      power: null                   # set an integer to skip soft-threshold sweep (usually start with 6)
+      power_range: [1,2,3,4,5,6,7,8,9,10,12,14,16,18,20]  # β values to evaluate
+      r2_threshold: 0.85            # minimum scale-free topology R² to accept a β
+      signed: true                  # true = signed adjacency (preserves correlation direction)
+      min_module_size: 30           # minimum features per module
+      merge_cut_height: 0.25        # merge modules with ME correlation > 1 − this value
+      deep_split: 2                 # 0–4; higher = more, smaller modules
 
   feature_selection:
     method: variance         # variance | feature_list

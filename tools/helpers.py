@@ -2295,6 +2295,554 @@ def group_features_leiden_knn(
     return node_table, empty_edge_table
 
 
+def group_features_wgcna(
+    data: pd.DataFrame,
+    power_range: List[int] = None,
+    power: int | None = None,
+    r2_threshold: float = 0.85,
+    signed: bool = True,
+    min_module_size: int = 30,
+    merge_cut_height: float = 0.25,
+    deep_split: int = 2,
+    output_dir: str = None,
+    output_filenames: Dict[str, str] = None,
+    datasets: List = None,
+    annotation_df: Optional[pd.DataFrame] = None,
+    integrated_data: pd.DataFrame = None,
+    integrated_metadata: pd.DataFrame = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Weighted Gene Co-expression Network Analysis (WGCNA) implemented in pure
+    Python using numpy/scipy/sklearn — no R dependency required.
+
+    **Algorithm**
+
+    1. **Soft-threshold (β) selection** — sweeps ``power_range`` values and
+       fits a linear model to ``log(k)`` vs ``log(p(k))`` (scale-free topology
+       criterion).  The smallest β where R² ≥ ``r2_threshold`` is chosen.
+       If ``power`` is set explicitly, the sweep is skipped.
+
+    2. **Adjacency matrix** — ``A_ij = |cor(i,j)|^β`` (unsigned) or
+       ``((1 + cor(i,j)) / 2)^β`` (signed, default).
+
+    3. **Topological Overlap Matrix (TOM)** — reduces noise by considering
+       shared neighbours:
+       ``TOM_ij = (Σ_k A_ik·A_kj + A_ij) / (min(k_i, k_j) + 1 − A_ij)``
+
+    4. **Hierarchical clustering** on ``1 − TOM`` dissimilarity (average linkage).
+
+    5. **Dynamic tree cut** — cuts the dendrogram using a simplified
+       ``deep_split`` heuristic to detect modules of at least
+       ``min_module_size`` features.
+
+    6. **Module merging** — modules whose eigengenes (PC1) are correlated
+       above ``1 − merge_cut_height`` are merged.
+
+    7. **Diagnostic outputs** written to ``<output_dir>/wgcna_results/``:
+
+       * ``soft_threshold_plot.pdf`` — R² and mean connectivity vs β
+       * ``dendrogram_modules.pdf`` — cluster dendrogram + module colour bar
+       * ``module_eigengenes.csv`` — ME × sample matrix
+       * ``module_membership_kme.csv`` — feature × module kME table
+       * ``intramodular_connectivity_kin.csv`` — per-feature kIN
+       * ``module_trait_correlation.pdf`` — ME × trait heatmap
+         (requires ``integrated_metadata`` with numeric columns)
+       * ``gs_vs_mm_plots/`` — GS vs MM scatter for each module × trait pair
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Feature × samples (or feature × contrasts) matrix.
+    power_range : list of int, optional
+        β values to sweep for soft-threshold selection.
+        Default: ``[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20]``.
+    power : int, optional
+        If set, skip the soft-threshold sweep and use this β directly.
+    r2_threshold : float, default 0.85
+        Minimum scale-free topology R² to accept a β value.
+    signed : bool, default True
+        Use signed adjacency (preserves direction of correlation).
+    min_module_size : int, default 30
+        Minimum number of features per module.
+    merge_cut_height : float, default 0.25
+        Modules with ME correlation > ``1 − merge_cut_height`` are merged.
+    output_dir : str
+        Base output directory.
+    output_filenames : Dict[str, str]
+        Dict with keys ``"node_table"`` and ``"edge_table"``.
+    datasets : List
+        Dataset objects with ``.dataset_name`` attribute.
+    annotation_df : pd.DataFrame, optional
+        Feature annotation table.
+    integrated_data : pd.DataFrame
+        Accepted for API consistency; not used.
+    integrated_metadata : pd.DataFrame, optional
+        Sample metadata with numeric trait columns for module-trait correlation.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.DataFrame]
+        ``(node_table, edge_table)`` where ``node_table`` is indexed by
+        feature ID with a ``'group'`` column (module assignment), and
+        ``edge_table`` is empty.
+    """
+    from scipy.cluster.hierarchy import linkage as _linkage, fcluster as _fcluster, dendrogram as _dendrogram
+    from scipy.spatial.distance import squareform as _squareform
+    from sklearn.decomposition import PCA as _PCA
+
+    if power_range is None:
+        power_range = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20]
+
+    wgcna_dir = os.path.join(output_dir, "wgcna_results")
+    os.makedirs(wgcna_dir, exist_ok=True)
+    gs_mm_dir = os.path.join(wgcna_dir, "gs_vs_mm_plots")
+    os.makedirs(gs_mm_dir, exist_ok=True)
+
+    # ── Prepare data matrix ───────────────────────────────────────────────────
+    numeric_data = data.select_dtypes(include=[np.number]).fillna(0)
+    numeric_data = numeric_data.loc[~(numeric_data == 0).all(axis=1)]
+    X = numeric_data.values.astype(np.float64)   # features × samples
+    n_features, n_samples = X.shape
+    feature_ids = numeric_data.index.tolist()
+
+    log.info(f"WGCNA: {n_features} features × {n_samples} samples/contrasts")
+
+    # ── Step 1: Pearson correlation matrix ────────────────────────────────────
+    log.info("WGCNA: Computing Pearson correlation matrix...")
+    # Standardise rows for correlation
+    Xc = X - X.mean(axis=1, keepdims=True)
+    norms = np.linalg.norm(Xc, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    Xn = Xc / norms
+    cor_mat = (Xn @ Xn.T) / (n_samples - 1)
+    np.clip(cor_mat, -1.0, 1.0, out=cor_mat)
+    np.fill_diagonal(cor_mat, 1.0)
+
+    # ── Step 2: Soft-threshold selection ─────────────────────────────────────
+    if power is None:
+        log.info(f"WGCNA: Sweeping soft-threshold β ∈ {power_range}...")
+        r2_vals, mean_k_vals = [], []
+        for beta in power_range:
+            if signed:
+                adj = ((1.0 + cor_mat) / 2.0) ** beta
+            else:
+                adj = np.abs(cor_mat) ** beta
+            np.fill_diagonal(adj, 0.0)
+            k = adj.sum(axis=1)
+            # Scale-free topology: fit log(p(k)) ~ log(k)
+            k_hist, k_edges = np.histogram(k, bins=min(20, n_features // 5 + 1))
+            k_centers = (k_edges[:-1] + k_edges[1:]) / 2
+            mask = (k_hist > 0) & (k_centers > 0)
+            if mask.sum() < 3:
+                r2_vals.append(0.0)
+                mean_k_vals.append(float(k.mean()))
+                continue
+            log_k = np.log10(k_centers[mask])
+            log_p = np.log10(k_hist[mask] / k_hist[mask].sum())
+            # Linear regression
+            A = np.vstack([log_k, np.ones(len(log_k))]).T
+            slope, intercept = np.linalg.lstsq(A, log_p, rcond=None)[0]
+            ss_res = np.sum((log_p - (slope * log_k + intercept)) ** 2)
+            ss_tot = np.sum((log_p - log_p.mean()) ** 2)
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+            r2_vals.append(float(r2))
+            mean_k_vals.append(float(k.mean()))
+
+        # Choose smallest β with R² ≥ threshold
+        chosen_power = None
+        for i, beta in enumerate(power_range):
+            if r2_vals[i] >= r2_threshold:
+                chosen_power = beta
+                break
+        if chosen_power is None:
+            chosen_power = power_range[int(np.argmax(r2_vals))]
+            log.warning(
+                f"WGCNA: No β reached R²≥{r2_threshold}. "
+                f"Using β={chosen_power} (best R²={max(r2_vals):.3f}). "
+                "Consider lowering r2_threshold or checking data quality."
+            )
+        else:
+            log.info(f"WGCNA: Selected β={chosen_power} (R²={r2_vals[power_range.index(chosen_power)]:.3f})")
+
+        # Plot soft-threshold diagnostics
+        fig_st, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        ax1.plot(power_range, r2_vals, "o-", color="#440154")
+        ax1.axhline(r2_threshold, color="red", linestyle="--", label=f"R²={r2_threshold}")
+        ax1.axvline(chosen_power, color="orange", linestyle=":", label=f"β={chosen_power}")
+        ax1.set_xlabel("Soft-threshold power (β)")
+        ax1.set_ylabel("Scale-free topology R²")
+        ax1.set_title("Soft-threshold selection")
+        ax1.legend()
+        ax1.set_ylim(0, 1.05)
+        ax2.plot(power_range, mean_k_vals, "s-", color="#21908c")
+        ax2.axvline(chosen_power, color="orange", linestyle=":", label=f"β={chosen_power}")
+        ax2.set_xlabel("Soft-threshold power (β)")
+        ax2.set_ylabel("Mean connectivity")
+        ax2.set_title("Mean connectivity vs β")
+        ax2.legend()
+        fig_st.tight_layout()
+        fig_st.savefig(os.path.join(wgcna_dir, "soft_threshold_plot.pdf"), bbox_inches="tight")
+        plt.close(fig_st)
+        log.info(f"WGCNA: Saved soft_threshold_plot.pdf")
+    else:
+        chosen_power = power
+        log.info(f"WGCNA: Using user-specified β={chosen_power}")
+
+    # ── Step 3: Adjacency matrix ──────────────────────────────────────────────
+    log.info(f"WGCNA: Building {'signed' if signed else 'unsigned'} adjacency (β={chosen_power})...")
+    if signed:
+        adj = ((1.0 + cor_mat) / 2.0) ** chosen_power
+    else:
+        adj = np.abs(cor_mat) ** chosen_power
+    np.fill_diagonal(adj, 0.0)
+
+    # ── Step 4: Topological Overlap Matrix (TOM) ──────────────────────────────
+    log.info("WGCNA: Computing Topological Overlap Matrix (TOM)...")
+    k = adj.sum(axis=1)                          # connectivity per feature
+    # Numerator: shared neighbour overlap + direct connection
+    numerator = adj @ adj + adj                  # (n × n)
+    # Denominator: min(k_i, k_j) + 1 − A_ij
+    ki = k[:, np.newaxis]
+    kj = k[np.newaxis, :]
+    denominator = np.minimum(ki, kj) + 1.0 - adj
+    denominator = np.where(denominator == 0, 1e-10, denominator)
+    tom = numerator / denominator
+    np.clip(tom, 0.0, 1.0, out=tom)
+    np.fill_diagonal(tom, 1.0)
+    dissimilarity = 1.0 - tom
+
+    # ── Step 5: Hierarchical clustering ───────────────────────────────────────
+    log.info("WGCNA: Hierarchical clustering on TOM dissimilarity...")
+    dist_condensed = _squareform(dissimilarity, checks=False)
+    Z = _linkage(dist_condensed, method="average")
+
+    # ── Step 6: Dynamic tree cut (simplified) ─────────────────────────────────
+    log.info(f"WGCNA: Cutting dendrogram (min_module_size={min_module_size}, deep_split={deep_split})...")
+    # Use a height-based cut with iterative refinement based on deep_split
+    # deep_split 0-4 maps to progressively lower cut heights
+    base_height = 0.99 - deep_split * 0.05
+    raw_labels = _fcluster(Z, t=base_height, criterion="distance")
+
+    # Merge small modules into "grey" (unassigned)
+    label_counts = pd.Series(raw_labels).value_counts()
+    small_labels = label_counts[label_counts < min_module_size].index
+    raw_labels = np.where(np.isin(raw_labels, small_labels), 0, raw_labels)
+
+    # Re-number modules 1..N (0 = grey/unassigned)
+    unique_nonzero = sorted(set(raw_labels) - {0})
+    remap = {old: new for new, old in enumerate(unique_nonzero, start=1)}
+    remap[0] = 0
+    module_labels = np.array([remap[l] for l in raw_labels])
+    n_modules = len(unique_nonzero)
+    log.info(f"WGCNA: {n_modules} modules detected before merging ({(module_labels == 0).sum()} features unassigned)")
+
+    # ── Step 7: Module eigengenes (ME = PC1 per module) ───────────────────────
+    log.info("WGCNA: Computing module eigengenes...")
+    sample_names = numeric_data.columns.tolist()
+    me_dict: Dict[int, np.ndarray] = {}
+    for mod_id in range(1, n_modules + 1):
+        mask = module_labels == mod_id
+        if mask.sum() < 2:
+            me_dict[mod_id] = np.zeros(n_samples)
+            continue
+        mod_X = X[mask]
+        pca = _PCA(n_components=1)
+        me = pca.fit_transform(mod_X.T).flatten()  # samples × 1 → (n_samples,)
+        # Ensure ME is positively correlated with average module expression
+        avg = mod_X.mean(axis=0)
+        if np.corrcoef(me, avg)[0, 1] < 0:
+            me = -me
+        me_dict[mod_id] = me
+
+    me_df = pd.DataFrame(
+        {f"ME{mod_id}": me_dict[mod_id] for mod_id in range(1, n_modules + 1)},
+        index=sample_names,
+    )
+
+    # ── Step 8: Module merging ────────────────────────────────────────────────
+    if n_modules > 1 and merge_cut_height < 1.0:
+        log.info(f"WGCNA: Merging modules with ME correlation > {1 - merge_cut_height:.2f}...")
+        me_cor = np.corrcoef(me_df.values.T)
+        me_dist = _squareform(1.0 - me_cor, checks=False)
+        me_Z = _linkage(me_dist, method="average")
+        me_cut = _fcluster(me_Z, t=merge_cut_height, criterion="distance")
+
+        # Build merge map: old module → new module
+        merge_map: Dict[int, int] = {}
+        for new_id, old_ids in enumerate(
+            [np.where(me_cut == c)[0] + 1 for c in sorted(set(me_cut))], start=1
+        ):
+            for old_id in old_ids:
+                merge_map[old_id] = new_id
+
+        module_labels = np.array([
+            merge_map.get(l, 0) if l != 0 else 0
+            for l in module_labels
+        ])
+        n_modules_merged = len(set(module_labels) - {0})
+        log.info(f"WGCNA: {n_modules_merged} modules after merging")
+
+        # Recompute MEs after merging
+        me_dict = {}
+        for mod_id in sorted(set(module_labels) - {0}):
+            mask = module_labels == mod_id
+            if mask.sum() < 2:
+                me_dict[mod_id] = np.zeros(n_samples)
+                continue
+            mod_X = X[mask]
+            pca = _PCA(n_components=1)
+            me = pca.fit_transform(mod_X.T).flatten()
+            avg = mod_X.mean(axis=0)
+            if np.corrcoef(me, avg)[0, 1] < 0:
+                me = -me
+            me_dict[mod_id] = me
+
+        me_df = pd.DataFrame(
+            {f"ME{mod_id}": me_dict[mod_id] for mod_id in sorted(me_dict)},
+            index=sample_names,
+        )
+
+    final_n_modules = len(set(module_labels) - {0})
+    log.info(f"WGCNA: Final module count: {final_n_modules}")
+
+    # ── Step 9: Module Membership (kME) ───────────────────────────────────────
+    log.info("WGCNA: Computing module membership (kME)...")
+    kme_dict: Dict[str, np.ndarray] = {}
+    for col in me_df.columns:
+        me_vec = me_df[col].values
+        kme_col = np.array([
+            float(np.corrcoef(X[i], me_vec)[0, 1]) if n_samples > 2 else 0.0
+            for i in range(n_features)
+        ])
+        kme_dict[col] = kme_col
+
+    kme_df = pd.DataFrame(kme_dict, index=feature_ids)
+    kme_df.index.name = "feature_id"
+    kme_df.to_csv(os.path.join(wgcna_dir, "module_membership_kme.csv"))
+    log.info("WGCNA: Saved module_membership_kme.csv")
+
+    # ── Step 10: Intramodular connectivity (kIN) ──────────────────────────────
+    log.info("WGCNA: Computing intramodular connectivity (kIN)...")
+    kin_values = np.zeros(n_features)
+    for mod_id in sorted(set(module_labels) - {0}):
+        mask = np.where(module_labels == mod_id)[0]
+        if len(mask) < 2:
+            continue
+        sub_adj = adj[np.ix_(mask, mask)]
+        kin_values[mask] = sub_adj.sum(axis=1)
+
+    kin_df = pd.DataFrame({
+        "feature_id": feature_ids,
+        "module": [f"module_{l}" if l != 0 else "grey" for l in module_labels],
+        "kIN": kin_values,
+    }).set_index("feature_id")
+    kin_df.to_csv(os.path.join(wgcna_dir, "intramodular_connectivity_kin.csv"))
+    log.info("WGCNA: Saved intramodular_connectivity_kin.csv")
+
+    # ── Step 11: Module eigengenes table ──────────────────────────────────────
+    me_df.to_csv(os.path.join(wgcna_dir, "module_eigengenes.csv"))
+    log.info("WGCNA: Saved module_eigengenes.csv")
+
+    # ── Step 12: Dendrogram + module colour bar ───────────────────────────────
+    log.info("WGCNA: Plotting cluster dendrogram with module colour bar...")
+    viridis_colors = plt.cm.get_cmap("tab20", max(final_n_modules, 1))
+    module_colors = [
+        viridis_colors(module_labels[i] - 1) if module_labels[i] != 0 else (0.7, 0.7, 0.7, 1.0)
+        for i in range(n_features)
+    ]
+
+    fig_dend, (ax_dend, ax_bar) = plt.subplots(
+        2, 1, figsize=(max(12, n_features // 50), 6),
+        gridspec_kw={"height_ratios": [4, 1]},
+    )
+    dend = _dendrogram(Z, ax=ax_dend, no_labels=True, color_threshold=0,
+                       above_threshold_color="gray", link_color_func=lambda k: "gray")
+    ax_dend.set_title("WGCNA Cluster Dendrogram (1 − TOM dissimilarity)")
+    ax_dend.set_ylabel("Height")
+    ax_dend.set_xticks([])
+
+    # Reorder module colours by dendrogram leaf order
+    leaf_order = dend["leaves"]
+    bar_colors = [module_colors[i] for i in leaf_order]
+    for j, color in enumerate(bar_colors):
+        ax_bar.add_patch(plt.Rectangle((j, 0), 1, 1, color=color))
+    ax_bar.set_xlim(0, n_features)
+    ax_bar.set_ylim(0, 1)
+    ax_bar.axis("off")
+    ax_bar.set_title("Module colours", loc="left", fontsize=8)
+
+    fig_dend.tight_layout()
+    fig_dend.savefig(os.path.join(wgcna_dir, "dendrogram_modules.pdf"), bbox_inches="tight")
+    plt.close(fig_dend)
+    log.info("WGCNA: Saved dendrogram_modules.pdf")
+
+    # ── Step 13: Module-trait correlation heatmap ─────────────────────────────
+    if integrated_metadata is not None and not integrated_metadata.empty and not me_df.empty:
+        log.info("WGCNA: Computing module-trait correlations...")
+        # Align metadata to samples
+        meta_aligned = integrated_metadata.reindex(me_df.index)
+        numeric_traits = meta_aligned.select_dtypes(include=[np.number]).dropna(axis=1, how="all")
+
+        if not numeric_traits.empty:
+            mt_cor = pd.DataFrame(index=me_df.columns, columns=numeric_traits.columns, dtype=float)
+            mt_pval = pd.DataFrame(index=me_df.columns, columns=numeric_traits.columns, dtype=float)
+            from scipy.stats import pearsonr as _pearsonr
+            for me_col in me_df.columns:
+                for trait_col in numeric_traits.columns:
+                    me_vec = me_df[me_col].values
+                    trait_vec = numeric_traits[trait_col].values
+                    valid = ~(np.isnan(me_vec) | np.isnan(trait_vec))
+                    if valid.sum() > 2:
+                        r, p = _pearsonr(me_vec[valid], trait_vec[valid])
+                        mt_cor.loc[me_col, trait_col] = r
+                        mt_pval.loc[me_col, trait_col] = p
+                    else:
+                        mt_cor.loc[me_col, trait_col] = np.nan
+                        mt_pval.loc[me_col, trait_col] = np.nan
+
+            mt_cor = mt_cor.astype(float)
+            mt_pval = mt_pval.astype(float)
+            mt_cor.to_csv(os.path.join(wgcna_dir, "module_trait_correlation.csv"))
+
+            # Heatmap with correlation values and p-value stars
+            fig_mt, ax_mt = plt.subplots(
+                figsize=(max(6, len(numeric_traits.columns) * 1.2),
+                         max(4, len(me_df.columns) * 0.5))
+            )
+            im = ax_mt.imshow(mt_cor.values, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+            plt.colorbar(im, ax=ax_mt, label="Pearson r")
+            ax_mt.set_xticks(range(len(numeric_traits.columns)))
+            ax_mt.set_xticklabels(numeric_traits.columns, rotation=45, ha="right", fontsize=8)
+            ax_mt.set_yticks(range(len(me_df.columns)))
+            ax_mt.set_yticklabels(me_df.columns, fontsize=8)
+            ax_mt.set_title("Module-Trait Correlation")
+
+            for i, me_col in enumerate(me_df.columns):
+                for j, trait_col in enumerate(numeric_traits.columns):
+                    r_val = mt_cor.loc[me_col, trait_col]
+                    p_val = mt_pval.loc[me_col, trait_col]
+                    if pd.isna(r_val):
+                        continue
+                    stars = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else ""
+                    ax_mt.text(j, i, f"{r_val:.2f}{stars}", ha="center", va="center",
+                               fontsize=6, color="white" if abs(r_val) > 0.5 else "black")
+
+            fig_mt.tight_layout()
+            fig_mt.savefig(os.path.join(wgcna_dir, "module_trait_correlation.pdf"), bbox_inches="tight")
+            plt.close(fig_mt)
+            log.info("WGCNA: Saved module_trait_correlation.pdf and .csv")
+
+            # ── Step 14: GS vs MM scatter plots ──────────────────────────────
+            log.info("WGCNA: Generating GS vs MM scatter plots...")
+            for me_col in me_df.columns:
+                mod_id_str = me_col.replace("ME", "")
+                try:
+                    mod_id = int(mod_id_str)
+                except ValueError:
+                    continue
+                mod_mask = module_labels == mod_id
+                if mod_mask.sum() < 5:
+                    continue
+                mm_vals = kme_df[me_col].values[mod_mask]
+                mod_feature_ids = [feature_ids[i] for i in range(n_features) if mod_mask[i]]
+
+                for trait_col in numeric_traits.columns:
+                    trait_vec = numeric_traits[trait_col].values
+                    gs_vals = np.array([
+                        float(np.corrcoef(X[i], trait_vec)[0, 1])
+                        if (~np.isnan(trait_vec)).sum() > 2 else 0.0
+                        for i in range(n_features) if mod_mask[i]
+                    ])
+                    valid = ~(np.isnan(mm_vals) | np.isnan(gs_vals))
+                    if valid.sum() < 5:
+                        continue
+
+                    fig_gs, ax_gs = plt.subplots(figsize=(5, 5))
+                    ax_gs.scatter(mm_vals[valid], gs_vals[valid], alpha=0.6, s=20, color="#440154")
+                    if valid.sum() > 2:
+                        from scipy.stats import pearsonr as _pr
+                        r_gs, p_gs = _pr(mm_vals[valid], gs_vals[valid])
+                        ax_gs.set_title(
+                            f"{me_col} vs {trait_col}\nr={r_gs:.3f}, p={p_gs:.2e}",
+                            fontsize=9
+                        )
+                    ax_gs.set_xlabel(f"Module Membership (kME, {me_col})", fontsize=8)
+                    ax_gs.set_ylabel(f"Gene Significance (GS, {trait_col})", fontsize=8)
+                    ax_gs.axhline(0, color="gray", linewidth=0.5)
+                    ax_gs.axvline(0, color="gray", linewidth=0.5)
+                    safe_trait = trait_col.replace("/", "_").replace(" ", "_")
+                    fig_gs.tight_layout()
+                    fig_gs.savefig(
+                        os.path.join(gs_mm_dir, f"{me_col}_{safe_trait}_gs_vs_mm.pdf"),
+                        bbox_inches="tight"
+                    )
+                    plt.close(fig_gs)
+            log.info(f"WGCNA: Saved GS vs MM plots to {gs_mm_dir}/")
+
+    # ── Step 15: Build node table ─────────────────────────────────────────────
+    group_labels_str = [
+        f"module_{l}" if l != 0 else "grey"
+        for l in module_labels
+    ]
+
+    all_prefixes = [ds.dataset_name + "_" for ds in (datasets or [])]
+    present_prefixes = [p for p in all_prefixes if any(f.startswith(p) for f in feature_ids)]
+    color_map, shape_map = _make_prefix_maps(present_prefixes)
+
+    def _get_color(fid):
+        for p in present_prefixes:
+            if fid.startswith(p):
+                return color_map.get(p, "gray")
+        return "gray"
+
+    def _get_shape(fid):
+        for p in present_prefixes:
+            if fid.startswith(p):
+                return shape_map.get(p, "circle")
+        return "circle"
+
+    node_table = pd.DataFrame({
+        "group": group_labels_str,
+        "datatype_color": [_get_color(f) for f in feature_ids],
+        "datatype_shape": [_get_shape(f) for f in feature_ids],
+        "kIN": kin_values,
+        "wgcna_module": group_labels_str,
+    }, index=feature_ids)
+    node_table.index.name = "node_id"
+
+    # Merge kME columns
+    node_table = node_table.join(kme_df, how="left")
+
+    # Merge annotation columns if provided
+    if annotation_df is not None and not annotation_df.empty:
+        ann = annotation_df.copy()
+        if "feature_id" in ann.columns:
+            ann = ann.set_index("feature_id")
+        ann_cols = [c for c in ann.columns if c not in node_table.columns]
+        node_table = node_table.join(ann[ann_cols], how="left")
+
+    n_groups = node_table["group"].nunique()
+    log.info(f"WGCNA: {n_groups} groups (including grey) across {len(node_table)} features.")
+
+    write_integration_file(
+        data=node_table,
+        output_dir=output_dir,
+        filename=output_filenames["node_table"],
+        indexing=True,
+        index_label="node_id",
+    )
+    empty_edge_table = pd.DataFrame(columns=["source", "target", "weight"])
+    write_integration_file(
+        data=empty_edge_table,
+        output_dir=output_dir,
+        filename=output_filenames["edge_table"],
+        indexing=True,
+        index_label="edge_index",
+    )
+
+    return node_table, empty_edge_table
+
+
 def group_features(
     data: pd.DataFrame,
     method: str,
@@ -2316,7 +2864,7 @@ def group_features(
         Feature matrix (features x samples or features x contrasts).
     method : str
         One of ``"network_modules"``, ``"hierarchical_clustering"``,
-        ``"hdbscan"``, ``"nmf"``, ``"leiden_knn"``.
+        ``"hdbscan"``, ``"nmf"``, ``"leiden_knn"``, ``"wgcna"``.
     method_params : Dict
         Sub-block from config for the selected method.
     output_dir : str
@@ -2421,10 +2969,28 @@ def group_features(
             integrated_metadata=integrated_metadata,
         )
 
+    elif method == "wgcna":
+        return group_features_wgcna(
+            data=data,
+            power_range=method_params.get('power_range', None),
+            power=method_params.get('power', None),
+            r2_threshold=method_params.get('r2_threshold', 0.85),
+            signed=method_params.get('signed', True),
+            min_module_size=method_params.get('min_module_size', 30),
+            merge_cut_height=method_params.get('merge_cut_height', 0.25),
+            deep_split=method_params.get('deep_split', 2),
+            output_dir=output_dir,
+            output_filenames=output_filenames,
+            datasets=datasets,
+            annotation_df=annotation_df,
+            integrated_data=integrated_data,
+            integrated_metadata=integrated_metadata,
+        )
+
     else:
         raise ValueError(
             f"Unknown feature_grouping method '{method}'. "
-            "Choose from: network_modules, hierarchical_clustering, hdbscan, nmf, leiden_knn"
+            "Choose from: network_modules, hierarchical_clustering, hdbscan, nmf, leiden_knn, wgcna"
         )
 
 

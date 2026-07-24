@@ -2201,7 +2201,7 @@ class Analysis(BaseDataHandler):
             return
 
     def group_features_step(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
-        """Unified feature grouping dispatcher supporting network_modules, hierarchical_clustering, hdbscan, nmf, leiden_knn."""
+        """Unified feature grouping dispatcher supporting network_modules, hierarchical_clustering, hdbscan, nmf, leiden_knn, wgcna."""
         def _group_method():
             log.info("Grouping Features")
             submodule_subdir = "submodules"
@@ -2299,6 +2299,12 @@ class Analysis(BaseDataHandler):
         * ``leiden_knn``              - Leiden community detection on an approximate
           k-nearest-neighbor graph (pynndescent); resolution auto-selected by
           maximising graph modularity.
+        * ``wgcna``                   - Weighted Gene Co-expression Network Analysis.
+          Builds a soft-thresholded adjacency matrix, computes the Topological
+          Overlap Matrix (TOM), clusters features, and detects modules.  Writes
+          full WGCNA diagnostic outputs (soft-threshold plot, dendrogram,
+          module eigengenes, kME, kIN, module-trait heatmap, GS vs MM plots)
+          to ``<output_dir>/wgcna_results/``.
 
         All methods write a node table (``feature_network_node_table``) with a
         unified ``group`` column and an edge table (``feature_network_edge_table``)
@@ -2306,7 +2312,7 @@ class Analysis(BaseDataHandler):
 
         For ``network_modules`` the correlation step is run automatically if
         ``feature_correlation_table`` is not yet present.  For all other methods
-        the correlation step is skipped.
+        (including ``wgcna``) the correlation step is skipped.
         """
         feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
         selected_method = feature_grouping_params.get('method', 'network_modules')
