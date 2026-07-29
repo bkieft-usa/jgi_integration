@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # --- Standard library imports ---
 import glob
 import gzip
@@ -8,13 +10,14 @@ from itertools import combinations
 import os
 import re
 import random
+import time
 import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 import yaml
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 import warnings
 import logging
 import json
@@ -50,12 +53,12 @@ from sklearn.preprocessing import quantile_transform
 # --- Plotting ---
 import matplotlib.pyplot as plt
 import seaborn as sns
-from matplotlib.cm import viridis
-from matplotlib.colors import to_hex
+from matplotlib.colors import Normalize, TwoSlopeNorm, to_hex
 from plotly.subplots import make_subplots
 from matplotlib.lines import Line2D
 from matplotlib.colors import PowerNorm
 import matplotlib.patheffects as pe
+from matplotlib import cm
 
 # --- Machine learning & statistics ---
 from sklearn.decomposition import PCA
@@ -1282,7 +1285,7 @@ def _make_prefix_maps(prefixes: List[str]) -> Tuple[Dict[str, str], Dict[str, st
         prefix → shape (networkx-compatible string)
     colors are taken from a viridis palette and are reproducible.
     """
-    palette = viridis(np.linspace(0, 1, max(3, len(prefixes))))
+    palette = cm.viridis(np.linspace(0, 1, max(3, len(prefixes))))
     colors = [to_hex(c) for c in palette]
     shape_map = {}
     for i, pref in enumerate(prefixes):
@@ -2429,23 +2432,33 @@ def group_features_wgcna(
                 adj = np.abs(cor_mat) ** beta
             np.fill_diagonal(adj, 0.0)
             k = adj.sum(axis=1)
-            # Scale-free topology: fit log(p(k)) ~ log(k)
-            k_hist, k_edges = np.histogram(k, bins=min(20, n_features // 5 + 1))
+
+            # Quantile-based binning instead of equal-width histogram bins,
+            # so skewed degree distributions still populate multiple bins.
+            nbins = min(20, n_features // 5 + 1)          # same cap you used before
+            quantile_edges = np.quantile(k, np.linspace(0, 1, nbins + 1))
+            quantile_edges = np.unique(quantile_edges)     # drop duplicate edges (ties in k)
+            if len(quantile_edges) < 4:                    # not enough distinct values to bin meaningfully
+                r2_vals.append(0.0)
+                mean_k_vals.append(float(k.mean()))
+                continue
+
+            k_hist, k_edges = np.histogram(k, bins=quantile_edges)
             k_centers = (k_edges[:-1] + k_edges[1:]) / 2
             mask = (k_hist > 0) & (k_centers > 0)
             if mask.sum() < 3:
                 r2_vals.append(0.0)
                 mean_k_vals.append(float(k.mean()))
                 continue
+
             log_k = np.log10(k_centers[mask])
             log_p = np.log10(k_hist[mask] / k_hist[mask].sum())
-            # Linear regression
             A = np.vstack([log_k, np.ones(len(log_k))]).T
             slope, intercept = np.linalg.lstsq(A, log_p, rcond=None)[0]
             ss_res = np.sum((log_p - (slope * log_k + intercept)) ** 2)
             ss_tot = np.sum((log_p - log_p.mean()) ** 2)
             r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-            r2_vals.append(float(r2))
+            r2_vals.append(r2 if slope < 0 else 0.0)       # enforce negative-slope criterion
             mean_k_vals.append(float(k.mean()))
 
         # Choose smallest β with R² ≥ threshold
@@ -2491,10 +2504,14 @@ def group_features_wgcna(
     # ── Step 3: Adjacency matrix ──────────────────────────────────────────────
     log.info(f"WGCNA: Building {'signed' if signed else 'unsigned'} adjacency (β={chosen_power})...")
     if signed:
-        adj = ((1.0 + cor_mat) / 2.0) ** chosen_power
+        _adj_check = ((1.0 + cor_mat) / 2.0) ** chosen_power
     else:
-        adj = np.abs(cor_mat) ** chosen_power
-    np.fill_diagonal(adj, 0.0)
+        _adj_check = np.abs(cor_mat) ** chosen_power
+    np.fill_diagonal(_adj_check, 0.0)
+    _mean_k = _adj_check.sum(axis=1).mean()
+    log.info(f"WGCNA: β={chosen_power} → mean connectivity={_mean_k:.2f} "
+             f"(max possible={n_features - 1}); "
+             f"{'network looks near-complete, consider raising β' if _mean_k > 0.3 * (n_features - 1) else 'OK'}")
 
     # ── Step 4: Topological Overlap Matrix (TOM) ──────────────────────────────
     log.info("WGCNA: Computing Topological Overlap Matrix (TOM)...")
@@ -2518,12 +2535,47 @@ def group_features_wgcna(
 
     # ── Step 6: Dynamic tree cut (simplified) ─────────────────────────────────
     log.info(f"WGCNA: Cutting dendrogram (min_module_size={min_module_size}, deep_split={deep_split})...")
-    # Use a height-based cut with iterative refinement based on deep_split
-    # deep_split 0-4 maps to progressively lower cut heights
-    base_height = 0.99 - deep_split * 0.05
-    raw_labels = _fcluster(Z, t=base_height, criterion="distance")
+    max_height = Z[:, 2].max()
+    _max_height = Z[:, 2].max()
+    log.info(f"WGCNA: dendrogram height range = [0, {_max_height:.4f}]")
+    if _max_height < 0.1:
+        raise ValueError("WGCNA: dendrogram is nearly flat (max height < 0.1) — "
+                        "TOM dissimilarities show little structure; check adjacency/β.")
+    # Scan from coarse (near root) to fine (near leaves); skip the exact endpoints
+    candidate_heights = np.linspace(max_height, 0, 50)[1:-1]
 
-    # Merge small modules into "grey" (unassigned)
+    cut_results = []
+    for h in candidate_heights:
+        labels = _fcluster(Z, t=h, criterion="distance")
+        counts = pd.Series(labels).value_counts()
+        n_valid = int((counts >= min_module_size).sum())
+        cut_results.append((h, n_valid, labels))
+
+    valid_cuts = [c for c in cut_results if c[1] > 0]
+
+    if not valid_cuts:
+        log.warning(
+            "WGCNA: No cut height produced modules ≥ min_module_size. "
+            "All features will be unassigned (grey). "
+            "Consider lowering min_module_size or checking TOM/adjacency."
+        )
+        raw_labels = np.zeros(n_features, dtype=int)
+    else:
+        # deep_split (0-4) selects position along the coarse→fine scan:
+        # 0 → earliest valid cut (largest height, fewer/larger modules)
+        # 4 → latest valid cut (smallest height, more/smaller modules)
+        idx = int(round((deep_split / 4.0) * (len(valid_cuts) - 1)))
+        idx = min(max(idx, 0), len(valid_cuts) - 1)
+        base_height, n_modules_at_height, raw_labels = valid_cuts[idx]
+        log.info(
+            f"WGCNA: Selected cut height={base_height:.4f} "
+            f"({n_modules_at_height} candidate modules ≥ min_module_size, "
+            f"deep_split={deep_split} → index {idx}/{len(valid_cuts) - 1})"
+        )
+
+    # Merge small modules into "grey" (unassigned)  ── (unchanged, still needed
+    # because the chosen height's labels may include some clusters just under
+    # min_module_size that weren't part of the n_valid count logic above)
     label_counts = pd.Series(raw_labels).value_counts()
     small_labels = label_counts[label_counts < min_module_size].index
     raw_labels = np.where(np.isin(raw_labels, small_labels), 0, raw_labels)
@@ -3289,7 +3341,7 @@ def _annotate_and_save_submodules(
     """
     # colors for submodules (shuffle for visual separation)
     n_mod = len(submodules)
-    sub_cols = viridis(np.linspace(0, 1, n_mod))
+    sub_cols = cm.viridis(np.linspace(0, 1, n_mod))
     sub_hex = [to_hex(c) for c in sub_cols]
     random.shuffle(sub_hex)
 
@@ -4901,7 +4953,7 @@ def _parse_pipe_field(value) -> dict[str, list[str]]:
     if not isinstance(value, str) or not value.strip():
         return result
 
-    for entry in value.split("|"):
+    for entry in value.split(";"):
         entry = entry.strip()
         if not entry or ":" not in entry:
             continue
@@ -4949,7 +5001,7 @@ def _build_ec_to_rxn(cache_path: Path) -> dict[str, str]:
     for rxn_id, ec_field in zip(df["id"], df["ec_numbers"]):
         if not isinstance(ec_field, str) or not ec_field.strip():
             continue
-        for ec in ec_field.split("|"):
+        for ec in ec_field.split(";"):
             ec = ec.strip()
             if ec:
                 ec_map.setdefault(ec, set()).add(rxn_id)
@@ -5684,6 +5736,7 @@ def annotate_integrated_features(
     integrated_data: pd.DataFrame,
     datasets: List = None,
     output_dir: str = None,
+    cache_dir: str = None,
     output_filename: str = None
 ) -> pd.DataFrame:
     """
@@ -5750,7 +5803,15 @@ def annotate_integrated_features(
     # Add ModelSEED pathway column (auto-detects dataset-prefixed rxn/cpd columns
     # if the "tx_"/"mx_" naming convention isn't exactly followed)
     final_annotation_df = add_modelseed_pathway_column(
-        final_annotation_df, cache_path=Path(output_dir) / "modelseed_reactions.tsv"
+        final_annotation_df, cache_path=Path(cache_dir) / "modelseed_reactions.tsv"
+    )
+
+    # Add KEGG pathway columns (mx_kegg_id, kegg_pathway, kegg_pathway_name),
+    # auto-detecting dataset-prefixed InChIKey/EC/KO columns, with API
+    # responses cached under output_dir so re-runs don't hit KEGG/MW again.
+    final_annotation_df = add_kegg_pathway_annotations(
+        final_annotation_df,
+        cache_dir=Path(cache_dir) if cache_dir else None,
     )
 
     final_annotation_df = final_annotation_df.fillna('Unassigned')
@@ -5783,14 +5844,14 @@ def annotate_integrated_features(
 
                 if dataset_annotation_cols:
                     dataset_annotated_mask = (
-                        ~final_annotation_df.loc[dataset_feature_indices, dataset_annotation_cols].isin(["Unassigned", ""])
+                        ~final_annotation_df.loc[dataset_feature_indices, dataset_annotation_cols].isin(["Unassigned", "", None])
                     ).any(axis=1)
                     dataset_annotated_count = dataset_annotated_mask.sum()
                 else:
                     dataset_annotated_count = 0
 
                 any_annotation_mask = (
-                    ~final_annotation_df.loc[dataset_feature_indices, final_annotation_df.columns[1:]].isin(["Unassigned", ""])
+                    ~final_annotation_df.loc[dataset_feature_indices, final_annotation_df.columns[1:]].isin(["Unassigned", "", None])
                 ).any(axis=1)
                 any_annotated_count = any_annotation_mask.sum()
 
@@ -5811,6 +5872,511 @@ def annotate_integrated_features(
         )
 
     return final_annotation_df
+
+def split_list_cell(
+    cell,
+    delimiter: str = ";",
+    drop_sentinel: Optional[str] = None,
+    keep_empty: bool = True,
+) -> List[str]:
+    """
+    Split a delimited cell into a list of tokens.
+
+    - delimiter: character to split on (';' or ',').
+    - drop_sentinel: if set (e.g. 'Unassigned'), tokens matching it
+      (case-insensitive) are dropped.
+    - keep_empty: if True, preserves empty slots in the output (needed
+      for structure-preserving mappings like InChIKey -> KEGG ID -> pathway,
+      where position across columns must line up). Set False for columns
+      like tx_kegg_ec where we just want a deduplicated set.
+    """
+    if pd.isna(cell):
+        return []
+    tokens = [part.strip() for part in str(cell).split(delimiter)]
+    if drop_sentinel is not None:
+        tokens = [t for t in tokens if t.lower() != drop_sentinel.lower()]
+    if not keep_empty:
+        tokens = [t for t in tokens if t]
+    return tokens
+
+MW_COMPOUND_URL = "https://www.metabolomicsworkbench.org/rest/compound/inchi_key/{}/all/"
+
+
+def fetch_kegg_id(
+    inchikey: str,
+    session: requests.Session,
+    timeout: int = 10,
+    retries: int = 3,
+    backoff: float = 1.0,
+) -> Optional[str]:
+    """Query MW REST API for one InChIKey and return its kegg_id (or None)."""
+    url = MW_COMPOUND_URL.format(inchikey)
+    for attempt in range(1, retries + 1):
+        try:
+            resp = session.get(url, timeout=timeout)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            # API can return a dict, a list of dicts, or an "error" payload
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            if not isinstance(data, dict):
+                return None
+            kegg_id = data.get("kegg_id")
+            return kegg_id if kegg_id else None
+        except (requests.RequestException, ValueError) as exc:
+            if attempt == retries:
+                print(f"Warning: failed to fetch '{inchikey}' after {retries} attempts: {exc}")
+                return None
+            time.sleep(backoff * attempt)
+    return None
+
+
+def build_inchikey_kegg_lookup(
+    inchikeys: List[str],
+    delay: float = 0.2,
+    cache_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Optional[str]]:
+    """Query MW API for each InChIKey not already in cache; return {inchikey: kegg_id}."""
+
+    def fetch_missing(missing_keys: List[str]) -> Dict[str, Optional[str]]:
+        result: Dict[str, Optional[str]] = {}
+        with requests.Session() as session:
+            session.headers.update({"User-Agent": "inchikey-to-kegg-lookup/1.0"})
+            for key in tqdm(missing_keys, desc="Fetching KEGG IDs", unit="InChIKey"):
+                result[key] = fetch_kegg_id(key, session)
+                time.sleep(delay)
+        return result
+
+    return get_cached_lookup(inchikeys, cache_path, fetch_missing)
+
+
+def add_kegg_compound_id_column(
+    df: pd.DataFrame,
+    inchikey_col: str = "mx_InChiKey",
+    new_col: str = "mx_kegg_id",
+    delay: float = 0.2,
+    cache_path: Optional[Union[str, Path]] = None,
+) -> pd.DataFrame:
+    df = df.copy()
+    key_lists = df[inchikey_col].apply(
+        lambda cell: split_list_cell(cell, delimiter=";", keep_empty=True)
+    )
+    all_keys = sorted({k for keys in key_lists for k in keys if k})
+    lookup = build_inchikey_kegg_lookup(all_keys, delay=delay, cache_path=cache_path)
+
+    def map_row(keys: List[str]) -> Optional[str]:
+        if not keys or all(not k for k in keys):
+            return None
+        return ";".join((lookup.get(k) or "") if k else "" for k in keys)
+
+    df[new_col] = key_lists.apply(map_row)
+    return df
+
+
+def fetch_kegg_links_batch(
+    ids: List[str],
+    prefix: str,
+    session: requests.Session,
+    target: str = "pathway",
+    timeout: int = 10,
+    retries: int = 3,
+    backoff: float = 1.0,
+) -> Dict[str, List[str]]:
+    """
+    Query KEGG REST 'link' API for a batch (<=10) of KEGG IDs sharing the
+    same db prefix (e.g. 'cpd:', 'ec:', 'ko:') and return
+    {id_without_prefix: [target_id, ...]}.
+    """
+    result: Dict[str, List[str]] = {i: [] for i in ids}
+    query = "+".join(f"{prefix}{i}" for i in ids)
+    
+    KEGG_LINK_URL = "https://rest.kegg.jp/link/{target}/{query}"
+    url = KEGG_LINK_URL.format(target=target, query=query)
+
+    for attempt in range(1, retries + 1):
+        try:
+            resp = session.get(url, timeout=timeout)
+            if resp.status_code == 404:
+                # No links found for any ID in this batch
+                return result
+            resp.raise_for_status()
+            for line in resp.text.strip().splitlines():
+                if not line:
+                    continue
+                source_entry, target_entry = line.split("\t")
+                key = source_entry.split(":", 1)[1]
+                result.setdefault(key, []).append(target_entry)
+            return result
+        except (requests.RequestException, ValueError) as exc:
+            if attempt == retries:
+                print(f"Warning: failed to fetch '{target}' links for batch {ids} after {retries} attempts: {exc}")
+                return result
+            time.sleep(backoff * attempt)
+    return result
+
+
+def build_kegg_link_lookup(
+    ids: List[str],
+    prefix: str,
+    target: str = "pathway",
+    delay: float = 0.2,
+    batch_size: int = 10,
+    cache_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, List[str]]:
+    """Batch-query the KEGG link API for IDs not already in cache."""
+
+    def fetch_missing(missing_ids: List[str]) -> Dict[str, List[str]]:
+        lookup: Dict[str, List[str]] = {}
+        with requests.Session() as session:
+            session.headers.update({"User-Agent": "kegg-link-lookup/1.0"})
+            desc = f"Fetching KEGG {target} links ({prefix.rstrip(':')})"
+            for i in tqdm(range(0, len(missing_ids), batch_size), desc=desc, unit="batch"):
+                chunk = missing_ids[i : i + batch_size]
+                lookup.update(fetch_kegg_links_batch(chunk, prefix, session, target=target))
+                time.sleep(delay)
+        return lookup
+
+    return get_cached_lookup(ids, cache_path, fetch_missing)
+
+def fetch_kegg_pathway_names_cached(
+    cache_path: Optional[Union[str, Path]] = None,
+    timeout: int = 10,
+    retries: int = 3,
+    backoff: float = 1.0,
+) -> Dict[str, str]:
+    """
+    Fetch the full KEGG reference pathway ID -> name list, using a cached
+    copy if available (this is a single bulk API call, so caching is
+    all-or-nothing rather than per-key).
+    """
+    cache = load_json_cache(cache_path)
+    if cache:
+        return cache
+
+    KEGG_LIST_URL = "https://rest.kegg.jp/list/{db}"
+    url = KEGG_LIST_URL.format(db="pathway")
+    with requests.Session() as session:
+        session.headers.update({"User-Agent": "kegg-pathway-name-lookup/1.0"})
+        for attempt in range(1, retries + 1):
+            try:
+                resp = session.get(url, timeout=timeout)
+                resp.raise_for_status()
+                names: Dict[str, str] = {}
+                for line in resp.text.strip().splitlines():
+                    if not line:
+                        continue
+                    pathway_id, name = line.split("\t")
+                    names[pathway_id.replace("path:", "")] = name
+                save_json_cache(cache_path, names)
+                return names
+            except (requests.RequestException, ValueError) as exc:
+                if attempt == retries:
+                    log.warning(f"Failed to fetch KEGG pathway names after {retries} attempts: {exc}")
+                    return {}
+                time.sleep(backoff * attempt)
+    return {}
+
+def add_compound_pathway_column(
+    df: pd.DataFrame,
+    kegg_id_col: str = "mx_kegg_id",
+    pathway_col: str = "kegg_pathway",
+    pathway_sep: str = ";",
+    delay: float = 0.2,
+    batch_size: int = 10,
+    cache_path: Optional[Union[str, Path]] = None,
+) -> pd.DataFrame:
+    df = df.copy()
+    if pathway_col not in df.columns:
+        df[pathway_col] = None
+
+    id_lists = df[kegg_id_col].apply(
+        lambda cell: split_list_cell(cell, delimiter=";", keep_empty=True)
+    )
+    all_ids = sorted({k for ids in id_lists for k in ids if k})
+    lookup = build_kegg_link_lookup(
+        all_ids, prefix="cpd:", target="pathway", delay=delay, batch_size=batch_size, cache_path=cache_path
+    )
+
+    def map_row(ids: List[str]) -> Optional[str]:
+        if not ids or all(not i for i in ids):
+            return None
+        return ";".join(pathway_sep.join(lookup.get(cid, []) or []) if cid else "" for cid in ids)
+
+    df[pathway_col] = id_lists.apply(map_row)
+    return df
+
+
+def get_ec_or_ko_ids(
+    row: pd.Series,
+    ec_col: str = "tx_kegg_ec",
+    ko_col: str = "tx_ko_acc",
+) -> Tuple[List[str], Optional[str]]:
+    """
+    Return (ids, source) for a row, using ec_col if present, falling back
+    to ko_col. source is 'ec', 'ko', or None if neither has values.
+    """
+    ec_ids = split_list_cell(row.get(ec_col), delimiter=",", drop_sentinel="Unassigned", keep_empty=False)
+    if ec_ids:
+        return ec_ids, "ec"
+    ko_ids = split_list_cell(row.get(ko_col), delimiter=",", drop_sentinel="Unassigned", keep_empty=False)
+    if ko_ids:
+        return ko_ids, "ko"
+    return [], None
+
+
+def add_ec_ko_pathway_column(
+    df: pd.DataFrame,
+    ec_col: str = "tx_kegg_ec",
+    ko_col: str = "tx_ko_acc",
+    pathway_col: str = "kegg_pathway",
+    pathway_sep: str = ";",
+    delay: float = 0.2,
+    batch_size: int = 10,
+    ec_cache_path: Optional[Union[str, Path]] = None,
+    ko_cache_path: Optional[Union[str, Path]] = None,
+) -> pd.DataFrame:
+    df = df.copy()
+    if pathway_col not in df.columns:
+        df[pathway_col] = None
+
+    id_source_pairs = df.apply(lambda row: get_ec_or_ko_ids(row, ec_col, ko_col), axis=1)
+    id_lists = id_source_pairs.apply(lambda pair: pair[0])
+    source_types = id_source_pairs.apply(lambda pair: pair[1])
+
+    ec_ids_all = sorted({i for ids, src in zip(id_lists, source_types) if src == "ec" for i in ids})
+    ko_ids_all = sorted({i for ids, src in zip(id_lists, source_types) if src == "ko" for i in ids})
+
+    ec_lookup = (
+        build_kegg_link_lookup(ec_ids_all, prefix="ec:", target="pathway",
+                                 delay=delay, batch_size=batch_size, cache_path=ec_cache_path)
+        if ec_ids_all else {}
+    )
+    ko_lookup = (
+        build_kegg_link_lookup(ko_ids_all, prefix="ko:", target="pathway",
+                                 delay=delay, batch_size=batch_size, cache_path=ko_cache_path)
+        if ko_ids_all else {}
+    )
+
+    def merge_row(existing, ids: List[str], source: Optional[str]) -> Optional[str]:
+        if not ids or source is None:
+            return existing
+        lookup = ec_lookup if source == "ec" else ko_lookup
+        new_pathways = list(dict.fromkeys(p for i in ids for p in (lookup.get(i) or [])))
+        if not new_pathways:
+            return existing
+        existing_pathways = []
+        if pd.notna(existing) and existing:
+            existing_pathways = [t.strip() for t in str(existing).replace(";", pathway_sep).split(pathway_sep) if t.strip()]
+        combined = list(dict.fromkeys(existing_pathways + new_pathways))
+        return pathway_sep.join(combined) if combined else None
+
+    df[pathway_col] = [
+        merge_row(existing, ids, src)
+        for existing, ids, src in zip(df[pathway_col], id_lists, source_types)
+    ]
+    return df
+
+def fetch_kegg_pathway_names(
+    session: requests.Session,
+    timeout: int = 10,
+    retries: int = 3,
+    backoff: float = 1.0,
+) -> Dict[str, str]:
+    """
+    Fetch the full KEGG reference pathway list and return
+    {pathway_id: pathway_name}, e.g. {'map00010': 'Glycolysis / Gluconeogenesis'}.
+
+    This is a single bulk request — KEGG only has ~550 reference pathways,
+    so there's no need to look up names one at a time.
+    """
+    KEGG_LIST_URL = "https://rest.kegg.jp/list/{db}"
+    url = KEGG_LIST_URL.format(db="pathway")
+
+    for attempt in range(1, retries + 1):
+        try:
+            resp = session.get(url, timeout=timeout)
+            resp.raise_for_status()
+            names: Dict[str, str] = {}
+            for line in resp.text.strip().splitlines():
+                if not line:
+                    continue
+                pathway_id, name = line.split("\t")
+                pathway_id = pathway_id.replace("path:", "")
+                names[pathway_id] = name
+            return names
+        except (requests.RequestException, ValueError) as exc:
+            if attempt == retries:
+                print(f"Warning: failed to fetch KEGG pathway names after {retries} attempts: {exc}")
+                return {}
+            time.sleep(backoff * attempt)
+    return {}
+
+
+def add_kegg_pathway_name_column(
+    df: pd.DataFrame,
+    pathway_col: str = "kegg_pathway",
+    new_col: str = "kegg_pathway_name",
+    pathway_sep: str = ";",
+    cache_path: Optional[Union[str, Path]] = None,
+) -> pd.DataFrame:
+    df = df.copy()
+    name_lookup = fetch_kegg_pathway_names_cached(cache_path=cache_path)
+
+    def resolve_pathway_id(pid: str) -> str:
+        clean_id = pid.replace("path:", "").strip()
+        if not clean_id:
+            return ""
+        name = name_lookup.get(clean_id)
+        if name:
+            return name
+        m = re.match(r"^[a-z]+(\d+)$", clean_id)
+        if m:
+            return name_lookup.get(f"map{m.group(1)}", "")
+        return ""
+
+    def map_cell(cell) -> Optional[str]:
+        if pd.isna(cell) or not cell:
+            return None
+        resolved_slots = []
+        for slot in str(cell).split(";"):
+            if not slot:
+                resolved_slots.append("")
+                continue
+            names = [resolve_pathway_id(pid) for pid in slot.split(pathway_sep)]
+            resolved_slots.append(pathway_sep.join(names))
+        return ";".join(resolved_slots)
+
+    df[new_col] = df[pathway_col].apply(map_cell)
+    return df
+
+def _find_column(df: pd.DataFrame, suffixes: List[str]) -> Optional[str]:
+    """Find the first column whose name ends with any of the given suffixes (case-insensitive)."""
+    for col in df.columns:
+        col_lower = col.lower()
+        for suffix in suffixes:
+            if col_lower.endswith(suffix.lower()):
+                return col
+    return None
+
+def add_kegg_pathway_annotations(
+    df: pd.DataFrame,
+    cache_dir: Optional[Union[str, Path]] = None,
+    inchikey_suffixes: List[str] = ("mx_InChiKey", "InChiKey"),
+    ec_suffixes: List[str] = ("tx_kegg_ec", "kegg_ec"),
+    ko_suffixes: List[str] = ("tx_ko_acc", "ko_acc"),
+    kegg_id_col: str = "mx_kegg_id",
+    pathway_col: str = "kegg_pathway",
+    pathway_name_col: str = "kegg_pathway_name",
+    delay: float = 0.2,
+    batch_size: int = 10,
+) -> pd.DataFrame:
+    """
+    Full KEGG pathway annotation pipeline, wired for cached API calls:
+      1. InChIKey          -> mx_kegg_id        (MW API, cached)
+      2. mx_kegg_id         -> kegg_pathway      (KEGG link API, cpd:, cached)
+      3. EC/KO (fallback)   -> kegg_pathway      (KEGG link API, ec:/ko:, cached, merged)
+      4. kegg_pathway       -> kegg_pathway_name (KEGG list API, cached)
+
+    Auto-detects source columns by suffix match, since upstream joins may
+    prefix columns with dataset names (e.g. 'metabolomics_mx_InChiKey').
+    Silently skips steps whose required source column isn't found.
+    """
+    df = df.copy()
+    cache_dir = Path(cache_dir) if cache_dir else None
+
+    inchikey_col = _find_column(df, list(inchikey_suffixes))
+    ec_col = _find_column(df, list(ec_suffixes))
+    ko_col = _find_column(df, list(ko_suffixes))
+
+    if inchikey_col:
+        log.info(f"KEGG annotation: using InChIKey column '{inchikey_col}'")
+        df = add_kegg_compound_id_column(
+            df, inchikey_col=inchikey_col, new_col=kegg_id_col, delay=delay,
+            cache_path=cache_dir / "kegg_inchikey_to_id.json" if cache_dir else None,
+        )
+        df = add_compound_pathway_column(
+            df, kegg_id_col=kegg_id_col, pathway_col=pathway_col, delay=delay, batch_size=batch_size,
+            cache_path=cache_dir / "kegg_cpd_to_pathway.json" if cache_dir else None,
+        )
+    else:
+        log.warning("KEGG annotation: no InChIKey column found, skipping compound->pathway mapping")
+
+    if ec_col or ko_col:
+        log.info(f"KEGG annotation: using EC column '{ec_col}', KO column '{ko_col}'")
+        df = add_ec_ko_pathway_column(
+            df, ec_col=ec_col, ko_col=ko_col, pathway_col=pathway_col, delay=delay, batch_size=batch_size,
+            ec_cache_path=cache_dir / "kegg_ec_to_pathway.json" if cache_dir else None,
+            ko_cache_path=cache_dir / "kegg_ko_to_pathway.json" if cache_dir else None,
+        )
+    else:
+        log.warning("KEGG annotation: no EC or KO column found, skipping EC/KO->pathway mapping")
+
+    if pathway_col in df.columns:
+        df = add_kegg_pathway_name_column(
+            df, pathway_col=pathway_col, new_col=pathway_name_col,
+            cache_path=cache_dir / "kegg_pathway_names.json" if cache_dir else None,
+        )
+
+    return df
+
+# ===============================
+# Helper scripts for annotation caching
+# ===============================
+
+def load_json_cache(cache_path: Optional[Union[str, Path]]) -> Dict:
+    """Load a JSON cache file if it exists, else return an empty dict."""
+    if cache_path is None:
+        return {}
+    cache_path = Path(cache_path)
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning(f"Failed to load cache {cache_path}: {exc}")
+            return {}
+    return {}
+
+
+def save_json_cache(cache_path: Optional[Union[str, Path]], data: Dict) -> None:
+    """Write a dict to a JSON cache file, creating parent dirs as needed."""
+    if cache_path is None:
+        return
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def get_cached_lookup(
+    keys: List[str],
+    cache_path: Optional[Union[str, Path]],
+    fetch_fn: Callable[[List[str]], Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Generic disk-cached key -> value lookup.
+
+    Loads an existing JSON cache, determines which `keys` are missing,
+    calls `fetch_fn(missing_keys)` to fetch only those, merges the result
+    into the cache, writes it back to disk, and returns the subset of the
+    (now up-to-date) cache relevant to `keys`.
+    """
+    cache = load_json_cache(cache_path)
+    missing = [k for k in keys if k not in cache]
+
+    if missing:
+        log.info(f"KEGG cache: fetching {len(missing)} new entries "
+                  f"({len(keys) - len(missing)} already cached) -> {cache_path}")
+        new_data = fetch_fn(missing)
+        cache.update(new_data)
+        save_json_cache(cache_path, cache)
+    else:
+        log.info(f"KEGG cache: all {len(keys)} entries found in cache, no API calls needed ({cache_path})")
+
+    return {k: cache.get(k) for k in keys}
+
 
 # ====================================
 # Data linking and integration functions
@@ -7728,568 +8294,1373 @@ def plot_heatmap_with_dendrogram(
     plt.show()
     plt.close()
 
-def plot_alluvial_for_submodules(
-    submodules_dir: str,
-    go_annotation_file: str,
-    show_plot_in_notebook: bool = False,
-    overwrite: bool = False
-) -> None:
-    """
-    Plot and save alluvial (Sankey) diagrams for network submodules using GO annotation.
-
-    Args:
-        submodules_dir (str): Directory containing submodule node tables.
-        go_annotation_file (str): Path to GO annotation file.
-        show_plot_in_notebook (bool): Show plot in notebook if True.
-        overwrite (bool): Overwrite existing plots if True.
-
-    Returns:
-        None
-    """
-
-    if os.path.exists(os.path.join(submodules_dir, "submodule_sankeys")) and overwrite is False:
-        log.info(f"Submodule Sankey diagrams already exist in {os.path.join(submodules_dir, 'submodule_sankeys')}. Set overwrite=True to regenerate.")
-        return
-    elif os.path.exists(os.path.join(submodules_dir, "submodule_sankeys")) and overwrite is True:
-        log.info(f"Overwriting existing submodule Sankey diagrams in {os.path.join(submodules_dir, 'submodule_sankeys')}.")
-        shutil.rmtree(os.path.join(submodules_dir, "submodule_sankeys"))
-        os.makedirs(os.path.join(submodules_dir, "submodule_sankeys"), exist_ok=True)
-    elif not os.path.exists(os.path.join(submodules_dir, "submodule_sankeys")):
-        os.makedirs(os.path.join(submodules_dir, "submodule_sankeys"), exist_ok=True)
-
-    # Read the GO annotation file
-    pathway_map = pd.read_csv(go_annotation_file, sep=None, engine='python')
-    pathway_map = pathway_map.loc[pathway_map.groupby('geneID').head(1).index]
-    pathway_map_classes = pathway_map[['geneID', 'goName', 'gotermType', 'goAcc']]
-
-    # Loop through all *_node_table.csv files in the submodules directory
-    node_table_files = glob.glob(os.path.join(submodules_dir, "*_node_table.csv"))
-    for node_table in tqdm(node_table_files, desc="Processing submodules", unit="node file"):
-        submodule = pd.read_csv(node_table)
-        submodule_annotated = pd.merge(pathway_map_classes, submodule, left_on='geneID', right_on='node_id', how='right')
-        submodule_annotated['goName'] = submodule_annotated['goName'].fillna('NA')
-        submodule_annotated['goAcc'] = submodule_annotated['goAcc'].fillna('NA')
-        submodule_annotated['gotermType'] = submodule_annotated['gotermType'].fillna('Unassigned_Type')
-        submodule_annotated['goLabel'] = submodule_annotated['goName'] + ' (' + submodule_annotated['goAcc'] + ')'
-        submodule_annotated['goLabel'] = submodule_annotated.groupby('goLabel')['goLabel'].transform(lambda x: x + ' (' + str(x.count()) + ')')
-
-        # Collapse all Unassigned_Type and NA (NA) into a single row
-        mask_unassigned = (submodule_annotated['gotermType'] == 'Unassigned_Type') | (submodule_annotated['goLabel'].str.startswith('NA (NA)'))
-        n_unassigned = mask_unassigned.sum()
-        # Remove all unassigned rows
-        submodule_annotated_collapsed = submodule_annotated[~mask_unassigned].copy()
-        # Add a single row for all unassigned, if any exist
-        if n_unassigned > 0:
-            collapsed_row = {
-                'gotermType': 'Unassigned',
-                'goLabel': f'Unassigned ({n_unassigned})'
-            }
-            # Add other columns as needed, or fill with NA
-            for col in submodule_annotated_collapsed.columns:
-                if col not in collapsed_row:
-                    collapsed_row[col] = pd.NA
-            submodule_annotated_collapsed = pd.concat([
-                submodule_annotated_collapsed,
-                pd.DataFrame([collapsed_row])
-            ], ignore_index=True)
-
-        submodule_annotated = submodule_annotated_collapsed
-
-        order = submodule_annotated['goLabel'].value_counts().index
-        submodule_annotated['sorter'] = submodule_annotated['goLabel'].map({k: i for i, k in enumerate(order)})
-        submodule_annotated = submodule_annotated.sort_values('sorter').drop('sorter', axis=1)
-        if submodule_annotated.empty:
-            continue
-
-        stages = ['gotermType', 'goLabel']
-        unique_labels = pd.concat([submodule_annotated[stage] for stage in stages]).unique()
-        n_labels = len(unique_labels)
-        min_height = 200  # Minimum height for readability
-        height_per_label = 20
-        height = max(min_height, n_labels * height_per_label)
-        width = 1000
-
-        labels = pd.concat([submodule_annotated[stage] for stage in stages]).unique().tolist()
-        label_to_index = {label: i for i, label in enumerate(labels)}
-        sources = submodule_annotated['gotermType'].map(label_to_index)
-        targets = submodule_annotated['goLabel'].map(label_to_index)
-        values = [1] * len(submodule_annotated)
-
-        goterm_counts = submodule_annotated.groupby('gotermType')['goLabel'].nunique().to_dict()
-        updated_labels = []
-        for label in labels:
-            if label == 'Unassigned':
-                updated_labels.append(f"Unassigned ({n_unassigned})")
-            elif label in goterm_counts:
-                updated_labels.append(f"{label} ({goterm_counts[label]})")
-            else:
-                updated_labels.append(label)
-
-        fig = go.Figure(go.Sankey(
-            node=dict(
-                pad=15,
-                thickness=20,
-                line=dict(color="black", width=0.5),
-                label=updated_labels,
-            ),
-            link=dict(
-                source=sources,
-                target=targets,
-                value=values,
-            )
-        ))
-
-        submodule_name = os.path.splitext(os.path.basename(node_table))[0].replace("_network_node_table", "")
-        fig.update_layout(
-            title_text=f"Alluvial Diagram for {submodule_name}",
-            font_size=10,
-            width=width,
-            height=height,
-            showlegend=False
-        )
-        if show_plot_in_notebook:
-            fig.show()
-            
-        output_pdf = os.path.join(submodules_dir, "submodule_sankeys", f"{submodule_name}_sankey_diagram.pdf")
-        fig.write_image(output_pdf, width=width, height=height)
-
 # ===================================
 # Pathway-module relatedness
 # ===================================
 
-def compute_feature_lfc_scores(quant_df: pd.DataFrame) -> pd.Series:
-    """Compute a robust per-feature magnitude-of-change score.
+# def compute_feature_lfc_scores(quant_df: pd.DataFrame) -> pd.Series:
+#     """Compute a robust per-feature magnitude-of-change score.
 
-    For each feature (row), takes the median of the absolute value across all
-    pairwise comparison columns, ignoring NaNs. Using the median (rather than
-    sum or mean) makes this robust to outlier contrasts and avoids biasing
-    toward features/pathways with more populated comparison columns.
+#     For each feature (row), takes the median of the absolute value across all
+#     pairwise comparison columns, ignoring NaNs. Using the median (rather than
+#     sum or mean) makes this robust to outlier contrasts and avoids biasing
+#     toward features/pathways with more populated comparison columns.
 
-    Parameters
-    ----------
-    quant_df : pd.DataFrame
-        Feature x comparison table of log fold changes, indexed by feature id.
+#     Parameters
+#     ----------
+#     quant_df : pd.DataFrame
+#         Feature x comparison table of log fold changes, indexed by feature id.
 
-    Returns
-    -------
-    pd.Series
-        Index: feature id. Values: median(|LFC|) across all comparisons.
-    """
-    return quant_df.abs().median(axis=1, skipna=True)
+#     Returns
+#     -------
+#     pd.Series
+#         Index: feature id. Values: median(|LFC|) across all comparisons.
+#     """
+#     return quant_df.abs().median(axis=1, skipna=True)
 
+# def _explode_node_pathways(
+#     node_df: pd.DataFrame,
+#     feature_id_col: str | None = None,
+#     pathway_col: str = "modelseed_pathway",
+#     submodule_col: str = "submodule",
+#     pathway_sep: str = ";",
+#     missing_token: str = "Unassigned",
+#     exclude_nopathway: bool = False,
+#     nopathway_prefix: str = "NOPATHWAY_",
+# ) -> pd.DataFrame:
+#     """Explode node_df's pathway_sep-joined pathway column into long format.
+
+#     Returns one row per (feature, pathway) pair, each carrying its submodule.
+#     Rows with a missing/"Unassigned" pathway or submodule are dropped, since
+#     they don't contribute to a pathway x submodule grouping.
+
+#     This is the single source of truth for (feature, pathway, submodule)
+#     membership -- both `build_pathway_submodule_matrices` (counts/heatmaps)
+#     and `compute_pathway_submodule_enrichment` (hypergeometric stats) call
+#     this same function with the same arguments, guaranteeing the plotted
+#     matrix and the significance test always agree on what "belongs" where.
+#     """
+#     df = node_df.copy()
+
+#     if feature_id_col is None:
+#         df = df.reset_index().rename(columns={df.index.name or "index": "feature_id"})
+#         feature_id_col = "feature_id"
+#     elif feature_id_col not in df.columns:
+#         raise KeyError(f"feature_id_col '{feature_id_col}' not found in node_df columns or index.")
+
+#     df = df[[feature_id_col, pathway_col, submodule_col]].dropna(subset=[pathway_col, submodule_col])
+#     df = df[df[pathway_col].astype(str).str.strip() != ""]
+#     df = df[df[pathway_col] != missing_token]
+#     df = df[df[submodule_col] != missing_token]
+
+#     exploded = df.assign(
+#         **{pathway_col: df[pathway_col].str.split(pathway_sep)}
+#     ).explode(pathway_col)
+#     exploded[pathway_col] = exploded[pathway_col].str.strip()
+#     exploded = exploded[exploded[pathway_col] != ""]
+
+#     if exclude_nopathway:
+#         n_before = exploded[pathway_col].nunique()
+#         exploded = exploded[~exploded[pathway_col].str.startswith(nopathway_prefix)]
+#         n_after = exploded[pathway_col].nunique()
+#         log.info(
+#             f"Excluded {n_before - n_after} placeholder '{nopathway_prefix}*' pathways "
+#             f"({n_after} real pathways remain)."
+#         )
+
+#     return exploded.rename(
+#         columns={feature_id_col: "feature_id", pathway_col: "pathway", submodule_col: "submodule"}
+#     )
+
+
+# def compute_submodule_sizes(
+#     node_df: pd.DataFrame,
+#     feature_id_col: str | None = None,
+#     submodule_col: str = "submodule",
+#     missing_token: str = "Unassigned",
+# ) -> pd.Series:
+#     """Count unique features assigned to each submodule.
+
+#     Uses each feature's single `submodule_col` assignment directly (not the
+#     exploded pathway table), since submodule membership is 1:1 per feature --
+#     counting via the exploded table would inflate sizes for features that
+#     belong to multiple pathways.
+
+#     Parameters
+#     ----------
+#     node_df : pd.DataFrame
+#         Node table with `submodule_col`. Feature id may be the index or a
+#         named column (see `feature_id_col`).
+#     feature_id_col : str, optional
+#         Column name for feature id. If None, uses `node_df.index`.
+#     missing_token : str
+#         Sentinel value indicating "no submodule assigned"; excluded from counts.
+
+#     Returns
+#     -------
+#     pd.Series
+#         Index: submodule name. Values: number of unique features, sorted descending.
+#     """
+#     df = node_df.copy()
+
+#     if feature_id_col is None:
+#         df = df.reset_index().rename(columns={df.index.name or "index": "feature_id"})
+#         feature_id_col = "feature_id"
+#     elif feature_id_col not in df.columns:
+#         raise KeyError(f"feature_id_col '{feature_id_col}' not found in node_df columns or index.")
+
+#     df = df.dropna(subset=[submodule_col])
+#     df = df[df[submodule_col] != missing_token]
+
+#     return (
+#         df.groupby(submodule_col)[feature_id_col]
+#         .nunique()
+#         .sort_values(ascending=False)
+#         .rename("n_features")
+#     )
+
+
+# def _resolve_qualifying_submodules(
+#     node_df: pd.DataFrame,
+#     feature_id_col: str | None,
+#     submodule_col: str,
+#     missing_token: str,
+#     min_submodule_size: int,
+# ) -> list[str] | None:
+#     """Shared min_submodule_size resolution used by both the matrix builder
+#     and the enrichment test, so both apply the identical submodule filter.
+
+#     Returns None if min_submodule_size <= 0 (no filtering).
+#     """
+#     if min_submodule_size <= 0:
+#         return None
+
+#     submodule_sizes = compute_submodule_sizes(
+#         node_df, feature_id_col=feature_id_col, submodule_col=submodule_col, missing_token=missing_token
+#     )
+#     qualifying = submodule_sizes[submodule_sizes >= min_submodule_size].index.tolist()
+#     n_dropped = submodule_sizes.shape[0] - len(qualifying)
+#     if n_dropped:
+#         log.info(
+#             f"Dropped {n_dropped} submodule(s) with fewer than {min_submodule_size} features "
+#             f"({len(qualifying)} submodule(s) remain)."
+#         )
+#     if not qualifying:
+#         raise ValueError(
+#             f"No submodules meet min_submodule_size={min_submodule_size}; "
+#             f"largest submodule has {submodule_sizes.max() if not submodule_sizes.empty else 0} features."
+#         )
+#     return qualifying
+
+
+# def build_pathway_submodule_matrices(
+#     node_df: pd.DataFrame,
+#     quant_df: pd.DataFrame | None = None,
+#     feature_id_col: str | None = None,
+#     pathway_col: str = "modelseed_pathway",
+#     submodule_col: str = "submodule",
+#     pathway_sep: str = ";",
+#     missing_token: str = "Unassigned",
+#     exclude_nopathway: bool = False,
+#     nopathway_prefix: str = "NOPATHWAY_",
+#     top_n: int = 100,
+#     rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
+#     min_submodule_size: int = 0,
+# ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
+#     """Build pathway x submodule count matrices, restricted to the top-N pathways.
+
+#     Parameters
+#     ----------
+#     node_df : pd.DataFrame
+#         Feature-level table with pathway and submodule columns.
+#     quant_df : pd.DataFrame, optional
+#         Feature x comparison LFC table, required when `rank_by="cumulative_abs_lfc"`.
+#     feature_id_col, pathway_col, submodule_col, pathway_sep, missing_token,
+#     exclude_nopathway, nopathway_prefix : see `_explode_node_pathways`.
+#     top_n : int
+#         Number of top-ranked pathways to keep in the returned matrices.
+#     rank_by : {"n_features", "cumulative_abs_lfc"}
+#         Ranking metric for pathway selection.
+#     min_submodule_size : int
+#         Minimum number of unique features a submodule must contain (across the
+#         whole `node_df`, independent of pathway membership) to be included in
+#         the output matrices. Submodules below this threshold are dropped
+#         entirely -- both their columns AND any features belonging to them --
+#         before pathway ranking/top-N selection, so the reported pathway stats
+#         and heatmap are self-consistent. Set to 0 (default) to disable.
+
+#     Returns
+#     -------
+#     counts_df : pd.DataFrame
+#         Top-N pathways (rows) x qualifying submodules (columns), raw feature counts.
+#     row_normalized_df : pd.DataFrame
+#         Same shape, each row divided by its row sum.
+#     pathway_stats_df : pd.DataFrame
+#         Full (pre-top_n-filter) per-pathway stats table, computed only from
+#         features in qualifying submodules.
+#     submodule_datatype_labels : pd.Series
+#         Index = submodule name, values = compact per-datatype feature count string
+#         (e.g. ``"tx:42 mx:18"``).  Computed from all features in each qualifying
+#         submodule (not just those with pathway annotations).
+#     """
+#     if rank_by == "cumulative_abs_lfc" and quant_df is None:
+#         raise ValueError("quant_df is required when rank_by='cumulative_abs_lfc'.")
+
+#     exploded = _explode_node_pathways(
+#         node_df,
+#         feature_id_col=feature_id_col,
+#         pathway_col=pathway_col,
+#         submodule_col=submodule_col,
+#         pathway_sep=pathway_sep,
+#         missing_token=missing_token,
+#         exclude_nopathway=exclude_nopathway,
+#         nopathway_prefix=nopathway_prefix,
+#     )
+
+#     if exploded.empty:
+#         raise ValueError("No (feature, pathway, submodule) rows remain after filtering; check inputs.")
+
+#     qualifying_submodules = _resolve_qualifying_submodules(
+#         node_df, feature_id_col, submodule_col, missing_token, min_submodule_size
+#     )
+#     if qualifying_submodules is not None:
+#         exploded = exploded[exploded["submodule"].isin(qualifying_submodules)]
+#         if exploded.empty:
+#             raise ValueError(
+#                 "No (feature, pathway, submodule) rows remain after applying min_submodule_size filter."
+#             )
+
+#     # --- Per-pathway stats (computed only from features in qualifying submodules) ---
+#     stats = exploded.groupby("pathway")["feature_id"].nunique().rename("n_features").to_frame()
+
+#     # --- Per-pathway per-datatype feature counts ---
+#     # Detect data-type prefixes from feature IDs (e.g. "tx_", "mx_", "px_")
+#     all_feature_ids = exploded["feature_id"].astype(str)
+#     detected_prefixes = sorted({fid.split("_")[0] + "_" for fid in all_feature_ids if "_" in fid})
+#     if detected_prefixes:
+#         exploded_copy = exploded.copy()
+#         exploded_copy["_dtype"] = all_feature_ids.str.split("_").str[0]
+#         dtype_counts = (
+#             exploded_copy.groupby(["pathway", "_dtype"])["feature_id"]
+#             .nunique()
+#             .unstack(fill_value=0)
+#         )
+#         # Build compact label: "tx:12 mx:5" (only include types with >0 features)
+#         def _make_label(row: pd.Series) -> str:
+#             parts = [f"{dtype}:{int(row[dtype])}" for dtype in sorted(row.index) if row[dtype] > 0]
+#             return " ".join(parts)
+#         stats["datatype_label"] = dtype_counts.reindex(stats.index, fill_value=0).apply(_make_label, axis=1)
+#     else:
+#         stats["datatype_label"] = ""
+
+#     if rank_by == "cumulative_abs_lfc" or quant_df is not None:
+#         feature_scores = compute_feature_lfc_scores(quant_df)
+#         missing_features = set(exploded["feature_id"]) - set(feature_scores.index)
+#         if missing_features:
+#             log.warning(
+#                 f"{len(missing_features)} features in node_df are missing from quant_df "
+#                 f"and will be scored as 0 for cumulative_abs_lfc ranking "
+#                 f"(e.g. {sorted(missing_features)[:5]})."
+#             )
+#         exploded = exploded.assign(
+#             feature_lfc_score=exploded["feature_id"].map(feature_scores).fillna(0.0)
+#         )
+#         cum_lfc = exploded.groupby("pathway")["feature_lfc_score"].sum().rename("cumulative_abs_lfc")
+#         stats = stats.join(cum_lfc, how="left")
+
+#     pathway_stats_df = stats.reset_index().sort_values(rank_by, ascending=False).reset_index(drop=True)
+
+#     # --- Select top N pathways, then build the crosstab ---
+#     top_pathways = pathway_stats_df.head(top_n)["pathway"].tolist()
+#     exploded_top = exploded[exploded["pathway"].isin(top_pathways)]
+
+#     counts_df = pd.crosstab(exploded_top["pathway"], exploded_top["submodule"])
+#     counts_df = counts_df.reindex(index=top_pathways)  # preserve rank order
+
+#     row_normalized_df = counts_df.div(counts_df.sum(axis=1), axis=0)
+
+#     # --- Per-submodule per-datatype feature counts (column labels) ---
+#     # Use node_df directly so ALL features in each group are counted,
+#     # not just those that have pathway annotations.
+#     fid_col = feature_id_col if feature_id_col is not None else (
+#         "feature_id" if "feature_id" in node_df.columns else node_df.index.name or "feature_id"
+#     )
+#     if fid_col in node_df.columns:
+#         node_fids = node_df[fid_col].astype(str)
+#     else:
+#         node_fids = node_df.index.astype(str)
+
+#     sub_col_name = submodule_col if submodule_col in node_df.columns else "submodule"
+#     if sub_col_name not in node_df.columns:
+#         submodule_datatype_labels = pd.Series(dtype=str)
+#     else:
+#         node_work = node_df[[sub_col_name]].copy()
+#         node_work["_fid"] = node_fids.values
+#         node_work["_dtype"] = node_work["_fid"].str.split("_").str[0]
+
+#         # Restrict to qualifying submodules (same filter as the heatmap columns)
+#         qualifying_cols = set(counts_df.columns)
+#         node_work = node_work[node_work[sub_col_name].isin(qualifying_cols)]
+
+#         sub_dtype_counts = (
+#             node_work.groupby([sub_col_name, "_dtype"])["_fid"]
+#             .nunique()
+#             .unstack(fill_value=0)
+#         )
+
+#         def _make_col_label(row: pd.Series) -> str:
+#             parts = [f"{dtype}:{int(row[dtype])}" for dtype in sorted(row.index) if row[dtype] > 0]
+#             return " ".join(parts)
+
+#         submodule_datatype_labels = sub_dtype_counts.apply(_make_col_label, axis=1)
+#         submodule_datatype_labels.index.name = sub_col_name
+
+#     log.info(
+#         f"Built pathway x submodule matrix: {counts_df.shape[0]} pathways "
+#         f"(top {top_n} by {rank_by}) x {counts_df.shape[1]} submodules "
+#         f"(min_submodule_size={min_submodule_size})."
+#     )
+
+#     return counts_df, row_normalized_df, pathway_stats_df, submodule_datatype_labels
+
+
+# def compute_pathway_submodule_enrichment(
+#     node_df: pd.DataFrame,
+#     counts_df: pd.DataFrame,
+#     feature_id_col: str | None = None,
+#     pathway_col: str = "modelseed_pathway",
+#     submodule_col: str = "submodule",
+#     pathway_sep: str = ";",
+#     missing_token: str = "Unassigned",
+#     exclude_nopathway: bool = False,
+#     nopathway_prefix: str = "NOPATHWAY_",
+#     min_submodule_size: int = 0,
+#     fdr_method: str = "fdr_bh",
+#     alpha: float = 0.05,
+# ) -> pd.DataFrame:
+#     """Hypergeometric over-representation test for the pathway x submodule
+#     pairs in `counts_df`.
+
+#     Tests whether a pathway's features are enriched within a given submodule
+#     more than expected by chance, given the pathway size, module size, and
+#     background universe -- correcting for the size confounds that a raw
+#     concentration heatmap cannot account for.
+
+#     Re-derives the same exploded (feature, pathway, submodule) table and
+#     min_submodule_size filtering as `build_pathway_submodule_matrices`, so
+#     background sizes (M, n, N) are computed on an identical universe to
+#     whatever produced `counts_df`. Pass the SAME feature_id_col/pathway_col/
+#     submodule_col/pathway_sep/missing_token/exclude_nopathway/nopathway_prefix/
+#     min_submodule_size arguments you used to build `counts_df`, or the two
+#     will silently diverge.
+
+#     Parameters
+#     ----------
+#     node_df : pd.DataFrame
+#         The same raw node table passed to `build_pathway_submodule_matrices`.
+#     counts_df : pd.DataFrame
+#         Output of `build_pathway_submodule_matrices` -- top-N pathways (rows)
+#         x qualifying submodules (columns). Enrichment is computed only for
+#         these cells; `k` (overlap) is read directly from `counts_df` rather
+#         than recomputed, guaranteeing exact agreement with the plotted matrix.
+#     fdr_method : str
+#         Passed to `statsmodels.stats.multitest.multipletests` (default
+#         Benjamini-Hochberg FDR).
+#     alpha : float
+#         Significance threshold used to populate the `significant` column.
+
+#     Returns
+#     -------
+#     pd.DataFrame with columns: pathway, submodule, k, n, N, M, expected,
+#     fold_enrichment, pvalue, padj, significant -- one row per (pathway,
+#     submodule) cell in `counts_df`. FDR correction is applied across exactly
+#     these cells (not the full, untested pathway universe).
+#     """
+#     exploded = _explode_node_pathways(
+#         node_df,
+#         feature_id_col=feature_id_col,
+#         pathway_col=pathway_col,
+#         submodule_col=submodule_col,
+#         pathway_sep=pathway_sep,
+#         missing_token=missing_token,
+#         exclude_nopathway=exclude_nopathway,
+#         nopathway_prefix=nopathway_prefix,
+#     )
+
+#     qualifying_submodules = _resolve_qualifying_submodules(
+#         node_df, feature_id_col, submodule_col, missing_token, min_submodule_size
+#     )
+#     if qualifying_submodules is not None:
+#         exploded = exploded[exploded["submodule"].isin(qualifying_submodules)]
+
+#     universe = exploded[["feature_id", "submodule"]].drop_duplicates()
+#     M = universe["feature_id"].nunique()
+#     module_sizes = universe.groupby("submodule")["feature_id"].nunique()
+#     pathway_sizes = exploded.groupby("pathway")["feature_id"].nunique()
+
+#     records = []
+#     for pathway in counts_df.index:
+#         n = pathway_sizes.get(pathway, 0)
+#         for submodule in counts_df.columns:
+#             N = module_sizes.get(submodule, 0)
+#             if n == 0 or N == 0:
+#                 continue
+#             k = int(counts_df.loc[pathway, submodule])
+#             # P(X >= k): survival function is P(X > x), so use sf(k - 1)
+#             pval = hypergeom.sf(k - 1, M, n, N)
+#             expected = n * N / M
+#             records.append({
+#                 "pathway": pathway,
+#                 "submodule": submodule,
+#                 "k": k, "n": n, "N": N, "M": M,
+#                 "expected": expected,
+#                 "fold_enrichment": (k / expected) if expected > 0 else np.nan,
+#                 "pvalue": pval,
+#             })
+
+#     result = pd.DataFrame.from_records(records)
+#     reject, padj, _, _ = multipletests(result["pvalue"], alpha=alpha, method=fdr_method)
+#     result["padj"] = padj
+#     result["significant"] = reject
+
+#     log.info(
+#         f"Computed hypergeometric enrichment for {len(result)} pathway x submodule "
+#         f"pairs; {result['significant'].sum()} significant at padj<{alpha} ({fdr_method})."
+#     )
+
+#     return result.sort_values("padj").reset_index(drop=True)
+
+# def add_significance_annotations(
+#     clustergrid: sns.matrix.ClusterGrid,
+#     matrix_df: pd.DataFrame,
+#     enrichment_df: pd.DataFrame,
+#     cluster_rows: bool,
+#     cluster_cols: bool,
+#     alpha_stars: dict[float, str] | None = None,
+# ) -> None:
+#     """Overlay hypergeometric significance stars on a ClusterGrid's heatmap Axes.
+
+#     Must be called BEFORE the ClusterGrid's `.figure` is extracted/returned --
+#     dendrogram reordering (`reordered_ind`) only exists on the ClusterGrid
+#     object itself, not on the plain Figure.
+
+#     Parameters
+#     ----------
+#     clustergrid : sns.matrix.ClusterGrid
+#         Object returned directly by `sns.clustermap(...)`, before `.figure`
+#         is accessed.
+#     matrix_df : pd.DataFrame
+#         The exact dataframe passed into that `sns.clustermap` call
+#         (`counts_df` or `row_normalized_df`) -- used to map reordered
+#         positions back to (pathway, submodule) labels.
+#     enrichment_df : pd.DataFrame
+#         Output of `compute_pathway_submodule_enrichment`.
+#     cluster_rows, cluster_cols : bool
+#         Whether clustering was enabled for this call. When False,
+#         `clustergrid.dendrogram_row`/`dendrogram_col` is None, so the
+#         original (unreordered) index/column order is used instead.
+#     alpha_stars : dict[float, str], optional
+#         Mapping of padj thresholds to marker strings, checked tightest-first.
+#         Defaults to {0.001: "***", 0.01: "**", 0.05: "*"}.
+#     """
+#     if alpha_stars is None:
+#         alpha_stars = {0.001: "***", 0.01: "**", 0.05: "*"}
+
+#     padj_lookup = enrichment_df.set_index(["pathway", "submodule"])["padj"]
+
+#     row_order = (
+#         clustergrid.dendrogram_row.reordered_ind if cluster_rows else range(len(matrix_df.index))
+#     )
+#     col_order = (
+#         clustergrid.dendrogram_col.reordered_ind if cluster_cols else range(len(matrix_df.columns))
+#     )
+
+#     ordered_rows = matrix_df.index[list(row_order)]
+#     ordered_cols = matrix_df.columns[list(col_order)]
+
+#     ax = clustergrid.ax_heatmap
+#     stroke = [pe.withStroke(linewidth=1.5, foreground="black")]
+
+#     for i, pathway in enumerate(ordered_rows):
+#         for j, submodule in enumerate(ordered_cols):
+#             padj = padj_lookup.get((pathway, submodule), np.nan)
+#             if pd.isna(padj):
+#                 continue
+#             for thresh, stars in sorted(alpha_stars.items()):
+#                 if padj < thresh:
+#                     ax.text(
+#                         j + 0.5, i + 0.7, stars,
+#                         ha="center", va="center",
+#                         color="white", fontsize=8, fontweight="bold",
+#                         path_effects=stroke,
+#                     )
+#                     break
+
+
+# def plot_pathway_submodule_clustermaps(
+#     counts_df: pd.DataFrame,
+#     row_normalized_df: pd.DataFrame,
+#     cluster_rows: bool = True,
+#     cluster_cols: bool = True,
+#     method: str = "average",
+#     metric: str = "euclidean",
+#     counts_cmap: str = "viridis",
+#     normalized_cmap: str = "magma",
+#     normalized_vmax: float | Literal["auto"] = "auto",
+#     counts_gamma: float | None = None,
+#     normalized_gamma: float | None = None,
+#     figsize: tuple[float, float] = (22, 18),
+#     output_dir: str | Path | None = None,
+#     counts_filename: str = "pathway_submodule_heatmap_counts.png",
+#     normalized_filename: str = "pathway_submodule_heatmap_normalized.png",
+#     dpi: int = 300,
+#     enrichment_df: pd.DataFrame | None = None,
+#     alpha_stars: dict[float, str] | None = None,
+#     pathway_datatype_labels: pd.Series | None = None,
+#     submodule_datatype_labels: pd.Series | None = None,
+# ) -> tuple[plt.Figure, plt.Figure]:
+#     """Plot raw-count and row-normalized pathway x submodule heatmaps with shared clustering.
+
+#     Parameters
+#     ----------
+#     counts_df, row_normalized_df : pd.DataFrame
+#         Outputs of `build_pathway_submodule_matrices`.
+#     cluster_rows, cluster_cols : bool
+#         Whether to hierarchically cluster rows/columns (shared linkage
+#         computed from `row_normalized_df`, applied to both panels so pathway/
+#         submodule ordering is identical across the two figures).
+#     method, metric : str
+#         Passed to `scipy.cluster.hierarchy.linkage`.
+#     counts_cmap, normalized_cmap : str
+#         Colormaps for each panel.
+#     normalized_vmax : float or "auto"
+#         Upper bound of the color scale for the row-normalized heatmap.
+#         "auto" (default) uses the actual maximum value in `row_normalized_df`.
+#     counts_gamma : float or None, default 0.4
+#         PowerNorm gamma for the raw-count panel.  Values < 1 stretch the low
+#         end of the color scale, making small counts visually distinguishable.
+#         Set to None for a standard linear scale.
+#     normalized_gamma : float or None, default 0.4
+#         PowerNorm gamma for the row-normalized panel.  Same semantics as
+#         ``counts_gamma``.  Set to None for a standard linear scale.
+#     output_dir, counts_filename, normalized_filename, dpi :
+#         Figure-saving options. If `output_dir` is None, figures are not saved.
+#     enrichment_df : pd.DataFrame, optional
+#         Output of `compute_pathway_submodule_enrichment`. If provided,
+#         significance stars are overlaid on both panels.
+#     alpha_stars : dict[float, str], optional
+#         padj threshold -> marker string for the significance overlay.
+#     pathway_datatype_labels : pd.Series, optional
+#         Index = pathway name, values = compact label string (e.g. ``"tx:12 mx:5"``).
+#         When provided, a narrow text column is rendered between the row
+#         dendrogram and the heatmap on both panels, showing the per-datatype
+#         feature breakdown for each pathway row in its clustered order.
+#     submodule_datatype_labels : pd.Series, optional
+#         Index = submodule name, values = compact label string (e.g. ``"tx:42 mx:18"``).
+#         When provided, a narrow text row is rendered below the column dendrogram
+#         on both panels, showing the per-datatype feature breakdown for each
+#         submodule column in its clustered order.
+
+#     Returns
+#     -------
+#     (fig_counts, fig_normalized) : tuple[plt.Figure, plt.Figure]
+#     """
+#     row_linkage = linkage(row_normalized_df.values, method=method, metric=metric) if cluster_rows else None
+#     col_linkage = linkage(row_normalized_df.values.T, method=method, metric=metric) if cluster_cols else None
+
+#     common_kwargs = dict(
+#         row_linkage=row_linkage,
+#         col_linkage=col_linkage,
+#         row_cluster=cluster_rows,
+#         col_cluster=cluster_cols,
+#         figsize=figsize,
+#         dendrogram_ratio=(0.15, 0.1),
+#         cbar_pos=(0.02, 0.83, 0.03, 0.15),
+#     )
+
+#     # --- Counts panel ---
+#     counts_vmax = counts_df.values.max() if counts_df.values.max() > 0 else 1
+#     counts_norm_kwargs: dict = {}
+#     if counts_gamma is not None:
+#         counts_norm_kwargs["norm"] = PowerNorm(gamma=counts_gamma, vmin=0, vmax=counts_vmax)
+#     else:
+#         counts_norm_kwargs["vmin"] = 0
+#         counts_norm_kwargs["vmax"] = counts_vmax
+
+#     g_counts = sns.clustermap(
+#         counts_df,
+#         cmap=counts_cmap,
+#         annot=False,
+#         fmt="d",
+#         **counts_norm_kwargs,
+#         **common_kwargs,
+#     )
+#     g_counts.ax_heatmap.set_xlabel("Submodule")
+#     g_counts.ax_heatmap.set_ylabel("Pathway")
+
+#     counts_title = "Feature count per pathway x submodule"
+#     if enrichment_df is not None:
+#         add_significance_annotations(
+#             g_counts, counts_df, enrichment_df, cluster_rows, cluster_cols, alpha_stars
+#         )
+#         counts_title += "\n* padj<0.05  ** padj<0.01  *** padj<0.001 (hypergeometric, BH-FDR)"
+#     g_counts.figure.suptitle(counts_title, y=1.04 if enrichment_df is not None else 1.02, fontsize=10)
+
+#     # --- Annotate row/column tick labels with datatype counts ---
+#     _annotate_clustermap_tick_labels(
+#         g_counts, counts_df,
+#         row_labels=pathway_datatype_labels,
+#         col_labels=submodule_datatype_labels,
+#         cluster_rows=cluster_rows,
+#         cluster_cols=cluster_cols,
+#     )
+
+#     # --- Row-normalized panel ---
+#     resolved_vmax = row_normalized_df.values.max() if normalized_vmax == "auto" else normalized_vmax
+
+#     norm_kwargs: dict = {}
+#     if normalized_gamma is not None:
+#         norm_kwargs["norm"] = PowerNorm(gamma=normalized_gamma, vmin=0, vmax=resolved_vmax)
+#     else:
+#         norm_kwargs["vmin"] = 0
+#         norm_kwargs["vmax"] = resolved_vmax
+
+#     g_norm = sns.clustermap(
+#         row_normalized_df,
+#         cmap=normalized_cmap,
+#         annot=False,
+#         fmt=".2f",
+#         **norm_kwargs,
+#         **common_kwargs,
+#     )
+#     g_norm.ax_heatmap.set_xlabel("Submodule")
+#     g_norm.ax_heatmap.set_ylabel("Pathway")
+
+#     if enrichment_df is not None:
+#         add_significance_annotations(
+#             g_norm, row_normalized_df, enrichment_df, cluster_rows, cluster_cols, alpha_stars
+#         )
+
+#     g_norm.figure.suptitle("Row-normalized fraction of pathway's features per submodule", y=1.02)
+
+#     _annotate_clustermap_tick_labels(
+#         g_norm, row_normalized_df,
+#         row_labels=pathway_datatype_labels,
+#         col_labels=submodule_datatype_labels,
+#         cluster_rows=cluster_rows,
+#         cluster_cols=cluster_cols,
+#     )
+
+#     if output_dir is not None:
+#         output_dir = Path(output_dir)
+#         output_dir.mkdir(parents=True, exist_ok=True)
+#         g_counts.figure.savefig(output_dir / counts_filename, dpi=dpi, bbox_inches="tight")
+#         g_norm.figure.savefig(output_dir / normalized_filename, dpi=dpi, bbox_inches="tight")
+#         log.info(f"Saved heatmaps to {output_dir / counts_filename} and {output_dir / normalized_filename}")
+
+#     return g_counts.figure, g_norm.figure
+
+
+# def _annotate_clustermap_tick_labels(
+#     clustergrid,
+#     matrix_df: pd.DataFrame,
+#     row_labels: "pd.Series | None" = None,
+#     col_labels: "pd.Series | None" = None,
+#     cluster_rows: bool = True,
+#     cluster_cols: bool = True,
+# ) -> None:
+#     """Embed per-datatype feature counts into the existing heatmap tick labels."""
+#     ax = clustergrid.ax_heatmap
+
+#     def _fmt_parenthetical(raw: str) -> str:
+#         """Convert 'tx:12 mx:5' → '(tx:12, mx:5)'."""
+#         if not raw:
+#             return ""
+#         parts = raw.split()
+#         return "(" + ", ".join(parts) + ")"
+
+#     # ── Row tick labels (y-axis) ──────────────────────────────────────────────
+#     if row_labels is not None:
+#         if cluster_rows and clustergrid.dendrogram_row is not None:
+#             row_order = list(clustergrid.dendrogram_row.reordered_ind)
+#         else:
+#             row_order = list(range(len(matrix_df.index)))
+#         ordered_rows = matrix_df.index[row_order]
+
+#         new_ylabels = []
+#         for pathway in ordered_rows:
+#             paren = _fmt_parenthetical(str(row_labels.get(pathway, "")))
+#             new_ylabels.append(f"{paren} {pathway}" if paren else pathway)
+
+#         ax.set_yticks(range(len(new_ylabels))) 
+#         ax.set_yticklabels(new_ylabels, fontsize=7)
+
+#     # ── Column tick labels (x-axis) ───────────────────────────────────────────
+#     if col_labels is not None:
+#         if cluster_cols and clustergrid.dendrogram_col is not None:
+#             col_order = list(clustergrid.dendrogram_col.reordered_ind)
+#         else:
+#             col_order = list(range(len(matrix_df.columns)))
+#         ordered_cols = matrix_df.columns[col_order]
+
+#         new_xlabels = []
+#         for submodule in ordered_cols:
+#             paren = _fmt_parenthetical(str(col_labels.get(submodule, "")))
+#             new_xlabels.append(f"{submodule} {paren}" if paren else submodule)
+
+#         ax.set_xticks(range(len(new_xlabels)))
+#         ax.set_xticklabels(new_xlabels, rotation=90, ha="center", fontsize=7)
+
+
+# def _filter_by_significance(
+#     counts_df: pd.DataFrame,
+#     row_normalized_df: pd.DataFrame,
+#     enrichment_df: pd.DataFrame,
+# ) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
+#     """Restrict to pathways (rows) AND submodules (columns) that each have at
+#     least one significant (padj < alpha) enrichment pair. Falls back to the
+#     unfiltered matrices (with a warning) if either axis would become empty.
+
+#     Returns
+#     -------
+#     (counts_df_plot, row_normalized_df_plot, kept_pathways, kept_submodules)
+#     """
+#     if enrichment_df.empty or not enrichment_df["significant"].any():
+#         return counts_df, row_normalized_df, list(counts_df.index), list(counts_df.columns)
+
+#     sig = enrichment_df.loc[enrichment_df["significant"]]
+#     kept_pathways = [p for p in counts_df.index if p in set(sig["pathway"])]
+#     kept_submodules = [s for s in counts_df.columns if s in set(sig["submodule"])]
+
+#     if not kept_pathways or not kept_submodules:
+#         log.warning(
+#             "show_only_sig=True would empty the heatmap on at least one axis "
+#             f"({len(kept_pathways)} pathways, {len(kept_submodules)} submodules "
+#             "would remain) — falling back to the full, unfiltered heatmap."
+#         )
+#         return counts_df, row_normalized_df, list(counts_df.index), list(counts_df.columns)
+
+#     counts_df_plot = counts_df.loc[kept_pathways, kept_submodules]
+#     row_normalized_df_plot = row_normalized_df.loc[kept_pathways, kept_submodules]
+
+#     log.info(
+#         f"show_only_sig=True: restricting heatmap to {len(kept_pathways)} pathways "
+#         f"(of {len(counts_df)}) x {len(kept_submodules)} submodules (of "
+#         f"{counts_df.shape[1]}) with >=1 significant pair."
+#     )
+#     return counts_df_plot, row_normalized_df_plot
+
+# def generate_pathway_submodule_heatmap(
+#     node_df: pd.DataFrame,
+#     quant_df: pd.DataFrame | None = None,
+#     top_n: int = 100,
+#     rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
+#     exclude_nopathway: bool = False,
+#     min_submodule_size: int = 0,
+#     normalized_vmax: float | Literal["auto"] = "auto",
+#     normalized_gamma: float | None = None,
+#     output_dir: str | Path | None = None,
+#     fdr_method: str = "fdr_bh",
+#     alpha: float = 0.05,
+#     show_only_sig: bool = False,
+#     **plot_kwargs,
+# ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, plt.Figure, plt.Figure]:
+#     """End-to-end: build pathway x submodule matrices, run hypergeometric
+#     enrichment, and plot both heatmap panels with significance stars overlaid.
+
+#     See `build_pathway_submodule_matrices`, `compute_pathway_submodule_enrichment`,
+#     and `plot_pathway_submodule_clustermaps` for parameter details.
+
+#     Parameters
+#     ----------
+#     node_df, quant_df, top_n, rank_by, exclude_nopathway, min_submodule_size :
+#         See `build_pathway_submodule_matrices`.
+#     normalized_vmax, normalized_gamma :
+#         See `plot_pathway_submodule_clustermaps`.
+#     output_dir :
+#         Directory to save figures to. If None, figures are not saved to disk.
+#     fdr_method : str
+#         Multiple-testing correction method for `compute_pathway_submodule_enrichment`
+#         (default Benjamini-Hochberg FDR).
+#     alpha : float
+#         Significance threshold used to populate `enrichment_df["significant"]`
+#         and the star overlay.
+#     **plot_kwargs
+#         Any additional keyword arguments forwarded to
+#         `plot_pathway_submodule_clustermaps` (e.g. `method`, `metric`,
+#         `counts_cmap`, `figsize`, `counts_filename`, `dpi`, `alpha_stars`, etc.).
+
+#     Returns
+#     -------
+#     (counts_df, row_normalized_df, pathway_stats_df, enrichment_df, fig_counts, fig_normalized)
+#     """
+#     counts_df, row_normalized_df, pathway_stats_df, submodule_datatype_labels = build_pathway_submodule_matrices(
+#         node_df,
+#         quant_df=quant_df,
+#         top_n=top_n,
+#         rank_by=rank_by,
+#         exclude_nopathway=exclude_nopathway,
+#         min_submodule_size=min_submodule_size,
+#     )
+
+#     enrichment_df = compute_pathway_submodule_enrichment(
+#         node_df,
+#         counts_df,
+#         exclude_nopathway=exclude_nopathway,
+#         min_submodule_size=min_submodule_size,
+#         fdr_method=fdr_method,
+#         alpha=alpha,
+#     )
+
+#     counts_df_plot, row_normalized_df_plot, = _filter_by_significance(
+#         counts_df, 
+#         row_normalized_df, 
+#         enrichment_df
+#     )
+
+
+#     # Extract per-datatype labels from pathway_stats_df (row labels) and submodule_datatype_labels (column labels)
+#     pathway_datatype_labels: pd.Series | None = None
+#     if "datatype_label" in pathway_stats_df.columns:
+#         pathway_datatype_labels = pathway_stats_df.set_index("pathway")["datatype_label"]
+
+#     fig_counts, fig_normalized = plot_pathway_submodule_clustermaps(
+#         counts_df_plot,
+#         row_normalized_df_plot,
+#         normalized_vmax=normalized_vmax,
+#         normalized_gamma=normalized_gamma,
+#         output_dir=output_dir,
+#         enrichment_df=enrichment_df,
+#         pathway_datatype_labels=pathway_datatype_labels,
+#         submodule_datatype_labels=submodule_datatype_labels if not submodule_datatype_labels.empty else None,
+#         **plot_kwargs,
+#     )
+
+#     return counts_df, row_normalized_df, pathway_stats_df, enrichment_df, fig_counts, fig_normalized
+
+
+# def compare_groups_to_pathways(
+#     node_table: pd.DataFrame,
+#     annotation_table: pd.DataFrame,
+#     quant_df: pd.DataFrame | None = None,
+#     pathway_col: str = "modelseed_pathway",
+#     group_col: str = "group",
+#     top_n: int = 100,
+#     rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
+#     exclude_nopathway: bool = False,
+#     min_group_size: int = 3,
+#     show_only_sig: bool = False,
+#     bipartite_only: bool = False,
+#     fdr_method: str = "fdr_bh",
+#     alpha: float = 0.05,
+#     output_dir: str | None = None,
+#     **plot_kwargs,
+# ) -> Dict[str, Any]:
+#     """
+#     Compare data-driven feature groups against knowledge-driven pathway annotations.
+
+#     Combines two complementary analyses into a single call:
+
+#     1. **Pathway x group heatmap** — builds a pathway x group count matrix
+#        (top ``top_n`` pathways by feature count or cumulative |LFC|), runs
+#        hypergeometric over-representation tests (BH-FDR corrected), and plots
+#        both a raw-count and a row-normalised clustermap with significance stars.
+
+#     2. **Adjusted Rand Index (ARI) and Normalised Mutual Information (NMI)** —
+#        single-number summaries of how well the data-driven grouping recovers
+#        pathway structure.  Features with no pathway annotation or assigned to
+#        the HDBSCAN noise class (``"noise"``) are excluded from the ARI/NMI
+#        calculation.
+
+#     Parameters
+#     ----------
+#     node_table : pd.DataFrame
+#         Feature-level node table produced by ``group_features()``.  Must be
+#         indexed by feature ID and contain a ``group`` column.
+#     annotation_table : pd.DataFrame
+#         Feature annotation table indexed by feature ID.  Must contain
+#         ``pathway_col`` (default ``"modelseed_pathway"``).
+#     quant_df : pd.DataFrame, optional
+#         Feature x comparison LFC matrix.  Required only when
+#         ``rank_by="cumulative_abs_lfc"``.
+#     pathway_col : str
+#         Column in ``annotation_table`` that holds pathway labels.
+#     group_col : str
+#         Column in ``node_table`` that holds the data-driven group labels.
+#         Falls back to ``"submodule"`` if ``"group"`` is absent.
+#     top_n : int
+#         Number of top-ranked pathways to show in the heatmap.
+#     rank_by : {"n_features", "cumulative_abs_lfc"}
+#         Pathway ranking metric.
+#     exclude_nopathway : bool
+#         If True, features with no pathway annotation are excluded from the
+#         heatmap (they are always excluded from ARI/NMI).
+#     min_group_size : int
+#         Groups with fewer than this many features are dropped from both the
+#         heatmap and the ARI/NMI calculation.
+#     show_only_sig : bool, default False
+#         If True, restrict the heatmap rows to pathways that are significantly
+#         enriched (``padj < alpha``) in at least one group.  Has no effect if
+#         the enrichment table is empty.
+#     bipartite_only : bool, default False
+#         If True, restrict the enrichment/heatmap analysis to pathways that
+#         have at least one feature from **each** data type present in the node
+#         table (identified by the dataset-name prefix, e.g. ``"tx_"``,
+#         ``"mx_"``).  Pathways represented by only a single data type are
+#         dropped before the heatmap is built.
+#     fdr_method : str
+#         Multiple-testing correction method (default ``"fdr_bh"``).
+#     alpha : float
+#         Significance threshold for the enrichment test and star overlay.
+#     output_dir : str, optional
+#         Directory to save heatmap PDFs.
+#     **plot_kwargs
+#         Forwarded to ``plot_pathway_submodule_clustermaps``.
+
+#     Returns
+#     -------
+#     dict with keys:
+#         ``counts_df``, ``row_normalized_df``, ``pathway_stats_df``,
+#         ``enrichment_df``, ``fig_counts``, ``fig_normalized``,
+#         ``ari``, ``nmi``, ``n_features_compared``
+#     """
+#     from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+#     from sklearn.preprocessing import LabelEncoder
+
+#     # ------------------------------------------------------------------ #
+#     # 1. Resolve group column                                              #
+#     # ------------------------------------------------------------------ #
+#     if group_col not in node_table.columns:
+#         if "submodule" in node_table.columns:
+#             log.info(
+#                 f"Column '{group_col}' not found in node_table; "
+#                 "falling back to 'submodule'."
+#             )
+#             group_col = "submodule"
+#         else:
+#             raise ValueError(
+#                 f"Neither '{group_col}' nor 'submodule' found in node_table columns: "
+#                 f"{node_table.columns.tolist()}"
+#             )
+
+#     # ------------------------------------------------------------------ #
+#     # 2. Merge pathway annotation onto node table                         #
+#     # ------------------------------------------------------------------ #
+#     node_df = node_table.copy()
+
+#     # Ensure 'submodule' column exists for generate_pathway_submodule_heatmap
+#     if "submodule" not in node_df.columns:
+#         node_df["submodule"] = node_df[group_col]
+
+#     if pathway_col not in node_df.columns:
+#         if pathway_col not in annotation_table.columns:
+#             raise ValueError(
+#                 f"Pathway column '{pathway_col}' not found in annotation_table. "
+#                 f"Available columns: {annotation_table.columns.tolist()}"
+#             )
+#         node_df = node_df.join(annotation_table[[pathway_col]], how="left")
+
+#     log.info(
+#         f"Annotated node table: {node_df.shape[0]} features, "
+#         f"{node_df[group_col].nunique()} groups, "
+#         f"{node_df[pathway_col].nunique()} unique pathways"
+#     )
+
+#     # ------------------------------------------------------------------ #
+#     # 2b. Optional bipartite filter                                        #
+#     # ------------------------------------------------------------------ #
+#     if bipartite_only:
+#         # Detect data-type prefixes from feature index (e.g. "tx_", "mx_", "px_")
+#         feature_ids = node_df.index.astype(str)
+#         detected_prefixes = sorted({fid.split("_")[0] + "_" for fid in feature_ids if "_" in fid})
+#         if len(detected_prefixes) < 2:
+#             log.warning(
+#                 "bipartite_only=True but fewer than 2 data-type prefixes detected "
+#                 f"({detected_prefixes}). Skipping bipartite filter."
+#             )
+#         else:
+#             log.info(
+#                 f"bipartite_only=True: keeping pathways with features from all "
+#                 f"data types: {detected_prefixes}"
+#             )
+#             # For each pathway, check which prefixes are represented
+#             node_df["_prefix"] = feature_ids.str.split("_").str[0] + "_"
+#             pathway_prefix_counts = (
+#                 node_df[node_df[pathway_col].notna()]
+#                 .groupby(pathway_col)["_prefix"]
+#                 .nunique()
+#             )
+#             bipartite_pathways = pathway_prefix_counts[
+#                 pathway_prefix_counts >= len(detected_prefixes)
+#             ].index
+#             n_before = node_df[pathway_col].nunique()
+#             node_df = node_df[
+#                 node_df[pathway_col].isna()
+#                 | node_df[pathway_col].isin(bipartite_pathways)
+#             ]
+#             node_df = node_df.drop(columns=["_prefix"])
+#             log.info(
+#                 f"  Bipartite filter: {len(bipartite_pathways)} of {n_before} pathways "
+#                 "have features from all data types."
+#             )
+
+#     # ------------------------------------------------------------------ #
+#     # 3. Pathway x group heatmap + hypergeometric enrichment              #
+#     # ------------------------------------------------------------------ #
+#     log.info("Building pathway x group heatmap and running enrichment tests...")
+#     (
+#         counts_df,
+#         row_normalized_df,
+#         pathway_stats_df,
+#         enrichment_df,
+#         fig_counts,
+#         fig_normalized,
+#     ) = generate_pathway_submodule_heatmap(
+#         node_df=node_df,
+#         quant_df=quant_df,
+#         top_n=top_n,
+#         rank_by=rank_by,
+#         exclude_nopathway=exclude_nopathway,
+#         min_submodule_size=min_group_size,
+#         output_dir=output_dir,
+#         fdr_method=fdr_method,
+#         alpha=alpha,
+#         show_only_sig=show_only_sig,
+#         **plot_kwargs,
+#     )
+
+#     # ------------------------------------------------------------------ #
+#     # 4. ARI and NMI                                                      #
+#     # ------------------------------------------------------------------ #
+#     comparison_df = node_df[[group_col, pathway_col]].copy()
+
+#     # Drop features with no pathway or in the noise class
+#     comparison_df = comparison_df[
+#         comparison_df[pathway_col].notna()
+#         & (comparison_df[pathway_col].astype(str) != "Unassigned")
+#         & (comparison_df[pathway_col].astype(str) != "")
+#         & comparison_df[group_col].notna()
+#         & (comparison_df[group_col].astype(str) != "noise")
+#     ]
+
+#     # Apply min_group_size filter
+#     if min_group_size > 0:
+#         group_sizes = comparison_df[group_col].value_counts()
+#         valid_groups = group_sizes[group_sizes >= min_group_size].index
+#         comparison_df = comparison_df[comparison_df[group_col].isin(valid_groups)]
+
+#     ari, nmi = np.nan, np.nan
+#     n_compared = len(comparison_df)
+
+#     if n_compared >= 2:
+#         comparison_df = comparison_df.copy()
+#         comparison_df["_primary_pathway"] = (
+#             comparison_df[pathway_col].astype(str).str.split(";").str[0].str.strip()
+#         )
+
+#         le_group = LabelEncoder()
+#         le_pathway = LabelEncoder()
+#         group_labels = le_group.fit_transform(comparison_df[group_col].astype(str))
+#         pathway_labels = le_pathway.fit_transform(comparison_df["_primary_pathway"])
+
+#         ari = float(adjusted_rand_score(pathway_labels, group_labels))
+#         nmi = float(normalized_mutual_info_score(pathway_labels, group_labels))
+
+#         log.info(f"Features used for ARI/NMI comparison : {n_compared:,}")
+#         log.info(f"Data-driven groups : {comparison_df[group_col].nunique()}")
+#         log.info(f"Unique pathways (primary) : {comparison_df['_primary_pathway'].nunique()}")
+#         log.info(f"Adjusted Rand Index (ARI) : {ari:.4f}  (1=perfect, 0=random)")
+#         log.info(f"Normalised Mutual Info (NMI) : {nmi:.4f}  (1=perfect, 0=none)")
+#     else:
+#         log.warning(
+#             f"Only {n_compared} features remain after filtering for ARI/NMI — "
+#             "skipping calculation."
+#         )
+
+#     return {
+#         "counts_df": counts_df,
+#         "row_normalized_df": row_normalized_df,
+#         "pathway_stats_df": pathway_stats_df,
+#         "enrichment_df": enrichment_df,
+#         "fig_counts": fig_counts,
+#         "fig_normalized": fig_normalized,
+#         "ari": ari,
+#         "nmi": nmi,
+#         "n_features_compared": n_compared,
+#     }
+
+# --------------------------------------------------------------------------- #
+# 1. Universe construction & filtering                                        #
+# --------------------------------------------------------------------------- #
 def _explode_node_pathways(
     node_df: pd.DataFrame,
-    feature_id_col: str | None = None,
-    pathway_col: str = "modelseed_pathway",
-    submodule_col: str = "submodule",
+    pathway_col: str,
+    group_col: str,
     pathway_sep: str = ";",
     missing_token: str = "Unassigned",
     exclude_nopathway: bool = False,
     nopathway_prefix: str = "NOPATHWAY_",
 ) -> pd.DataFrame:
-    """Explode node_df's pathway_sep-joined pathway column into long format.
+    """Explode semicolon-joined pathway annotations into long format:
+    one row per (feature_id, pathway, group)."""
+    df = node_df.reset_index().rename(columns={node_df.index.name or "index": "feature_id"})
+    df = df[["feature_id", pathway_col, group_col]].dropna(subset=[pathway_col, group_col])
+    df = df[
+        (df[pathway_col].astype(str).str.strip() != "")
+        & (df[pathway_col] != missing_token)
+        & (df[group_col] != missing_token)
+    ]
 
-    Returns one row per (feature, pathway) pair, each carrying its submodule.
-    Rows with a missing/"Unassigned" pathway or submodule are dropped, since
-    they don't contribute to a pathway x submodule grouping.
-
-    This is the single source of truth for (feature, pathway, submodule)
-    membership -- both `build_pathway_submodule_matrices` (counts/heatmaps)
-    and `compute_pathway_submodule_enrichment` (hypergeometric stats) call
-    this same function with the same arguments, guaranteeing the plotted
-    matrix and the significance test always agree on what "belongs" where.
-    """
-    df = node_df.copy()
-
-    if feature_id_col is None:
-        df = df.reset_index().rename(columns={df.index.name or "index": "feature_id"})
-        feature_id_col = "feature_id"
-    elif feature_id_col not in df.columns:
-        raise KeyError(f"feature_id_col '{feature_id_col}' not found in node_df columns or index.")
-
-    df = df[[feature_id_col, pathway_col, submodule_col]].dropna(subset=[pathway_col, submodule_col])
-    df = df[df[pathway_col].astype(str).str.strip() != ""]
-    df = df[df[pathway_col] != missing_token]
-    df = df[df[submodule_col] != missing_token]
-
-    exploded = df.assign(
-        **{pathway_col: df[pathway_col].str.split(pathway_sep)}
-    ).explode(pathway_col)
+    exploded = df.assign(**{pathway_col: df[pathway_col].str.split(pathway_sep)}).explode(pathway_col)
     exploded[pathway_col] = exploded[pathway_col].str.strip()
     exploded = exploded[exploded[pathway_col] != ""]
 
     if exclude_nopathway:
-        n_before = exploded[pathway_col].nunique()
+        n0 = exploded[pathway_col].nunique()
         exploded = exploded[~exploded[pathway_col].str.startswith(nopathway_prefix)]
-        n_after = exploded[pathway_col].nunique()
-        log.info(
-            f"Excluded {n_before - n_after} placeholder '{nopathway_prefix}*' pathways "
-            f"({n_after} real pathways remain)."
-        )
+        log.info(f"exclude_nopathway: dropped {n0 - exploded[pathway_col].nunique()} placeholder pathways.")
 
-    return exploded.rename(
-        columns={feature_id_col: "feature_id", pathway_col: "pathway", submodule_col: "submodule"}
-    )
+    return exploded.rename(columns={pathway_col: "pathway", group_col: "group"})[["feature_id", "pathway", "group"]]
 
 
-def compute_submodule_sizes(
+def _prepare_universe(
     node_df: pd.DataFrame,
-    feature_id_col: str | None = None,
-    submodule_col: str = "submodule",
-    missing_token: str = "Unassigned",
-) -> pd.Series:
-    """Count unique features assigned to each submodule.
-
-    Uses each feature's single `submodule_col` assignment directly (not the
-    exploded pathway table), since submodule membership is 1:1 per feature --
-    counting via the exploded table would inflate sizes for features that
-    belong to multiple pathways.
-
-    Parameters
-    ----------
-    node_df : pd.DataFrame
-        Node table with `submodule_col`. Feature id may be the index or a
-        named column (see `feature_id_col`).
-    feature_id_col : str, optional
-        Column name for feature id. If None, uses `node_df.index`.
-    missing_token : str
-        Sentinel value indicating "no submodule assigned"; excluded from counts.
-
-    Returns
-    -------
-    pd.Series
-        Index: submodule name. Values: number of unique features, sorted descending.
-    """
-    df = node_df.copy()
-
-    if feature_id_col is None:
-        df = df.reset_index().rename(columns={df.index.name or "index": "feature_id"})
-        feature_id_col = "feature_id"
-    elif feature_id_col not in df.columns:
-        raise KeyError(f"feature_id_col '{feature_id_col}' not found in node_df columns or index.")
-
-    df = df.dropna(subset=[submodule_col])
-    df = df[df[submodule_col] != missing_token]
-
-    return (
-        df.groupby(submodule_col)[feature_id_col]
-        .nunique()
-        .sort_values(ascending=False)
-        .rename("n_features")
-    )
-
-
-def _resolve_qualifying_submodules(
-    node_df: pd.DataFrame,
-    feature_id_col: str | None,
-    submodule_col: str,
+    pathway_col: str,
+    group_col: str,
+    pathway_sep: str,
     missing_token: str,
-    min_submodule_size: int,
-) -> list[str] | None:
-    """Shared min_submodule_size resolution used by both the matrix builder
-    and the enrichment test, so both apply the identical submodule filter.
-
-    Returns None if min_submodule_size <= 0 (no filtering).
-    """
-    if min_submodule_size <= 0:
-        return None
-
-    submodule_sizes = compute_submodule_sizes(
-        node_df, feature_id_col=feature_id_col, submodule_col=submodule_col, missing_token=missing_token
-    )
-    qualifying = submodule_sizes[submodule_sizes >= min_submodule_size].index.tolist()
-    n_dropped = submodule_sizes.shape[0] - len(qualifying)
-    if n_dropped:
-        log.info(
-            f"Dropped {n_dropped} submodule(s) with fewer than {min_submodule_size} features "
-            f"({len(qualifying)} submodule(s) remain)."
-        )
-    if not qualifying:
-        raise ValueError(
-            f"No submodules meet min_submodule_size={min_submodule_size}; "
-            f"largest submodule has {submodule_sizes.max() if not submodule_sizes.empty else 0} features."
-        )
-    return qualifying
-
-
-def build_pathway_submodule_matrices(
-    node_df: pd.DataFrame,
-    quant_df: pd.DataFrame | None = None,
-    feature_id_col: str | None = None,
-    pathway_col: str = "modelseed_pathway",
-    submodule_col: str = "submodule",
-    pathway_sep: str = ";",
-    missing_token: str = "Unassigned",
-    exclude_nopathway: bool = False,
-    nopathway_prefix: str = "NOPATHWAY_",
-    top_n: int = 100,
-    rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
-    min_submodule_size: int = 0,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
-    """Build pathway x submodule count matrices, restricted to the top-N pathways.
-
-    Parameters
-    ----------
-    node_df : pd.DataFrame
-        Feature-level table with pathway and submodule columns.
-    quant_df : pd.DataFrame, optional
-        Feature x comparison LFC table, required when `rank_by="cumulative_abs_lfc"`.
-    feature_id_col, pathway_col, submodule_col, pathway_sep, missing_token,
-    exclude_nopathway, nopathway_prefix : see `_explode_node_pathways`.
-    top_n : int
-        Number of top-ranked pathways to keep in the returned matrices.
-    rank_by : {"n_features", "cumulative_abs_lfc"}
-        Ranking metric for pathway selection.
-    min_submodule_size : int
-        Minimum number of unique features a submodule must contain (across the
-        whole `node_df`, independent of pathway membership) to be included in
-        the output matrices. Submodules below this threshold are dropped
-        entirely -- both their columns AND any features belonging to them --
-        before pathway ranking/top-N selection, so the reported pathway stats
-        and heatmap are self-consistent. Set to 0 (default) to disable.
-
-    Returns
-    -------
-    counts_df : pd.DataFrame
-        Top-N pathways (rows) x qualifying submodules (columns), raw feature counts.
-    row_normalized_df : pd.DataFrame
-        Same shape, each row divided by its row sum.
-    pathway_stats_df : pd.DataFrame
-        Full (pre-top_n-filter) per-pathway stats table, computed only from
-        features in qualifying submodules.
-    submodule_datatype_labels : pd.Series
-        Index = submodule name, values = compact per-datatype feature count string
-        (e.g. ``"tx:42 mx:18"``).  Computed from all features in each qualifying
-        submodule (not just those with pathway annotations).
-    """
-    if rank_by == "cumulative_abs_lfc" and quant_df is None:
-        raise ValueError("quant_df is required when rank_by='cumulative_abs_lfc'.")
-
+    exclude_nopathway: bool,
+    nopathway_prefix: str,
+    bipartite_only: bool,
+    min_features_per_pathway: int,
+    min_features_per_group: int,
+) -> pd.DataFrame:
+    """Step 1: build and filter the (feature, pathway, group) universe used
+    by every downstream calculation. Order: explode -> bipartite -> min
+    pathway size -> min group size (group size always computed from the
+    WHOLE node table, independent of pathway annotation)."""
     exploded = _explode_node_pathways(
-        node_df,
-        feature_id_col=feature_id_col,
-        pathway_col=pathway_col,
-        submodule_col=submodule_col,
-        pathway_sep=pathway_sep,
-        missing_token=missing_token,
-        exclude_nopathway=exclude_nopathway,
-        nopathway_prefix=nopathway_prefix,
+        node_df, pathway_col, group_col, pathway_sep, missing_token, exclude_nopathway, nopathway_prefix
     )
+
+    if bipartite_only:
+        prefixes = _detect_dtype_prefixes(exploded["feature_id"])
+        if len(prefixes) < 2:
+            log.warning(f"bipartite_only=True but <2 datatypes detected ({prefixes}); skipping.")
+        else:
+            dtype = exploded["feature_id"].astype(str).str.split("_", n=1).str[0]
+            covered = dtype.groupby(exploded["pathway"]).nunique()
+            keep = covered[covered >= len(prefixes)].index
+            n0 = exploded["pathway"].nunique()
+            exploded = exploded[exploded["pathway"].isin(keep)]
+            log.info(f"bipartite_only: kept {exploded['pathway'].nunique()} of {n0} pathways spanning {prefixes}.")
+
+    if min_features_per_pathway > 0:
+        sizes = exploded.groupby("pathway")["feature_id"].nunique()
+        exploded = exploded[exploded["pathway"].isin(sizes[sizes >= min_features_per_pathway].index)]
+
+    if min_features_per_group > 0:
+        all_sizes = node_df[group_col].value_counts()
+        keep_groups = all_sizes[all_sizes >= min_features_per_group].index
+        exploded = exploded[exploded["group"].isin(keep_groups)]
 
     if exploded.empty:
-        raise ValueError("No (feature, pathway, submodule) rows remain after filtering; check inputs.")
-
-    qualifying_submodules = _resolve_qualifying_submodules(
-        node_df, feature_id_col, submodule_col, missing_token, min_submodule_size
-    )
-    if qualifying_submodules is not None:
-        exploded = exploded[exploded["submodule"].isin(qualifying_submodules)]
-        if exploded.empty:
-            raise ValueError(
-                "No (feature, pathway, submodule) rows remain after applying min_submodule_size filter."
-            )
-
-    # --- Per-pathway stats (computed only from features in qualifying submodules) ---
-    stats = exploded.groupby("pathway")["feature_id"].nunique().rename("n_features").to_frame()
-
-    # --- Per-pathway per-datatype feature counts ---
-    # Detect data-type prefixes from feature IDs (e.g. "tx_", "mx_", "px_")
-    all_feature_ids = exploded["feature_id"].astype(str)
-    detected_prefixes = sorted({fid.split("_")[0] + "_" for fid in all_feature_ids if "_" in fid})
-    if detected_prefixes:
-        exploded_copy = exploded.copy()
-        exploded_copy["_dtype"] = all_feature_ids.str.split("_").str[0]
-        dtype_counts = (
-            exploded_copy.groupby(["pathway", "_dtype"])["feature_id"]
-            .nunique()
-            .unstack(fill_value=0)
-        )
-        # Build compact label: "tx:12 mx:5" (only include types with >0 features)
-        def _make_label(row: pd.Series) -> str:
-            parts = [f"{dtype}:{int(row[dtype])}" for dtype in sorted(row.index) if row[dtype] > 0]
-            return " ".join(parts)
-        stats["datatype_label"] = dtype_counts.reindex(stats.index, fill_value=0).apply(_make_label, axis=1)
-    else:
-        stats["datatype_label"] = ""
-
-    if rank_by == "cumulative_abs_lfc" or quant_df is not None:
-        feature_scores = compute_feature_lfc_scores(quant_df)
-        missing_features = set(exploded["feature_id"]) - set(feature_scores.index)
-        if missing_features:
-            log.warning(
-                f"{len(missing_features)} features in node_df are missing from quant_df "
-                f"and will be scored as 0 for cumulative_abs_lfc ranking "
-                f"(e.g. {sorted(missing_features)[:5]})."
-            )
-        exploded = exploded.assign(
-            feature_lfc_score=exploded["feature_id"].map(feature_scores).fillna(0.0)
-        )
-        cum_lfc = exploded.groupby("pathway")["feature_lfc_score"].sum().rename("cumulative_abs_lfc")
-        stats = stats.join(cum_lfc, how="left")
-
-    pathway_stats_df = stats.reset_index().sort_values(rank_by, ascending=False).reset_index(drop=True)
-
-    # --- Select top N pathways, then build the crosstab ---
-    top_pathways = pathway_stats_df.head(top_n)["pathway"].tolist()
-    exploded_top = exploded[exploded["pathway"].isin(top_pathways)]
-
-    counts_df = pd.crosstab(exploded_top["pathway"], exploded_top["submodule"])
-    counts_df = counts_df.reindex(index=top_pathways)  # preserve rank order
-
-    row_normalized_df = counts_df.div(counts_df.sum(axis=1), axis=0)
-
-    # --- Per-submodule per-datatype feature counts (column labels) ---
-    # Use node_df directly so ALL features in each group are counted,
-    # not just those that have pathway annotations.
-    fid_col = feature_id_col if feature_id_col is not None else (
-        "feature_id" if "feature_id" in node_df.columns else node_df.index.name or "feature_id"
-    )
-    if fid_col in node_df.columns:
-        node_fids = node_df[fid_col].astype(str)
-    else:
-        node_fids = node_df.index.astype(str)
-
-    sub_col_name = submodule_col if submodule_col in node_df.columns else "submodule"
-    if sub_col_name not in node_df.columns:
-        submodule_datatype_labels = pd.Series(dtype=str)
-    else:
-        node_work = node_df[[sub_col_name]].copy()
-        node_work["_fid"] = node_fids.values
-        node_work["_dtype"] = node_work["_fid"].str.split("_").str[0]
-
-        # Restrict to qualifying submodules (same filter as the heatmap columns)
-        qualifying_cols = set(counts_df.columns)
-        node_work = node_work[node_work[sub_col_name].isin(qualifying_cols)]
-
-        sub_dtype_counts = (
-            node_work.groupby([sub_col_name, "_dtype"])["_fid"]
-            .nunique()
-            .unstack(fill_value=0)
-        )
-
-        def _make_col_label(row: pd.Series) -> str:
-            parts = [f"{dtype}:{int(row[dtype])}" for dtype in sorted(row.index) if row[dtype] > 0]
-            return " ".join(parts)
-
-        submodule_datatype_labels = sub_dtype_counts.apply(_make_col_label, axis=1)
-        submodule_datatype_labels.index.name = sub_col_name
+        raise ValueError("No (feature, pathway, group) rows remain after filtering; check inputs/thresholds.")
 
     log.info(
-        f"Built pathway x submodule matrix: {counts_df.shape[0]} pathways "
-        f"(top {top_n} by {rank_by}) x {counts_df.shape[1]} submodules "
-        f"(min_submodule_size={min_submodule_size})."
+        f"Universe after filtering: {exploded['feature_id'].nunique()} features, "
+        f"{exploded['pathway'].nunique()} pathways, {exploded['group'].nunique()} groups."
     )
+    return exploded
 
-    return counts_df, row_normalized_df, pathway_stats_df, submodule_datatype_labels
 
-
-def compute_pathway_submodule_enrichment(
-    node_df: pd.DataFrame,
-    counts_df: pd.DataFrame,
-    feature_id_col: str | None = None,
-    pathway_col: str = "modelseed_pathway",
-    submodule_col: str = "submodule",
-    pathway_sep: str = ";",
-    missing_token: str = "Unassigned",
-    exclude_nopathway: bool = False,
-    nopathway_prefix: str = "NOPATHWAY_",
-    min_submodule_size: int = 0,
-    fdr_method: str = "fdr_bh",
-    alpha: float = 0.05,
-) -> pd.DataFrame:
-    """Hypergeometric over-representation test for the pathway x submodule
-    pairs in `counts_df`.
-
-    Tests whether a pathway's features are enriched within a given submodule
-    more than expected by chance, given the pathway size, module size, and
-    background universe -- correcting for the size confounds that a raw
-    concentration heatmap cannot account for.
-
-    Re-derives the same exploded (feature, pathway, submodule) table and
-    min_submodule_size filtering as `build_pathway_submodule_matrices`, so
-    background sizes (M, n, N) are computed on an identical universe to
-    whatever produced `counts_df`. Pass the SAME feature_id_col/pathway_col/
-    submodule_col/pathway_sep/missing_token/exclude_nopathway/nopathway_prefix/
-    min_submodule_size arguments you used to build `counts_df`, or the two
-    will silently diverge.
-
-    Parameters
-    ----------
-    node_df : pd.DataFrame
-        The same raw node table passed to `build_pathway_submodule_matrices`.
-    counts_df : pd.DataFrame
-        Output of `build_pathway_submodule_matrices` -- top-N pathways (rows)
-        x qualifying submodules (columns). Enrichment is computed only for
-        these cells; `k` (overlap) is read directly from `counts_df` rather
-        than recomputed, guaranteeing exact agreement with the plotted matrix.
-    fdr_method : str
-        Passed to `statsmodels.stats.multitest.multipletests` (default
-        Benjamini-Hochberg FDR).
-    alpha : float
-        Significance threshold used to populate the `significant` column.
+# --------------------------------------------------------------------------- #
+# 2. Hypergeometric enrichment                                                #
+# --------------------------------------------------------------------------- #
+def compute_enrichment(exploded: pd.DataFrame, fdr_method: str = "fdr_bh", alpha: float = 0.05) -> pd.DataFrame:
+    """Hypergeometric over-representation test for every (pathway, group)
+    pair present in `exploded`. Tests, for each pair, whether the pathway's
+    features are concentrated in that group more than expected under random
+    assignment given the pathway size, group size, and total universe size.
 
     Returns
     -------
-    pd.DataFrame with columns: pathway, submodule, k, n, N, M, expected,
-    fold_enrichment, pvalue, padj, significant -- one row per (pathway,
-    submodule) cell in `counts_df`. FDR correction is applied across exactly
-    these cells (not the full, untested pathway universe).
+    pd.DataFrame with one row per (pathway, group) pair:
+        n_features_overlap        - features shared by this pathway and this group (hypergeometric "k")
+        n_features_pathway_total  - total features annotated to this pathway, universe-wide ("n")
+        n_features_group_total    - total features in this group, universe-wide ("N")
+        n_features_universe_total - total features in the filtered universe ("M")
+        expected, fold_enrichment, pvalue, padj, significant
     """
-    exploded = _explode_node_pathways(
-        node_df,
-        feature_id_col=feature_id_col,
-        pathway_col=pathway_col,
-        submodule_col=submodule_col,
-        pathway_sep=pathway_sep,
-        missing_token=missing_token,
-        exclude_nopathway=exclude_nopathway,
-        nopathway_prefix=nopathway_prefix,
-    )
+    k_df = pd.crosstab(exploded["pathway"], exploded["group"])
+    M = exploded["feature_id"].nunique()
+    n = exploded.groupby("pathway")["feature_id"].nunique().reindex(k_df.index)
+    N = exploded.groupby("group")["feature_id"].nunique().reindex(k_df.columns)
 
-    qualifying_submodules = _resolve_qualifying_submodules(
-        node_df, feature_id_col, submodule_col, missing_token, min_submodule_size
-    )
-    if qualifying_submodules is not None:
-        exploded = exploded[exploded["submodule"].isin(qualifying_submodules)]
+    n_arr, N_arr, k_arr = n.values[:, None], N.values[None, :], k_df.values
+    expected = n_arr * N_arr / M
+    fold = np.divide(k_arr, expected, out=np.zeros_like(expected, dtype=float), where=expected > 0)
+    pval = hypergeom.sf(k_arr - 1, M, n_arr, N_arr)
 
-    universe = exploded[["feature_id", "submodule"]].drop_duplicates()
-    M = universe["feature_id"].nunique()
-    module_sizes = universe.groupby("submodule")["feature_id"].nunique()
-    pathway_sizes = exploded.groupby("pathway")["feature_id"].nunique()
-
-    records = []
-    for pathway in counts_df.index:
-        n = pathway_sizes.get(pathway, 0)
-        for submodule in counts_df.columns:
-            N = module_sizes.get(submodule, 0)
-            if n == 0 or N == 0:
-                continue
-            k = int(counts_df.loc[pathway, submodule])
-            # P(X >= k): survival function is P(X > x), so use sf(k - 1)
-            pval = hypergeom.sf(k - 1, M, n, N)
-            expected = n * N / M
-            records.append({
-                "pathway": pathway,
-                "submodule": submodule,
-                "k": k, "n": n, "N": N, "M": M,
-                "expected": expected,
-                "fold_enrichment": (k / expected) if expected > 0 else np.nan,
-                "pvalue": pval,
-            })
-
-    result = pd.DataFrame.from_records(records)
-    reject, padj, _, _ = multipletests(result["pvalue"], alpha=alpha, method=fdr_method)
-    result["padj"] = padj
-    result["significant"] = reject
+    n_p, n_g = k_df.shape
+    result = pd.DataFrame({
+        "pathway": np.repeat(k_df.index.values, n_g),
+        "group": np.tile(k_df.columns.values, n_p),
+        "n_features_overlap": k_arr.ravel(),                     # was "k": features in both this pathway AND this group
+        "n_features_pathway_total": np.repeat(n_arr.ravel(), n_g),  # was "n": total features in this pathway (universe-wide)
+        "n_features_group_total": np.tile(N_arr.ravel(), n_p),      # was "N": total features in this group (universe-wide)
+        "n_features_universe_total": M,                             # was "M": total features in the filtered universe
+        "expected": expected.ravel(),
+        "fold_enrichment": fold.ravel(),
+        "pvalue": pval.ravel(),
+    })
+    result["padj"] = multipletests(result["pvalue"], alpha=alpha, method=fdr_method)[1]
+    result["significant"] = result["padj"] < alpha
 
     log.info(
-        f"Computed hypergeometric enrichment for {len(result)} pathway x submodule "
-        f"pairs; {result['significant'].sum()} significant at padj<{alpha} ({fdr_method})."
+        f"Tested {len(result)} pathway x group pairs; "
+        f"{int(result['significant'].sum())} significant at padj<{alpha} ({fdr_method})."
     )
-
     return result.sort_values("padj").reset_index(drop=True)
 
-def add_significance_annotations(
+
+# --------------------------------------------------------------------------- #
+# 4a. Pathway selection for display                                           #
+# --------------------------------------------------------------------------- #
+def select_top_pathways(
+    exploded: pd.DataFrame,
+    enrichment_df: pd.DataFrame,
+    quant_df: pd.DataFrame | None,
+    top_n: int,
+    rank_by: Literal["n_features", "summed_significance", "mean_abs_value"],
+) -> list[str]:
+    """Rank pathways for heatmap *display only* -- this never affects the
+    stats test or export (that's governed by `min_features_per_pathway` and
+    the significance axis filter upstream).
+
+    rank_by:
+        "n_features"          -- most annotated features.
+        "summed_significance" -- highest sum of -log10(padj) across all its
+                                  group pairs (pathways strongly concentrated
+                                  in one or more groups).
+        "mean_abs_value"      -- highest mean(|value|) across all samples/
+                                  comparisons, averaged over its features
+                                  (pathways whose features change the most).
+                                  Requires `quant_df` (features x samples or
+                                  features x comparisons).
+    """
+    if rank_by == "n_features":
+        score = exploded.groupby("pathway")["feature_id"].nunique()
+    elif rank_by == "summed_significance":
+        neg_log_padj = -np.log10(enrichment_df["padj"].clip(lower=1e-300))
+        score = neg_log_padj.groupby(enrichment_df["pathway"]).sum()
+    elif rank_by == "mean_abs_value":
+        if quant_df is None:
+            raise ValueError("quant_df is required when rank_by='mean_abs_value'.")
+        feature_score = quant_df.abs().mean(axis=1)
+        score = exploded.assign(_s=exploded["feature_id"].map(feature_score)).groupby("pathway")["_s"].mean()
+    else:
+        raise ValueError(f"Unknown rank_by: {rank_by!r}")
+
+    return score.sort_values(ascending=False).head(top_n).index.tolist()
+
+
+# --------------------------------------------------------------------------- #
+# 4b. Matrix builders                                                         #
+# --------------------------------------------------------------------------- #
+def _build_group_pathway_matrices(
+    exploded: pd.DataFrame, groups: list[str], pathways: list[str]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Group (rows) x pathway (cols) raw counts and row-normalized fractions."""
+    sub = exploded[exploded["pathway"].isin(pathways) & exploded["group"].isin(groups)]
+    counts = pd.crosstab(sub["group"], sub["pathway"]).reindex(index=groups, columns=pathways, fill_value=0)
+    row_sums = counts.sum(axis=1).replace(0, np.nan)
+    row_normalized = counts.div(row_sums, axis=0).fillna(0.0)
+    return counts, row_normalized
+
+
+def build_enrichment_matrix(
+    enrichment_df: pd.DataFrame,
+    reference_df: pd.DataFrame,
+    value: Literal["fold_enrichment", "neg_log10_padj"] = "fold_enrichment",
+) -> pd.DataFrame:
+    """Pivot the long-format enrichment table into a group x pathway heat
+    matrix aligned to `reference_df`'s index/columns (post-selection)."""
+    if enrichment_df.empty:
+        return pd.DataFrame(0.0, index=reference_df.index, columns=reference_df.columns)
+
+    df = enrichment_df.copy()
+    df["_v"] = df["fold_enrichment"] if value == "fold_enrichment" else -np.log10(df["padj"].clip(lower=1e-300))
+    mat = df.pivot(index="group", columns="pathway", values="_v")
+    return mat.reindex(index=reference_df.index, columns=reference_df.columns, fill_value=0.0).fillna(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# 4c. Datatype composition color strips (replaces old text tick labels)       #
+# --------------------------------------------------------------------------- #
+def _detect_dtype_prefixes(feature_ids) -> list[str]:
+    ids = pd.Index(feature_ids).astype(str)
+    return sorted({fid.split("_", 1)[0] for fid in ids if "_" in fid})
+
+
+def _dtype_color_strip(
+    exploded: pd.DataFrame, id_col: Literal["group", "pathway"], id_order: list[str]
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] | tuple[None, None, None]:
+    """Build row_colors/col_colors-ready color strip plus the raw counts and
+    normalized intensities behind it (needed to overlay contrasting text).
+    Returns (colors_df, counts_df, norm_df), or (None, None, None) if <2
+    datatypes are detected."""
+    prefixes = _detect_dtype_prefixes(exploded["feature_id"])
+    if len(prefixes) < 2:
+        return None, None, None
+
+    df = exploded.copy()
+    df["_dtype"] = df["feature_id"].astype(str).str.split("_", n=1).str[0]
+    counts = df.groupby([id_col, "_dtype"])["feature_id"].nunique().unstack(fill_value=0)
+    counts = counts.reindex(index=id_order, columns=prefixes, fill_value=0)
+
+    cmap = plt.get_cmap("Greys")
+    colors, norm_vals = pd.DataFrame(index=counts.index), pd.DataFrame(index=counts.index)
+    for dtype in counts.columns:
+        vals = counts[dtype].to_numpy(dtype=float)
+        vmax = vals.max() if vals.max() > 0 else 1.0
+        normed = vals / vmax
+        colors[dtype] = [to_hex(cmap(v)) if v > 0 else "#ffffff" for v in normed]
+        norm_vals[dtype] = normed
+    return colors, counts, norm_vals
+
+
+def _annotate_dtype_counts(
+    clustergrid: sns.matrix.ClusterGrid,
+    counts_df: pd.DataFrame,
+    norm_df: pd.DataFrame,
+    order: list[str],
+    axis: Literal["row", "col"],
+    luminance_threshold: float = 0.5,
+) -> None:
+    """Overlay raw feature counts as text on the row_colors/col_colors strip,
+    switching between white/black text based on the strip's own grayscale
+    intensity so numbers stay legible on both light and dark cells.
+    """
+    ax = clustergrid.ax_row_colors if axis == "row" else clustergrid.ax_col_colors
+    if ax is None:
+        return
+    dtypes = list(counts_df.columns)
+
+    for pos, id_ in enumerate(order):
+        for level, dtype in enumerate(dtypes):
+            val = int(counts_df.loc[id_, dtype])
+            if val == 0:
+                continue
+            txt_color = "white" if norm_df.loc[id_, dtype] > luminance_threshold else "black"
+            x, y = (level, pos) if axis == "row" else (pos, level)
+            ax.text(x + 0.5, y + 0.5, str(val), ha="center", va="center", fontsize=6, color=txt_color)
+
+
+# --------------------------------------------------------------------------- #
+# 4d. Significance star overlay                                               #
+# --------------------------------------------------------------------------- #
+def _overlay_significance(
     clustergrid: sns.matrix.ClusterGrid,
     matrix_df: pd.DataFrame,
     enrichment_df: pd.DataFrame,
@@ -8297,671 +9668,593 @@ def add_significance_annotations(
     cluster_cols: bool,
     alpha_stars: dict[float, str] | None = None,
 ) -> None:
-    """Overlay hypergeometric significance stars on a ClusterGrid's heatmap Axes.
+    """Overlay significance stars at (group, pathway) cells. Must run before
+    `.figure` is extracted -- dendrogram reordering only exists on the
+    ClusterGrid itself."""
+    _ALPHA_STARS_DEFAULT = {0.001: "***", 0.01: "**", 0.05: "*"}
+    alpha_stars = alpha_stars or _ALPHA_STARS_DEFAULT
+    padj = enrichment_df.set_index(["group", "pathway"])["padj"]
 
-    Must be called BEFORE the ClusterGrid's `.figure` is extracted/returned --
-    dendrogram reordering (`reordered_ind`) only exists on the ClusterGrid
-    object itself, not on the plain Figure.
-
-    Parameters
-    ----------
-    clustergrid : sns.matrix.ClusterGrid
-        Object returned directly by `sns.clustermap(...)`, before `.figure`
-        is accessed.
-    matrix_df : pd.DataFrame
-        The exact dataframe passed into that `sns.clustermap` call
-        (`counts_df` or `row_normalized_df`) -- used to map reordered
-        positions back to (pathway, submodule) labels.
-    enrichment_df : pd.DataFrame
-        Output of `compute_pathway_submodule_enrichment`.
-    cluster_rows, cluster_cols : bool
-        Whether clustering was enabled for this call. When False,
-        `clustergrid.dendrogram_row`/`dendrogram_col` is None, so the
-        original (unreordered) index/column order is used instead.
-    alpha_stars : dict[float, str], optional
-        Mapping of padj thresholds to marker strings, checked tightest-first.
-        Defaults to {0.001: "***", 0.01: "**", 0.05: "*"}.
-    """
-    if alpha_stars is None:
-        alpha_stars = {0.001: "***", 0.01: "**", 0.05: "*"}
-
-    padj_lookup = enrichment_df.set_index(["pathway", "submodule"])["padj"]
-
-    row_order = (
-        clustergrid.dendrogram_row.reordered_ind if cluster_rows else range(len(matrix_df.index))
-    )
-    col_order = (
-        clustergrid.dendrogram_col.reordered_ind if cluster_cols else range(len(matrix_df.columns))
-    )
-
-    ordered_rows = matrix_df.index[list(row_order)]
-    ordered_cols = matrix_df.columns[list(col_order)]
+    row_idx = clustergrid.dendrogram_row.reordered_ind if cluster_rows else range(len(matrix_df.index))
+    col_idx = clustergrid.dendrogram_col.reordered_ind if cluster_cols else range(len(matrix_df.columns))
+    rows, cols = matrix_df.index[list(row_idx)], matrix_df.columns[list(col_idx)]
 
     ax = clustergrid.ax_heatmap
     stroke = [pe.withStroke(linewidth=1.5, foreground="black")]
-
-    for i, pathway in enumerate(ordered_rows):
-        for j, submodule in enumerate(ordered_cols):
-            padj = padj_lookup.get((pathway, submodule), np.nan)
-            if pd.isna(padj):
+    for i, g in enumerate(rows):
+        for j, p in enumerate(cols):
+            val = padj.get((g, p), np.nan)
+            if pd.isna(val):
                 continue
             for thresh, stars in sorted(alpha_stars.items()):
-                if padj < thresh:
-                    ax.text(
-                        j + 0.5, i + 0.7, stars,
-                        ha="center", va="center",
-                        color="white", fontsize=8, fontweight="bold",
-                        path_effects=stroke,
-                    )
+                if val < thresh:
+                    ax.text(j + 0.5, i + 0.7, stars, ha="center", va="center",
+                            color="white", fontsize=8, fontweight="bold", path_effects=stroke)
                     break
 
 
-def plot_pathway_submodule_clustermaps(
+def _finish_panel(g, df, title, enrichment_df, cluster_rows, cluster_cols, alpha_stars):
+    #g.ax_heatmap.set_xlabel("Pathway")
+    #g.ax_heatmap.set_ylabel("Feature group")
+    g.ax_heatmap.tick_params(labelsize=7)
+    if not enrichment_df.empty:
+        _overlay_significance(g, df, enrichment_df, cluster_rows, cluster_cols, alpha_stars)
+        title += "\n* padj<0.05  ** padj<0.01  *** padj<0.001 (hypergeometric, BH-FDR)"
+    g.figure.suptitle(title, y=1.02, fontsize=10)
+
+
+# --------------------------------------------------------------------------- #
+# 4. Plotting                                                                 #
+# --------------------------------------------------------------------------- #
+
+def _clustered_order(df: pd.DataFrame, axis: Literal["rows", "cols"], cluster: bool, method: str, metric: str) -> list[str]:
+    """Return row or column labels in dendrogram-leaf order (or original
+    order if clustering is disabled). Uses the same method/metric as
+    `plot_group_pathway_heatmaps` so the leaf order is guaranteed identical."""
+    from scipy.cluster.hierarchy import dendrogram
+
+    labels = list(df.index) if axis == "rows" else list(df.columns)
+    if not cluster:
+        return labels
+    data = df.values if axis == "rows" else df.values.T
+    link = linkage(data, method=method, metric=metric)
+    leaves = dendrogram(link, no_plot=True)["leaves"]
+    return [labels[i] for i in leaves]
+
+
+def _compute_group_trend_rgba(
+    node_df: pd.DataFrame,
+    abundance_df: pd.DataFrame,
+    group_col: str,
+    row_order: list[str],
+    columns: list[str],
+    column_members: dict[str, list[str]] | None = None,
+    feature_id_col: str | None = None,
+    agg: Literal["mean", "median"] = "median",
+    dispersion: Literal["sem", "std", "iqr", "none"] = "iqr",
+    dispersion_norm: Literal["global", "row"] = "global",
+    cmap: str = "RdBu_r",
+    vmax: float | Literal["auto"] = "auto",
+    min_alpha: float = 0.25,
+    max_alpha: float = 1.0,
+) -> np.ndarray:
+    """Build an (n_groups, n_columns, 4) RGBA array via a strict two-stage
+    aggregation with no other data transformation:
+
+      1. Collapse samples per feature: for each raw feature and each
+         sample-group column, `agg` across that column's member samples.
+      2. Collapse features per feature-group: for each row in `row_order`,
+         `agg` across that group's features, using the already
+         sample-collapsed values from step 1 (not the raw values).
+
+    `row_order` MUST match the heatmap panel's own clustered row order
+    exactly, so the track's rows line up with the main heatmap's rows.
+    `column_members`, if given, maps each entry in `columns` to the raw
+    `abundance_df` column labels it pools for step 1; if None, each entry
+    in `columns` is a literal `abundance_df` column label (no pooling).
+    """
+    node = node_df.copy()
+    if feature_id_col is not None:
+        node = node.set_index(feature_id_col)
+    groups_series = node[group_col].astype(str)
+
+    member_cols = [column_members[c] for c in columns] if column_members is not None else [[c] for c in columns]
+    all_raw_cols = sorted({c for members in member_cols for c in members})
+    abundance_sub = abundance_df.reindex(columns=all_raw_cols)
+    agg_fn = np.nanmean if agg == "mean" else np.nanmedian
+
+    # --- Stage 1: collapse samples, per feature, per sample-group column ---
+    collapsed = pd.DataFrame(
+        {col: agg_fn(abundance_sub[members].values, axis=1) for col, members in zip(columns, member_cols)},
+        index=abundance_sub.index,
+    )
+
+    def _disp(vals: np.ndarray) -> float:
+        vals = vals[~np.isnan(vals)]
+        if len(vals) < 2 or dispersion == "none":
+            return 0.0
+        if dispersion == "sem":
+            return float(np.std(vals, ddof=1) / np.sqrt(len(vals)))
+        if dispersion == "std":
+            return float(np.std(vals, ddof=1))
+        if dispersion == "iqr":
+            q75, q25 = np.percentile(vals, [75, 25])
+            return float(q75 - q25)
+        raise ValueError(f"Unknown dispersion: {dispersion!r}")
+
+    value_mat = np.full((len(row_order), len(columns)), np.nan)
+    disp_mat = np.zeros_like(value_mat)
+
+    for i, group in enumerate(row_order):
+        feat_ids = [f for f in groups_series[groups_series == group].index if f in collapsed.index]
+        sub = collapsed.loc[feat_ids]
+        if sub.empty:
+            continue
+        # --- Stage 2: collapse features, per feature-group, per sample-group column ---
+        value_mat[i, :] = agg_fn(sub.values, axis=0)
+        disp_mat[i, :] = [_disp(sub.values[:, j]) for j in range(sub.shape[1])]
+
+    resolved_vmax = max(np.nanmax(np.abs(value_mat)) if vmax == "auto" else vmax, 1e-6)
+    norm = TwoSlopeNorm(vmin=-resolved_vmax, vcenter=0.0, vmax=resolved_vmax)
+    rgba = cm.get_cmap(cmap)(norm(np.nan_to_num(value_mat, nan=0.0)))
+
+    if dispersion != "none":
+        if dispersion_norm == "row":
+            d_max = np.nanmax(disp_mat, axis=1, keepdims=True)
+            d_max = np.where(d_max > 0, d_max, 1.0)
+        else:
+            d_max = max(np.nanmax(disp_mat), 1e-9)
+        d_norm = np.clip(disp_mat / d_max, 0, 1)
+        alpha = max_alpha - d_norm * (max_alpha - min_alpha)
+    else:
+        alpha = np.full_like(value_mat, max_alpha)
+    rgba[..., 3] = np.where(np.isnan(value_mat), 0.0, alpha)
+    return rgba
+
+
+def _measure_ticklabel_right_edge(ax: plt.Axes) -> float:
+    """Rightmost extent (figure-fraction x) of an axes' rendered y-tick
+    labels. Forces a canvas draw so text layout/width is accurate rather
+    than guessed."""
+    fig = ax.figure
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    extents = [t.get_window_extent(renderer=renderer) for t in ax.get_yticklabels() if t.get_text()]
+    if not extents:
+        return ax.get_position().x1
+    max_x_display = max(e.x1 for e in extents)
+    return fig.transFigure.inverted().transform((max_x_display, 0))[0]
+
+
+def _add_row_trend_track(
+    clustergrid: sns.matrix.ClusterGrid,
+    rgba: np.ndarray,
+    columns: list[str],
+    width: float = 0.12,
+    pad: float = 0.01,
+    xtick_rotation: float = 90,
+    max_xticks: int = 10,
+    label: str = "Median\nabundance",
+) -> plt.Axes:
+    """Attach a thin per-row trend heat-strip immediately to the right of a
+    ClusterGrid's row tick labels, sharing `ax_heatmap`'s exact row (y)
+    extent so rows line up. Must be called after `sns.clustermap` returns
+    and after row tick labels are finalized (i.e. after `_finish_panel` /
+    `_annotate_strips`)."""
+    fig = clustergrid.figure
+    heat_pos = clustergrid.ax_heatmap.get_position()
+    label_edge = _measure_ticklabel_right_edge(clustergrid.ax_heatmap)
+
+    ax = fig.add_axes([label_edge + pad, heat_pos.y0, width, heat_pos.height])
+    ax.imshow(rgba, aspect="auto", interpolation="nearest")
+    ax.set_yticks([])
+    ax.yaxis.set_visible(False)
+
+    step = max(1, len(columns) // max_xticks)
+    tick_pos = list(range(0, len(columns), step))
+    ax.set_xticks(tick_pos)
+    ax.set_xticklabels([columns[i] for i in tick_pos], rotation=xtick_rotation, fontsize=5, ha="right")
+    ax.set_title(label, fontsize=7, pad=4)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    return ax
+
+def _resolve_trend_column_groups(
+    abundance_df: pd.DataFrame,
+    metadata: pd.DataFrame | pd.Series | None,
+    sort_by: str | None,
+    collapse_by: str | None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Resolve the trend track's x-axis columns.
+
+    If `collapse_by` is given, samples are pooled into one column per unique
+    metadata category (e.g. "timepoint" values collapse all replicate
+    samples into a single column per timepoint) -- categories ordered by the
+    mean `sort_by` rank of their member samples if `sort_by` is also given,
+    else by first appearance. Otherwise, one column per raw sample, ordered
+    by `sort_by` if given.
+
+    Returns
+    -------
+    (column_labels, members) : `column_labels` is the ordered x-axis label
+    list (sample IDs, or metadata category names if collapsed); `members`
+    maps each label to the raw sample columns to pool for it (a single-item
+    list when uncollapsed).
+    """
+    samples = list(abundance_df.columns)
+
+    if collapse_by is not None:
+        if metadata is None:
+            raise ValueError("`metadata` is required when a collapse-by category is set.")
+        cat_df = metadata if isinstance(metadata, pd.DataFrame) else metadata.to_frame(collapse_by)
+        if collapse_by not in cat_df.columns:
+            raise ValueError(f"'{collapse_by}' not found in metadata columns: {cat_df.columns.tolist()}")
+
+        cat_series = cat_df[collapse_by].reindex(samples)
+        valid = cat_series.dropna().astype(str)
+        dropped = set(samples) - set(valid.index)
+        if dropped:
+            log.warning(f"{len(dropped)} samples missing '{collapse_by}' and excluded from trend track: {sorted(dropped)[:5]}")
+
+        members: dict[str, list[str]] = {cat: g.index.tolist() for cat, g in valid.groupby(valid)}
+
+        if sort_by is not None and sort_by in cat_df.columns:
+            sort_series = cat_df[sort_by].reindex(samples)
+            rank = sort_series.rank(method="average", na_option="bottom")
+            order_key = {cat: np.mean([rank.get(s, np.inf) for s in mem]) for cat, mem in members.items()}
+            column_labels = sorted(members.keys(), key=lambda c: order_key[c])
+        else:
+            if sort_by is not None:
+                log.warning(f"'{sort_by}' not found in metadata columns; collapsed trend-track categories ordered by first appearance instead.")
+            column_labels = list(dict.fromkeys(valid.tolist()))
+
+        return column_labels, members
+
+    # --- uncollapsed: one column per raw sample ---
+    columns = samples
+    if metadata is not None and sort_by is not None:
+        meta_sort = metadata if isinstance(metadata, pd.Series) else metadata[sort_by]
+        meta_sort = meta_sort.reindex(columns)
+        columns = meta_sort.sort_values(kind="stable", na_position="last").index.tolist()
+    return columns, {c: [c] for c in columns}
+
+def plot_group_pathway_heatmaps(
     counts_df: pd.DataFrame,
     row_normalized_df: pd.DataFrame,
+    enrichment_matrix_df: pd.DataFrame,
+    enrichment_df: pd.DataFrame,
+    group_dtype_colors: pd.DataFrame | None = None,
+    group_dtype_counts: pd.DataFrame | None = None,
+    group_dtype_norm: pd.DataFrame | None = None,
+    pathway_dtype_colors: pd.DataFrame | None = None,
+    pathway_dtype_counts: pd.DataFrame | None = None,
+    pathway_dtype_norm: pd.DataFrame | None = None,
     cluster_rows: bool = True,
     cluster_cols: bool = True,
     method: str = "average",
     metric: str = "euclidean",
     counts_cmap: str = "viridis",
     normalized_cmap: str = "magma",
-    normalized_vmax: float | Literal["auto"] = "auto",
-    counts_gamma: float | None = 0.4,
-    normalized_gamma: float | None = 0.4,
-    figsize: tuple[float, float] = (20, 14),
-    output_dir: str | Path | None = None,
-    counts_filename: str = "pathway_submodule_heatmap_counts.png",
-    normalized_filename: str = "pathway_submodule_heatmap_normalized.png",
-    dpi: int = 300,
-    enrichment_df: pd.DataFrame | None = None,
+    enrichment_cmap: str = "RdBu_r",
+    enrichment_value: Literal["fold_enrichment", "neg_log10_padj"] = "fold_enrichment",
+    figsize: tuple[float, float] = (16, 10),
     alpha_stars: dict[float, str] | None = None,
-    pathway_datatype_labels: pd.Series | None = None,
-    submodule_datatype_labels: pd.Series | None = None,
-) -> tuple[plt.Figure, plt.Figure]:
-    """Plot raw-count and row-normalized pathway x submodule heatmaps with shared clustering.
+    cbar_size: tuple[float, float] = (0.015, 0.075),
+    cbar_pos_anchor: tuple[float, float] = (0.02, 0.83),
+    cbar_fontsize: float = 10.0,
+    output_dir: str | Path | None = None,
+    dpi: int = 300,
+    node_df: pd.DataFrame | None = None,
+    abundance_df: pd.DataFrame | None = None,
+    trend_metadata: pd.DataFrame | pd.Series | None = None,
+    trend_sort_by: str | None = None,
+    trend_collapse_by: str | None = None,
+    group_col: str = "group",
+    feature_id_col: str | None = None,
+    trend_agg: Literal["mean", "median"] = "median",
+    trend_dispersion: Literal["sem", "std", "iqr", "none"] = "iqr",
+    trend_dispersion_norm: Literal["global", "row"] = "global",
+    trend_cmap: str = "RdBu_r",
+    trend_vmax: float | Literal["auto"] = "auto",
+    trend_track_width: float = 0.12,
+    trend_track_pad: float = 0.01,
+    trend_max_xticks: int = 10,
+) -> dict[str, plt.Figure]:
+    """Three group(rows) x pathway(cols) heatmaps sharing one clustering:
+    raw counts, row-normalized fractions, and hypergeometric enrichment,
+    each with significance stars, optional per-datatype composition color
+    strips, and -- if `abundance_df` is given -- a thin per-row trend
+    heat-strip attached immediately right of the row labels on every panel.
+
+    The trend track shows, per feature group, `trend_agg` (default median)
+    abundance as color and internal feature agreement as opacity (via
+    `trend_dispersion`), across either raw samples or samples collapsed
+    into metadata categories.
 
     Parameters
     ----------
-    counts_df, row_normalized_df : pd.DataFrame
-        Outputs of `build_pathway_submodule_matrices`.
-    cluster_rows, cluster_cols : bool
-        Whether to hierarchically cluster rows/columns (shared linkage
-        computed from `row_normalized_df`, applied to both panels so pathway/
-        submodule ordering is identical across the two figures).
-    method, metric : str
-        Passed to `scipy.cluster.hierarchy.linkage`.
-    counts_cmap, normalized_cmap : str
-        Colormaps for each panel.
-    normalized_vmax : float or "auto"
-        Upper bound of the color scale for the row-normalized heatmap.
-        "auto" (default) uses the actual maximum value in `row_normalized_df`.
-    counts_gamma : float or None, default 0.4
-        PowerNorm gamma for the raw-count panel.  Values < 1 stretch the low
-        end of the color scale, making small counts visually distinguishable.
-        Set to None for a standard linear scale.
-    normalized_gamma : float or None, default 0.4
-        PowerNorm gamma for the row-normalized panel.  Same semantics as
-        ``counts_gamma``.  Set to None for a standard linear scale.
-    output_dir, counts_filename, normalized_filename, dpi :
-        Figure-saving options. If `output_dir` is None, figures are not saved.
-    enrichment_df : pd.DataFrame, optional
-        Output of `compute_pathway_submodule_enrichment`. If provided,
-        significance stars are overlaid on both panels.
-    alpha_stars : dict[float, str], optional
-        padj threshold -> marker string for the significance overlay.
-    pathway_datatype_labels : pd.Series, optional
-        Index = pathway name, values = compact label string (e.g. ``"tx:12 mx:5"``).
-        When provided, a narrow text column is rendered between the row
-        dendrogram and the heatmap on both panels, showing the per-datatype
-        feature breakdown for each pathway row in its clustered order.
-    submodule_datatype_labels : pd.Series, optional
-        Index = submodule name, values = compact label string (e.g. ``"tx:42 mx:18"``).
-        When provided, a narrow text row is rendered below the column dendrogram
-        on both panels, showing the per-datatype feature breakdown for each
-        submodule column in its clustered order.
-
-    Returns
-    -------
-    (fig_counts, fig_normalized) : tuple[plt.Figure, plt.Figure]
+    counts_df, row_normalized_df, enrichment_matrix_df, enrichment_df :
+        See prior versions -- group(rows) x pathway(cols) matrices and the
+        long-format hypergeometric test output.
+    cbar_size : (width, height)
+        Figure-fraction size of each panel's colorbar box.
+    cbar_pos_anchor : (left, bottom)
+        Figure-fraction anchor position of each panel's colorbar box.
+    cbar_fontsize : float
+        Font size for colorbar tick labels (kept small/unobtrusive).
+    node_df, abundance_df : pd.DataFrame, optional
+        `node_df` (with `group_col`) and a features x samples abundance
+        matrix. If either is None, no trend track is drawn.
+    trend_metadata : pd.DataFrame or pd.Series, optional
+        Sample metadata indexed like `abundance_df.columns`. Required if
+        `trend_sort_by` and/or `trend_collapse_by` are set.
+    trend_sort_by : str, optional
+        Metadata column to order the trend track's columns by. If
+        `trend_collapse_by` is also set, categories are ordered by the mean
+        rank of their member samples under this column; otherwise, raw
+        samples are sorted directly by this column.
+    trend_collapse_by : str, optional
+        Metadata column to POOL samples by (e.g. "timepoint" or
+        "treatment") -- all replicate samples sharing a category become one
+        trend-track column, pooling every value from every feature in the
+        group AND every sample in that category together for both the
+        color (agg) and opacity (dispersion) statistics. None keeps one
+        column per raw sample.
+    group_col, feature_id_col :
+        Identify each row's feature membership in `node_df` -- must match
+        whatever grouping produced `counts_df`/`row_normalized_df`.
+    trend_agg, trend_dispersion, trend_dispersion_norm, trend_cmap, trend_vmax :
+        See `_compute_group_trend_rgba`.
+    trend_track_width, trend_track_pad, trend_max_xticks :
+        Layout of the attached track (figure-fraction width, gap past the
+        row labels, and x-tick density).
     """
-    row_linkage = linkage(row_normalized_df.values, method=method, metric=metric) if cluster_rows else None
-    col_linkage = linkage(row_normalized_df.values.T, method=method, metric=metric) if cluster_cols else None
-
-    common_kwargs = dict(
-        row_linkage=row_linkage,
-        col_linkage=col_linkage,
-        row_cluster=cluster_rows,
-        col_cluster=cluster_cols,
-        figsize=figsize,
-        dendrogram_ratio=(0.15, 0.1),
-        cbar_pos=(0.02, 0.83, 0.03, 0.15),
+    row_link = linkage(row_normalized_df.values, method=method, metric=metric) if cluster_rows else None
+    col_link = linkage(row_normalized_df.values.T, method=method, metric=metric) if cluster_cols else None
+    cbar_pos = (*cbar_pos_anchor, *cbar_size)
+    common = dict(
+        row_linkage=row_link, col_linkage=col_link, row_cluster=cluster_rows, col_cluster=cluster_cols,
+        figsize=figsize, dendrogram_ratio=(0.12, 0.12), cbar_pos=cbar_pos,
+        row_colors=group_dtype_colors, col_colors=pathway_dtype_colors, colors_ratio=0.02,
     )
 
-    # --- Counts panel ---
-    counts_vmax = counts_df.values.max() if counts_df.values.max() > 0 else 1
-    counts_norm_kwargs: dict = {}
-    if counts_gamma is not None:
-        counts_norm_kwargs["norm"] = PowerNorm(gamma=counts_gamma, vmin=0, vmax=counts_vmax)
-    else:
-        counts_norm_kwargs["vmin"] = 0
-        counts_norm_kwargs["vmax"] = counts_vmax
+    row_order = _clustered_order(row_normalized_df, "rows", cluster_rows, method, metric)
+    col_order = _clustered_order(row_normalized_df, "cols", cluster_cols, method, metric)
 
-    g_counts = sns.clustermap(
-        counts_df,
-        cmap=counts_cmap,
-        annot=False,
-        fmt="d",
-        **counts_norm_kwargs,
-        **common_kwargs,
-    )
-    g_counts.ax_heatmap.set_xlabel("Submodule")
-    g_counts.ax_heatmap.set_ylabel("Pathway")
+    def _annotate_strips(g):
+        if group_dtype_counts is not None:
+            _annotate_dtype_counts(g, group_dtype_counts, group_dtype_norm, row_order, axis="row")
+        if pathway_dtype_counts is not None:
+            _annotate_dtype_counts(g, pathway_dtype_counts, pathway_dtype_norm, col_order, axis="col")
 
-    counts_title = "Feature count per pathway x submodule"
-    if enrichment_df is not None:
-        add_significance_annotations(
-            g_counts, counts_df, enrichment_df, cluster_rows, cluster_cols, alpha_stars
+    def _shrink_cbar(g):
+        g.cax.tick_params(labelsize=cbar_fontsize)
+        if g.cax.yaxis.label.get_text():
+            g.cax.yaxis.label.set_size(cbar_fontsize)
+
+    # --- Precompute the trend track once; identical across all 3 panels since
+    #     it only depends on feature-group membership, not pathway selection ---
+    trend_rgba, trend_columns = None, None
+    if node_df is not None and abundance_df is not None:
+        trend_columns, trend_members = _resolve_trend_column_groups(
+            abundance_df, trend_metadata, trend_sort_by, trend_collapse_by
         )
-        counts_title += "\n* padj<0.05  ** padj<0.01  *** padj<0.001 (hypergeometric, BH-FDR)"
-    g_counts.figure.suptitle(counts_title, y=1.04 if enrichment_df is not None else 1.02, fontsize=10)
-
-    # --- Annotate row/column tick labels with datatype counts ---
-    _annotate_clustermap_tick_labels(
-        g_counts, counts_df,
-        row_labels=pathway_datatype_labels,
-        col_labels=submodule_datatype_labels,
-        cluster_rows=cluster_rows,
-        cluster_cols=cluster_cols,
-    )
-
-    # --- Row-normalized panel ---
-    resolved_vmax = row_normalized_df.values.max() if normalized_vmax == "auto" else normalized_vmax
-
-    norm_kwargs: dict = {}
-    if normalized_gamma is not None:
-        norm_kwargs["norm"] = PowerNorm(gamma=normalized_gamma, vmin=0, vmax=resolved_vmax)
-    else:
-        norm_kwargs["vmin"] = 0
-        norm_kwargs["vmax"] = resolved_vmax
-
-    g_norm = sns.clustermap(
-        row_normalized_df,
-        cmap=normalized_cmap,
-        annot=False,
-        fmt=".2f",
-        **norm_kwargs,
-        **common_kwargs,
-    )
-    g_norm.ax_heatmap.set_xlabel("Submodule")
-    g_norm.ax_heatmap.set_ylabel("Pathway")
-
-    if enrichment_df is not None:
-        add_significance_annotations(
-            g_norm, row_normalized_df, enrichment_df, cluster_rows, cluster_cols, alpha_stars
+        trend_rgba = _compute_group_trend_rgba(
+            node_df=node_df,
+            abundance_df=abundance_df,
+            group_col=group_col,
+            row_order=row_order,
+            columns=trend_columns,
+            column_members=trend_members,
+            feature_id_col=feature_id_col,
+            agg=trend_agg,
+            dispersion=trend_dispersion,
+            dispersion_norm=trend_dispersion_norm,
+            cmap=trend_cmap,
+            vmax=trend_vmax,
         )
 
-    g_norm.figure.suptitle("Row-normalized fraction of pathway's features per submodule", y=1.02)
+    def _attach_trend(g):
+        if trend_rgba is not None:
+            _add_row_trend_track(
+                g, trend_rgba, trend_columns,
+                width=trend_track_width, pad=trend_track_pad, max_xticks=trend_max_xticks,
+                label=f"{trend_agg.capitalize()}\nabundance",
+            )
 
-    _annotate_clustermap_tick_labels(
-        g_norm, row_normalized_df,
-        row_labels=pathway_datatype_labels,
-        col_labels=submodule_datatype_labels,
-        cluster_rows=cluster_rows,
-        cluster_cols=cluster_cols,
+    figs: dict[str, plt.Figure] = {}
+    for name, df, cmap, vmax, title in [
+        ("counts", counts_df, counts_cmap, max(counts_df.values.max(), 1), "Feature count per group x pathway"),
+        ("normalized", row_normalized_df, normalized_cmap, max(row_normalized_df.values.max(), 1e-6),
+         "Fraction of group's features per pathway"),
+    ]:
+        g = sns.clustermap(df, cmap=cmap, vmin=0, vmax=vmax, **common)
+        _finish_panel(g, df, title, enrichment_df, cluster_rows, cluster_cols, alpha_stars)
+        _annotate_strips(g)
+        _attach_trend(g)
+        _shrink_cbar(g)
+        figs[name] = g.figure
+
+    enr_vmax = max(enrichment_matrix_df.values.max(), 1e-6)
+    label = "Fold enrichment (obs/exp)" if enrichment_value == "fold_enrichment" else "-log10(padj)"
+    cmap = enrichment_cmap if enrichment_value == "fold_enrichment" else "viridis"
+    g = sns.clustermap(enrichment_matrix_df, cmap=cmap, vmin=0, vmax=enr_vmax, **common)
+    _finish_panel(
+        g, enrichment_matrix_df,
+        f"Hypergeometric enrichment ({label}):\nhow much more likely than random each pathway is in each group",
+        enrichment_df, cluster_rows, cluster_cols, alpha_stars,
     )
+    _annotate_strips(g)
+    _attach_trend(g)
+    _shrink_cbar(g)
+    figs["enrichment"] = g.figure
 
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        g_counts.figure.savefig(output_dir / counts_filename, dpi=dpi, bbox_inches="tight")
-        g_norm.figure.savefig(output_dir / normalized_filename, dpi=dpi, bbox_inches="tight")
-        log.info(f"Saved heatmaps to {output_dir / counts_filename} and {output_dir / normalized_filename}")
+        for name, fig in figs.items():
+            fig.savefig(output_dir / f"group_pathway_heatmap_{name}.png", dpi=dpi, bbox_inches="tight")
+        log.info(f"Saved 3 heatmap panels to {output_dir}")
 
-    return g_counts.figure, g_norm.figure
+    return figs
 
-
-def _annotate_clustermap_tick_labels(
-    clustergrid,
-    matrix_df: pd.DataFrame,
-    row_labels: "pd.Series | None" = None,
-    col_labels: "pd.Series | None" = None,
-    cluster_rows: bool = True,
-    cluster_cols: bool = True,
-) -> None:
-    """Embed per-datatype feature counts into the existing heatmap tick labels.
-
-    Row tick labels (y-axis, pathways) become:
-        ``"(mx:10, tx:30) PATHWAY NAME"``
-
-    Column tick labels (x-axis, submodules) become:
-        ``"group_X\\n(mx:5, tx:15)"``
-
-    Parameters
-    ----------
-    clustergrid : sns.matrix.ClusterGrid
-        Live ClusterGrid object (before ``.figure`` is extracted).
-    matrix_df : pd.DataFrame
-        The DataFrame passed to ``sns.clustermap`` for this panel.
-    row_labels : pd.Series, optional
-        Index = pathway name, values = compact datatype string (e.g. ``"tx:12 mx:5"``).
-        When provided, prepended as a parenthetical to each y-tick label.
-    col_labels : pd.Series, optional
-        Index = submodule name, values = compact datatype string (e.g. ``"tx:42 mx:18"``).
-        When provided, appended as a parenthetical on a new line to each x-tick label.
-    cluster_rows, cluster_cols : bool
-        Whether clustering was applied (determines tick order).
-    """
-    ax = clustergrid.ax_heatmap
-
-    def _fmt_parenthetical(raw: str) -> str:
-        """Convert 'tx:12 mx:5' → '(tx:12, mx:5)'."""
-        if not raw:
-            return ""
-        parts = raw.split()
-        return "(" + ", ".join(parts) + ")"
-
-    # ── Row tick labels (y-axis) ──────────────────────────────────────────────
-    if row_labels is not None:
-        # Determine clustered row order
-        if cluster_rows and clustergrid.dendrogram_row is not None:
-            row_order = list(clustergrid.dendrogram_row.reordered_ind)
-        else:
-            row_order = list(range(len(matrix_df.index)))
-        ordered_rows = matrix_df.index[row_order]
-
-        new_ylabels = []
-        for pathway in ordered_rows:
-            paren = _fmt_parenthetical(str(row_labels.get(pathway, "")))
-            new_ylabels.append(f"{paren} {pathway}" if paren else pathway)
-
-        ax.set_yticklabels(new_ylabels, fontsize=7)
-
-    # ── Column tick labels (x-axis) ───────────────────────────────────────────
-    if col_labels is not None:
-        # Determine clustered column order
-        if cluster_cols and clustergrid.dendrogram_col is not None:
-            col_order = list(clustergrid.dendrogram_col.reordered_ind)
-        else:
-            col_order = list(range(len(matrix_df.columns)))
-        ordered_cols = matrix_df.columns[col_order]
-
-        new_xlabels = []
-        for submodule in ordered_cols:
-            paren = _fmt_parenthetical(str(col_labels.get(submodule, "")))
-            new_xlabels.append(f"{submodule} {paren}" if paren else submodule)
-
-        ax.set_xticklabels(new_xlabels, rotation=90, ha="center", fontsize=7)
-
-
-def generate_pathway_submodule_heatmap(
-    node_df: pd.DataFrame,
-    quant_df: pd.DataFrame | None = None,
-    top_n: int = 100,
-    rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
-    exclude_nopathway: bool = False,
-    min_submodule_size: int = 0,
-    normalized_vmax: float | Literal["auto"] = "auto",
-    normalized_gamma: float | None = None,
-    output_dir: str | Path | None = None,
-    fdr_method: str = "fdr_bh",
-    alpha: float = 0.05,
-    **plot_kwargs,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, plt.Figure, plt.Figure]:
-    """End-to-end: build pathway x submodule matrices, run hypergeometric
-    enrichment, and plot both heatmap panels with significance stars overlaid.
-
-    See `build_pathway_submodule_matrices`, `compute_pathway_submodule_enrichment`,
-    and `plot_pathway_submodule_clustermaps` for parameter details.
-
-    Parameters
-    ----------
-    node_df, quant_df, top_n, rank_by, exclude_nopathway, min_submodule_size :
-        See `build_pathway_submodule_matrices`.
-    normalized_vmax, normalized_gamma :
-        See `plot_pathway_submodule_clustermaps`.
-    output_dir :
-        Directory to save figures to. If None, figures are not saved to disk.
-    fdr_method : str
-        Multiple-testing correction method for `compute_pathway_submodule_enrichment`
-        (default Benjamini-Hochberg FDR).
-    alpha : float
-        Significance threshold used to populate `enrichment_df["significant"]`
-        and the star overlay.
-    **plot_kwargs
-        Any additional keyword arguments forwarded to
-        `plot_pathway_submodule_clustermaps` (e.g. `method`, `metric`,
-        `counts_cmap`, `figsize`, `counts_filename`, `dpi`, `alpha_stars`, etc.).
-
-    Returns
-    -------
-    (counts_df, row_normalized_df, pathway_stats_df, enrichment_df, fig_counts, fig_normalized)
-    """
-    counts_df, row_normalized_df, pathway_stats_df, submodule_datatype_labels = build_pathway_submodule_matrices(
-        node_df,
-        quant_df=quant_df,
-        top_n=top_n,
-        rank_by=rank_by,
-        exclude_nopathway=exclude_nopathway,
-        min_submodule_size=min_submodule_size,
-    )
-
-    enrichment_df = compute_pathway_submodule_enrichment(
-        node_df,
-        counts_df,
-        exclude_nopathway=exclude_nopathway,
-        min_submodule_size=min_submodule_size,
-        fdr_method=fdr_method,
-        alpha=alpha,
-    )
-
-    # Extract per-datatype labels from pathway_stats_df (row labels) and submodule_datatype_labels (column labels)
-    pathway_datatype_labels: pd.Series | None = None
-    if "datatype_label" in pathway_stats_df.columns:
-        pathway_datatype_labels = pathway_stats_df.set_index("pathway")["datatype_label"]
-
-    fig_counts, fig_normalized = plot_pathway_submodule_clustermaps(
-        counts_df,
-        row_normalized_df,
-        normalized_vmax=normalized_vmax,
-        normalized_gamma=normalized_gamma,
-        output_dir=output_dir,
-        enrichment_df=enrichment_df,
-        pathway_datatype_labels=pathway_datatype_labels,
-        submodule_datatype_labels=submodule_datatype_labels if not submodule_datatype_labels.empty else None,
-        **plot_kwargs,
-    )
-
-    return counts_df, row_normalized_df, pathway_stats_df, enrichment_df, fig_counts, fig_normalized
-
-
+# --------------------------------------------------------------------------- #
+# Orchestrator                                                                #
+# --------------------------------------------------------------------------- #
 def compare_groups_to_pathways(
     node_table: pd.DataFrame,
     annotation_table: pd.DataFrame,
     quant_df: pd.DataFrame | None = None,
+    metadata_df: pd.DataFrame | None = None,
     pathway_col: str = "modelseed_pathway",
     group_col: str = "group",
-    top_n: int = 100,
-    rank_by: Literal["n_features", "cumulative_abs_lfc"] = "n_features",
+    trend_sort_by: str | None = None,
+    trend_collapse_by: str | None = None,
+    cluster_rows: bool = True,
+    cluster_cols: bool = True,
+    method: str = "average",
+    metric: str = "euclidean",
+    pathway_sep: str = ";",
+    missing_token: str = "Unassigned",
     exclude_nopathway: bool = False,
-    min_group_size: int = 3,
-    show_only_sig: bool = False,
+    nopathway_prefix: str = "NOPATHWAY_",
     bipartite_only: bool = False,
+    min_features_per_pathway: int = 3,
+    min_features_per_group: int = 5,
     fdr_method: str = "fdr_bh",
     alpha: float = 0.05,
-    output_dir: str | None = None,
+    show_only_sig: bool = False,
+    top_n: int = 50,
+    rank_by: Literal["n_features", "summed_significance", "mean_abs_value"] = "n_features",
+    enrichment_value: Literal["fold_enrichment", "neg_log10_padj"] = "fold_enrichment",
+    output_dir: str | Path | None = None,
     **plot_kwargs,
-) -> Dict[str, Any]:
-    """
-    Compare data-driven feature groups against knowledge-driven pathway annotations.
+) -> dict[str, Any]:
+    """Compare data-driven feature groups against pathway annotations.
 
-    Combines two complementary analyses into a single call:
-
-    1. **Pathway x group heatmap** — builds a pathway x group count matrix
-       (top ``top_n`` pathways by feature count or cumulative |LFC|), runs
-       hypergeometric over-representation tests (BH-FDR corrected), and plots
-       both a raw-count and a row-normalised clustermap with significance stars.
-
-    2. **Adjusted Rand Index (ARI) and Normalised Mutual Information (NMI)** —
-       single-number summaries of how well the data-driven grouping recovers
-       pathway structure.  Features with no pathway annotation or assigned to
-       the HDBSCAN noise class (``"noise"``) are excluded from the ARI/NMI
-       calculation.
+    1. Filter the whole universe (bipartite -> min features/pathway ->
+       min features/group -> unnamed-pathway exclusion).
+    2. Hypergeometric enrichment test across every pathway x group pair in
+       that filtered universe.
+    3. Optionally restrict to pathways/groups with >=1 significant pair.
+    4. Select up to `top_n` pathways to display (by `rank_by`) and plot
+       counts / row-normalized / enrichment heatmaps.
+    5. Export the full (pre-top_n, post-filter) enrichment stats to CSV.
 
     Parameters
     ----------
     node_table : pd.DataFrame
-        Feature-level node table produced by ``group_features()``.  Must be
-        indexed by feature ID and contain a ``group`` column.
+        Feature-level table indexed by feature ID, containing `group_col`
+        (falls back to "submodule" if absent).
     annotation_table : pd.DataFrame
-        Feature annotation table indexed by feature ID.  Must contain
-        ``pathway_col`` (default ``"modelseed_pathway"``).
+        Feature annotation table indexed by feature ID, containing
+        `pathway_col`.
     quant_df : pd.DataFrame, optional
-        Feature x comparison LFC matrix.  Required only when
-        ``rank_by="cumulative_abs_lfc"``.
-    pathway_col : str
-        Column in ``annotation_table`` that holds pathway labels.
-    group_col : str
-        Column in ``node_table`` that holds the data-driven group labels.
-        Falls back to ``"submodule"`` if ``"group"`` is absent.
-    top_n : int
-        Number of top-ranked pathways to show in the heatmap.
-    rank_by : {"n_features", "cumulative_abs_lfc"}
-        Pathway ranking metric.
-    exclude_nopathway : bool
-        If True, features with no pathway annotation are excluded from the
-        heatmap (they are always excluded from ARI/NMI).
-    min_group_size : int
-        Groups with fewer than this many features are dropped from both the
-        heatmap and the ARI/NMI calculation.
-    show_only_sig : bool, default False
-        If True, restrict the heatmap rows to pathways that are significantly
-        enriched (``padj < alpha``) in at least one group.  Has no effect if
-        the enrichment table is empty.
-    bipartite_only : bool, default False
-        If True, restrict the enrichment/heatmap analysis to pathways that
-        have at least one feature from **each** data type present in the node
-        table (identified by the dataset-name prefix, e.g. ``"tx_"``,
-        ``"mx_"``).  Pathways represented by only a single data type are
-        dropped before the heatmap is built.
-    fdr_method : str
-        Multiple-testing correction method (default ``"fdr_bh"``).
-    alpha : float
-        Significance threshold for the enrichment test and star overlay.
+        Feature x sample (or feature x comparison) matrix. Required only
+        when `rank_by="mean_abs_value"`.
+    min_features_per_pathway, min_features_per_group : int
+        Universe-level size filters (step 1) -- independent of `top_n`,
+        which only controls what's *displayed* (step 4).
+    show_only_sig : bool
+        If True, restrict to pathways/groups with >=1 significant
+        (padj < alpha) pair before pathway selection and plotting.
+    top_n, rank_by :
+        Display-only pathway selection. See `select_top_pathways`.
+    enrichment_value : {"fold_enrichment", "neg_log10_padj"}
+        Heat metric for the third panel.
     output_dir : str, optional
-        Directory to save heatmap PDFs.
+        Where to save heatmap PNGs and `group_pathway_enrichment_stats.csv`.
+        If None, nothing is written to disk.
     **plot_kwargs
-        Forwarded to ``plot_pathway_submodule_clustermaps``.
+        Forwarded to `plot_group_pathway_heatmaps`.
 
     Returns
     -------
-    dict with keys:
-        ``counts_df``, ``row_normalized_df``, ``pathway_stats_df``,
-        ``enrichment_df``, ``fig_counts``, ``fig_normalized``,
-        ``ari``, ``nmi``, ``n_features_compared``
+    dict with keys: "counts", "normalized", "enrichment" (figures),
+    "enrichment_stats_path", "n_pathways_tested", "n_groups_tested",
+    "n_pathways_shown".
     """
-    from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-    from sklearn.preprocessing import LabelEncoder
-
-    # ------------------------------------------------------------------ #
-    # 1. Resolve group column                                              #
-    # ------------------------------------------------------------------ #
     if group_col not in node_table.columns:
         if "submodule" in node_table.columns:
-            log.info(
-                f"Column '{group_col}' not found in node_table; "
-                "falling back to 'submodule'."
-            )
             group_col = "submodule"
         else:
-            raise ValueError(
-                f"Neither '{group_col}' nor 'submodule' found in node_table columns: "
-                f"{node_table.columns.tolist()}"
-            )
+            raise ValueError(f"'{group_col}' not in node_table and no 'submodule' fallback found.")
 
-    # ------------------------------------------------------------------ #
-    # 2. Merge pathway annotation onto node table                         #
-    # ------------------------------------------------------------------ #
     node_df = node_table.copy()
-
-    # Ensure 'submodule' column exists for generate_pathway_submodule_heatmap
-    if "submodule" not in node_df.columns:
-        node_df["submodule"] = node_df[group_col]
-
     if pathway_col not in node_df.columns:
-        if pathway_col not in annotation_table.columns:
-            raise ValueError(
-                f"Pathway column '{pathway_col}' not found in annotation_table. "
-                f"Available columns: {annotation_table.columns.tolist()}"
-            )
         node_df = node_df.join(annotation_table[[pathway_col]], how="left")
 
-    log.info(
-        f"Annotated node table: {node_df.shape[0]} features, "
-        f"{node_df[group_col].nunique()} groups, "
-        f"{node_df[pathway_col].nunique()} unique pathways"
+    # ---- 1. Filter the whole universe ----
+    exploded = _prepare_universe(
+        node_df, pathway_col, group_col, pathway_sep, missing_token,
+        exclude_nopathway, nopathway_prefix, bipartite_only,
+        min_features_per_pathway, min_features_per_group,
     )
 
-    # ------------------------------------------------------------------ #
-    # 2b. Optional bipartite filter                                        #
-    # ------------------------------------------------------------------ #
-    if bipartite_only:
-        # Detect data-type prefixes from feature index (e.g. "tx_", "mx_", "px_")
-        feature_ids = node_df.index.astype(str)
-        detected_prefixes = sorted({fid.split("_")[0] + "_" for fid in feature_ids if "_" in fid})
-        if len(detected_prefixes) < 2:
-            log.warning(
-                "bipartite_only=True but fewer than 2 data-type prefixes detected "
-                f"({detected_prefixes}). Skipping bipartite filter."
-            )
-        else:
-            log.info(
-                f"bipartite_only=True: keeping pathways with features from all "
-                f"data types: {detected_prefixes}"
-            )
-            # For each pathway, check which prefixes are represented
-            node_df["_prefix"] = feature_ids.str.split("_").str[0] + "_"
-            pathway_prefix_counts = (
-                node_df[node_df[pathway_col].notna()]
-                .groupby(pathway_col)["_prefix"]
-                .nunique()
-            )
-            bipartite_pathways = pathway_prefix_counts[
-                pathway_prefix_counts >= len(detected_prefixes)
-            ].index
-            n_before = node_df[pathway_col].nunique()
-            node_df = node_df[
-                node_df[pathway_col].isna()
-                | node_df[pathway_col].isin(bipartite_pathways)
-            ]
-            node_df = node_df.drop(columns=["_prefix"])
-            log.info(
-                f"  Bipartite filter: {len(bipartite_pathways)} of {n_before} pathways "
-                "have features from all data types."
-            )
+    # ---- 2. Hypergeometric enrichment across the full filtered universe ----
+    enrichment_df = compute_enrichment(exploded, fdr_method=fdr_method, alpha=alpha)
 
-    # ------------------------------------------------------------------ #
-    # 3. Pathway x group heatmap + hypergeometric enrichment              #
-    # ------------------------------------------------------------------ #
-    log.info("Building pathway x group heatmap and running enrichment tests...")
-    (
-        counts_df,
-        row_normalized_df,
-        pathway_stats_df,
-        enrichment_df,
-        fig_counts,
-        fig_normalized,
-    ) = generate_pathway_submodule_heatmap(
-        node_df=node_df,
-        quant_df=quant_df,
-        top_n=top_n,
-        rank_by=rank_by,
-        exclude_nopathway=exclude_nopathway,
-        min_submodule_size=min_group_size,
-        output_dir=None,          # defer saving until after optional sig filter
-        fdr_method=fdr_method,
-        alpha=alpha,
+    # ---- 3. Optional significance-based axis filter ----
+    if show_only_sig and enrichment_df["significant"].any():
+        sig = enrichment_df.loc[enrichment_df["significant"]]
+        kept_pathways, kept_groups = sorted(set(sig["pathway"])), sorted(set(sig["group"]))
+        exploded = exploded[exploded["pathway"].isin(kept_pathways) & exploded["group"].isin(kept_groups)]
+        enrichment_df = enrichment_df[
+            enrichment_df["pathway"].isin(kept_pathways) & enrichment_df["group"].isin(kept_groups)
+        ]
+        log.info(f"show_only_sig: kept {len(kept_pathways)} pathways x {len(kept_groups)} groups with >=1 significant pair.")
+    else:
+        kept_groups = sorted(exploded["group"].unique())
+
+    # ---- 4. Select pathways to display + plot ----
+    selected_pathways = select_top_pathways(exploded, enrichment_df, quant_df, top_n, rank_by)
+    counts_df, row_normalized_df = _build_group_pathway_matrices(exploded, kept_groups, selected_pathways)
+    enrichment_matrix_df = build_enrichment_matrix(enrichment_df, counts_df, value=enrichment_value)
+
+    group_dtype_colors, group_dtype_counts, group_dtype_norm = _dtype_color_strip(
+        exploded[exploded["group"].isin(kept_groups)], "group", kept_groups
+    )
+    pathway_dtype_colors, pathway_dtype_counts, pathway_dtype_norm = _dtype_color_strip(
+        exploded[exploded["pathway"].isin(selected_pathways)], "pathway", selected_pathways
+    )
+
+    figs = plot_group_pathway_heatmaps(
+        counts_df, row_normalized_df, enrichment_matrix_df,
+        enrichment_df[enrichment_df["pathway"].isin(selected_pathways)],
+        group_dtype_colors=group_dtype_colors,
+        group_dtype_counts=group_dtype_counts,
+        group_dtype_norm=group_dtype_norm,
+        pathway_dtype_colors=pathway_dtype_colors,
+        pathway_dtype_counts=pathway_dtype_counts,
+        pathway_dtype_norm=pathway_dtype_norm,
+        cluster_rows=cluster_rows,
+        cluster_cols=cluster_cols,
+        method=method,
+        metric=metric,
+        enrichment_value=enrichment_value,
+        node_df=node_table,
+        abundance_df=quant_df,
+        trend_metadata=metadata_df,
+        trend_sort_by=trend_sort_by,
+        trend_collapse_by=trend_collapse_by,
+        group_col=group_col,
+        output_dir=output_dir,
         **plot_kwargs,
     )
 
-    n_sig = int(enrichment_df["significant"].sum()) if not enrichment_df.empty else 0
-    log.info(
-        f"Significant pathway-group enrichments (padj < {alpha}): "
-        f"{n_sig} of {len(enrichment_df)} tested pairs"
-    )
-
-    # ------------------------------------------------------------------ #
-    # 3b. Optional show_only_sig filter — rebuild heatmap on subset       #
-    # ------------------------------------------------------------------ #
-    if show_only_sig and not enrichment_df.empty and n_sig > 0:
-        sig_pathways = enrichment_df.loc[
-            enrichment_df["significant"], "pathway"
-        ].unique()
-        counts_df_plot = counts_df.loc[counts_df.index.isin(sig_pathways)]
-        row_normalized_df_plot = row_normalized_df.loc[row_normalized_df.index.isin(sig_pathways)]
-        log.info(
-            f"show_only_sig=True: restricting heatmap to {len(sig_pathways)} "
-            f"significantly enriched pathways (of {len(counts_df)} total)."
-        )
-        if counts_df_plot.empty:
-            log.warning("No significant pathways remain after filtering — using full heatmap.")
-            counts_df_plot = counts_df
-            row_normalized_df_plot = row_normalized_df
-    else:
-        counts_df_plot = counts_df
-        row_normalized_df_plot = row_normalized_df
-
-    # Re-render heatmaps on the (possibly filtered) matrices
-    from tools.helpers import plot_pathway_submodule_clustermaps as _plot_clustermaps
-    fig_counts, fig_normalized = _plot_clustermaps(
-        counts_df_plot,
-        row_normalized_df_plot,
-        output_dir=output_dir,
-        enrichment_df=enrichment_df,
-        **{k: v for k, v in plot_kwargs.items()
-           if k in {
-               "cluster_rows", "cluster_cols", "method", "metric",
-               "counts_cmap", "normalized_cmap", "normalized_vmax",
-               "counts_gamma", "normalized_gamma", "figsize",
-               "counts_filename", "normalized_filename", "dpi", "alpha_stars",
-           }},
-    )
-
-    # ------------------------------------------------------------------ #
-    # 4. ARI and NMI                                                      #
-    # ------------------------------------------------------------------ #
-    comparison_df = node_df[[group_col, pathway_col]].copy()
-
-    # Drop features with no pathway or in the noise class
-    comparison_df = comparison_df[
-        comparison_df[pathway_col].notna()
-        & (comparison_df[pathway_col].astype(str) != "Unassigned")
-        & (comparison_df[pathway_col].astype(str) != "")
-        & comparison_df[group_col].notna()
-        & (comparison_df[group_col].astype(str) != "noise")
-    ]
-
-    # Apply min_group_size filter
-    if min_group_size > 0:
-        group_sizes = comparison_df[group_col].value_counts()
-        valid_groups = group_sizes[group_sizes >= min_group_size].index
-        comparison_df = comparison_df[comparison_df[group_col].isin(valid_groups)]
-
-    ari, nmi = np.nan, np.nan
-    n_compared = len(comparison_df)
-
-    if n_compared >= 2:
-        comparison_df = comparison_df.copy()
-        comparison_df["_primary_pathway"] = (
-            comparison_df[pathway_col].astype(str).str.split(";").str[0].str.strip()
-        )
-
-        le_group = LabelEncoder()
-        le_pathway = LabelEncoder()
-        group_labels = le_group.fit_transform(comparison_df[group_col].astype(str))
-        pathway_labels = le_pathway.fit_transform(comparison_df["_primary_pathway"])
-
-        ari = float(adjusted_rand_score(pathway_labels, group_labels))
-        nmi = float(normalized_mutual_info_score(pathway_labels, group_labels))
-
-        log.info(f"Features used for ARI/NMI comparison : {n_compared:,}")
-        log.info(f"Data-driven groups : {comparison_df[group_col].nunique()}")
-        log.info(f"Unique pathways (primary) : {comparison_df['_primary_pathway'].nunique()}")
-        log.info(f"Adjusted Rand Index (ARI) : {ari:.4f}  (1=perfect, 0=random)")
-        log.info(f"Normalised Mutual Info (NMI) : {nmi:.4f}  (1=perfect, 0=none)")
-    else:
-        log.warning(
-            f"Only {n_compared} features remain after filtering for ARI/NMI — "
-            "skipping calculation."
-        )
+    # ---- 5. Export stats (file only) ----
+    stats_path = None
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stats_path = output_dir / "group_pathway_enrichment_stats.csv"
+        enrichment_df.sort_values("padj").to_csv(stats_path, index=False)
+        log.info(f"Wrote enrichment stats ({len(enrichment_df)} rows) to {stats_path}")
 
     return {
         "counts_df": counts_df,
         "row_normalized_df": row_normalized_df,
-        "pathway_stats_df": pathway_stats_df,
         "enrichment_df": enrichment_df,
-        "fig_counts": fig_counts,
-        "fig_normalized": fig_normalized,
-        "ari": ari,
-        "nmi": nmi,
-        "n_features_compared": n_compared,
+        "enrichment_matrix_df": enrichment_matrix_df,
+        "figs": figs,
     }

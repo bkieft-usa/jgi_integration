@@ -485,6 +485,7 @@ class Project:
         self.study_variables = self.user_settings['variable_list']
         self.project_name = self.user_settings['project_name']
         self.output_dir = self.project_config['results_path']
+        self.cache_dir = self.project_config['results_path'] + "/cache"
         self.raw_data_dir = self.project_config['raw_data_path']
         self.project_dir = f"{self.output_dir}/{self.project_name}"
         os.makedirs(self.project_dir, exist_ok=True)
@@ -2053,6 +2054,7 @@ class Analysis(BaseDataHandler):
                 integrated_data=self.integrated_data,
                 datasets=self.datasets,
                 output_dir=self.output_dir,
+                cache_dir=self.project.cache_dir,
                 output_filename=self._feature_annotation_table_filename,
             )
 
@@ -2099,12 +2101,12 @@ class Analysis(BaseDataHandler):
     def perform_feature_selection(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
         """Hybrid: Class parameter setup + external hlp.perform_feature_selection function."""
         def _feature_selection_method():
-            log.info("Subsetting Features before Network Analysis")
             if self.check_and_load_attribute('integrated_data_selected', self._integrated_data_selected_filename, self.overwrite):
                 log.info(f"\tFeature selection data object 'integrated_data_selected' with {self.integrated_data_selected.shape[0]} features and {self.integrated_data_selected.shape[1]} samples.")
                 return
 
             feature_selection_params = self.analysis_parameters.get('feature_selection', {})
+            log.info(f"Subsetting Features using the {feature_selection_params.get('method', 'unspecified')} method with parameters: {feature_selection_params.get('params', {})}")
             call_params = {
                 'data': self.integrated_data,
                 'metadata': self.integrated_metadata,
@@ -2334,19 +2336,39 @@ class Analysis(BaseDataHandler):
         ``analysis.yml``.  Any keyword arguments passed directly to this method
         override the config values.
 
+        Pipeline: (1) filter the feature/pathway/group universe, (2) run a
+        hypergeometric enrichment test across every pathway x group pair,
+        (3) optionally restrict to pathways/groups with >=1 significant pair,
+        (4) select pathways to display and plot heatmaps (each with an
+        attached per-group trend track showing abundance across samples,
+        optionally collapsed into metadata categories), (5) export the full
+        enrichment stats table to CSV in ``self.output_dir``.
+
         Config keys (under ``analysis.pathway_enrichment``):
-            ``top_n``              - number of top pathways to show (default 50)
-            ``rank_by``            - ``"n_features"`` or ``"cumulative_abs_lfc"``
-            ``exclude_nopathway``  - drop pathways with no canonical name (default False)
-            ``min_group_size``     - minimum features per group (default 3)
-            ``show_only_sig``      - show only significantly enriched pathways
-            ``bipartite_only``     - keep only pathways with features from every data type
-            ``alpha``              - FDR significance threshold (default 0.05)
+            ``pathway_col``             - annotation column to use (default "modelseed_pathway")
+            ``exclude_nopathway``       - drop pathways with no canonical name (default True)
+            ``bipartite_only``          - keep only pathways with features from every data type
+            ``min_features_per_pathway``- drop pathways smaller than this before testing (default 3)
+            ``min_features_per_group``  - drop groups smaller than this before testing (default 5)
+            ``fdr_method``              - multiple-testing correction method (default "fdr_bh")
+            ``alpha``                   - FDR significance threshold (default 0.05)
+            ``show_only_sig``           - restrict to pathways/groups with >=1 significant pair
+            ``top_n``                   - number of pathways to *display* in the heatmap (default 50)
+            ``rank_by``                 - display ranking: "n_features" | "summed_significance" | "mean_abs_value"
+            ``enrichment_value``        - heat metric for the enrichment panel:
+                                          "fold_enrichment" | "neg_log10_padj"
+            ``trend_sort_by``           - metadata column to sort/order the trend track's columns by
+                                          (e.g. "timepoint"); also determines collapsed-category order
+            ``trend_collapse_by``       - metadata column to pool samples by in the trend track
+                                          (e.g. "timepoint" or "treatment"); None keeps one column
+                                          per raw sample
+            ``trend_agg``               - "mean" | "median" summary shown as trend track color (default "median")
+            ``trend_dispersion``        - "sem" | "std" | "iqr" | "none" driving trend track opacity
 
         Returns a dict with keys:
-            ``counts_df``, ``row_normalized_df``, ``pathway_stats_df``,
-            ``enrichment_df``, ``fig_counts``, ``fig_normalized``,
-            ``ari``, ``nmi``, ``n_features_compared``
+            ``counts``, ``normalized``, ``enrichment`` (heatmap figures, each
+            with an attached trend track), ``enrichment_stats_path``,
+            ``n_pathways_tested``, ``n_groups_tested``, ``n_pathways_shown``
         """
         if not hasattr(self, 'feature_network_node_table') or self.feature_network_node_table.empty:
             raise RuntimeError(
@@ -2360,19 +2382,26 @@ class Analysis(BaseDataHandler):
         pe = self.analysis_parameters.get('pathway_enrichment', {})
 
         call_params = {
-            'node_table':        self.feature_network_node_table,
-            'annotation_table':  self.feature_annotation_table,
-            'quant_df':          self.integrated_data_selected,
-            'pathway_col':       pe.get('pathway_col', 'modelseed_pathway'),
-            'top_n':             pe.get('top_n', 50),
-            'rank_by':           pe.get('rank_by', 'n_features'),
-            'exclude_nopathway': pe.get('exclude_nopathway', False),
-            'min_group_size':    pe.get('min_group_size', 3),
-            'show_only_sig':     pe.get('show_only_sig', False),
-            'bipartite_only':    pe.get('bipartite_only', False),
-            'fdr_method':        pe.get('fdr_method', 'fdr_bh'),
-            'alpha':             pe.get('alpha', 0.05),
-            'output_dir':        self.output_dir,
+            'node_table':                self.feature_network_node_table,
+            'annotation_table':          self.feature_annotation_table,
+            'quant_df':                  self.integrated_data_selected,
+            'metadata_df':               self.integrated_metadata,
+            'trend_sort_by':             pe.get('trend_sort_by', None),
+            'trend_collapse_by':         pe.get('trend_collapse_by', None),
+            'pathway_col':               pe.get('pathway_col', 'modelseed_pathway'),
+            'exclude_nopathway':         pe.get('exclude_nopathway', True),
+            'bipartite_only':            pe.get('bipartite_only', False),
+            'min_features_per_pathway':  pe.get('min_features_per_pathway', 3),
+            'min_features_per_group':    pe.get('min_features_per_group', 5),
+            'fdr_method':                pe.get('fdr_method', 'fdr_bh'),
+            'alpha':                     pe.get('alpha', 0.05),
+            'show_only_sig':             pe.get('show_only_sig', False),
+            'top_n':                     pe.get('top_n', 50),
+            'rank_by':                   pe.get('rank_by', 'n_features'),
+            'enrichment_value':          pe.get('enrichment_value', 'fold_enrichment'),
+            'trend_agg':                 pe.get('trend_agg', 'median'),
+            'trend_dispersion':          pe.get('trend_dispersion', 'iqr'),
+            'output_dir':                self.output_dir,
         }
         call_params.update(override_kwargs)
 

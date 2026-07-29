@@ -26,23 +26,23 @@ analysis:
       min_samples: 3                # minimum samples in a neighborhood (larger = more conservative)
 
       ###   nmf                       # Non-negative Matrix Factorization; k chosen automatically via reconstruction-error elbow.
-      k_min: 10                      # minimum number of components to evaluate
-      k_max: 200                     # maximum number of components to evaluate
+      k_min: 33                      # minimum number of components to evaluate
+      k_max: 500                     # maximum number of components to evaluate
       n_runs: 3                     # random restarts per k for stability
       max_iter: 500                 # NMF iterations per run
 
       ###   leiden_knn                # Leiden community detection on an approximate k-NN graph
-      n_neighbors: 2               # k-NN graph connectivity
+      n_neighbors: 3               # k-NN graph connectivity
       resolution_min: 0.1           # lower bound of resolution sweep
-      resolution_max: 3.0           # upper bound of resolution sweep
-      resolution_steps: 20          # number of resolution values to evaluate
+      resolution_max: 2.75           # upper bound of resolution sweep
+      resolution_steps: 25          # number of resolution values to evaluate
 
-      ###   wgcna                     # Weighted Gene Co-expression Network Analysis
-      power: null                   # set an integer to skip soft-threshold sweep (usually start with 6)
-      power_range: [1,2,3,4,5,6,7,8,9,10,12,14,16,18,20]  # β values to evaluate
-      r2_threshold: 0.85            # minimum scale-free topology R² to accept a β
+      ###   wgcna                     # Weighted Gene Co-expression Network Analysis (only recommended for >50 samples)
+      #power: 6                   # set an integer to skip soft-threshold sweep (usually start with 6)
+      power_range: [1,2,3,4,5,6,7,8,9,10,12,14,16,18,20,22,24,26,28,30]  # β values to evaluate
+      r2_threshold: 0.7            # minimum scale-free topology R² to accept a β
       signed: true                  # true = signed adjacency (preserves correlation direction)
-      min_module_size: 30           # minimum features per module
+      min_module_size: 25           # minimum features per module
       merge_cut_height: 0.25        # merge modules with ME correlation > 1 − this value
       deep_split: 2                 # 0–4; higher = more, smaller modules
 
@@ -58,11 +58,15 @@ analysis:
       feature_list_file:
 
   pathway_enrichment:
-    top_n: 50                 # number of top-ranked pathways to show in heatmap
-    rank_by: n_features        # n_features | cumulative_abs_lfc
-    exclude_nopathway: true    # exclude pathways with no canonical name
-    min_group_size: 20         # drop groups with fewer than this many features
-    show_only_sig: false       # show only pathways significantly enriched in ≥1 group
-    bipartite_only: false      # keep only pathways with features from every data type
-    alpha: 0.05                # FDR significance threshold for enrichment test
-
+    pathway_col: modelseed_pathway   # kegg_pathway | modelseed_pathway
+    exclude_nopathway: true          # exclude pathways with no canonical name
+    bipartite_only: false            # keep only pathways with features from every data type
+    min_features_per_pathway: 3      # drop pathways with fewer than this many features before testing
+    min_features_per_group: 5        # drop groups with fewer than this many features before testing
+    alpha: 0.05                      # FDR significance threshold for enrichment test
+    show_only_sig: false             # restrict heatmap to pathways/groups with >=1 significant pair
+    top_n: 50                        # number of pathways to DISPLAY in the heatmap (does not affect the stats test)
+    rank_by: n_features              # n_features | summed_significance | mean_abs_value
+    enrichment_value: fold_enrichment # fold_enrichment | neg_log10_padj (heat metric for the enrichment panel)
+    sparkline_sort_by: null          # metadata column to sort samples by, e.g. "timepoint"
+    sparkline_color_by: null         # metadata column to shade sample blocks by (defaults to sparkline_sort_by)
