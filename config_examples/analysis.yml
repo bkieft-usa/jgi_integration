@@ -18,7 +18,7 @@ analysis:
       ###   hierarchical_clustering # scipy agglomerative clustering on feature vectors.
       distance_metric: correlation  # correlation | braycurtis | jaccard | euclidean (any scipy pdist metric)
       linkage_method: weighted          # single | complete | average | ward | weighted (any scipy linkage method)
-      height_cutoff: 0.55            # dendrogram height at which to cut clusters (0–1)
+      height_cutoff: 0.5            # dendrogram height at which to cut clusters (0–1)
 
       ###   hdbscan                   # HDBSCAN density-based clustering (no k required).
       metric: euclidean           # euclidean | correlation (precomputed)
@@ -51,22 +51,24 @@ analysis:
     params:
 
       ### variance
-      top_n: 10000            # number of top-variance features to keep
-      max_features: 10000    # hard cap on features passed to grouping step
+      top_n: 12000            # number of top-variance features to keep
+      max_features: 12000    # hard cap on features passed to grouping step
 
       ### feature_list
       feature_list_file:
 
   pathway_enrichment:
-    pathway_col: modelseed_pathway   # kegg_pathway | modelseed_pathway
+    pathway_col: modelseed_pathway    # kegg_pathway | modelseed_pathway
     exclude_nopathway: true          # exclude pathways with no canonical name
-    bipartite_only: false            # keep only pathways with features from every data type
-    min_features_per_pathway: 3      # drop pathways with fewer than this many features before testing
-    min_features_per_group: 5        # drop groups with fewer than this many features before testing
-    alpha: 0.05                      # FDR significance threshold for enrichment test
-    show_only_sig: false             # restrict heatmap to pathways/groups with >=1 significant pair
-    top_n: 50                        # number of pathways to DISPLAY in the heatmap (does not affect the stats test)
-    rank_by: n_features              # n_features | summed_significance | mean_abs_value
+    bipartite_only: true              # keep only pathways with features from every data type
+    min_features_per_pathway: 2       # drop pathways with fewer than this many features before testing
+    min_features_per_group: 2         # drop groups with fewer than this many features before testing
+    alpha: 0.05                       # FDR significance threshold for enrichment test
+    show_only_sig: false              # restrict heatmap to pathways/groups with >=1 significant pair
+    top_n: 75                         # number of pathways to DISPLAY in the heatmap (does not affect the stats test)
+    rank_by: n_features      # n_features | summed_significance | mean_abs_value
     enrichment_value: fold_enrichment # fold_enrichment | neg_log10_padj (heat metric for the enrichment panel)
-    sparkline_sort_by: null          # metadata column to sort samples by, e.g. "timepoint"
-    sparkline_color_by: null         # metadata column to shade sample blocks by (defaults to sparkline_sort_by)
+    trend_sort_by: timepoint          # metadata column to order the trend track's columns by
+    trend_collapse_by: timepoint      # metadata column to POOL samples by in the trend track (null = one column per sample)
+    trend_agg: median                 # mean | median -- trend track color statistic
+    trend_dispersion: none             # sem | std | iqr | none -- trend track opacity statistic

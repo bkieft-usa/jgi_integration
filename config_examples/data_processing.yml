@@ -5,15 +5,15 @@ datasets:
       filtering:
         method: minimum          # minimum | proportion | none
         params:
-          value: 100             # minimum: minimum count threshold; proportion: minimum fraction of samples with non-zero value (0–1)
+          value: 10             # minimum: minimum count threshold; proportion: minimum fraction of samples with non-zero value (0–1)
       devariancing:
         method: percent          # percent | none
         params:
-          value: 20              # percent: bottom N% of variance removed
+          value: 25              # percent: bottom N% of variance removed
       replicate_handling:
         method: variance         # variance | none
         params:
-          value: 0.8                # variance: max allowed coefficient of variation (std/mean) within a group before flagging as unreliable
+          value: 0.5                # variance: max allowed coefficient of variation (std/mean) within a group before flagging as unreliable
       scaling:
         method: modified_zscore                # lfc | moderated_lfc | zscore | vst | vsn | rank_normal | modified_zscore | none
         # For sample_resolution track:
@@ -39,7 +39,7 @@ datasets:
       devariancing:
         method: percent          # percent | none
         params:
-          value: 20
+          value: 25
       replicate_handling:
         method: variance         # variance | none
         params:
