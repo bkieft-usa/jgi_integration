@@ -7243,7 +7243,7 @@ def scale_data(
     elif norm_method == "vst":
         log.info(f"Applying VST transformation to {dataset_name}...")
         vst_df = np.arcsinh(np.sqrt(df))
-        scaled_df = vst_df.apply(lambda x: (x - x.mean()) / x.std(), axis=0)
+        scaled_df = vst_df.sub(vst_df.mean(axis=1), axis=0).div(vst_df.std(axis=1), axis=0)
     
     # VSN - Variance Stabilizing Normalization
     elif norm_method == "vsn":
@@ -7290,9 +7290,12 @@ def scale_data(
         if log2 and norm_method not in ["logfc_mean", "logfc_median", "logfc_geometric_mean"]:
             df = np.log2(df + 1)
         if norm_method == "zscore":
-            scaled_df = df.apply(lambda x: (x - x.mean()) / x.std(), axis=0)
+            scaled_df = df.sub(df.mean(axis=1), axis=0).div(df.std(axis=1), axis=0)
         elif norm_method == "modified_zscore":
-            scaled_df = df.apply(lambda x: ((x - x.median()) * 0.6745) / (x - x.median()).abs().median(), axis=0)
+            med = df.median(axis=1)
+            centered = df.sub(med, axis=0)
+            mad = centered.abs().median(axis=1)
+            scaled_df = centered.multiply(0.6745).div(mad, axis=0)
         elif norm_method == "logfc_mean":
             log.info(f"Scaling {dataset_name} data using log2 fold-change relative to mean...")
             df_pseudocount = df + 1
@@ -7833,10 +7836,10 @@ def plot_simple_histogram(
         alpha=transparency
     )
 
-    plt.xlabel('Normalized Abundance')
+    plt.xlabel('Abundance')
     if xlog:
         plt.xscale('log')
-        plt.xlabel('Normalized Abundance (log)')
+        plt.xlabel('Abundance (log)')
 
     plt.ylabel('Frequency')
     if ylog:
@@ -8312,68 +8315,72 @@ import pathlib
 # 1. DATA PIPELINE
 # ==========================================
 
-def prepare_universe(node_table, pathway_col, group_col, pe_cfg):
+def prepare_universe(node_table, pathway_col, group_col, pe_cfg, missing_token='Unassigned'):
     df = node_table[[group_col, pathway_col]].copy()
-    
-    # Filter out 'Unassigned' pathways before exploding
-    df = df[df[pathway_col].astype(str) != 'Unassigned']
-    
+
+    df[pathway_col] = df[pathway_col].fillna(missing_token).astype(str)
     df[pathway_col] = df[pathway_col].str.split(';')
     exploded = df.explode(pathway_col)
     exploded[pathway_col] = exploded[pathway_col].str.strip()
-    
-    exploded = exploded[
-        (exploded[pathway_col].notna()) & 
-        (exploded[pathway_col] != "") & 
-        (~exploded[pathway_col].str.startswith("NOPATHWAY_"))
-    ].rename(columns={pathway_col: "pathway", group_col: "group"})
-    
-    # Bipartite Filter
-    if pe_cfg.get('bipartite_only'):
-        # Fix: Convert Index to Series to allow .to_dict()
-        dtypes_series = pd.Series(node_table.index.astype(str).str.split('_').str[0], index=node_table.index)
-        dtype_map = dtypes_series.to_dict()
-        
-        # Map dtypes to the exploded table
-        exploded['dtype'] = exploded.index.map(dtype_map)
-        total_dtypes_count = dtypes_series.nunique()
-        
-        # 1. Filter Pathways: must contain all dtypes
-        pathway_dtype_counts = exploded.groupby('pathway')['dtype'].nunique()
-        valid_pathways = pathway_dtype_counts[pathway_dtype_counts >= total_dtypes_count].index
-        exploded = exploded[exploded['pathway'].isin(valid_pathways)]
-        
-        # 2. Filter Groups: must contain all dtypes
-        # We use the original node_table for group-dtype mapping to be exhaustive
-        group_dtype_counts = dtypes_series.groupby(node_table[group_col]).nunique()
-        valid_groups = group_dtype_counts[group_dtype_counts >= total_dtypes_count].index
-        exploded = exploded[exploded['group'].isin(valid_groups)]
 
-    # Min Size Filters
-    p_counts = exploded['pathway'].value_counts()
-    exploded = exploded[exploded['pathway'].isin(p_counts[p_counts >= pe_cfg['min_features_per_pathway']].index)]
-    
-    g_counts = node_table[group_col].value_counts()
-    exploded = exploded[exploded['group'].isin(g_counts[g_counts >= pe_cfg['min_features_per_group']].index)]
-    
+    exploded = exploded[
+        (exploded[pathway_col].notna()) & (exploded[pathway_col] != "")
+    ].rename(columns={pathway_col: "pathway", group_col: "group"})
+
+    if pe_cfg.get('exclude_nopathway'):
+        exploded = exploded[~exploded['pathway'].str.startswith("NOPATHWAY_")]
+
+    is_missing = (exploded['pathway'] == missing_token).to_numpy()
+
+    if pe_cfg.get('bipartite_only'):
+        exploded['dtype'] = exploded.index.astype(str).str.split('_').str[0]
+        total_dtypes = node_table.index.astype(str).str.split('_').str[0].nunique()
+        real = exploded.loc[~is_missing]
+        counts = real.groupby('pathway')['dtype'].nunique()
+        keep_pathways = counts[counts >= total_dtypes].index
+        keep_mask = exploded['pathway'].isin(keep_pathways).to_numpy() | is_missing
+        exploded = exploded[keep_mask]
+        is_missing = (exploded['pathway'] == missing_token).to_numpy()
+
+    real = exploded.loc[~is_missing]
+    p_counts = real['pathway'].value_counts()
+    keep_pathways = p_counts[p_counts >= pe_cfg['min_features_per_pathway']].index
+    keep_mask = exploded['pathway'].isin(keep_pathways).to_numpy() | is_missing
+    exploded = exploded[keep_mask]
+
+    node_dedup = node_table[~node_table.index.duplicated(keep='first')]
+    g_counts = node_dedup[group_col].value_counts()
+    keep_groups = g_counts[g_counts >= pe_cfg['min_features_per_group']].index
+    exploded = exploded[exploded['group'].isin(keep_groups)]
+
     return exploded
 
-
-def compute_enrichment_matrix(exploded, alpha=0.05, fdr_method='fdr_bh'):
-    overlap_mat = pd.crosstab(exploded['pathway'], exploded['group'])
+def compute_enrichment_matrix(exploded, alpha=0.05, fdr_method='fdr_bh', missing_token='Unassigned'):
+    # Full-universe background -- includes unannotated ('Unassigned') features,
+    # so M/N reflect the true population, not just annotated features.
     M = exploded.index.nunique()
+    N = exploded.index.to_series().groupby(exploded['group']).nunique()
 
-    n = exploded.index.to_series().groupby(exploded['pathway']).nunique().reindex(overlap_mat.index)
-    N = exploded.index.to_series().groupby(exploded['group']).nunique().reindex(overlap_mat.columns)
+    # Drop 'Unassigned' from what's actually TESTED -- see prior message.
+    testable = exploded[exploded['pathway'] != missing_token]
+    overlap_mat = pd.crosstab(testable['pathway'], testable['group'])
+    overlap_mat = overlap_mat.reindex(columns=N.index, fill_value=0)
 
-    pval_mat = np.array([[hypergeom.sf(k - 1, M, n[p], N[g]) for g, k in row.items()]
+    n = testable.index.to_series().groupby(testable['pathway']).nunique().reindex(overlap_mat.index)
+    N_aligned = N.reindex(overlap_mat.columns)
+
+    pval_mat = np.array([[hypergeom.sf(k - 1, M, n[p], N_aligned[g]) for g, k in row.items()]
                         for p, row in overlap_mat.iterrows()])
     pval_df = pd.DataFrame(pval_mat, index=overlap_mat.index, columns=overlap_mat.columns)
 
-    flat_reject, flat_padj, _, _ = multipletests(pval_df.values.ravel(), alpha=alpha, method=fdr_method)
-    padj_df = pd.DataFrame(flat_padj.reshape(pval_df.shape), index=pval_df.index, columns=pval_df.columns)
+    flat_reject, flat_padj, _, _ = multipletests(
+        pval_df.values.ravel(), alpha=alpha, method=fdr_method
+    )
+    padj_df = pd.DataFrame(
+        flat_padj.reshape(pval_df.shape), index=pval_df.index, columns=pval_df.columns
+    )
 
-    expected = np.outer(n.values, N.values) / M
+    expected = np.outer(n.values, N_aligned.values) / M
     fold_df = pd.DataFrame(overlap_mat.values / expected, index=overlap_mat.index, columns=overlap_mat.columns)
 
     return overlap_mat, fold_df, pval_df, padj_df
@@ -8399,7 +8406,7 @@ def get_trend_values(quant_df, mapping_df, group_col, metadata_df, sort_by, coll
     labels = mapping_df[group_col].unique()
     final_values = []
     for label in labels:
-        feats = mapping_df[mapping_df[group_col] == label].index
+        feats = mapping_df[mapping_df[group_col] == label].index.unique()
         valid_feats = [f for f in feats if f in collapsed_samples.index]
         val = collapsed_samples.loc[valid_feats].agg(agg, axis=0) if valid_feats else pd.Series(np.nan, index=collapsed_samples.columns)
         final_values.append(val)
@@ -8407,25 +8414,63 @@ def get_trend_values(quant_df, mapping_df, group_col, metadata_df, sort_by, coll
     return pd.DataFrame(final_values, index=labels)
 
 # ==========================================
-# 2. VISUAL ENGINE (ALIGNMENT FIXES)
+# 2. VISUAL ENGINE
 # ==========================================
+
+# ---- Fixed-inch layout constants ----
+DENDRO_W_IN = 1.5            # row dendrogram width / col dendrogram height
+COMPOSITION_UNIT_IN = 0.18   # width/height per dtype column in the composition strip
+TREND_UNIT_IN = 0.35         # width/height per metadata category in a trend track
+TREND_PAD_IN = 0.35          # extra room for trend-track title/labels
+HEATMAP_PER_COL_IN = 0.3
+HEATMAP_PER_ROW_IN = 0.3
+MIN_HEATMAP_W_IN = 8.0
+MIN_HEATMAP_H_IN = 6.0
+LABEL_MARGIN_W_IN = 3.0      # room for heatmap y-tick labels + cbar
+LABEL_MARGIN_H_IN = 2.0      # room for heatmap x-tick labels + title
+
+
+def _compute_fixed_layout(n_rows, n_cols, row_dtype_cnt, col_dtype_cnt, row_trends, col_trends):
+    n_row_dtypes = max(row_dtype_cnt.shape[1], 1) if row_dtype_cnt is not None else 1
+    n_col_dtypes = max(col_dtype_cnt.shape[1], 1) if col_dtype_cnt is not None else 1
+    n_row_trend_cats = row_trends.shape[1] if row_trends is not None and not row_trends.empty else 0
+    n_col_trend_cats = col_trends.shape[1] if col_trends is not None and not col_trends.empty else 0
+
+    heatmap_w_in = max(MIN_HEATMAP_W_IN, n_cols * HEATMAP_PER_COL_IN)
+    heatmap_h_in = max(MIN_HEATMAP_H_IN, n_rows * HEATMAP_PER_ROW_IN)
+
+    dendro_w_in = DENDRO_W_IN
+    dendro_h_in = DENDRO_W_IN
+    colors_w_in = COMPOSITION_UNIT_IN * n_row_dtypes
+    colors_h_in = COMPOSITION_UNIT_IN * n_col_dtypes
+    row_trend_w_in = (TREND_UNIT_IN * n_row_trend_cats + TREND_PAD_IN) if n_row_trend_cats else 0.0
+    col_trend_h_in = (TREND_UNIT_IN * n_col_trend_cats + TREND_PAD_IN) if n_col_trend_cats else 0.0
+
+    fig_w_in = dendro_w_in + colors_w_in + heatmap_w_in + row_trend_w_in + LABEL_MARGIN_W_IN
+    fig_h_in = dendro_h_in + colors_h_in + heatmap_h_in + col_trend_h_in + LABEL_MARGIN_H_IN
+
+    return {
+        "figsize": (fig_w_in, fig_h_in),
+        "dendrogram_ratio": (dendro_w_in / fig_w_in, dendro_h_in / fig_h_in),
+        "colors_ratio": (colors_w_in / fig_w_in, colors_h_in / fig_h_in),
+        "row_trend_frac_w": row_trend_w_in / fig_w_in,
+        "col_trend_frac_h": col_trend_h_in / fig_h_in,
+    }
 
 def _get_dtype_composition(exploded, id_col, id_order):
     df = exploded.copy()
-    df['dtype'] = df.index.astype(str).str.split('_').str[0] if id_col == 'pathway' else df.index.map(lambda x: str(x).split('_')[0])
-    # If id_col is 'group', we need the mapping from node_table, but since we use exploded:
-    if id_col == 'group':
-        # Correct dtype attribution for groups
-        dtype_map = exploded.groupby('group')['dtype'].first() # Groups are usually single-dtype or mapped
-        counts = pd.DataFrame(index=id_order) # This part varies based on data
-    
-    # Standardized count approach
-    counts = df.groupby([id_col, 'dtype']).size().unstack(fill_value=0)
+    df['dtype'] = df.index.astype(str).str.split('_').str[0]
+
+    feat_col = exploded.index.name or "feature_id"
+    df = df.reset_index(names=feat_col)
+
+    counts = df.groupby([id_col, 'dtype'])[feat_col].nunique().unstack(fill_value=0)
     counts = counts.reindex(index=id_order, fill_value=0)
-    
+
+    prefixes = sorted(counts.columns)
     cmap = plt.get_cmap("Greys")
     colors, norms = pd.DataFrame(index=counts.index), pd.DataFrame(index=counts.index)
-    for dtype in counts.columns:
+    for dtype in prefixes:
         vals = counts[dtype].values.astype(float)
         vmax = vals.max() if vals.max() > 0 else 1.0
         normed = vals / vmax
@@ -8487,20 +8532,12 @@ def _overlay_significance(g, pval_df, row_order, col_order, alpha_stars={0.001: 
                             color="white", fontsize=8, fontweight="bold", path_effects=stroke)
                     break
 
-def _add_trend_track(g, rgba, category_labels, axis='row', label="Trend"):
-    """
-    rgba shapes (imshow axis0=vertical, axis1=horizontal):
-      axis='row': (n_items, n_categories, 4) -- n_items = heatmap rows (long/vertical),
-                                                  n_categories = short/horizontal axis
-      axis='col': (n_categories, n_items, 4) -- n_items = heatmap cols (long/horizontal),
-                                                  n_categories = short/vertical axis
-    category_labels: metadata category names, always drawn on the SHORT axis.
-    """
+def _add_trend_track(g, rgba, category_labels, axis='row', label="Trend", size_frac=0.1):
     fig = g.figure
     heat_pos = g.ax_heatmap.get_position()
     if axis == 'row':
         edge = _measure_ticklabel_right_edge(g.ax_heatmap)
-        ax = fig.add_axes([edge + 0.01, heat_pos.y0, 0.1, heat_pos.height])
+        ax = fig.add_axes([edge + 0.01, heat_pos.y0, size_frac, heat_pos.height])
         ax.imshow(rgba, aspect='auto')
         ax.set_yticks([])
         n_cat = rgba.shape[1]
@@ -8510,7 +8547,7 @@ def _add_trend_track(g, rgba, category_labels, axis='row', label="Trend"):
         ax.set_title(label, fontsize=8)
     else:
         edge = _measure_ticklabel_bottom_edge(g.ax_heatmap)
-        ax = fig.add_axes([heat_pos.x0, edge - 0.01 - 0.08, heat_pos.width, 0.08])
+        ax = fig.add_axes([heat_pos.x0, edge - 0.01 - size_frac, heat_pos.width, size_frac])
         ax.imshow(rgba, aspect='auto')
         ax.set_xticks([])
         n_cat = rgba.shape[0]
@@ -8535,26 +8572,48 @@ def compare_groups_to_pathways(
     overlap_mat, fold_mat, pval_mat, padj_mat = compute_enrichment_matrix(
         exploded, alpha=pe['alpha'], fdr_method=pe.get('fdr_method', 'fdr_bh')
     )
+    missing_token = pe.get('missing_token', 'Unassigned')
 
-    if pe.get('rank_by') == 'summed_significance':
-        # rank by corrected significance, not raw p
-        rank_scores = -np.log10(padj_mat.clip(lower=1e-300)).sum(axis=1).sort_values(ascending=False)
+    # get selected_pathways from pe (as a comma-separated list of strings in quotes)
+    selected_pathways = pe.get('selected_pathways', None)
+    if selected_pathways:
+        # User-specified subset takes priority over ranking entirely.
+        available = set(padj_mat.index)
+        requested = list(dict.fromkeys(selected_pathways))  # de-dup, preserve order
+        missing = [p for p in requested if p not in available]
+        if missing:
+            print(f"[compare_groups_to_pathways] Warning: {len(missing)} requested "
+                  f"pathway(s) not found after universe filtering (dropped by "
+                  f"min_features_per_pathway/bipartite_only, or misspelled): {missing}")
+        chosen_pathways = [p for p in requested if p in available]
+        if not chosen_pathways:
+            raise ValueError(
+                "None of the requested `selected_pathways` are present in the "
+                "tested/filtered pathway universe."
+            )
+        # Groups restricted to those with >=1 feature in the chosen pathways.
+        kept_groups = sorted(
+            exploded.loc[exploded['pathway'].isin(chosen_pathways), 'group'].unique()
+        )
     else:
-        rank_scores = exploded.groupby('pathway').size().sort_values(ascending=False)
+        if pe.get('rank_by') == 'summed_significance':
+            rank_scores = -np.log10(padj_mat.clip(lower=1e-300)).sum(axis=1).sort_values(ascending=False)
+        else:
+            rank_scores = (
+                exploded[exploded['pathway'] != missing_token]
+                .groupby('pathway').size().sort_values(ascending=False)
+            )
+        chosen_pathways = rank_scores.head(pe['top_n']).index.tolist()
+        kept_groups = sorted(exploded['group'].unique())
 
-    selected_pathways = rank_scores.head(pe['top_n']).index.tolist()
-    kept_groups = sorted(exploded['group'].unique())
+    counts_df = overlap_mat.T.loc[kept_groups, chosen_pathways]
+    enrich_df = fold_mat.T.loc[kept_groups, chosen_pathways]
+    padj_df   = padj_mat.T.loc[kept_groups, chosen_pathways]
+    norm_df   = counts_df.div(counts_df.sum(axis=0).replace(0, np.nan), axis=1).fillna(0)
 
-    counts_df = overlap_mat.T.loc[kept_groups, selected_pathways]
-    enrich_df = fold_mat.T.loc[kept_groups, selected_pathways]
-    padj_df   = padj_mat.T.loc[kept_groups, selected_pathways]
-    norm_df   = counts_df.div(counts_df.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-
-    # Composition strips: now correctly aligned (rows=groups, cols=pathways)
     row_dtype_cols, row_dtype_cnt, row_dtype_norm = _get_dtype_composition(exploded, 'group', kept_groups)
-    col_dtype_cols, col_dtype_cnt, col_dtype_norm = _get_dtype_composition(exploded, 'pathway', selected_pathways)
+    col_dtype_cols, col_dtype_cnt, col_dtype_norm = _get_dtype_composition(exploded, 'pathway', chosen_pathways)
 
-    # Trends: row_trends indexed by group (matches rows), col_trends indexed by pathway (matches cols)
     row_trends = get_trend_values(quant_df, node_table, 'group', metadata_df, pe['trend_sort_by'], pe['trend_collapse_by'], pe['trend_agg'])
     col_trends = get_trend_values(quant_df, exploded, 'pathway', metadata_df, pe['trend_sort_by'], pe['trend_collapse_by'], pe['trend_agg'])
 
@@ -8565,35 +8624,59 @@ def compare_groups_to_pathways(
         col_dtype_cols=col_dtype_cols, col_dtype_cnt=col_dtype_cnt, col_dtype_norm=col_dtype_norm,
         trend_cmap=pe.get('trend_cmap', 'RdBu_r'), output_dir=output_dir
     )
-    return {"figs": figs, "pval_matrix": padj_df}
 
-def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_df, pval_df, 
+    # ---- Export everything
+    if output_dir:
+        out = pathlib.Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+
+        exploded.to_csv(out / "exploded_universe.csv")
+
+        overlap_mat.to_csv(out / "full_overlap_matrix.csv")
+        fold_mat.to_csv(out / "full_fold_enrichment_matrix.csv")
+        pval_mat.to_csv(out / "full_pvalue_matrix.csv")
+        padj_mat.to_csv(out / "full_padj_matrix.csv")
+
+        row_trends.to_csv(out / "group_trend_values.csv")
+        col_trends.to_csv(out / "pathway_trend_values.csv")
+
+        with open(out / "run_config.json", "w") as f:
+            json.dump({
+                "pe": {k: v for k, v in pe.items()},
+                "selected_pathways_requested": selected_pathways,
+                "selected_pathways_used": chosen_pathways,
+                "kept_groups": kept_groups,
+            }, f, indent=2, default=str)
+
+    return {"figs": figs, "padj_matrix": padj_df, "selected_pathways": chosen_pathways, "kept_groups": kept_groups}
+
+def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_df, pval_df,
                                 row_trends, col_trends, row_dtype_cols, row_dtype_cnt, row_dtype_norm,
-                                col_dtype_cols, col_dtype_cnt, col_dtype_norm, 
-                                trend_cmap='RdBu_r', output_dir=None):
-    
-    n_rows, n_cols = row_normalized_df.shape
-    dynamic_figsize = (max(16, n_cols * 0.3), max(10, n_rows * 0.2))
-    
-    # Linkage based on normalized fractions
+                                col_dtype_cols, col_dtype_cnt, col_dtype_norm,
+                                trend_cmap='RdBu_r', output_dir=None, **kwargs):
+
+    n_rows, n_cols = len(row_normalized_df), len(row_normalized_df.columns)
+    layout = _compute_fixed_layout(n_rows, n_cols, row_dtype_cnt, col_dtype_cnt, row_trends, col_trends)
+
     row_link = linkage(row_normalized_df.values, method='average')
     col_link = linkage(row_normalized_df.values.T, method='average')
-    common = dict(row_linkage=row_link, col_linkage=col_link, row_cluster=True, col_cluster=True, 
-                  figsize=dynamic_figsize, cbar_pos=(0.02, 0.83, 0.015, 0.075))
+    common = dict(
+        row_linkage=row_link, col_linkage=col_link, row_cluster=True, col_cluster=True,
+        figsize=layout["figsize"],
+        dendrogram_ratio=layout["dendrogram_ratio"],
+        colors_ratio=layout["colors_ratio"],
+        cbar_pos=(0.02, 0.83, 0.015, 0.075),
+    )
 
     panels = [("counts", counts_df, "viridis", "Feature Count"),
-              ("normalized", row_normalized_df, "magma", "Fraction of Group"),
+              ("normalized", row_normalized_df, "magma", "Fraction of Pathway"),
               ("enrichment", enrichment_matrix_df, "RdBu_r", "Fold Enrichment")]
-    
+
     figs = {}
     for name, df, cmap, title in panels:
         g = sns.clustermap(df, cmap=cmap, row_colors=row_dtype_cols, col_colors=col_dtype_cols, **common)
-        g.figure.suptitle(title, y=1.02)
-
         g.ax_heatmap.tick_params(labelsize=7)
 
-        # Ground-truth clustered order — immune to tick thinning / axis
-        # inversion quirks that plague reading labels off the axes.
         curr_row_order = df.index[g.dendrogram_row.reordered_ind].tolist()
         curr_col_order = df.columns[g.dendrogram_col.reordered_ind].tolist()
 
@@ -8604,15 +8687,17 @@ def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_
         _annotate_dtype_counts(g, row_dtype_cnt, row_dtype_norm, curr_row_order, axis='row')
         _annotate_dtype_counts(g, col_dtype_cnt, col_dtype_norm, curr_col_order, axis='col')
 
-        if row_trends is not None:
+        if row_trends is not None and not row_trends.empty:
             row_trend_aligned = row_trends.reindex(curr_row_order)
             rgba = _values_to_rgba_zscored(row_trend_aligned.values, cmap=trend_cmap)
-            _add_trend_track(g, rgba, row_trend_aligned.columns, axis='row', label="Group Trend")
+            _add_trend_track(g, rgba, row_trend_aligned.columns, axis='row', label="Group Trend",
+                              size_frac=layout["row_trend_frac_w"])
 
-        if col_trends is not None:
+        if col_trends is not None and not col_trends.empty:
             col_trend_aligned = col_trends.reindex(curr_col_order)
             rgba = _values_to_rgba_zscored(col_trend_aligned.values.T, cmap=trend_cmap)
-            _add_trend_track(g, rgba, col_trend_aligned.columns, axis='col', label="Path. Trend")
+            _add_trend_track(g, rgba, col_trend_aligned.columns, axis='col', label="Path. Trend",
+                              size_frac=layout["col_trend_frac_h"])
 
         figs[name] = g.figure
 
