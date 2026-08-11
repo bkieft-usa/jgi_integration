@@ -8417,27 +8417,32 @@ def get_trend_values(quant_df, mapping_df, group_col, metadata_df, sort_by, coll
 # 2. VISUAL ENGINE
 # ==========================================
 
-# ---- Fixed-inch layout constants ----
-DENDRO_W_IN = 1.5            # row dendrogram width / col dendrogram height
-COMPOSITION_UNIT_IN = 0.18   # width/height per dtype column in the composition strip
-TREND_UNIT_IN = 0.35         # width/height per metadata category in a trend track
-TREND_PAD_IN = 0.35          # extra room for trend-track title/labels
-HEATMAP_PER_COL_IN = 0.3
-HEATMAP_PER_ROW_IN = 0.3
-MIN_HEATMAP_W_IN = 8.0
-MIN_HEATMAP_H_IN = 6.0
-LABEL_MARGIN_W_IN = 3.0      # room for heatmap y-tick labels + cbar
-LABEL_MARGIN_H_IN = 2.0      # room for heatmap x-tick labels + title
-
-
-def _compute_fixed_layout(n_rows, n_cols, row_dtype_cnt, col_dtype_cnt, row_trends, col_trends):
+def _compute_fixed_layout(n_rows, n_cols, row_dtype_cnt, col_dtype_cnt, row_trends, col_trends,
+                           square_cells=False):
+    
+    DENDRO_W_IN = 1.5            # row dendrogram width / col dendrogram height
+    COMPOSITION_UNIT_IN = 0.18   # width/height per dtype column in the composition strip
+    TREND_UNIT_IN = 0.25         # width/height per metadata category in a trend track
+    TREND_PAD_IN = 0.25          # extra room for trend-track title/labels
+    HEATMAP_PER_COL_IN = 0.1
+    HEATMAP_PER_ROW_IN = 0.1
+    MIN_HEATMAP_W_IN = 1.0
+    MIN_HEATMAP_H_IN = 6.0
+    LABEL_MARGIN_W_IN = 3.0      # room for heatmap y-tick labels + cbar
+    LABEL_MARGIN_H_IN = 2.0      # room for heatmap x-tick labels + title
+    
     n_row_dtypes = max(row_dtype_cnt.shape[1], 1) if row_dtype_cnt is not None else 1
     n_col_dtypes = max(col_dtype_cnt.shape[1], 1) if col_dtype_cnt is not None else 1
     n_row_trend_cats = row_trends.shape[1] if row_trends is not None and not row_trends.empty else 0
     n_col_trend_cats = col_trends.shape[1] if col_trends is not None and not col_trends.empty else 0
 
-    heatmap_w_in = max(MIN_HEATMAP_W_IN, n_cols * HEATMAP_PER_COL_IN)
     heatmap_h_in = max(MIN_HEATMAP_H_IN, n_rows * HEATMAP_PER_ROW_IN)
+    if square_cells:
+        # Force each cell to be square: derive width from height-per-row
+        cell_in = heatmap_h_in / n_rows
+        heatmap_w_in = cell_in * n_cols
+    else:
+        heatmap_w_in = max(MIN_HEATMAP_W_IN, n_cols * HEATMAP_PER_COL_IN)
 
     dendro_w_in = DENDRO_W_IN
     dendro_h_in = DENDRO_W_IN
@@ -8491,6 +8496,20 @@ def _annotate_dtype_counts(g, counts_df, norm_df, order, axis='row'):
             x, y = (level, pos) if axis == 'row' else (pos, level)
             ax.text(x + 0.5, y + 0.5, str(val), ha="center", va="center", fontsize=6, color=txt_color)
 
+    # Dtype column-name ticks centred on each cell — seaborn uses pcolormesh so
+    # cell centres are at 0.5, 1.5, ... in data coordinates.
+    if axis == 'row':
+        ax.set_xticks(np.arange(len(dtypes)) + 0.5)
+        ax.set_xticklabels(dtypes, rotation=90, fontsize=5)
+        ax.xaxis.tick_top()
+        ax.set_yticks([])
+        ax.set_ylabel("")
+    else:
+        ax.set_yticks(np.arange(len(dtypes)) + 0.5)
+        ax.set_yticklabels(dtypes, fontsize=5)
+        ax.set_xticks([])
+        ax.set_xlabel("")
+
 def _measure_ticklabel_right_edge(ax):
     fig = ax.figure
     fig.canvas.draw()
@@ -8507,11 +8526,16 @@ def _measure_ticklabel_bottom_edge(ax):
     if not extents: return ax.get_position().y0
     return fig.transFigure.inverted().transform((0, min(e.y0 for e in extents)))[1]
 
-def _values_to_rgba_zscored(value_mat, cmap='RdBu_r'):
+def _values_to_rgba_zscored(value_mat, cmap='RdBu_r', vmax=None):
+    """Convert a value matrix to RGBA using a symmetric diverging norm centred at 0.
+
+    vmax : if provided, use this as the colour scale maximum (allows a shared
+           scale across multiple calls). If None, derived from the data.
+    """
     if value_mat.size == 0 or np.all(np.isnan(value_mat)):
         return np.full((*value_mat.shape, 4), cm.get_cmap(cmap)(0.5))
-    abs_max = np.nanmax(np.abs(value_mat))
-    vmax = max(abs_max, 1e-9)
+    if vmax is None:
+        vmax = max(np.nanmax(np.abs(value_mat)), 1e-9)
     norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
     rgba = cm.get_cmap(cmap)(norm(np.nan_to_num(value_mat, nan=0.0)))
     rgba[np.isnan(value_mat), 3] = 0.0
@@ -8532,29 +8556,228 @@ def _overlay_significance(g, pval_df, row_order, col_order, alpha_stars={0.001: 
                             color="white", fontsize=8, fontweight="bold", path_effects=stroke)
                     break
 
-def _add_trend_track(g, rgba, category_labels, axis='row', label="Trend", size_frac=0.1):
+def _add_trend_track(g, rgba, value_mat, category_labels, tick_labels,
+                     axis='row', size_frac=0.1, gap_frac=0.005):
+    """
+    Place a trend-heatmap track directly adjacent to the main heatmap.
+
+    gap_frac : small figure-fraction gap between the heatmap edge and the track
+               (prevents tick labels from overlapping the heatmap border).
+
+    For axis='row':
+      - track sits to the right of the heatmap (+ gap)
+      - category labels (metadata columns) go on top as rotated xticklabels
+      - group-name tick labels appear on the RIGHT side of this track
+    For axis='col':
+      - track sits below the heatmap (+ gap)
+      - category labels (metadata rows) go on the left as yticklabels
+      - pathway-name tick labels appear on the BOTTOM of this track
+    """
     fig = g.figure
     heat_pos = g.ax_heatmap.get_position()
+
     if axis == 'row':
-        edge = _measure_ticklabel_right_edge(g.ax_heatmap)
-        ax = fig.add_axes([edge + 0.01, heat_pos.y0, size_frac, heat_pos.height])
-        ax.imshow(rgba, aspect='auto')
-        ax.set_yticks([])
-        n_cat = rgba.shape[1]
-        ax.set_xticks(np.arange(n_cat))
+        n_rows, n_cats = rgba.shape[0], rgba.shape[1]
+
+        ax = fig.add_axes([heat_pos.x1 + gap_frac, heat_pos.y0, size_frac, heat_pos.height])
+        ax.imshow(rgba, aspect='auto',
+                  extent=[-0.5, n_cats - 0.5, n_rows - 0.5, -0.5])
+
+        # Category labels on top — centred on each column
+        ax.set_xticks(np.arange(n_cats))
         ax.set_xticklabels(category_labels, rotation=90, fontsize=5, ha="center")
         ax.xaxis.tick_top()
-        ax.set_title(label, fontsize=8)
+        ax.set_title("")   # no label
+
+        # Group-name tick labels on the RIGHT — centred on each row
+        ax.set_yticks(np.arange(n_rows))
+        ax.yaxis.set_label_position('right')
+        ax.yaxis.tick_right()
+        ax.set_yticklabels(tick_labels, fontsize=7, ha='left')
+        ax.set_ylim(n_rows - 0.5, -0.5)   # top-to-bottom, matching imshow
+
+        # 3 sig-fig cell annotations
+        for r in range(value_mat.shape[0]):
+            for c in range(value_mat.shape[1]):
+                v = value_mat[r, c]
+                if not np.isnan(v):
+                    lum = 0.299*rgba[r,c,0] + 0.587*rgba[r,c,1] + 0.114*rgba[r,c,2]
+                    txt_col = 'black' if lum > 0.5 else 'white'
+                    ax.text(c, r, f"{v:.3g}", ha='center', va='center',
+                            fontsize=4, color=txt_col)
+
     else:
-        edge = _measure_ticklabel_bottom_edge(g.ax_heatmap)
-        ax = fig.add_axes([heat_pos.x0, edge - 0.01 - size_frac, heat_pos.width, size_frac])
-        ax.imshow(rgba, aspect='auto')
-        ax.set_xticks([])
-        n_cat = rgba.shape[0]
-        ax.set_yticks(np.arange(n_cat))
+        n_cats, n_cols = rgba.shape[0], rgba.shape[1]
+
+        ax = fig.add_axes([heat_pos.x0, heat_pos.y0 - gap_frac - size_frac,
+                           heat_pos.width, size_frac])
+        ax.imshow(rgba, aspect='auto',
+                  extent=[-0.5, n_cols - 0.5, n_cats - 0.5, -0.5])
+
+        # Category labels on the left — centred on each row
+        ax.set_yticks(np.arange(n_cats))
         ax.set_yticklabels(category_labels, fontsize=5)
-        ax.set_ylabel(label, fontsize=8)
+        ax.set_ylabel("")   # no label
+        ax.set_ylim(n_cats - 0.5, -0.5)
+
+        # Pathway-name tick labels on the BOTTOM — centred on each column
+        ax.set_xticks(np.arange(n_cols))
+        ax.xaxis.set_label_position('bottom')
+        ax.xaxis.tick_bottom()
+        ax.set_xticklabels(tick_labels, rotation=90, fontsize=7,
+                           ha='right', rotation_mode='anchor')
+        ax.set_xlim(-0.5, n_cols - 0.5)
+
+        # 3 sig-fig cell annotations
+        for r in range(value_mat.shape[0]):
+            for c in range(value_mat.shape[1]):
+                v = value_mat[r, c]
+                if not np.isnan(v):
+                    lum = 0.299*rgba[r,c,0] + 0.587*rgba[r,c,1] + 0.114*rgba[r,c,2]
+                    txt_col = 'black' if lum > 0.5 else 'white'
+                    ax.text(c, r, f"{v:.3g}", ha='center', va='center',
+                            fontsize=4, color=txt_col)
+
     for spine in ax.spines.values(): spine.set_visible(False)
+
+def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_df, pval_df,
+                                row_trends, col_trends, row_dtype_cols, row_dtype_cnt, row_dtype_norm,
+                                col_dtype_cols, col_dtype_cnt, col_dtype_norm,
+                                trend_cmap='RdBu_r', output_dir=None, **kwargs):
+
+    n_rows, n_cols = len(row_normalized_df), len(row_normalized_df.columns)
+    square_cells = kwargs.get('square_cells', False)
+    layout = _compute_fixed_layout(n_rows, n_cols, row_dtype_cnt, col_dtype_cnt, row_trends, col_trends,
+                                   square_cells=square_cells)
+
+    row_link = linkage(row_normalized_df.values, method='average')
+    col_link = linkage(row_normalized_df.values.T, method='average')
+
+    has_row_trend = row_trends is not None and not row_trends.empty
+    has_col_trend = col_trends is not None and not col_trends.empty
+    n_row_trend_cats = row_trends.shape[1] if has_row_trend else 0
+    n_col_trend_cats = col_trends.shape[1] if has_col_trend else 0
+
+    trend_gap = kwargs.get('trend_gap', 0.025)   # configurable gap (figure-fraction)
+
+    common = dict(
+        row_linkage=row_link, col_linkage=col_link, row_cluster=True, col_cluster=True,
+        figsize=layout["figsize"],
+        dendrogram_ratio=layout["dendrogram_ratio"],
+        colors_ratio=layout["colors_ratio"],
+        # Colorbar: top-left, aligned with the figure title
+        cbar_pos=(0.02, 0.88, 0.015, 0.08),
+    )
+
+    panels = [("counts", counts_df, "viridis", "Feature Count"),
+              ("normalized", row_normalized_df, "magma", "Fraction of Pathway"),
+              ("enrichment", enrichment_matrix_df, "RdBu_r", "Fold Enrichment")]
+
+    figs = {}
+    for name, df, cmap, title in panels:
+        g = sns.clustermap(df, cmap=cmap, row_colors=row_dtype_cols, col_colors=col_dtype_cols, **common)
+
+        curr_row_order = df.index[g.dendrogram_row.reordered_ind].tolist()
+        curr_col_order = df.columns[g.dendrogram_col.reordered_ind].tolist()
+
+        # Suppress heatmap tick labels that will be re-drawn on the trend tracks,
+        # and remove the axis labels ("group" / "pathway").
+        ax_hm = g.ax_heatmap
+        ax_hm.set_xlabel("")
+        ax_hm.set_ylabel("")
+        if has_row_trend:
+            # y-tick labels (group names) will appear on the right of the row trend track
+            ax_hm.set_yticks(ax_hm.get_yticks())
+            ax_hm.set_yticklabels([])
+        else:
+            ax_hm.tick_params(axis='y', labelsize=7)
+        if has_col_trend:
+            # x-tick labels (pathway names) will appear on the bottom of the col trend track
+            ax_hm.set_xticks(ax_hm.get_xticks())
+            ax_hm.set_xticklabels([])
+        else:
+            ax_hm.tick_params(axis='x', labelsize=7)
+
+        if name == "enrichment":
+            _overlay_significance(g, pval_df, curr_row_order, curr_col_order)
+            g.figure.suptitle(
+                title + "\n* padj<0.05  ** padj<0.01  *** padj<0.001 (hypergeometric, BH-FDR)",
+                y=1.02)
+        else:
+            g.figure.suptitle(title, y=1.02)
+
+        _annotate_dtype_counts(g, row_dtype_cnt, row_dtype_norm, curr_row_order, axis='row')
+        _annotate_dtype_counts(g, col_dtype_cnt, col_dtype_norm, curr_col_order, axis='col')
+
+        # ── Trend track sizing ────────────────────────────────────────────────
+        # Row trend track: each column is just wide enough to fit the widest
+        #   3-sig-fig annotation text (measured via a temporary Text artist).
+        # Col trend track: each row is cell_h_px tall (matches heatmap row height).
+        if has_row_trend or has_col_trend:
+            fig = g.figure
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            heat_pos = ax_hm.get_position()
+            fig_w_px, fig_h_px = fig.get_size_inches() * fig.dpi
+            heat_w_px = heat_pos.width  * fig_w_px
+            heat_h_px = heat_pos.height * fig_h_px
+
+            cell_h_px = heat_h_px / n_rows   # height of one heatmap row
+
+            if has_row_trend:
+                # Find the widest 3-sig-fig label across all row-trend values
+                row_vals = row_trends.values.ravel()
+                row_vals = row_vals[~np.isnan(row_vals)]
+                widest_str = max(
+                    (f"{v:.3g}" for v in row_vals),
+                    key=len,
+                    default="0.0"
+                )
+                # Measure pixel width of that string at fontsize=4
+                tmp = fig.text(0, 0, widest_str, fontsize=4, visible=False)
+                fig.canvas.draw()
+                txt_w_px = tmp.get_window_extent(renderer=renderer).width
+                tmp.remove()
+                TEXT_PAD_PX = 12   # padding on each side of the text
+                col_cell_w_px = txt_w_px + 2 * TEXT_PAD_PX
+                row_trend_frac_w = (col_cell_w_px * n_row_trend_cats) / fig_w_px
+            else:
+                row_trend_frac_w = 0.0
+
+            # Col trend: n_col_trend_cats rows, each cell_h_px tall
+            col_trend_frac_h = (cell_h_px * n_col_trend_cats) / fig_h_px if has_col_trend else 0.0
+        else:
+            row_trend_frac_w = layout["row_trend_frac_w"]
+            col_trend_frac_h = layout["col_trend_frac_h"]
+
+        # Each trend track is colour-scaled independently from its own data.
+        if has_row_trend:
+            row_trend_aligned = row_trends.reindex(curr_row_order)
+            rgba = _values_to_rgba_zscored(row_trend_aligned.values, cmap=trend_cmap)
+            _add_trend_track(g, rgba, value_mat=row_trend_aligned.values,
+                              category_labels=row_trend_aligned.columns,
+                              tick_labels=curr_row_order,
+                              axis='row', size_frac=row_trend_frac_w,
+                              gap_frac=trend_gap)
+
+        if has_col_trend:
+            col_trend_aligned = col_trends.reindex(curr_col_order)
+            # rgba shape: (n_cats, n_pathways, 4)  — transpose values for imshow
+            rgba = _values_to_rgba_zscored(col_trend_aligned.values.T, cmap=trend_cmap)
+            _add_trend_track(g, rgba, value_mat=col_trend_aligned.values.T,
+                              category_labels=col_trend_aligned.columns,
+                              tick_labels=curr_col_order,
+                              axis='col', size_frac=col_trend_frac_h,
+                              gap_frac=trend_gap)
+
+        figs[name] = g.figure
+
+    if output_dir:
+        out = pathlib.Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        for name, fig in figs.items():
+            fig.savefig(out / f"heatmap_{name}.png", bbox_inches='tight', dpi=300)
+    return figs
 
 # ==========================================
 # 3. INTEGRATION
@@ -8649,1233 +8872,3 @@ def compare_groups_to_pathways(
             }, f, indent=2, default=str)
 
     return {"figs": figs, "padj_matrix": padj_df, "selected_pathways": chosen_pathways, "kept_groups": kept_groups}
-
-def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_df, pval_df,
-                                row_trends, col_trends, row_dtype_cols, row_dtype_cnt, row_dtype_norm,
-                                col_dtype_cols, col_dtype_cnt, col_dtype_norm,
-                                trend_cmap='RdBu_r', output_dir=None, **kwargs):
-
-    n_rows, n_cols = len(row_normalized_df), len(row_normalized_df.columns)
-    layout = _compute_fixed_layout(n_rows, n_cols, row_dtype_cnt, col_dtype_cnt, row_trends, col_trends)
-
-    row_link = linkage(row_normalized_df.values, method='average')
-    col_link = linkage(row_normalized_df.values.T, method='average')
-    common = dict(
-        row_linkage=row_link, col_linkage=col_link, row_cluster=True, col_cluster=True,
-        figsize=layout["figsize"],
-        dendrogram_ratio=layout["dendrogram_ratio"],
-        colors_ratio=layout["colors_ratio"],
-        cbar_pos=(0.02, 0.83, 0.015, 0.075),
-    )
-
-    panels = [("counts", counts_df, "viridis", "Feature Count"),
-              ("normalized", row_normalized_df, "magma", "Fraction of Pathway"),
-              ("enrichment", enrichment_matrix_df, "RdBu_r", "Fold Enrichment")]
-
-    figs = {}
-    for name, df, cmap, title in panels:
-        g = sns.clustermap(df, cmap=cmap, row_colors=row_dtype_cols, col_colors=col_dtype_cols, **common)
-        g.ax_heatmap.tick_params(labelsize=7)
-
-        curr_row_order = df.index[g.dendrogram_row.reordered_ind].tolist()
-        curr_col_order = df.columns[g.dendrogram_col.reordered_ind].tolist()
-
-        if name == "enrichment":
-            _overlay_significance(g, pval_df, curr_row_order, curr_col_order)
-        g.figure.suptitle(title + "\n* padj<0.05  ** padj<0.01  *** padj<0.001 (hypergeometric, BH-FDR)", y=1.02)
-
-        _annotate_dtype_counts(g, row_dtype_cnt, row_dtype_norm, curr_row_order, axis='row')
-        _annotate_dtype_counts(g, col_dtype_cnt, col_dtype_norm, curr_col_order, axis='col')
-
-        if row_trends is not None and not row_trends.empty:
-            row_trend_aligned = row_trends.reindex(curr_row_order)
-            rgba = _values_to_rgba_zscored(row_trend_aligned.values, cmap=trend_cmap)
-            _add_trend_track(g, rgba, row_trend_aligned.columns, axis='row', label="Group Trend",
-                              size_frac=layout["row_trend_frac_w"])
-
-        if col_trends is not None and not col_trends.empty:
-            col_trend_aligned = col_trends.reindex(curr_col_order)
-            rgba = _values_to_rgba_zscored(col_trend_aligned.values.T, cmap=trend_cmap)
-            _add_trend_track(g, rgba, col_trend_aligned.columns, axis='col', label="Path. Trend",
-                              size_frac=layout["col_trend_frac_h"])
-
-        figs[name] = g.figure
-
-    if output_dir:
-        out = pathlib.Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        for name, fig in figs.items():
-            fig.savefig(out / f"heatmap_{name}.png", bbox_inches='tight', dpi=300)
-    return figs
-
-
-# # ===================================
-# # Pathway-module relatedness
-# # ===================================
-
-# # def _explode_node_pathways(
-# #     node_df: pd.DataFrame,
-# #     pathway_col: str,
-# #     group_col: str,
-# #     pathway_sep: str = ";",
-# #     missing_token: str = "Unassigned",
-# #     exclude_nopathway: bool = False,
-# #     nopathway_prefix: str = "NOPATHWAY_",
-# # ) -> pd.DataFrame:
-# #     """Explode semicolon-joined pathway annotations into long format:
-# #     one row per (feature_id, pathway, group)."""
-# #     df = node_df.reset_index().rename(columns={node_df.index.name or "index": "feature_id"})
-# #     df = df[["feature_id", pathway_col, group_col]].dropna(subset=[pathway_col, group_col])
-# #     df = df[
-# #         (df[pathway_col].astype(str).str.strip() != "")
-# #         & (df[pathway_col] != missing_token)
-# #         & (df[group_col] != missing_token)
-# #     ]
-
-# #     exploded = df.assign(**{pathway_col: df[pathway_col].str.split(pathway_sep)}).explode(pathway_col)
-# #     exploded[pathway_col] = exploded[pathway_col].str.strip()
-# #     exploded = exploded[exploded[pathway_col] != ""]
-
-# #     if exclude_nopathway:
-# #         n0 = exploded[pathway_col].nunique()
-# #         exploded = exploded[~exploded[pathway_col].str.startswith(nopathway_prefix)]
-# #         log.info(f"exclude_nopathway: dropped {n0 - exploded[pathway_col].nunique()} placeholder pathways.")
-
-# #     return exploded.rename(columns={pathway_col: "pathway", group_col: "group"})[["feature_id", "pathway", "group"]]
-
-
-# # def _prepare_universe(
-# #     node_df: pd.DataFrame,
-# #     pathway_col: str,
-# #     group_col: str,
-# #     pathway_sep: str,
-# #     missing_token: str,
-# #     exclude_nopathway: bool,
-# #     nopathway_prefix: str,
-# #     bipartite_only: bool,
-# #     min_features_per_pathway: int,
-# #     min_features_per_group: int,
-# # ) -> pd.DataFrame:
-# #     """Step 1: build and filter the (feature, pathway, group) universe used
-# #     by every downstream calculation. Order: explode -> bipartite -> min
-# #     pathway size -> min group size (group size always computed from the
-# #     WHOLE node table, independent of pathway annotation)."""
-# #     exploded = _explode_node_pathways(
-# #         node_df, pathway_col, group_col, pathway_sep, missing_token, exclude_nopathway, nopathway_prefix
-# #     )
-
-# #     if bipartite_only:
-# #         prefixes = _detect_dtype_prefixes(exploded["feature_id"])
-# #         if len(prefixes) < 2:
-# #             log.warning(f"bipartite_only=True but <2 datatypes detected ({prefixes}); skipping.")
-# #         else:
-# #             dtype = exploded["feature_id"].astype(str).str.split("_", n=1).str[0]
-# #             covered = dtype.groupby(exploded["pathway"]).nunique()
-# #             keep = covered[covered >= len(prefixes)].index
-# #             n0 = exploded["pathway"].nunique()
-# #             exploded = exploded[exploded["pathway"].isin(keep)]
-# #             log.info(f"bipartite_only: kept {exploded['pathway'].nunique()} of {n0} pathways spanning {prefixes}.")
-
-# #     if min_features_per_pathway > 0:
-# #         sizes = exploded.groupby("pathway")["feature_id"].nunique()
-# #         exploded = exploded[exploded["pathway"].isin(sizes[sizes >= min_features_per_pathway].index)]
-
-# #     if min_features_per_group > 0:
-# #         all_sizes = node_df[group_col].value_counts()
-# #         keep_groups = all_sizes[all_sizes >= min_features_per_group].index
-# #         exploded = exploded[exploded["group"].isin(keep_groups)]
-
-# #     if exploded.empty:
-# #         raise ValueError("No (feature, pathway, group) rows remain after filtering; check inputs/thresholds.")
-
-# #     log.info(
-# #         f"Universe after filtering: {exploded['feature_id'].nunique()} features, "
-# #         f"{exploded['pathway'].nunique()} pathways, {exploded['group'].nunique()} groups."
-# #     )
-# #     return exploded
-
-
-# # def compute_enrichment(exploded: pd.DataFrame, fdr_method: str = "fdr_bh", alpha: float = 0.05) -> pd.DataFrame:
-# #     """Hypergeometric over-representation test for every (pathway, group)
-# #     pair present in `exploded`. Tests, for each pair, whether the pathway's
-# #     features are concentrated in that group more than expected under random
-# #     assignment given the pathway size, group size, and total universe size.
-
-# #     Returns
-# #     -------
-# #     pd.DataFrame with one row per (pathway, group) pair:
-# #         n_features_overlap        - features shared by this pathway and this group (hypergeometric "k")
-# #         n_features_pathway_total  - total features annotated to this pathway, universe-wide ("n")
-# #         n_features_group_total    - total features in this group, universe-wide ("N")
-# #         n_features_universe_total - total features in the filtered universe ("M")
-# #         expected, fold_enrichment, pvalue, padj, significant
-# #     """
-# #     k_df = pd.crosstab(exploded["pathway"], exploded["group"])
-# #     M = exploded["feature_id"].nunique()
-# #     n = exploded.groupby("pathway")["feature_id"].nunique().reindex(k_df.index)
-# #     N = exploded.groupby("group")["feature_id"].nunique().reindex(k_df.columns)
-
-# #     n_arr, N_arr, k_arr = n.values[:, None], N.values[None, :], k_df.values
-# #     expected = n_arr * N_arr / M
-# #     fold = np.divide(k_arr, expected, out=np.zeros_like(expected, dtype=float), where=expected > 0)
-# #     pval = hypergeom.sf(k_arr - 1, M, n_arr, N_arr)
-
-# #     n_p, n_g = k_df.shape
-# #     result = pd.DataFrame({
-# #         "pathway": np.repeat(k_df.index.values, n_g),
-# #         "group": np.tile(k_df.columns.values, n_p),
-# #         "n_features_overlap": k_arr.ravel(),
-# #         "n_features_pathway_total": np.repeat(n_arr.ravel(), n_g),
-# #         "n_features_group_total": np.tile(N_arr.ravel(), n_p),
-# #         "n_features_universe_total": M,
-# #         "expected": expected.ravel(),
-# #         "fold_enrichment": fold.ravel(),
-# #         "pvalue": pval.ravel(),
-# #     })
-# #     result["padj"] = multipletests(result["pvalue"], alpha=alpha, method=fdr_method)[1]
-# #     result["significant"] = result["padj"] < alpha
-
-# #     log.info(
-# #         f"Tested {len(result)} pathway x group pairs; "
-# #         f"{int(result['significant'].sum())} significant at padj<{alpha} ({fdr_method})."
-# #     )
-# #     return result.sort_values("padj").reset_index(drop=True)
-
-# def prepare_universe(node_table, pathway_col, group_col, pe):
-#     # 1. Explode pathways and clean
-#     df = node_table[[group_col, pathway_col]].copy()
-#     df[pathway_col] = df[pathway_col].str.split(';')
-#     exploded = df.explode(pathway_col)
-#     exploded[pathway_col] = exploded[pathway_col].str.strip()
-    
-#     # 2. Basic cleaning
-#     exploded = exploded[
-#         (exploded[pathway_col].notna()) & 
-#         (exploded[pathway_col] != "") & 
-#         (~exploded[pathway_col].str.startswith("NOPATHWAY_")) # Simplified filter
-#     ].rename(columns={pathway_col: "pathway", group_col: "group"})
-    
-#     # 3. Bipartite Filter (Keep pathways containing features from all detected dtypes)
-#     if pe.get('bipartite_only'):
-#         # Assuming feature_id is the index of node_table
-#         dtypes = node_table.index.str.split('_').str[0]
-#         # Map feature_id -> dtype
-#         dtype_map = dtypes.to_dict()
-#         exploded['dtype'] = exploded.index.map(dtype_map)
-        
-#         # Count unique dtypes per pathway
-#         counts = exploded.groupby('pathway')['dtype'].nunique()
-#         required = dtypes.nunique()
-#         exploded = exploded[exploded['pathway'].isin(counts[counts >= required].index)]
-
-#     # 4. Min Size Filters
-#     # Pathway size (based on universe)
-#     p_counts = exploded['pathway'].value_counts()
-#     exploded = exploded[exploded['pathway'].isin(p_counts[p_counts >= pe['min_features_per_pathway']].index)]
-    
-#     # Group size (based on original node_table)
-#     g_counts = node_table[group_col].value_counts()
-#     exploded = exploded[exploded['group'].isin(g_counts[g_counts >= pe['min_features_per_group']].index)]
-    
-#     return exploded
-
-
-# def compute_enrichment_matrix(exploded, alpha=0.05):
-#     # Contingency table: Rows=Pathways, Cols=Groups
-#     overlap_mat = pd.crosstab(exploded['pathway'], exploded['group'])
-    
-#     # Universe totals
-#     M = exploded.index.nunique()
-#     n = exploded.groupby('pathway').index.nunique() # Pathway totals
-#     N = exploded.groupby('group').index.nunique()    # Group totals
-    
-#     # Vectorized hypergeometric test
-#     # p-value for each cell: hypergeom.sf(k-1, M, n, N)
-#     # We use broadcasting: n[:, None] and N[None, :]
-#     pval_mat = np.array([
-#         [hypergeom.sf(k - 1, M, n[p], N[g]) for g, k in row.items()] 
-#         for p, row in overlap_mat.iterrows()
-#     ])
-    
-#     # Convert to DataFrame for easier handling
-#     pval_df = pd.DataFrame(pval_mat, index=overlap_mat.index, columns=overlap_mat.columns)
-    
-#     # Fold enrichment: observed / expected
-#     expected = np.outer(n.values, N.values)
-#     fold_mat = overlap_mat.values / expected
-#     fold_df = pd.DataFrame(fold_mat, index=overlap_mat.index, columns=overlap_mat.columns)
-    
-#     return overlap_mat, fold_df, pval_df
-
-
-
-# def get_trend_values(quant_df, mapping_df, group_col, metadata_df, sort_by, collapse_by, agg='median'):
-#     """
-#     Generic aggregator for either row (group) or col (pathway) trends.
-#     mapping_df: node_table (features x group/pathway)
-#     """
-#     # 1. Collapse Samples first (Metadata pooling)
-#     # If collapse_by is 'timepoint', we group samples by timepoint and agg abundance
-#     if collapse_by:
-#         # Align metadata with quant_df columns
-#         meta = metadata_df.reindex(quant_df.columns)
-#         # Group by metadata category, then compute median across samples
-#         collapsed_samples = quant_df.groupby(meta[collapse_by], axis=1).agg(agg)
-#     else:
-#         collapsed_samples = quant_df
-
-#     # 2. Collapse Features
-#     # Use the mapping_df to group features
-#     # mapping_df is node_table; index=feature, column=group/pathway
-#     # Note: Pathways are many-to-many, Groups are one-to-one. 
-#     # For simplicity, we use a helper that handles the membership:
-    
-#     final_values = []
-#     labels = mapping_df[group_col].unique()
-    
-#     for label in labels:
-#         # Get features belonging to this group/pathway
-#         # This handles the ';' separated pathways if the mapping_df is the exploded one
-#         feats = mapping_df[mapping_df[group_col] == label].index
-#         # Agg abundance across these features
-#         final_values.append(collapsed_samples.loc[feats].agg(agg, axis=0))
-        
-#     return pd.DataFrame(final_values, index=labels)
-
-# def select_top_pathways(
-#     exploded: pd.DataFrame,
-#     enrichment_df: pd.DataFrame,
-#     quant_df: pd.DataFrame | None,
-#     top_n: int,
-#     rank_by: Literal["n_features", "summed_significance", "mean_abs_value"],
-# ) -> list[str]:
-#     """Rank pathways for heatmap *display only* -- this never affects the
-#     stats test or export (that's governed by `min_features_per_pathway` and
-#     the significance axis filter upstream).
-
-#     rank_by:
-#         "n_features"          -- most annotated features.
-#         "summed_significance" -- highest sum of -log10(padj) across all its
-#                                   group pairs (pathways strongly concentrated
-#                                   in one or more groups).
-#         "mean_abs_value"      -- highest mean(|value|) across all samples/
-#                                   comparisons, averaged over its features
-#                                   (pathways whose features change the most).
-#                                   Requires `quant_df` (features x samples or
-#                                   features x comparisons).
-#     """
-#     if rank_by == "n_features":
-#         score = exploded.groupby("pathway")["feature_id"].nunique()
-#     elif rank_by == "summed_significance":
-#         neg_log_padj = -np.log10(enrichment_df["padj"].clip(lower=1e-300))
-#         score = neg_log_padj.groupby(enrichment_df["pathway"]).sum()
-#     elif rank_by == "mean_abs_value":
-#         if quant_df is None:
-#             raise ValueError("quant_df is required when rank_by='mean_abs_value'.")
-#         feature_score = quant_df.abs().mean(axis=1)
-#         score = exploded.assign(_s=exploded["feature_id"].map(feature_score)).groupby("pathway")["_s"].mean()
-#     else:
-#         raise ValueError(f"Unknown rank_by: {rank_by!r}")
-
-#     return score.sort_values(ascending=False).head(top_n).index.tolist()
-
-# def _build_group_pathway_matrices(
-#     exploded: pd.DataFrame, groups: list[str], pathways: list[str]
-# ) -> tuple[pd.DataFrame, pd.DataFrame]:
-#     """Group (rows) x pathway (cols) raw counts and row-normalized fractions."""
-#     sub = exploded[exploded["pathway"].isin(pathways) & exploded["group"].isin(groups)]
-#     counts = pd.crosstab(sub["group"], sub["pathway"]).reindex(index=groups, columns=pathways, fill_value=0)
-#     row_sums = counts.sum(axis=1).replace(0, np.nan)
-#     row_normalized = counts.div(row_sums, axis=0).fillna(0.0)
-#     return counts, row_normalized
-
-# # def build_enrichment_matrix(
-# #     enrichment_df: pd.DataFrame,
-# #     reference_df: pd.DataFrame,
-# #     value: Literal["fold_enrichment", "neg_log10_padj"] = "fold_enrichment",
-# # ) -> pd.DataFrame:
-# #     """Pivot the long-format enrichment table into a group x pathway heat
-# #     matrix aligned to `reference_df`'s index/columns (post-selection)."""
-# #     if enrichment_df.empty:
-# #         return pd.DataFrame(0.0, index=reference_df.index, columns=reference_df.columns)
-
-# #     df = enrichment_df.copy()
-# #     df["_v"] = df["fold_enrichment"] if value == "fold_enrichment" else -np.log10(df["padj"].clip(lower=1e-300))
-# #     mat = df.pivot(index="group", columns="pathway", values="_v")
-# #     return mat.reindex(index=reference_df.index, columns=reference_df.columns, fill_value=0.0).fillna(0.0)
-
-# def _detect_dtype_prefixes(feature_ids) -> list[str]:
-#     ids = pd.Index(feature_ids).astype(str)
-#     return sorted({fid.split("_", 1)[0] for fid in ids if "_" in fid})
-
-# def _dtype_color_strip(
-#     exploded: pd.DataFrame, id_col: Literal["group", "pathway"], id_order: list[str]
-# ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] | tuple[None, None, None]:
-#     """Build row_colors/col_colors-ready color strip plus the raw counts and
-#     normalized intensities behind it (needed to overlay contrasting text).
-#     Returns (colors_df, counts_df, norm_df), or (None, None, None) if <2
-#     datatypes are detected."""
-#     prefixes = _detect_dtype_prefixes(exploded["feature_id"])
-#     if len(prefixes) < 2:
-#         return None, None, None
-
-#     df = exploded.copy()
-#     df["_dtype"] = df["feature_id"].astype(str).str.split("_", n=1).str[0]
-#     counts = df.groupby([id_col, "_dtype"])["feature_id"].nunique().unstack(fill_value=0)
-#     counts = counts.reindex(index=id_order, columns=prefixes, fill_value=0)
-
-#     cmap = plt.get_cmap("Greys")
-#     colors, norm_vals = pd.DataFrame(index=counts.index), pd.DataFrame(index=counts.index)
-#     for dtype in counts.columns:
-#         vals = counts[dtype].to_numpy(dtype=float)
-#         vmax = vals.max() if vals.max() > 0 else 1.0
-#         normed = vals / vmax
-#         colors[dtype] = [to_hex(cmap(v)) if v > 0 else "#ffffff" for v in normed]
-#         norm_vals[dtype] = normed
-#     return colors, counts, norm_vals
-
-# def _annotate_dtype_counts(
-#     clustergrid: sns.matrix.ClusterGrid,
-#     counts_df: pd.DataFrame,
-#     norm_df: pd.DataFrame,
-#     order: list[str],
-#     axis: Literal["row", "col"],
-#     luminance_threshold: float = 0.5,
-# ) -> None:
-#     """Overlay raw feature counts as text on the row_colors/col_colors strip,
-#     switching between white/black text based on the strip's own grayscale
-#     intensity so numbers stay legible on both light and dark cells.
-#     """
-#     ax = clustergrid.ax_row_colors if axis == "row" else clustergrid.ax_col_colors
-#     if ax is None:
-#         return
-#     dtypes = list(counts_df.columns)
-
-#     for pos, id_ in enumerate(order):
-#         for level, dtype in enumerate(dtypes):
-#             val = int(counts_df.loc[id_, dtype])
-#             if val == 0:
-#                 continue
-#             txt_color = "white" if norm_df.loc[id_, dtype] > luminance_threshold else "black"
-#             x, y = (level, pos) if axis == "row" else (pos, level)
-#             ax.text(x + 0.5, y + 0.5, str(val), ha="center", va="center", fontsize=6, color=txt_color)
-
-# def _overlay_significance(
-#     clustergrid: sns.matrix.ClusterGrid,
-#     matrix_df: pd.DataFrame,
-#     enrichment_df: pd.DataFrame,
-#     cluster_rows: bool,
-#     cluster_cols: bool,
-#     alpha_stars: dict[float, str] | None = None,
-# ) -> None:
-#     """Overlay significance stars at (group, pathway) cells. Must run before
-#     `.figure` is extracted -- dendrogram reordering only exists on the
-#     ClusterGrid itself."""
-#     _ALPHA_STARS_DEFAULT = {0.001: "***", 0.01: "**", 0.05: "*"}
-#     alpha_stars = alpha_stars or _ALPHA_STARS_DEFAULT
-#     padj = enrichment_df.set_index(["group", "pathway"])["padj"]
-
-#     row_idx = clustergrid.dendrogram_row.reordered_ind if cluster_rows else range(len(matrix_df.index))
-#     col_idx = clustergrid.dendrogram_col.reordered_ind if cluster_cols else range(len(matrix_df.columns))
-#     rows, cols = matrix_df.index[list(row_idx)], matrix_df.columns[list(col_idx)]
-
-#     ax = clustergrid.ax_heatmap
-#     stroke = [pe.withStroke(linewidth=1.5, foreground="black")]
-#     for i, g in enumerate(rows):
-#         for j, p in enumerate(cols):
-#             val = padj.get((g, p), np.nan)
-#             if pd.isna(val):
-#                 continue
-#             for thresh, stars in sorted(alpha_stars.items()):
-#                 if val < thresh:
-#                     ax.text(j + 0.5, i + 0.7, stars, ha="center", va="center",
-#                             color="white", fontsize=8, fontweight="bold", path_effects=stroke)
-#                     break
-
-
-# def _finish_panel(g, df, title, enrichment_df, cluster_rows, cluster_cols, alpha_stars):
-#     #g.ax_heatmap.set_xlabel("Pathway")
-#     #g.ax_heatmap.set_ylabel("Feature group")
-#     g.ax_heatmap.tick_params(labelsize=7)
-#     if not enrichment_df.empty:
-#         _overlay_significance(g, df, enrichment_df, cluster_rows, cluster_cols, alpha_stars)
-#         title += "\n* padj<0.05  ** padj<0.01  *** padj<0.001 (hypergeometric, BH-FDR)"
-#     g.figure.suptitle(title, y=1.02, fontsize=10)
-
-# # def _compute_pathway_trend_rgba(
-# #     pathway_membership: dict[str, list[str]],
-# #     abundance_df: pd.DataFrame,
-# #     col_order: list[str],
-# #     columns: list[str],
-# #     column_members: dict[str, list[str]] | None,
-# #     agg: Literal["mean", "median"],
-# #     dispersion: Literal["sem", "std", "iqr", "none"],
-# #     dispersion_norm: Literal["global", "row"],
-# #     cmap: str,
-# #     vmin: float,
-# #     vmax: float,
-# #     min_alpha: float = 0.25,
-# #     max_alpha: float = 1.0,
-# # ) -> np.ndarray:
-# #     """Pathway (column) trend track. `pathway_membership` must map each
-# #     label in `col_order` to its raw feature IDs -- many-to-many, since a
-# #     feature can belong to multiple pathways after `pathway_sep` splitting
-# #     (unlike feature-groups, which are single-label). Returns an RGBA array
-# #     shaped (len(columns), len(col_order), 4) -- TRANSPOSED relative to the
-# #     row track -- ready to imshow directly below the heatmap."""
-# #     value_mat, disp_mat = _aggregate_membership_trend(
-# #         pathway_membership, abundance_df, col_order, columns, column_members, agg, dispersion
-# #     )
-# #     rgba = _values_to_rgba(value_mat, disp_mat, dispersion, dispersion_norm, cmap, vmin, vmax, min_alpha, max_alpha)
-# #     return rgba.transpose(1, 0, 2)
-
-# # def _aggregate_membership_trend(
-# #     membership: dict[str, list[str]],
-# #     abundance_df: pd.DataFrame,
-# #     row_order: list[str],
-# #     columns: list[str],
-# #     column_members: dict[str, list[str]] | None,
-# #     agg: Literal["mean", "median"],
-# #     dispersion: Literal["sem", "std", "iqr", "none"],
-# # ) -> tuple[np.ndarray, np.ndarray]:
-# #     """Shared two-stage aggregation used by both the feature-group row
-# #     track and the pathway column track: (1) collapse samples per feature
-# #     per trend column, (2) collapse features per category (`row_order`
-# #     label) using the already sample-collapsed values. `membership` maps
-# #     each `row_order` label to its raw feature IDs -- may be many-to-many
-# #     (a feature can appear under multiple labels, as with pathways)."""
-# #     member_cols = [column_members[c] for c in columns] if column_members is not None else [[c] for c in columns]
-# #     all_raw_cols = sorted({c for members in member_cols for c in members})
-# #     abundance_sub = abundance_df.reindex(columns=all_raw_cols)
-# #     agg_fn = np.nanmean if agg == "mean" else np.nanmedian
-
-# #     collapsed = pd.DataFrame(
-# #         {col: agg_fn(abundance_sub[members].values, axis=1) for col, members in zip(columns, member_cols)},
-# #         index=abundance_sub.index,
-# #     )
-
-# #     def _disp(vals: np.ndarray) -> float:
-# #         vals = vals[~np.isnan(vals)]
-# #         if len(vals) < 2 or dispersion == "none":
-# #             return 0.0
-# #         if dispersion == "sem":
-# #             return float(np.std(vals, ddof=1) / np.sqrt(len(vals)))
-# #         if dispersion == "std":
-# #             return float(np.std(vals, ddof=1))
-# #         if dispersion == "iqr":
-# #             q75, q25 = np.percentile(vals, [75, 25])
-# #             return float(q75 - q25)
-# #         raise ValueError(f"Unknown dispersion: {dispersion!r}")
-
-# #     value_mat = np.full((len(row_order), len(columns)), np.nan)
-# #     disp_mat = np.zeros_like(value_mat)
-# #     for i, label in enumerate(row_order):
-# #         feat_ids = [f for f in membership.get(label, []) if f in collapsed.index]
-# #         sub = collapsed.loc[feat_ids]
-# #         if sub.empty:
-# #             continue
-# #         value_mat[i, :] = agg_fn(sub.values, axis=0)
-# #         disp_mat[i, :] = [_disp(sub.values[:, j]) for j in range(sub.shape[1])]
-# #     return value_mat, disp_mat
-
-# def _values_to_rgba(
-#     value_mat: np.ndarray,
-#     disp_mat: np.ndarray,
-#     dispersion: Literal["sem", "std", "iqr", "none"],
-#     dispersion_norm: Literal["global", "row"],
-#     cmap: str,
-#     vmin: float,
-#     vmax: float,
-#     min_alpha: float,
-#     max_alpha: float,
-# ) -> np.ndarray:
-#     """Plain linear color mapping (no zero-centering) + dispersion-driven
-#     opacity. Shared by both trend tracks so they can use one common
-#     vmin/vmax and stay visually comparable to each other."""
-#     norm = Normalize(vmin=vmin, vmax=vmax)
-#     rgba = cm.get_cmap(cmap)(norm(np.nan_to_num(value_mat, nan=vmin)))
-
-#     if dispersion != "none":
-#         if dispersion_norm == "row":
-#             d_max = np.nanmax(disp_mat, axis=1, keepdims=True)
-#             d_max = np.where(d_max > 0, d_max, 1.0)
-#         else:
-#             d_max = max(np.nanmax(disp_mat), 1e-9)
-#         d_norm = np.clip(disp_mat / d_max, 0, 1)
-#         alpha = max_alpha - d_norm * (max_alpha - min_alpha)
-#     else:
-#         alpha = np.full_like(value_mat, max_alpha)
-#     rgba[..., 3] = np.where(np.isnan(value_mat), 0.0, alpha)
-#     return rgba
-
-# def _clustered_order(df: pd.DataFrame, axis: Literal["rows", "cols"], cluster: bool, method: str, metric: str) -> list[str]:
-#     """Return row or column labels in dendrogram-leaf order (or original
-#     order if clustering is disabled). Uses the same method/metric as
-#     `plot_group_pathway_heatmaps` so the leaf order is guaranteed identical."""
-#     from scipy.cluster.hierarchy import dendrogram
-
-#     labels = list(df.index) if axis == "rows" else list(df.columns)
-#     if not cluster:
-#         return labels
-#     data = df.values if axis == "rows" else df.values.T
-#     link = linkage(data, method=method, metric=metric)
-#     leaves = dendrogram(link, no_plot=True)["leaves"]
-#     return [labels[i] for i in leaves]
-
-# def _annotate_trend_values(
-#     ax: plt.Axes,
-#     value_mat: np.ndarray,
-#     rgba: np.ndarray,
-#     transpose: bool = False,
-#     fmt: str = "{:.2g}",
-#     fontsize: float = 5.0,
-#     luminance_threshold: float = 0.5,
-# ) -> None:
-#     """Overlay each trend-track cell's literal aggregated value (straight
-#     from `abundance_df`, no transformation) as text, switching white/black
-#     based on the cell's own rendered luminance so it stays legible -- same
-#     approach as `_annotate_dtype_counts`. `value_mat` is the pre-color
-#     (rows=labels, cols=trend columns) array; `rgba` is the already-colored,
-#     possibly-transposed array actually drawn via imshow, used only to
-#     derive per-cell luminance for text contrast."""
-#     def _luminance(rgb) -> float:
-#         r, g, b = rgb[:3]
-#         return 0.2126 * r + 0.7152 * g + 0.0722 * b
-
-#     n_rows, n_cols = value_mat.shape
-#     for i in range(n_rows):
-#         for j in range(n_cols):
-#             val = value_mat[i, j]
-#             if np.isnan(val):
-#                 continue
-#             cell_rgba = rgba[j, i] if transpose else rgba[i, j]
-#             txt_color = "white" if _luminance(cell_rgba) < luminance_threshold else "black"
-#             x, y = (i, j) if transpose else (j, i)
-#             ax.text(x, y, fmt.format(val), ha="center", va="center", fontsize=fontsize, color=txt_color)
-
-# # def _compute_group_trend_rgba(
-# #     node_df: pd.DataFrame,
-# #     abundance_df: pd.DataFrame,
-# #     group_col: str,
-# #     row_order: list[str],
-# #     columns: list[str],
-# #     column_members: dict[str, list[str]] | None = None,
-# #     feature_id_col: str | None = None,
-# #     agg: Literal["mean", "median"] = "median",
-# #     dispersion: Literal["sem", "std", "iqr", "none"] = "iqr",
-# #     dispersion_norm: Literal["global", "row"] = "global",
-# #     cmap: str = "RdBu_r",
-# #     vmax: float | Literal["auto"] = "auto",
-# #     min_alpha: float = 0.25,
-# #     max_alpha: float = 1.0,
-# # ) -> np.ndarray:
-# #     """Build an (n_groups, n_columns, 4) RGBA array via a strict two-stage
-# #     aggregation with no other data transformation:
-
-# #       1. Collapse samples per feature: for each raw feature and each
-# #          sample-group column, `agg` across that column's member samples.
-# #       2. Collapse features per feature-group: for each row in `row_order`,
-# #          `agg` across that group's features, using the already
-# #          sample-collapsed values from step 1 (not the raw values).
-
-# #     `row_order` MUST match the heatmap panel's own clustered row order
-# #     exactly, so the track's rows line up with the main heatmap's rows.
-# #     `column_members`, if given, maps each entry in `columns` to the raw
-# #     `abundance_df` column labels it pools for step 1; if None, each entry
-# #     in `columns` is a literal `abundance_df` column label (no pooling).
-# #     """
-# #     node = node_df.copy()
-# #     if feature_id_col is not None:
-# #         node = node.set_index(feature_id_col)
-# #     groups_series = node[group_col].astype(str)
-
-# #     member_cols = [column_members[c] for c in columns] if column_members is not None else [[c] for c in columns]
-# #     all_raw_cols = sorted({c for members in member_cols for c in members})
-# #     abundance_sub = abundance_df.reindex(columns=all_raw_cols)
-# #     agg_fn = np.nanmean if agg == "mean" else np.nanmedian
-
-# #     # --- Stage 1: collapse samples, per feature, per sample-group column ---
-# #     collapsed = pd.DataFrame(
-# #         {col: agg_fn(abundance_sub[members].values, axis=1) for col, members in zip(columns, member_cols)},
-# #         index=abundance_sub.index,
-# #     )
-
-# #     def _disp(vals: np.ndarray) -> float:
-# #         vals = vals[~np.isnan(vals)]
-# #         if len(vals) < 2 or dispersion == "none":
-# #             return 0.0
-# #         if dispersion == "sem":
-# #             return float(np.std(vals, ddof=1) / np.sqrt(len(vals)))
-# #         if dispersion == "std":
-# #             return float(np.std(vals, ddof=1))
-# #         if dispersion == "iqr":
-# #             q75, q25 = np.percentile(vals, [75, 25])
-# #             return float(q75 - q25)
-# #         raise ValueError(f"Unknown dispersion: {dispersion!r}")
-
-# #     value_mat = np.full((len(row_order), len(columns)), np.nan)
-# #     disp_mat = np.zeros_like(value_mat)
-
-# #     for i, group in enumerate(row_order):
-# #         feat_ids = [f for f in groups_series[groups_series == group].index if f in collapsed.index]
-# #         sub = collapsed.loc[feat_ids]
-# #         if sub.empty:
-# #             continue
-# #         # --- Stage 2: collapse features, per feature-group, per sample-group column ---
-# #         value_mat[i, :] = agg_fn(sub.values, axis=0)
-# #         disp_mat[i, :] = [_disp(sub.values[:, j]) for j in range(sub.shape[1])]
-
-# #     resolved_vmax = max(np.nanmax(np.abs(value_mat)) if vmax == "auto" else vmax, 1e-6)
-# #     norm = TwoSlopeNorm(vmin=-resolved_vmax, vcenter=0.0, vmax=resolved_vmax)
-# #     rgba = cm.get_cmap(cmap)(norm(np.nan_to_num(value_mat, nan=0.0)))
-
-# #     if dispersion != "none":
-# #         if dispersion_norm == "row":
-# #             d_max = np.nanmax(disp_mat, axis=1, keepdims=True)
-# #             d_max = np.where(d_max > 0, d_max, 1.0)
-# #         else:
-# #             d_max = max(np.nanmax(disp_mat), 1e-9)
-# #         d_norm = np.clip(disp_mat / d_max, 0, 1)
-# #         alpha = max_alpha - d_norm * (max_alpha - min_alpha)
-# #     else:
-# #         alpha = np.full_like(value_mat, max_alpha)
-# #     rgba[..., 3] = np.where(np.isnan(value_mat), 0.0, alpha)
-# #     return rgba
-
-# def _measure_ticklabel_right_edge(ax: plt.Axes) -> float:
-#     """Rightmost extent (figure-fraction x) of an axes' rendered y-tick
-#     labels. Forces a canvas draw so text layout/width is accurate rather
-#     than guessed."""
-#     fig = ax.figure
-#     fig.canvas.draw()
-#     renderer = fig.canvas.get_renderer()
-#     extents = [t.get_window_extent(renderer=renderer) for t in ax.get_yticklabels() if t.get_text()]
-#     if not extents:
-#         return ax.get_position().x1
-#     max_x_display = max(e.x1 for e in extents)
-#     return fig.transFigure.inverted().transform((max_x_display, 0))[0]
-
-# def _measure_ticklabel_bottom_edge(ax: plt.Axes) -> float:
-#     """Bottommost extent (figure-fraction y) of an axes' rendered x-tick
-#     labels, so a track can be attached below without overlapping them."""
-#     fig = ax.figure
-#     fig.canvas.draw()
-#     renderer = fig.canvas.get_renderer()
-#     extents = [t.get_window_extent(renderer=renderer) for t in ax.get_xticklabels() if t.get_text()]
-#     if not extents:
-#         return ax.get_position().y0
-#     min_y_display = min(e.y0 for e in extents)
-#     return fig.transFigure.inverted().transform((0, min_y_display))[1]
-
-# def _add_col_trend_track(
-#     clustergrid: sns.matrix.ClusterGrid,
-#     rgba: np.ndarray,
-#     row_labels: list[str],
-#     value_mat: np.ndarray,
-#     height: float = 0.12,
-#     pad: float = 0.01,
-#     ytick_fontsize: float = 5,
-#     max_yticks: int = 10,
-#     label: str = "Median\nabundance",
-#     annotate: bool = True,
-# ) -> plt.Axes:
-#     """Attach a thin per-column trend heat-strip below a ClusterGrid's x
-#     tick labels, sharing `ax_heatmap`'s exact column (x) extent so pathway
-#     columns line up. `rgba` must already be transposed, as returned by
-#     `_compute_pathway_trend_rgba`."""
-#     fig = clustergrid.figure
-#     heat_pos = clustergrid.ax_heatmap.get_position()
-#     label_edge = _measure_ticklabel_bottom_edge(clustergrid.ax_heatmap)
-
-#     ax = fig.add_axes([heat_pos.x0, label_edge - pad - height, heat_pos.width, height])
-#     ax.imshow(rgba, aspect="auto", interpolation="nearest")
-#     if annotate:
-#         _annotate_trend_values(ax, value_mat, rgba, transpose=True)
-#     ax.set_xticks([])
-#     ax.xaxis.set_visible(False)
-
-#     step = max(1, len(row_labels) // max_yticks)
-#     tick_pos = list(range(0, len(row_labels), step))
-#     ax.set_yticks(tick_pos)
-#     ax.set_yticklabels([row_labels[i] for i in tick_pos], fontsize=ytick_fontsize)
-#     ax.set_ylabel(label, fontsize=7)
-#     for spine in ax.spines.values():
-#         spine.set_visible(False)
-#     return ax
-
-# def _add_row_trend_track(
-#     clustergrid: sns.matrix.ClusterGrid,
-#     rgba: np.ndarray,
-#     columns: list[str],
-#     value_mat: np.ndarray,
-#     width: float = 0.12,
-#     pad: float = 0.01,
-#     xtick_rotation: float = 90,
-#     max_xticks: int = 10,
-#     label: str = "Median\nabundance",
-#     annotate: bool = True,
-# ) -> plt.Axes:
-#     """Attach a thin per-row trend heat-strip immediately to the right of a
-#     ClusterGrid's row tick labels, sharing `ax_heatmap`'s exact row (y)
-#     extent so rows line up. Must be called after `sns.clustermap` returns
-#     and after row tick labels are finalized (i.e. after `_finish_panel` /
-#     `_annotate_strips`)."""
-#     fig = clustergrid.figure
-#     heat_pos = clustergrid.ax_heatmap.get_position()
-#     label_edge = _measure_ticklabel_right_edge(clustergrid.ax_heatmap)
-
-#     ax = fig.add_axes([label_edge + pad, heat_pos.y0, width, heat_pos.height])
-#     ax.imshow(rgba, aspect="auto", interpolation="nearest")
-#     if annotate:
-#         _annotate_trend_values(ax, value_mat, rgba, transpose=False)
-#     ax.set_yticks([])
-#     ax.yaxis.set_visible(False)
-
-#     step = max(1, len(columns) // max_xticks)
-#     tick_pos = list(range(0, len(columns), step))
-#     ax.set_xticks(tick_pos)
-#     ax.set_xticklabels([columns[i] for i in tick_pos], rotation=xtick_rotation, fontsize=5, ha="right")
-#     ax.set_title(label, fontsize=7, pad=4)
-#     for spine in ax.spines.values():
-#         spine.set_visible(False)
-#     return ax
-
-# # def _resolve_trend_column_groups(
-# #     abundance_df: pd.DataFrame,
-# #     metadata: pd.DataFrame | pd.Series | None,
-# #     sort_by: str | None,
-# #     collapse_by: str | None,
-# # ) -> tuple[list[str], dict[str, list[str]]]:
-# #     """Resolve the trend track's x-axis columns.
-
-# #     If `collapse_by` is given, samples are pooled into one column per unique
-# #     metadata category (e.g. "timepoint" values collapse all replicate
-# #     samples into a single column per timepoint) -- categories ordered by the
-# #     mean `sort_by` rank of their member samples if `sort_by` is also given,
-# #     else by first appearance. Otherwise, one column per raw sample, ordered
-# #     by `sort_by` if given.
-
-# #     Returns
-# #     -------
-# #     (column_labels, members) : `column_labels` is the ordered x-axis label
-# #     list (sample IDs, or metadata category names if collapsed); `members`
-# #     maps each label to the raw sample columns to pool for it (a single-item
-# #     list when uncollapsed).
-# #     """
-# #     samples = list(abundance_df.columns)
-
-# #     if collapse_by is not None:
-# #         if metadata is None:
-# #             raise ValueError("`metadata` is required when a collapse-by category is set.")
-# #         cat_df = metadata if isinstance(metadata, pd.DataFrame) else metadata.to_frame(collapse_by)
-# #         if collapse_by not in cat_df.columns:
-# #             raise ValueError(f"'{collapse_by}' not found in metadata columns: {cat_df.columns.tolist()}")
-
-# #         cat_series = cat_df[collapse_by].reindex(samples)
-# #         valid = cat_series.dropna().astype(str)
-# #         dropped = set(samples) - set(valid.index)
-# #         if dropped:
-# #             log.warning(f"{len(dropped)} samples missing '{collapse_by}' and excluded from trend track: {sorted(dropped)[:5]}")
-
-# #         members: dict[str, list[str]] = {cat: g.index.tolist() for cat, g in valid.groupby(valid)}
-
-# #         if sort_by is not None and sort_by in cat_df.columns:
-# #             sort_series = cat_df[sort_by].reindex(samples)
-# #             rank = sort_series.rank(method="average", na_option="bottom")
-# #             order_key = {cat: np.mean([rank.get(s, np.inf) for s in mem]) for cat, mem in members.items()}
-# #             column_labels = sorted(members.keys(), key=lambda c: order_key[c])
-# #         else:
-# #             if sort_by is not None:
-# #                 log.warning(f"'{sort_by}' not found in metadata columns; collapsed trend-track categories ordered by first appearance instead.")
-# #             column_labels = list(dict.fromkeys(valid.tolist()))
-
-# #         return column_labels, members
-
-# #     # --- uncollapsed: one column per raw sample ---
-# #     columns = samples
-# #     if metadata is not None and sort_by is not None:
-# #         meta_sort = metadata if isinstance(metadata, pd.Series) else metadata[sort_by]
-# #         meta_sort = meta_sort.reindex(columns)
-# #         columns = meta_sort.sort_values(kind="stable", na_position="last").index.tolist()
-# #     return columns, {c: [c] for c in columns}
-
-# def plot_group_pathway_heatmaps(
-#     counts_df: pd.DataFrame,
-#     row_normalized_df: pd.DataFrame,
-#     enrichment_matrix_df: pd.DataFrame,
-#     enrichment_df: pd.DataFrame,
-#     group_dtype_colors: pd.DataFrame | None = None,
-#     group_dtype_counts: pd.DataFrame | None = None,
-#     group_dtype_norm: pd.DataFrame | None = None,
-#     pathway_dtype_colors: pd.DataFrame | None = None,
-#     pathway_dtype_counts: pd.DataFrame | None = None,
-#     pathway_dtype_norm: pd.DataFrame | None = None,
-#     cluster_rows: bool = True,
-#     cluster_cols: bool = True,
-#     method: str = "average",
-#     metric: str = "euclidean",
-#     counts_cmap: str = "viridis",
-#     normalized_cmap: str = "magma",
-#     enrichment_cmap: str = "RdBu_r",
-#     enrichment_value: Literal["fold_enrichment", "neg_log10_padj"] = "fold_enrichment",
-#     figsize: tuple[float, float] = (16, 10),
-#     alpha_stars: dict[float, str] | None = None,
-#     cbar_size: tuple[float, float] = (0.015, 0.075),
-#     cbar_pos_anchor: tuple[float, float] = (0.02, 0.83),
-#     cbar_fontsize: float = 10.0,
-#     output_dir: str | Path | None = None,
-#     dpi: int = 300,
-#     node_df: pd.DataFrame | None = None,
-#     pathway_membership: dict[str, list[str]] | None = None,
-#     abundance_df: pd.DataFrame | None = None,
-#     trend_metadata: pd.DataFrame | pd.Series | None = None,
-#     trend_sort_by: str | None = None,
-#     trend_collapse_by: str | None = None,
-#     group_col: str = "group",
-#     feature_id_col: str | None = None,
-#     trend_agg: Literal["mean", "median"] = "median",
-#     trend_dispersion: Literal["sem", "std", "iqr", "none"] = "iqr",
-#     trend_dispersion_norm: Literal["global", "row"] = "global",
-#     trend_cmap: str = "RdBu_r",
-#     trend_vmax: float | Literal["auto"] = "auto",
-#     trend_vmin: float | Literal["auto"] = "auto",
-#     trend_share_scale: bool = True,
-#     trend_track_width: float = 0.12,
-#     trend_track_height: float = 0.12,
-#     trend_track_pad: float = 0.01,
-#     trend_max_xticks: int = 10,
-#     trend_max_yticks: int = 10,
-# ) -> dict[str, plt.Figure]:
-#     """Three group(rows) x pathway(cols) heatmaps sharing one clustering:
-#     raw counts, row-normalized fractions, and hypergeometric enrichment,
-#     each with significance stars, optional per-datatype composition color
-#     strips, and -- if `abundance_df` is given -- a thin per-row trend
-#     heat-strip attached immediately right of the row labels on every panel.
-
-#     The trend track shows, per feature group, `trend_agg` (default median)
-#     abundance as color and internal feature agreement as opacity (via
-#     `trend_dispersion`), across either raw samples or samples collapsed
-#     into metadata categories.
-
-#     Parameters
-#     ----------
-#     counts_df, row_normalized_df, enrichment_matrix_df, enrichment_df :
-#         See prior versions -- group(rows) x pathway(cols) matrices and the
-#         long-format hypergeometric test output.
-#     cbar_size : (width, height)
-#         Figure-fraction size of each panel's colorbar box.
-#     cbar_pos_anchor : (left, bottom)
-#         Figure-fraction anchor position of each panel's colorbar box.
-#     cbar_fontsize : float
-#         Font size for colorbar tick labels (kept small/unobtrusive).
-#     node_df, abundance_df : pd.DataFrame, optional
-#         `node_df` (with `group_col`) and a features x samples abundance
-#         matrix. If either is None, no trend track is drawn.
-#     trend_metadata : pd.DataFrame or pd.Series, optional
-#         Sample metadata indexed like `abundance_df.columns`. Required if
-#         `trend_sort_by` and/or `trend_collapse_by` are set.
-#     trend_sort_by : str, optional
-#         Metadata column to order the trend track's columns by. If
-#         `trend_collapse_by` is also set, categories are ordered by the mean
-#         rank of their member samples under this column; otherwise, raw
-#         samples are sorted directly by this column.
-#     trend_collapse_by : str, optional
-#         Metadata column to POOL samples by (e.g. "timepoint" or
-#         "treatment") -- all replicate samples sharing a category become one
-#         trend-track column, pooling every value from every feature in the
-#         group AND every sample in that category together for both the
-#         color (agg) and opacity (dispersion) statistics. None keeps one
-#         column per raw sample.
-#     group_col, feature_id_col :
-#         Identify each row's feature membership in `node_df` -- must match
-#         whatever grouping produced `counts_df`/`row_normalized_df`.
-#     trend_agg, trend_dispersion, trend_dispersion_norm, trend_cmap, trend_vmax :
-#         See `_compute_group_trend_rgba`.
-#     trend_track_width, trend_track_pad, trend_max_xticks :
-#         Layout of the attached track (figure-fraction width, gap past the
-#         row labels, and x-tick density).
-#     """
-#     row_link = linkage(row_normalized_df.values, method=method, metric=metric) if cluster_rows else None
-#     col_link = linkage(row_normalized_df.values.T, method=method, metric=metric) if cluster_cols else None
-#     cbar_pos = (*cbar_pos_anchor, *cbar_size)
-#     common = dict(
-#         row_linkage=row_link, col_linkage=col_link, row_cluster=cluster_rows, col_cluster=cluster_cols,
-#         figsize=figsize, dendrogram_ratio=(0.12, 0.12), cbar_pos=cbar_pos,
-#         row_colors=group_dtype_colors, col_colors=pathway_dtype_colors, colors_ratio=0.02,
-#     )
-
-#     row_order = _clustered_order(row_normalized_df, "rows", cluster_rows, method, metric)
-#     col_order = _clustered_order(row_normalized_df, "cols", cluster_cols, method, metric)
-
-#     def _annotate_strips(g):
-#         if group_dtype_counts is not None:
-#             _annotate_dtype_counts(g, group_dtype_counts, group_dtype_norm, row_order, axis="row")
-#         if pathway_dtype_counts is not None:
-#             _annotate_dtype_counts(g, pathway_dtype_counts, pathway_dtype_norm, col_order, axis="col")
-
-#     def _shrink_cbar(g):
-#         g.cax.tick_params(labelsize=cbar_fontsize)
-#         if g.cax.yaxis.label.get_text():
-#             g.cax.yaxis.label.set_size(cbar_fontsize)
-
-#     # --- Precompute both trend tracks once; shared trend_columns/members ---
-#     row_trend_rgba = col_trend_rgba = trend_columns = None
-#     if abundance_df is not None:
-#         trend_columns, trend_members = _resolve_trend_column_groups(
-#             abundance_df, trend_metadata, trend_sort_by, trend_collapse_by
-#         )
-
-#         row_value_mat = row_disp_mat = col_value_mat = col_disp_mat = None
-#         if node_df is not None:
-#             node = node_df.copy()
-#             if feature_id_col is not None:
-#                 node = node.set_index(feature_id_col)
-#             groups_series = node[group_col].astype(str)
-#             row_membership = {g: groups_series[groups_series == g].index.tolist() for g in row_order}
-#             row_value_mat, row_disp_mat = _aggregate_membership_trend(
-#                 row_membership, abundance_df, row_order, trend_columns, trend_members, trend_agg, trend_dispersion
-#             )
-
-#         if pathway_membership is not None:
-#             col_value_mat, col_disp_mat = _aggregate_membership_trend(
-#                 pathway_membership, abundance_df, col_order, trend_columns, trend_members, trend_agg, trend_dispersion
-#             )
-
-#         resolved_vmin, resolved_vmax = trend_vmin, trend_vmax
-#         if trend_share_scale and (trend_vmin == "auto" or trend_vmax == "auto"):
-#             combined = np.concatenate([m.ravel() for m in (row_value_mat, col_value_mat) if m is not None])
-#             if trend_vmin == "auto":
-#                 resolved_vmin = np.nanmin(combined)
-#             if trend_vmax == "auto":
-#                 resolved_vmax = np.nanmax(combined)
-
-#         if row_value_mat is not None:
-#             row_vmin = np.nanmin(row_value_mat) if trend_vmin == "auto" and not trend_share_scale else resolved_vmin
-#             row_vmax = np.nanmax(row_value_mat) if trend_vmax == "auto" and not trend_share_scale else resolved_vmax
-#             row_trend_rgba = _values_to_rgba(
-#                 row_value_mat, row_disp_mat, trend_dispersion, trend_dispersion_norm,
-#                 trend_cmap, row_vmin, row_vmax, min_alpha=0.25, max_alpha=1.0,
-#             )
-#         if col_value_mat is not None:
-#             col_vmin = np.nanmin(col_value_mat) if trend_vmin == "auto" and not trend_share_scale else resolved_vmin
-#             col_vmax = np.nanmax(col_value_mat) if trend_vmax == "auto" and not trend_share_scale else resolved_vmax
-#             col_rgba = _values_to_rgba(
-#                 col_value_mat, col_disp_mat, trend_dispersion, trend_dispersion_norm,
-#                 trend_cmap, col_vmin, col_vmax, min_alpha=0.25, max_alpha=1.0,
-#             )
-#             col_trend_rgba = col_rgba.transpose(1, 0, 2)
-
-#     def _attach_trend(g):
-#         if row_trend_rgba is not None:
-#             _add_row_trend_track(
-#                 g, row_trend_rgba, trend_columns, row_value_mat,
-#                 width=trend_track_width, pad=trend_track_pad, max_xticks=trend_max_xticks,
-#                 label=f"{trend_agg.capitalize()}\nabundance",
-#             )
-#         if col_trend_rgba is not None:
-#             _add_col_trend_track(
-#                 g, col_trend_rgba, trend_columns, col_value_mat,
-#                 height=trend_track_height, pad=trend_track_pad, max_yticks=trend_max_yticks,
-#                 label=f"{trend_agg.capitalize()}\nabundance",
-#             )
-
-#     figs: dict[str, plt.Figure] = {}
-#     for name, df, cmap, vmax, title in [
-#         ("counts", counts_df, counts_cmap, max(counts_df.values.max(), 1), "Feature count per group x pathway"),
-#         ("normalized", row_normalized_df, normalized_cmap, max(row_normalized_df.values.max(), 1e-6),
-#          "Fraction of group's features per pathway"),
-#     ]:
-#         g = sns.clustermap(df, cmap=cmap, vmin=0, vmax=vmax, **common)
-#         _finish_panel(g, df, title, enrichment_df, cluster_rows, cluster_cols, alpha_stars)
-#         _annotate_strips(g)
-#         _attach_trend(g)
-#         _shrink_cbar(g)
-#         figs[name] = g.figure
-
-#     enr_vmax = max(enrichment_matrix_df.values.max(), 1e-6)
-#     label = "Fold enrichment (obs/exp)" if enrichment_value == "fold_enrichment" else "-log10(padj)"
-#     cmap = enrichment_cmap if enrichment_value == "fold_enrichment" else "viridis"
-#     g = sns.clustermap(enrichment_matrix_df, cmap=cmap, vmin=0, vmax=enr_vmax, **common)
-#     _finish_panel(
-#         g, enrichment_matrix_df,
-#         f"Hypergeometric enrichment ({label}):\nhow much more likely than random each pathway is in each group",
-#         enrichment_df, cluster_rows, cluster_cols, alpha_stars,
-#     )
-#     _annotate_strips(g)
-#     _attach_trend(g)
-#     _shrink_cbar(g)
-#     figs["enrichment"] = g.figure
-
-#     if output_dir is not None:
-#         output_dir = Path(output_dir)
-#         output_dir.mkdir(parents=True, exist_ok=True)
-#         for name, fig in figs.items():
-#             fig.savefig(output_dir / f"group_pathway_heatmap_{name}.png", dpi=dpi, bbox_inches="tight")
-#         log.info(f"Saved 3 heatmap panels to {output_dir}")
-
-#     return figs
-
-# # Orchestrator
-# def compare_groups_to_pathways(
-#     node_table: pd.DataFrame,
-#     annotation_table: pd.DataFrame,
-#     quant_df: pd.DataFrame | None = None,
-#     metadata_df: pd.DataFrame | None = None,
-#     pathway_col: str = "modelseed_pathway",
-#     group_col: str = "group",
-#     trend_sort_by: str | None = None,
-#     trend_collapse_by: str | None = None,
-#     cluster_rows: bool = True,
-#     cluster_cols: bool = True,
-#     method: str = "average",
-#     metric: str = "euclidean",
-#     pathway_sep: str = ";",
-#     missing_token: str = "Unassigned",
-#     exclude_nopathway: bool = False,
-#     nopathway_prefix: str = "NOPATHWAY_",
-#     bipartite_only: bool = False,
-#     min_features_per_pathway: int = 3,
-#     min_features_per_group: int = 5,
-#     fdr_method: str = "fdr_bh",
-#     alpha: float = 0.05,
-#     show_only_sig: bool = False,
-#     top_n: int = 50,
-#     rank_by: Literal["n_features", "summed_significance", "mean_abs_value"] = "n_features",
-#     enrichment_value: Literal["fold_enrichment", "neg_log10_padj"] = "fold_enrichment",
-#     output_dir: str | Path | None = None,
-#     **plot_kwargs,
-# ) -> dict[str, Any]:
-#     """Compare data-driven feature groups against pathway annotations.
-
-#     1. Filter the whole universe (bipartite -> min features/pathway ->
-#        min features/group -> unnamed-pathway exclusion).
-#     2. Hypergeometric enrichment test across every pathway x group pair in
-#        that filtered universe.
-#     3. Optionally restrict to pathways/groups with >=1 significant pair.
-#     4. Select up to `top_n` pathways to display (by `rank_by`) and plot
-#        counts / row-normalized / enrichment heatmaps.
-#     5. Export the full (pre-top_n, post-filter) enrichment stats to CSV.
-
-#     Parameters
-#     ----------
-#     node_table : pd.DataFrame
-#         Feature-level table indexed by feature ID, containing `group_col`
-#         (falls back to "submodule" if absent).
-#     annotation_table : pd.DataFrame
-#         Feature annotation table indexed by feature ID, containing
-#         `pathway_col`.
-#     quant_df : pd.DataFrame, optional
-#         Feature x sample (or feature x comparison) matrix. Required only
-#         when `rank_by="mean_abs_value"`.
-#     min_features_per_pathway, min_features_per_group : int
-#         Universe-level size filters (step 1) -- independent of `top_n`,
-#         which only controls what's *displayed* (step 4).
-#     show_only_sig : bool
-#         If True, restrict to pathways/groups with >=1 significant
-#         (padj < alpha) pair before pathway selection and plotting.
-#     top_n, rank_by :
-#         Display-only pathway selection. See `select_top_pathways`.
-#     enrichment_value : {"fold_enrichment", "neg_log10_padj"}
-#         Heat metric for the third panel.
-#     output_dir : str, optional
-#         Where to save heatmap PNGs and `group_pathway_enrichment_stats.csv`.
-#         If None, nothing is written to disk.
-#     **plot_kwargs
-#         Forwarded to `plot_group_pathway_heatmaps`.
-
-#     Returns
-#     -------
-#     dict with keys: "counts", "normalized", "enrichment" (figures),
-#     "enrichment_stats_path", "n_pathways_tested", "n_groups_tested",
-#     "n_pathways_shown".
-#     """
-#     if group_col not in node_table.columns:
-#         if "submodule" in node_table.columns:
-#             group_col = "submodule"
-#         else:
-#             raise ValueError(f"'{group_col}' not in node_table and no 'submodule' fallback found.")
-
-#     node_df = node_table.copy()
-#     if pathway_col not in node_df.columns:
-#         node_df = node_df.join(annotation_table[[pathway_col]], how="left")
-
-#     # ---- 1. Filter the whole universe ----
-#     exploded = prepare_universe(self.feature_network_node_table, 
-#                                 pe['pathway_col'], 
-#                                 'group', 
-#                                 pe)
-
-#     # ---- 2. Hypergeometric enrichment across the full filtered universe ----
-#     enrichment_df = compute_enrichment(exploded, fdr_method=fdr_method, alpha=alpha)
-
-#     # ---- 3. Optional significance-based axis filter ----
-#     if show_only_sig and enrichment_df["significant"].any():
-#         sig = enrichment_df.loc[enrichment_df["significant"]]
-#         kept_pathways, kept_groups = sorted(set(sig["pathway"])), sorted(set(sig["group"]))
-#         exploded = exploded[exploded["pathway"].isin(kept_pathways) & exploded["group"].isin(kept_groups)]
-#         enrichment_df = enrichment_df[
-#             enrichment_df["pathway"].isin(kept_pathways) & enrichment_df["group"].isin(kept_groups)
-#         ]
-#         log.info(f"show_only_sig: kept {len(kept_pathways)} pathways x {len(kept_groups)} groups with >=1 significant pair.")
-#     else:
-#         kept_groups = sorted(exploded["group"].unique())
-
-#     # ---- 4. Select pathways to display + plot ----
-#     selected_pathways = select_top_pathways(exploded, enrichment_df, quant_df, top_n, rank_by)
-#     counts_df, row_normalized_df = _build_group_pathway_matrices(exploded, kept_groups, selected_pathways)
-#     enrichment_matrix_df = build_enrichment_matrix(enrichment_df, counts_df, value=enrichment_value)
-
-#     group_dtype_colors, group_dtype_counts, group_dtype_norm = _dtype_color_strip(
-#         exploded[exploded["group"].isin(kept_groups)], "group", kept_groups
-#     )
-#     pathway_dtype_colors, pathway_dtype_counts, pathway_dtype_norm = _dtype_color_strip(
-#         exploded[exploded["pathway"].isin(selected_pathways)], "pathway", selected_pathways
-#     )
-#     pathway_membership = (
-#         exploded[exploded["pathway"].isin(selected_pathways)]
-#         .groupby("pathway")["feature_id"]
-#         .apply(list)
-#         .to_dict()
-#     )
-
-#     figs = plot_group_pathway_heatmaps(
-#         counts_df, row_normalized_df, enrichment_matrix_df,
-#         enrichment_df[enrichment_df["pathway"].isin(selected_pathways)],
-#         group_dtype_colors=group_dtype_colors,
-#         group_dtype_counts=group_dtype_counts,
-#         group_dtype_norm=group_dtype_norm,
-#         pathway_dtype_colors=pathway_dtype_colors,
-#         pathway_dtype_counts=pathway_dtype_counts,
-#         pathway_dtype_norm=pathway_dtype_norm,
-#         cluster_rows=cluster_rows,
-#         cluster_cols=cluster_cols,
-#         method=method,
-#         metric=metric,
-#         enrichment_value=enrichment_value,
-#         node_df=node_table,
-#         pathway_membership=pathway_membership,
-#         abundance_df=quant_df,
-#         trend_metadata=metadata_df,
-#         trend_sort_by=trend_sort_by,
-#         trend_collapse_by=trend_collapse_by,
-#         group_col=group_col,
-#         output_dir=output_dir,
-#         **plot_kwargs,
-#     )
-
-#     # ---- 5. Export stats ----
-#     stats_path = None
-#     if output_dir is not None:
-#         output_dir = Path(output_dir)
-#         output_dir.mkdir(parents=True, exist_ok=True)
-#         stats_path = output_dir / "group_pathway_enrichment_stats.csv"
-#         enrichment_df.sort_values("padj").to_csv(stats_path, index=False)
-#         log.info(f"Wrote enrichment stats ({len(enrichment_df)} rows) to {stats_path}")
-
-#     return {
-#         "counts_df": counts_df,
-#         "row_normalized_df": row_normalized_df,
-#         "enrichment_df": enrichment_df,
-#         "enrichment_matrix_df": enrichment_matrix_df,
-#         "figs": figs,
-#     }
