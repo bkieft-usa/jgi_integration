@@ -50,7 +50,7 @@ project:
   proposal_ID: 123456
   results_path: /home/jovyan/work/output_data
   raw_data_path: /home/jovyan/work/input_data/raw_data
-  metadata_link: /home/jovyan/work/input_data/link_script/metadata_link_script.py
+  link_table: /home/jovyan/work/input_data/link_table.csv
 ```
 
 ---

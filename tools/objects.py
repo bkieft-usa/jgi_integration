@@ -6,15 +6,9 @@ import pandas as pd
 import numpy as np
 import shutil
 from typing import Dict, Any, List, Optional, Tuple
-from IPython.display import display, Javascript
 from IPython import get_ipython
 import tools.helpers as hlp
 import logging
-from tqdm.notebook import tqdm
-import matplotlib.pyplot as plt
-import plotly.graph_objects as go
-import inspect
-import re
 import time
 import hashlib
 import json
@@ -39,12 +33,8 @@ class ConfigManager:
         # Set up config file paths
         self.project_config_file = self.config_dir / "project.yml"
         self.data_processing_config_file = self.config_dir / "data_processing.yml"
-
-        # Analysis config: detect which branch file is present.
-        # Priority: analysis_lfc.yml > analysis_replicate_matched.yml > analysis.yml (legacy)
         self.analysis_config_file = self._detect_analysis_config_file()
 
-        # If hashes are specified, try to load from persistent configs
         if self.target_data_hash and self.target_analysis_hash:
             self._load_from_persistent_configs()
         elif not self._standard_configs_exist():
@@ -200,239 +190,10 @@ class ConfigManager:
             'analysis_hash': analysis_hash
         }
     
-class WorkflowProgressTracker:
-    """Class to track and visualize workflow progress."""
-    
-    def __init__(self, project_name="JGI Integration Workflow"):
-        self.project_name = project_name
-        self.current_step = None
-        self.completed_steps = set()
-        self.steps = []
-        self.step_mapping = {}
-        self._setup_workflow()
-    
-    def _setup_workflow(self):
-        """Initialize the workflow steps."""
-        # Define steps in linear order
-        self.steps = [
-            {'id': 'init_project', 'label': 'Initialize Project', 'category': 'setup'},
-            {'id': 'create_datasets', 'label': 'Create Dataset Objects', 'category': 'setup'},
-            {'id': 'create_analysis', 'label': 'Create Analysis Object', 'category': 'setup'},
-            {'id': 'link_metadata', 'label': 'Link Metadata', 'category': 'data_processing'},
-            {'id': 'link_data', 'label': 'Link Data', 'category': 'data_processing'},
-            {'id': 'filter_dataset_features', 'label': 'Filter Rare Features', 'category': 'data_processing'},
-            {'id': 'devariance_dataset_features', 'label': 'Remove Low-Variance Features', 'category': 'data_processing'},
-            {'id': 'replicability_test_dataset_features', 'label': 'Replicability Filtering', 'category': 'data_processing'},
-            {'id': 'scale_dataset_features', 'label': 'Scale Dataset Features', 'category': 'data_processing'},
-            {'id': 'integrate_metadata', 'label': 'Integrate Metadata', 'category': 'analysis'},
-            {'id': 'integrate_data', 'label': 'Integrate Data', 'category': 'analysis'},
-            {'id': 'feature_selection', 'label': 'Feature Selection', 'category': 'analysis'},
-            {'id': 'calculate_correlations', 'label': 'Calculate Correlations', 'category': 'analysis'},
-            {'id': 'plot_correlation_network', 'label': 'Plot Correlation Network', 'category': 'analysis'},
-            {'id': 'group_features', 'label': 'Group Features', 'category': 'analysis'},
-        ]
-        
-        # Add step numbers and status
-        for i, step in enumerate(self.steps):
-            step['step'] = i + 1
-            step['status'] = 'pending'
-    
-    def set_current_step(self, step_id):
-        """Manually set the current step."""
-        step_ids = [step['id'] for step in self.steps]
-        if step_id in step_ids:
-            self.current_step = step_id
-            self._update_status()
-        else:
-            raise ValueError(f"Unknown step: {step_id}")
-    
-    def mark_completed(self, step_id):
-        """Mark a step as completed."""
-        step_ids = [step['id'] for step in self.steps]
-        if step_id in step_ids:
-            self.completed_steps.add(step_id)
-            self._update_status()
-    
-    def _update_status(self):
-        """Update the status of all steps based on current progress."""
-        current_idx = next((i for i, step in enumerate(self.steps) if step['id'] == self.current_step), -1)
-        
-        for i, step in enumerate(self.steps):
-            if step['id'] in self.completed_steps:
-                step['status'] = 'completed'
-            elif i == current_idx and self.current_step:
-                step['status'] = 'current'
-            elif i < current_idx:
-                step['status'] = 'completed'
-                self.completed_steps.add(step['id'])
-            else:
-                step['status'] = 'pending'
-    
-    def get_progress_stats(self):
-        """Get current progress statistics."""
-        total_steps = len(self.steps)
-        completed_count = len(self.completed_steps)
-        current_step = next((step for step in self.steps if step['id'] == self.current_step), None)
-        current_label = current_step['label'] if current_step else 'Not started'
-        progress_pct = (completed_count / total_steps) * 100
-        
-        return {
-            'completed': completed_count,
-            'total': total_steps,
-            'percentage': progress_pct,
-            'current_step': self.current_step,
-            'current_label': current_label
-        }
-    
-    def plot(self, show_plot=True, save_path=None, **kwargs):
-        """Plot the current workflow progress as a linear diagram."""
-        self._update_status()
-        return self._plot_linear(show_plot, save_path, **kwargs)
-    
-    def _plot_linear(self, show_plot=True, save_path=None, **kwargs):
-        """Create linear workflow visualization."""
-        # Color mapping for status
-        status_colors = {
-            'completed': '#2ecc71',    # Green
-            'current': '#f39c12',      # Orange
-            'pending': '#bdc3c7',      # Light gray
-        }
-        
-        # Calculate positions for linear layout
-        x_positions = list(range(len(self.steps)))
-        y_position = 0
-        
-        traces = []
-        
-        # Create connecting lines
-        line_x = []
-        line_y = []
-        for i in range(len(self.steps) - 1):
-            current_status = self.steps[i]['status']
-            next_status = self.steps[i + 1]['status']
-            
-            # Color line based on completion
-            if current_status in ['completed', 'current'] and next_status in ['completed', 'current']:
-                line_color = '#2ecc71'
-                line_width = 4
-            else:
-                line_color = '#bdc3c7'
-                line_width = 2
-            
-            line_x.extend([i, i + 1, None])
-            line_y.extend([y_position, y_position, None])
-        
-        # Add line trace
-        traces.append(go.Scatter(
-            x=line_x, y=line_y,
-            mode='lines',
-            line=dict(width=3, color='#bdc3c7'),
-            hoverinfo='skip',
-            showlegend=False
-        ))
-        
-        # Create node traces by status
-        for status in ['pending', 'completed', 'current']:
-            step_x, step_y, step_text, step_numbers = [], [], [], []
-            
-            for i, step in enumerate(self.steps):
-                if step['status'] == status:
-                    step_x.append(i)
-                    step_y.append(y_position)
-                    step_text.append(f"{step['step']}. {step['label']} ({step['category']})")
-                    step_numbers.append(str(step['step']))
-            
-            if step_x:
-                # Special styling for current step
-                if status == 'current':
-                    traces.append(go.Scatter(
-                        x=step_x, y=step_y,
-                        mode='markers+text',
-                        text=step_numbers,
-                        textposition="middle center",
-                        textfont=dict(size=14, color='white', family='Arial Black'),
-                        hovertext=step_text,
-                        hoverinfo='text',
-                        marker=dict(
-                            size=35,
-                            color=status_colors[status],
-                            line=dict(width=2, color='red'),
-                            symbol='circle'
-                        ),
-                        name=f'{status.title()} Step',
-                        showlegend=True
-                    ))
-                else:
-                    traces.append(go.Scatter(
-                        x=step_x, y=step_y,
-                        mode='markers+text',
-                        text=step_numbers,
-                        textposition="middle center",
-                        textfont=dict(size=12, color='white' if status != 'pending' else 'gray'),
-                        hovertext=step_text,
-                        hoverinfo='text',
-                        marker=dict(
-                            size=30,
-                            color=status_colors[status],
-                            line=dict(width=1, color='black'),
-                            symbol='circle'
-                        ),
-                        name=f'{status.title()} Steps',
-                        showlegend=True
-                    ))
-        
-        # Get progress stats
-        stats = self.get_progress_stats()
-        title_text = f'<sub>Progress: Completed {stats["completed"]}/{stats["total"]} steps ({stats["percentage"]:.1f}%)<br>Current: {stats["current_label"]}</sub>'
-        #title_text = f'<sub>Progress: Completed {stats["completed"]}/{stats["total"]} steps ({stats["percentage"]:.1f}%)</sub>'
-        
-        # Create figure
-        fig = go.Figure(
-            data=traces,
-            layout=go.Layout(
-                title=dict(text=title_text, x=0, font=dict(size=16)),
-                showlegend=False,
-                hovermode='closest',
-                margin=dict(b=60, l=40, r=40, t=100),
-                xaxis=dict(
-                    showgrid=False, 
-                    zeroline=False, 
-                    showticklabels=False,
-                    range=[-0.5, len(self.steps) - 0.5]
-                ),
-                yaxis=dict(
-                    showgrid=False, 
-                    zeroline=False, 
-                    showticklabels=False,
-                    range=[-1, 1]
-                ),
-                plot_bgcolor='white',
-                height=200,
-                width=1000,
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="center",
-                    x=0.5
-                )
-            )
-        )
-        
-        if save_path:
-            fig.write_html(save_path)
-        
-        if show_plot:
-            fig.show()
-        
-        return fig
-
 class Project:
     """Project configuration and directory management with hash-based tagging."""
 
     def __init__(self, data_processing_hash: str = None, analysis_hash: str = None, overwrite: bool = False):
-        self.workflow_tracker = WorkflowProgressTracker()
-        self.workflow_tracker.set_current_step('init_project')
         log.info("Initializing Project")
         
         # Handle default config directory
@@ -491,13 +252,6 @@ class Project:
         os.makedirs(self.project_dir, exist_ok=True)
         log.info(f"Project directory: {self.project_dir}")
         self._validate_directory_structure()
-        self._complete_tracking('init_project')
-
-    def _complete_tracking(self, step_id: str):
-        """Helper method to track workflow steps with after visualization."""
-        # Mark as completed and show updated status (green)
-        self.workflow_tracker.mark_completed(step_id)
-        self.workflow_tracker.plot(show_plot=True)
 
     def save_persistent_config_and_notebook(self):
         """Save the current configuration and notebook with timestamp and tags for this run."""
@@ -737,8 +491,6 @@ class Dataset(BaseDataHandler):
 
     def __init__(self, dataset_name: str, project: Project, overwrite: bool = False, superuser: bool = False):
         self.project = project
-        self.workflow_tracker = self.project.workflow_tracker
-        self.workflow_tracker.set_current_step('create_datasets')
         log.info("Initializing Datasets")
         self.dataset_name = dataset_name
         self.datasets_config = self.project.config['datasets']
@@ -766,12 +518,6 @@ class Dataset(BaseDataHandler):
         # Configuration
         self.normalization_params = self.dataset_config.get('normalization_parameters', {})
         self.superuser = superuser
-
-    def _complete_tracking(self, step_id: str):
-        """Helper method to track workflow steps with after visualization."""
-        # Mark as completed and show updated status (green)
-        self.workflow_tracker.mark_completed(step_id)
-        self.workflow_tracker.plot(show_plot=True)
 
     @staticmethod
     def set_up_dataset_outdir(project: Project, data_processing_tag: str, dataset_config: dict, dataset_name: str, overwrite: bool = False) -> str:
@@ -831,83 +577,57 @@ class Dataset(BaseDataHandler):
             self.save_data(df, self.output_dir, filename, indexing=True)
         self._cache[key] = df
 
-    def _complete_tracking(self, step_id: str):
-        """Helper method to track workflow steps with after visualization."""
-        # Mark as completed and show updated status (green)
-        self.workflow_tracker.mark_completed(step_id)
-        self.workflow_tracker.plot(show_plot=True)
-
-    def filter_data(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+    def filter_data(self, overwrite: bool = False, **kwargs) -> None:
         """Hybrid: Class validation + external hlp.filter_data function."""
-        def _filter_method():
-            if self.check_and_load_attribute('filtered_data', self._filtered_data_filename, self.overwrite):
-                return
-            
-            step = self.normalization_params.get('filtering', {})
-            p = step.get('params', step)   # new layout: step['params']; old layout: step itself
-            call_params = {
-                'data': self.linked_data,
-                'dataset_name': self.dataset_name,
-                'data_type': self.datatype,
-                'output_filename': self._filtered_data_filename,
-                'output_dir': self.output_dir,
-                'filter_method': step.get('method', 'minimum'),
-                'filter_value': p.get('value', 0)
-            }
-            call_params.update(kwargs)
-            result = hlp.filter_data(**call_params)
-            if result.empty:
-                log.error(f"Filtering resulted in empty dataset for {self.dataset_name}. Please adjust filtering parameters.")
-                sys.exit(1)
-            self.filtered_data = result
-            log.info(f"Created table: {self._filtered_data_filename}")
-            log.info("Created attribute: filtered_data")
-        
-        if show_progress:
-            self.workflow_tracker.set_current_step('filter_dataset_features')
-            _filter_method()
-            self._complete_tracking('filter_dataset_features')
-            return
-        else:
-            _filter_method()
+        if self.check_and_load_attribute('filtered_data', self._filtered_data_filename, self.overwrite):
             return
 
-    def devariance_data(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+        step = self.normalization_params.get('filtering', {})
+        p = step.get('params', step)   # new layout: step['params']; old layout: step itself
+        call_params = {
+            'data': self.linked_data,
+            'dataset_name': self.dataset_name,
+            'data_type': self.datatype,
+            'output_filename': self._filtered_data_filename,
+            'output_dir': self.output_dir,
+            'filter_method': step.get('method', 'minimum'),
+            'filter_value': p.get('value', 0)
+        }
+        call_params.update(kwargs)
+        result = hlp.filter_data(**call_params)
+        if result.empty:
+            log.error(f"Filtering resulted in empty dataset for {self.dataset_name}. Please adjust filtering parameters.")
+            sys.exit(1)
+        self.filtered_data = result
+        log.info(f"Created table: {self._filtered_data_filename}")
+        log.info("Created attribute: filtered_data")
+
+    def devariance_data(self, overwrite: bool = False, **kwargs) -> None:
         """Remove low-variance features using external helper function with class integration."""
-        def _devariance_method():
-            if self.check_and_load_attribute('devarianced_data', self._devarianced_data_filename, self.overwrite):
-                return
-            
-            step = self.normalization_params.get('devariancing', {})
-            p = step.get('params', step)   # new layout: step['params']; old layout: step itself
-            call_params = {
-                'data': self.filtered_data,
-                'filter_value': p.get('value', 0),
-                'dataset_name': self.dataset_name,
-                'output_filename': self._devarianced_data_filename,
-                'output_dir': self.output_dir,
-                'devariance_mode': step.get('method', 'none')
-            }
-            call_params.update(kwargs)
-
-            result = hlp.devariance_data(**call_params)
-            if result.empty:
-                log.error(f"Devariancing resulted in empty dataset for {self.dataset_name}. Please adjust devariancing parameters.")
-                sys.exit(1)
-            self.devarianced_data = result
-            log.info(f"Created table: {self._devarianced_data_filename}")
-            log.info("Created attribute: devarianced_data")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('devariance_dataset_features')
-            _devariance_method()
-            self._complete_tracking('devariance_dataset_features')
-            return
-        else:
-            _devariance_method()
+        if self.check_and_load_attribute('devarianced_data', self._devarianced_data_filename, self.overwrite):
             return
 
-    def scale_data(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+        step = self.normalization_params.get('devariancing', {})
+        p = step.get('params', step)   # new layout: step['params']; old layout: step itself
+        call_params = {
+            'data': self.filtered_data,
+            'filter_value': p.get('value', 0),
+            'dataset_name': self.dataset_name,
+            'output_filename': self._devarianced_data_filename,
+            'output_dir': self.output_dir,
+            'devariance_mode': step.get('method', 'none')
+        }
+        call_params.update(kwargs)
+
+        result = hlp.devariance_data(**call_params)
+        if result.empty:
+            log.error(f"Devariancing resulted in empty dataset for {self.dataset_name}. Please adjust devariancing parameters.")
+            sys.exit(1)
+        self.devarianced_data = result
+        log.info(f"Created table: {self._devarianced_data_filename}")
+        log.info("Created attribute: devarianced_data")
+
+    def scale_data(self, overwrite: bool = False, **kwargs) -> None:
         """
         Per-dataset scaling step for replicate_matched mode.
 
@@ -927,114 +647,84 @@ class Dataset(BaseDataHandler):
         - ``"quantile"``       : quantile normalisation (forces identical distributions)
         - ``"none"``           : pass-through (no scaling applied)
         """
-        def _scale_method():
-            if self.check_and_load_attribute('scaled_data', self._scaled_data_filename, self.overwrite):
-                log.info(f"\tScaled data already exists for {self.dataset_name}.")
-                return
-
-            step = self.normalization_params.get('scaling', {})
-            p = step.get('params', step)   # new layout: step['params']; old layout: step itself
-            norm_method = step.get('method', 'vst')
-            log2 = True
-
-            log.info(f"Scaling {self.dataset_name} data using method='{norm_method}'...")
-
-            call_params = {
-                'df': self.replicate_filtered_data,
-                'output_filename': self._scaled_data_filename,
-                'output_dir': self.output_dir,
-                'dataset_name': self.dataset_name,
-                'log2': log2,
-                'norm_method': norm_method,
-            }
-            call_params.update(kwargs)
-
-            result = hlp.scale_data(**call_params)
-            if result is None or result.empty:
-                log.error(f"Scaling resulted in empty dataset for {self.dataset_name}. Check scaling parameters.")
-                sys.exit(1)
-            self.scaled_data = result
-            log.info(f"Created table: {self._scaled_data_filename}")
-            log.info("Created attribute: scaled_data")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('scale_dataset_features')
-            _scale_method()
-            self._complete_tracking('scale_dataset_features')
-            return
-        else:
-            _scale_method()
+        if self.check_and_load_attribute('scaled_data', self._scaled_data_filename, self.overwrite):
+            log.info(f"\tScaled data already exists for {self.dataset_name}.")
             return
 
-    def remove_low_replicable_features(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+        step = self.normalization_params.get('scaling', {})
+        p = step.get('params', step)   # new layout: step['params']; old layout: step itself
+        norm_method = step.get('method', 'vst')
+        log2 = True
+
+        log.info(f"Scaling {self.dataset_name} data using method='{norm_method}'...")
+
+        call_params = {
+            'df': self.replicate_filtered_data,
+            'output_filename': self._scaled_data_filename,
+            'output_dir': self.output_dir,
+            'dataset_name': self.dataset_name,
+            'log2': log2,
+            'norm_method': norm_method,
+        }
+        call_params.update(kwargs)
+
+        result = hlp.scale_data(**call_params)
+        if result is None or result.empty:
+            log.error(f"Scaling resulted in empty dataset for {self.dataset_name}. Check scaling parameters.")
+            sys.exit(1)
+        self.scaled_data = result
+        log.info(f"Created table: {self._scaled_data_filename}")
+        log.info("Created attribute: scaled_data")
+
+    def remove_low_replicable_features(self, overwrite: bool = False, **kwargs) -> None:
         """Hybrid: Class validation + external hlp.remove_low_replicable_features function."""
-        def _replicate_method():
-            if self.check_and_load_attribute('replicate_filtered_data', self._replicate_filtered_data_filename, self.overwrite):
-                return
-            
-            step = self.normalization_params.get('replicate_handling', {})
-            p = step.get('params', step)
-            call_params = {
-                'data': self.devarianced_data,
-                'metadata': self.linked_metadata,
-                'dataset_name': self.dataset_name,
-                'output_filename': self._replicate_filtered_data_filename,
-                'output_dir': self.output_dir,
-                'method': step.get('method', 'variance'),
-                'group_col': 'group',
-                'threshold': p.get('value', 0.5),
-                'normalize': True,
-                'normalization_scale': 1000000,
-                'min_replicates': 2,
-            }
-            call_params.update(kwargs)
-            
-            result = hlp.remove_low_replicable_features(**call_params)
-            if result.empty:
-                log.error(f"Replicability filtering resulted in empty dataset for {self.dataset_name}. Please adjust replicability parameters.")
-                sys.exit(1)
-            self.replicate_filtered_data = result
-            log.info(f"Created table: {self._replicate_filtered_data_filename}")
-            log.info("Created attribute: replicate_filtered_data")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('replicability_test_dataset_features')
-            _replicate_method()
-            self._complete_tracking('replicability_test_dataset_features')
-            return
-        else:
-            _replicate_method()
+        if self.check_and_load_attribute('replicate_filtered_data', self._replicate_filtered_data_filename, self.overwrite):
             return
 
-    def plot_pca(self, overwrite: bool = False, analysis_outdir = None, show_plot = True, show_progress: bool = True, **kwargs) -> None:
+        step = self.normalization_params.get('replicate_handling', {})
+        p = step.get('params', step)
+        call_params = {
+            'data': self.devarianced_data,
+            'metadata': self.linked_metadata,
+            'dataset_name': self.dataset_name,
+            'output_filename': self._replicate_filtered_data_filename,
+            'output_dir': self.output_dir,
+            'method': step.get('method', 'variance'),
+            'group_col': 'group',
+            'threshold': p.get('value', 0.5),
+            'normalize': True,
+            'normalization_scale': 1000000,
+            'min_replicates': 2,
+        }
+        call_params.update(kwargs)
+
+        result = hlp.remove_low_replicable_features(**call_params)
+        if result.empty:
+            log.error(f"Replicability filtering resulted in empty dataset for {self.dataset_name}. Please adjust replicability parameters.")
+            sys.exit(1)
+        self.replicate_filtered_data = result
+        log.info(f"Created table: {self._replicate_filtered_data_filename}")
+        log.info("Created attribute: replicate_filtered_data")
+
+    def plot_pca(self, overwrite: bool = False, analysis_outdir = None, show_plot = True, **kwargs) -> None:
         """Hybrid: Class setup + external hlp.plot_pca function."""
-        def _pca_method():
-            log.info("Plotting individual PCAs and grid")
-            plot_subdir = "pca_plots"
-            plot_dir = os.path.join(self.output_dir, plot_subdir)
-            os.makedirs(plot_dir, exist_ok=True)
-            
-            call_params = {
-                'data': {"linked": self.linked_data, "replicate_filtered": self.replicate_filtered_data},
-                'metadata': self.linked_metadata,
-                'metadata_variables': self.project.study_variables,
-                'alpha': 0.75,
-                'output_dir': plot_dir,
-                'output_filename': self._pca_grid_filename,
-                'dataset_name': self.dataset_name,
-                'show_plot': show_plot
-            }
-            call_params.update(kwargs)
-            hlp.plot_pca(**call_params)
+        log.info("Plotting individual PCAs and grid")
+        plot_subdir = "pca_plots"
+        plot_dir = os.path.join(self.output_dir, plot_subdir)
+        os.makedirs(plot_dir, exist_ok=True)
 
-        if show_progress:
-            self.workflow_tracker.set_current_step('plot_pca')
-            _pca_method()
-            self._complete_tracking('plot_pca')
-            return
-        else:
-            _pca_method()
-            return
+        call_params = {
+            'data': {"linked": self.linked_data, "replicate_filtered": self.replicate_filtered_data},
+            'metadata': self.linked_metadata,
+            'metadata_variables': self.project.study_variables,
+            'alpha': 0.75,
+            'output_dir': plot_dir,
+            'output_filename': self._pca_grid_filename,
+            'dataset_name': self.dataset_name,
+            'show_plot': show_plot
+        }
+        call_params.update(kwargs)
+        hlp.plot_pca(**call_params)
 
 # Set up properties for Dataset class
 manual_file_storage = {
@@ -1057,7 +747,6 @@ class MX(Dataset):
     """Metabolomics dataset with specific configuration."""
     def __init__(self, project: Project, overwrite: bool = False, last: bool = False, superuser: bool = False):
         super().__init__("mx", project, overwrite, superuser)
-        self.workflow_tracker = self.project.workflow_tracker
         self.chromatography = self.dataset_config['chromatography']
         self.polarity = self.dataset_config['polarity']
         self.mode = "untargeted" # Currently only untargeted supported, not configurable
@@ -1067,342 +756,202 @@ class MX(Dataset):
             log.info(f"Using only metabolite fraction '{self.metabolite_fraction}' for MX dataset.")
         else:
             self.metabolite_fraction = None
-        self._get_raw_metadata(overwrite=self.overwrite, show_progress=False, superuser=superuser)
-        self._get_raw_data(overwrite=self.overwrite, show_progress=False)
-        self._generate_annotation_table(overwrite=self.overwrite, show_progress=False)
-        if last:
-            self._complete_tracking('create_datasets')
+        self._get_raw_data(overwrite=self.overwrite)
+        self._generate_annotation_table(overwrite=self.overwrite)
 
-    def _get_raw_data(self, overwrite: bool = False, show_progress: bool = True) -> None:
-        def _get_data_method():
-            log.info("Getting Raw Data (MX)")
-            if self.check_and_load_attribute('raw_data', self._raw_data_filename, self.overwrite):
-                log.info(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.")
-                return
+    def _get_raw_data(self, overwrite: bool = False) -> None:
+        log.info("Getting Raw Data (MX)")
+        if self.check_and_load_attribute('raw_data', self._raw_data_filename, self.overwrite):
+            log.info(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.")
+            return
 
-            result = hlp.get_mx_data(
-                input_dir=self.dataset_raw_dir,
-                output_dir=self.output_dir,
-                output_filename=self._raw_data_filename,
-                chromatography=self.chromatography,
-                polarity=self.polarity,
-                datatype=self.datatype,
+        result = hlp.get_mx_data(
+            input_dir=self.dataset_raw_dir,
+            output_dir=self.output_dir,
+            output_filename=self._raw_data_filename,
+            chromatography=self.chromatography,
+            polarity=self.polarity,
+            datatype=self.datatype,
+        )
+        if result is None or result.empty:
+            raise FileNotFoundError(
+                f"No MX results data found under {self.dataset_raw_dir}/"
+                f"{self.chromatography} for polarity={self.polarity}."
             )
-            if result.empty:
-                log.error(f"No data found for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
-                sys.exit(1)
 
-            # Normalize raw data sample-wise using median-of-ratios method
-            log.info("Normalizing MX raw data using median-of-ratios method")
-            scale = 1.0
-            feature_col_name = result.columns[0]
-            result = result.set_index(feature_col_name)
-            min_dataset_value = result[result > 0].min().min()
-            mask = (result > min_dataset_value).any(axis=1)
-            counts_pos = result.loc[mask]
-            # Replace zeros with a small positive value to avoid log(0) warning
-            counts_pos = counts_pos.replace(0, np.finfo(float).eps)
-            log_counts = np.log(counts_pos)
-            geo_means = np.exp(log_counts.mean(axis=1))
-            ratios = counts_pos.divide(geo_means, axis=0)
-            size_factors = ratios.median(axis=0)
-            norm_counts = result.div(size_factors, axis=1) * scale
-            norm_counts = norm_counts.reset_index()
+        # Normalize raw data sample-wise using median-of-ratios method
+        log.info("Normalizing MX raw data using median-of-ratios method")
+        scale = 1.0
+        feature_col_name = result.columns[0]
+        result = result.set_index(feature_col_name)
+        min_dataset_value = result[result > 0].min().min()
+        mask = (result > min_dataset_value).any(axis=1)
+        counts_pos = result.loc[mask]
+        # Replace zeros with a small positive value to avoid log(0) warning
+        counts_pos = counts_pos.replace(0, np.finfo(float).eps)
+        log_counts = np.log(counts_pos)
+        geo_means = np.exp(log_counts.mean(axis=1))
+        ratios = counts_pos.divide(geo_means, axis=0)
+        size_factors = ratios.median(axis=0)
+        norm_counts = result.div(size_factors, axis=1) * scale
+        norm_counts = norm_counts.reset_index()
 
-            self.raw_data = norm_counts
-            log.info(f"\tCreated raw data for MX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
-            log.info(f"Created table: {self._raw_data_filename}")
-            log.info("Created attribute: raw_data")
-        
-        if show_progress:
-            self.workflow_tracker.set_current_step('load_data')
-            _get_data_method()
-            self._complete_tracking('load_data')
-            return
-        else:
-            _get_data_method()
+        self.raw_data = norm_counts
+        log.info(f"\tCreated raw data for MX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
+        log.info(f"Created table: {self._raw_data_filename}")
+        log.info("Created attribute: raw_data")
+
+    def _get_raw_metadata(self, overwrite: bool = False, superuser: bool = False) -> None:
+        log.info("Getting Raw Metadata (MX)")
+        if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, self.overwrite):
+            log.info(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
             return
 
-    def _get_raw_metadata(self, overwrite: bool = False, show_progress: bool = True, superuser: bool = False) -> None:
-        def _get_metadata_method():
-            log.info("Getting Raw Metadata (MX)")
-            if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, self.overwrite):
-                log.info(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
-                return
+        result = hlp.load_mx_metadata(
+            input_dir=self.dataset_raw_dir,
+            chromatography=self.chromatography,
+            output_filename=self._raw_metadata_filename,
+            output_dir=self.output_dir,
+        )
+        self.raw_metadata = result
+        log.info(f"\tCreated raw metadata for MX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
+        log.info(f"Created table: {self._raw_metadata_filename}")
+        log.info("Created attribute: raw_metadata")
 
-            mx_data_pattern = f"{self.dataset_raw_dir}/*{self.chromatography}*/*_{self.datatype}.csv"
-            if not glob.glob(mx_data_pattern):
-                mx_parent_folder = hlp.find_mx_parent_folder(
-                    pid=self.project.proposal_ID,
-                    pi_name=self.project.PI_name,
-                    mx_dir=self.dataset_raw_dir,
-                    polarity=self.polarity,
-                    datatype=self.datatype,
-                    chromatography=self.chromatography,
-                    overwrite=overwrite,
-                    superuser=superuser
-                )
-                if mx_parent_folder:
-                    archives = hlp.gather_mx_files(
-                        mx_untargeted_remote=mx_parent_folder,
-                        mx_dir=self.dataset_raw_dir,
-                        polarity=self.polarity,
-                        datatype=self.datatype,
-                        chromatography=self.chromatography,
-                        extract=True,
-                        overwrite=overwrite,
-                        superuser=superuser
-                    )
-            result = hlp.get_mx_metadata(
-                output_filename=self._raw_metadata_filename,
-                output_dir=self.output_dir,
-                input_dir=self.dataset_raw_dir,
-                chromatography=self.chromatography,
-                polarity=self.polarity
-            )
-            if result.empty:
-                log.error(f"No metadata found for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
-                sys.exit(1)
-            self.raw_metadata = result
-            log.info(f"\tCreated raw metadata for MX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
-            log.info(f"Created table: {self._raw_metadata_filename}")
-            log.info("Created attribute: raw_metadata")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('load_metadata')
-            _get_metadata_method()
-            self._complete_tracking('load_metadata')
-            return
-        else:
-            _get_metadata_method()
-            return
-
-    def _generate_annotation_table(self, overwrite: bool = False, show_progress: bool = True) -> None:
+    def _generate_annotation_table(self, overwrite: bool = False) -> None:
         """Generate metabolite ID to annotation mapping table for metabolomics data."""
-        def _generate_annotation_method():
-            log.info("Generating Metabolite Annotation Mapping")
-            if self.check_and_load_attribute('annotation_table', self._annotation_table_filename, self.overwrite):
-                log.info(f"\tAnnotation mapping with {self.annotation_table.shape[0]} rows and {self.annotation_table.shape[1]} columns.")
-                return
-            
-            call_params = {
-                'raw_data': self.raw_data,
-                'dataset_raw_dir': self.dataset_raw_dir,
-                'polarity': self.polarity,
-                'output_dir': self.output_dir,
-                'output_filename': self._annotation_table_filename
-            }
-
-            result = hlp.generate_mx_annotation_table(**call_params)
-            if result.empty:
-                log.error(f"No annotation mapping generated for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
-                sys.exit(1)
-            self.annotation_table = result
-            log.info(f"Created table: {self._annotation_table_filename}")
-            log.info("Created attribute: annotation_table")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('generate_annotation_table')
-            _generate_annotation_method()
-            self._complete_tracking('generate_annotation_table')
+        log.info("Generating Metabolite Annotation Mapping")
+        if self.check_and_load_attribute('annotation_table', self._annotation_table_filename, self.overwrite):
+            log.info(f"\tAnnotation mapping with {self.annotation_table.shape[0]} rows and {self.annotation_table.shape[1]} columns.")
             return
-        else:
-            _generate_annotation_method()
-            return
+
+        call_params = {
+            'raw_data': self.raw_data,
+            'dataset_raw_dir': self.dataset_raw_dir,
+            'polarity': self.polarity,
+            'output_dir': self.output_dir,
+            'output_filename': self._annotation_table_filename
+        }
+
+        result = hlp.generate_mx_annotation_table(**call_params)
+        if result.empty:
+            log.error(f"No annotation mapping generated for MX dataset with chromatography={self.chromatography} and polarity={self.polarity}. Please check your raw data files.")
+            sys.exit(1)
+        self.annotation_table = result
+        log.info(f"Created table: {self._annotation_table_filename}")
+        log.info("Created attribute: annotation_table")
 
 class TX(Dataset):
     """Transcriptomics dataset with specific configuration."""
     def __init__(self, project: Project, overwrite: bool = False, last: bool = False, superuser: bool = False):
         super().__init__("tx", project, overwrite, superuser)
-        self.workflow_tracker = self.project.workflow_tracker
         self.index = 1 # Currently only index 1 supported, not configurable
         self.apid = None
         self.genome_type = self.project.config['project']['genome_type']
         self.datatype = "counts" # Currently only counts supported, not configurable
-        self._get_raw_metadata(overwrite=self.overwrite, show_progress=False, superuser=superuser)
-        self._get_raw_data(overwrite=self.overwrite, show_progress=False)
-        self._generate_annotation_table(overwrite=self.overwrite, show_progress=False)
-        if last:
-            self._complete_tracking('create_datasets')
+        self._get_raw_data(overwrite=self.overwrite)
+        self._generate_annotation_table(overwrite=self.overwrite)
 
-    def _get_raw_data(self, overwrite: bool = False, show_progress: bool = True) -> None:
-        def _get_data_method():
-            log.info("Getting Raw Data (TX)")
-            if self.check_and_load_attribute('raw_data', self._raw_data_filename, self.overwrite):
-                log.info(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.")
-                return
-            
-            result = hlp.get_tx_data(
-                input_dir=self.dataset_raw_dir,
-                output_dir=self.output_dir,
-                output_filename=self._raw_data_filename,
-                type=self.datatype,
-                overwrite=overwrite
+    def _get_raw_data(self, overwrite: bool = False) -> None:
+        log.info("Getting Raw Data (TX)")
+        counts_path = Path(self.dataset_raw_dir) / f"{self.datatype}.csv"
+        self.identifier_column = (
+            pd.read_csv(counts_path, nrows=0).columns[0]
+            if counts_path.is_file()
+            else None
+        )
+        if self.check_and_load_attribute('raw_data', self._raw_data_filename, self.overwrite):
+            if self.identifier_column is None:
+                self.identifier_column = self.raw_data.columns[0]
+            log.info(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} samples and {self.raw_data.shape[1]} features.")
+            return
+
+        result = hlp.get_tx_data(
+            input_dir=self.dataset_raw_dir,
+            output_dir=self.output_dir,
+            output_filename=self._raw_data_filename,
+            type=self.datatype,
+            overwrite=overwrite
+        )
+        if result is None or result.empty:
+            raise FileNotFoundError(
+                f"No TX {self.datatype} file found under {self.dataset_raw_dir}."
             )
-            if result.empty:
-                log.error(f"No data found for TX dataset. Please check your raw data files.")
-            # Normalize raw data sample-wise using median-of-ratios method
-            log.info("Normalizing TX raw data using median-of-ratios method")
-            scale = 1.0
-            feature_col_name = result.columns[0]
-            result = result.set_index(feature_col_name)
-            min_dataset_value = result[result > 0].min().min()
-            mask = (result > min_dataset_value).any(axis=1)
-            counts_pos = result.loc[mask]
-            counts_pos = counts_pos.replace(0, np.finfo(float).eps)
-            log_counts = np.log(counts_pos)
-            geo_means = np.exp(log_counts.mean(axis=1))
-            ratios = counts_pos.divide(geo_means, axis=0)
-            size_factors = ratios.median(axis=0)
-            norm_counts = result.div(size_factors, axis=1) * scale
-            norm_counts = norm_counts.reset_index()
-            norm_counts = result.div(size_factors, axis=1) * scale
-            norm_counts = norm_counts.reset_index()
+        self.identifier_column = result.columns[0]
+        # Normalize raw data sample-wise using median-of-ratios method
+        log.info("Normalizing TX raw data using median-of-ratios method")
+        scale = 1.0
+        feature_col_name = result.columns[0]
+        result = result.set_index(feature_col_name)
+        min_dataset_value = result[result > 0].min().min()
+        mask = (result > min_dataset_value).any(axis=1)
+        counts_pos = result.loc[mask]
+        counts_pos = counts_pos.replace(0, np.finfo(float).eps)
+        log_counts = np.log(counts_pos)
+        geo_means = np.exp(log_counts.mean(axis=1))
+        ratios = counts_pos.divide(geo_means, axis=0)
+        size_factors = ratios.median(axis=0)
+        norm_counts = result.div(size_factors, axis=1) * scale
+        norm_counts = norm_counts.reset_index()
+        norm_counts = result.div(size_factors, axis=1) * scale
+        norm_counts = norm_counts.reset_index()
 
-            self.raw_data = norm_counts
-            log.info(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
-            log.info(f"Created table: {self._raw_data_filename}")
-            log.info("Created attribute: raw_data")
+        self.raw_data = norm_counts
+        log.info(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
+        log.info(f"Created table: {self._raw_data_filename}")
+        log.info("Created attribute: raw_data")
 
-        if show_progress:
-            self.workflow_tracker.set_current_step('load_data')
-            _get_data_method()
-            self._complete_tracking('load_data')
-            return
-        else:
-            _get_data_method()
+    def _get_raw_metadata(self, overwrite: bool = False, superuser: bool = False) -> None:
+        log.info("Getting Raw Metadata (TX)")
+        if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, self.overwrite):
+            self.apid = self.raw_metadata['APID'].iloc[0] if 'APID' in self.raw_metadata.columns else None
+            log.info(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
             return
 
-    def _get_raw_metadata(self, overwrite: bool = False, show_progress: bool = True, superuser: bool = False) -> None:
-        def _get_metadata_method():
-            log.info("Getting Raw Metadata (TX)")
-            if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, self.overwrite):
-                self.apid = self.raw_metadata['APID'].iloc[0] if 'APID' in self.raw_metadata.columns else None
-                log.info(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
-                return
-            
-            tx_files_path = os.path.join(self.dataset_raw_dir, "all_tx_portal_files.txt")
-            if not os.path.exists(tx_files_path):
-                tx_files = hlp.find_tx_files(
-                    pid=self.project.proposal_ID,
-                    tx_dir=self.dataset_raw_dir,
-                    tx_index=self.dataset_config['index'],
-                    overwrite=self.overwrite,
-                    superuser=superuser
-                )
-                self.apid = hlp.gather_tx_files(
-                    file_list=tx_files,
-                    tx_index=self.dataset_config['index'],
-                    tx_dir=self.dataset_raw_dir,
-                    overwrite=self.overwrite,
-                    superuser=superuser
-                )
-            else:
-                tx_files = pd.read_csv(tx_files_path, sep='\t')
-                if 'index' in self.dataset_config:
-                    analysis_index = self.dataset_config['index']
-                    log.info("Confirm that the data_processing.yml configuration has the correct analysis index selected (the 'ix' column, integer) from all libraries available for this project:")
-                    # Move column ix as index for display purposes
-                    tx_files_display = tx_files.set_index('ix')
-                    display(tx_files_display)
-                    # Copy files from the unprocessed directory over to the dataset_raw_dir
-                    unprocessed_dir = os.path.join(self.dataset_raw_dir, "unprocessed")
-                    selected_libs = tx_files[tx_files['ix'] == self.dataset_config['index']]
-                    for _, row in selected_libs.iterrows():
-                        apid = row['APID']
-                        gff3_file_src = os.path.join(unprocessed_dir, os.path.basename(row['ref_gff']))
-                        gff_file_dest = os.path.join(self.dataset_raw_dir, "genes.gff3")
-                        counts_file_src = os.path.join(unprocessed_dir, f"tx_counts_data_{analysis_index}_{apid}.csv")
-                        counts_file_dest = os.path.join(self.dataset_raw_dir, "counts.csv")
-                        kegg_annotation_file_src = os.path.join(unprocessed_dir, os.path.basename(row['ref_protein_kegg']))
-                        kegg_annotation_file_dest = os.path.join(self.dataset_raw_dir, "kegg_annotation_table.tsv")
-                        metadata_file_src = os.path.join(unprocessed_dir, f"tx_metadata_{analysis_index}_{apid}.csv")
-                        metadata_file_dest = os.path.join(self.dataset_raw_dir, "portal_metadata.csv")
-                        for src_file, dest_file in [
-                            (gff3_file_src, gff_file_dest),
-                            (counts_file_src, counts_file_dest),
-                            (kegg_annotation_file_src, kegg_annotation_file_dest),
-                            (metadata_file_src, metadata_file_dest)
-                        ]:
-                            shutil.copy2(src_file, dest_file)
-                    self.apid = apid
-                    log.info(f"Using APID: {self.apid} for TX dataset metadata extraction.")
-            if not hasattr(self, 'apid') or self.apid is None:
-                apid_file = os.path.join(self.dataset_raw_dir, "apid.txt")
-                if os.path.exists(apid_file):
-                    with open(apid_file, 'r') as f:
-                        self.apid = f.read().strip()
-                else:
-                    raise ValueError("APID not found. Cannot proceed without JGI APID.")
-            result = hlp.get_tx_metadata(
-                tx_files=tx_files,
-                output_dir=self.dataset_raw_dir,
-                proposal_ID=self.project.proposal_ID,
-                apid=str(self.apid),
-                overwrite=self.overwrite,
-                superuser=superuser
-            )
-            if result.empty:
-                log.error(f"No metadata found for TX dataset. Please check your raw data files.")
-                sys.exit(1)
-            self.raw_metadata = result
-            log.info(f"\tCreated raw metadata for TX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
-            log.info(f"Created table: {self._raw_metadata_filename}")
-            log.info("Created attribute: raw_metadata")
+        result = hlp.load_raw_metadata(
+            input_dir=self.dataset_raw_dir,
+            output_dir=self.output_dir,
+            output_filename=self._raw_metadata_filename,
+        )
+        self.apid = result['APID'].iloc[0] if 'APID' in result.columns else None
+        self.raw_metadata = result
+        log.info(f"\tCreated raw metadata for TX with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
+        log.info(f"Created table: {self._raw_metadata_filename}")
+        log.info("Created attribute: raw_metadata")
 
-        if show_progress:
-            self.workflow_tracker.set_current_step('load_metadata')
-            _get_metadata_method()
-            self._complete_tracking('load_metadata')
-            return
-        else:
-            _get_metadata_method()
-            return
-
-    def _generate_annotation_table(self, overwrite: bool = False, show_progress: bool = True) -> None:
+    def _generate_annotation_table(self, overwrite: bool = False) -> None:
         """Generate gene annotation table for transcriptomics data."""
-        def _generate_annotation_method():
-            log.info("Generating Gene Annotation Table")
-            if self.check_and_load_attribute('annotation_table', self._annotation_table_filename, self.overwrite):
-                log.info(f"\tAnnotation table with {self.annotation_table.shape[0]} rows and {self.annotation_table.shape[1]} columns.")
-                return
-            
-            call_params = {
-                'raw_data': self.raw_data,
-                'raw_data_dir': self.dataset_raw_dir,
-                'genome_type': self.genome_type,
-                'output_dir': self.output_dir,
-                'output_filename': self._annotation_table_filename
-            }
-
-            result = hlp.generate_tx_annotation_table(**call_params)
-            if result.empty:
-                log.error(f"No annotation table generated for TX dataset. Please check your raw data files.")
-                sys.exit(1)
-            self.annotation_table = result
-            log.info(f"Created table: {self._annotation_table_filename}")
-            log.info("Created attribute: annotation_table")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('generate_annotation_table')
-            _generate_annotation_method()
-            self._complete_tracking('generate_annotation_table')
+        log.info("Generating Gene Annotation Table")
+        if self.check_and_load_attribute('annotation_table', self._annotation_table_filename, self.overwrite):
+            log.info(f"\tAnnotation table with {self.annotation_table.shape[0]} rows and {self.annotation_table.shape[1]} columns.")
             return
-        else:
-            _generate_annotation_method()
-            return
+
+        call_params = {
+            'raw_data': self.raw_data,
+            'raw_data_dir': self.dataset_raw_dir,
+            'genome_type': self.genome_type,
+            'output_dir': self.output_dir,
+            'output_filename': self._annotation_table_filename,
+            'identifier_column': self.identifier_column,
+        }
+
+        result = hlp.generate_tx_annotation_table(**call_params)
+        if result.empty:
+            log.error(f"No annotation table generated for TX dataset. Please check your raw data files.")
+            sys.exit(1)
+        self.annotation_table = result
+        log.info(f"Created table: {self._annotation_table_filename}")
+        log.info("Created attribute: annotation_table")
 
 class Analysis(BaseDataHandler):
     """Analysis class with hash-based tagging."""
     
     def __init__(self, project: Project, datasets: list = None, overwrite: bool = False):
         self.project = project
-        self.workflow_tracker = self.project.workflow_tracker
-        self.workflow_tracker.set_current_step('create_analysis')
         log.info("Initializing Analysis")
         self.datasets_config = self.project.config['datasets']
         self.analysis_config = self.project.config['analysis']
-        self.metadata_link_script = self.project.project_config['metadata_link']
+        self.link_table = self.project.project_config.get('link_table')
         self.overwrite = self.project.overwrite
 
         # Use hash-based tags for output directory
@@ -1423,6 +972,14 @@ class Analysis(BaseDataHandler):
 
         # analysis_config is the flat 'analysis:' block from analysis.yml.
         self.datasets = datasets or []
+        if not self.link_table:
+            raise ValueError("project.link_table must point to the master link table.")
+        linked_metadata = hlp.load_link_table_metadata(
+            datasets=self.datasets,
+            link_table_path=self.link_table,
+        )
+        for ds in self.datasets:
+            ds.linked_metadata = linked_metadata[ds.dataset_name]
 
         # Derive integration_mode from the scaling.method configured for each dataset
         # in data_processing.yml.  lfc / moderated_lfc → condition_resolution;
@@ -1434,8 +991,6 @@ class Analysis(BaseDataHandler):
         log.info(f"Created analysis with {len(self.datasets)} datasets.")
         for ds in self.datasets:
             log.info(f"\t- {ds.dataset_name} with output directory: {ds.output_dir}")
-        
-        self._complete_tracking('create_analysis')
 
     # ── LFC scaling methods that imply condition_resolution ──────────────────
     _LFC_METHODS: frozenset = frozenset({"lfc", "moderated_lfc"})
@@ -1593,50 +1148,23 @@ class Analysis(BaseDataHandler):
             self.save_data(df, self.output_dir, filename, indexing=True)
         self._cache[key] = df
 
-    def _complete_tracking(self, step_id: str):
-        """Helper method to track workflow steps with after visualization."""
-        # Mark as completed and show updated status (green)
-        self.workflow_tracker.mark_completed(step_id)
-        self.workflow_tracker.plot(show_plot=True)
-
-    def filter_all_datasets(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+    def filter_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply filtering to all datasets in the analysis."""
-        def _filter_method():
-            log.info("Filtering Data")
-            for ds in self.datasets:
-                log.info(f"Filtering {ds.dataset_name} dataset...")
-                ds.filter_data(overwrite=self.overwrite, show_progress=False, **kwargs)
+        log.info("Filtering Data")
+        for ds in self.datasets:
+            log.info(f"Filtering {ds.dataset_name} dataset...")
+            ds.filter_data(overwrite=self.overwrite, **kwargs)
 
-        if show_progress:
-            self.workflow_tracker.set_current_step('filter_dataset_features')
-            _filter_method()
-            self._complete_tracking('filter_dataset_features')
-            return
-        else:
-            _filter_method()
-            return
-
-    def devariance_all_datasets(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+    def devariance_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Apply devariancing to all datasets in the analysis."""
-        def _devariance_method():
-            log.info("Devariancing Data")
-            for ds in self.datasets:
-                log.info(f"Devariancing {ds.dataset_name} dataset...")
-                ds.devariance_data(overwrite=self.overwrite, show_progress=False, **kwargs)
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('devariance_dataset_features')
-            _devariance_method()
-            self._complete_tracking('devariance_dataset_features')
-            return
-        else:
-            _devariance_method()
-            return
+        log.info("Devariancing Data")
+        for ds in self.datasets:
+            log.info(f"Devariancing {ds.dataset_name} dataset...")
+            ds.devariance_data(overwrite=self.overwrite, **kwargs)
 
     def scale_all_datasets(
         self,
         overwrite: bool = False,
-        show_progress: bool = True,
         group_col: str = "group",
         sample_col: str = "unique_group",
         min_reps_for_se: int = 2,
@@ -1734,238 +1262,149 @@ class Analysis(BaseDataHandler):
                     log.info(f"  [{ds.dataset_name}] Scaling: method='{method}'...")
                     ds.scale_data(
                         overwrite=overwrite,
-                        show_progress=False,
                         norm_method=method,
                         log2=True,
                         **kwargs
                     )
 
-        if show_progress:
-            self.workflow_tracker.set_current_step('scale_dataset_features')
-            _scale_method()
-            self._complete_tracking('scale_dataset_features')
-            return
-        else:
-            _scale_method()
-            return
-
-    def replicability_test_all_datasets(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
-        """Remove low replicable features from all datasets in the analysis."""
-        def _replicate_method():
-            log.info("Removing Unreplicable Features")
-            for ds in self.datasets:
-                log.info(f"Filtering outlier replicates from {ds.dataset_name} dataset (output: replicate_filtered_data)...")
-                ds.remove_low_replicable_features(overwrite=self.overwrite, show_progress=False, **kwargs)
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('replicability_test_dataset_features')
-            _replicate_method()
-            self._complete_tracking('replicability_test_dataset_features')
-            return
-        else:
-            _replicate_method()
-            return
-
-    def plot_pca_all_datasets(self, overwrite: bool = False, show_plot: bool = True, show_progress: bool = True, **kwargs) -> None:
-        """Plot PCA for all datasets in the analysis."""
-        def _pca_method():
-            log.info("Plotting Individual PCAs and Grid")
-            for ds in self.datasets:
-                log.info(f"Plotting PCA for {ds.dataset_name} dataset...")
-                ds.plot_pca(overwrite=self.overwrite, 
-                            analysis_outdir=self.output_dir, 
-                            show_plot=show_plot,
-                            show_progress=False,
-                            **kwargs)
-
-        _pca_method()
+        _scale_method()
         return
 
-    def link_metadata(self, overwrite: bool = False, show_progress: bool = True) -> None:
-        """Hybrid: Class orchestration + external hlp.link_metadata_with_custom_script function."""
-        def _link_metadata_method():
-            log.info("Linking analysis datasets along shared metadata")
+    def replicability_test_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
+        """Remove low replicable features from all datasets in the analysis."""
+        log.info("Removing Unreplicable Features")
+        for ds in self.datasets:
+            log.info(f"Filtering outlier replicates from {ds.dataset_name} dataset (output: replicate_filtered_data)...")
+            ds.remove_low_replicable_features(overwrite=self.overwrite, **kwargs)
 
-            # Check if datasets already have linked metadata
-            datasets_to_process = [
-                ds for ds in self.datasets 
-                if not ds.check_and_load_attribute('linked_metadata', ds._linked_metadata_filename, self.overwrite)
-            ]
-            if not datasets_to_process:
-                return
-            
-            # Call external function
-            linked_metadata = hlp.link_metadata_with_custom_script(datasets=self.datasets,
-                                                                   custom_script_path=self.metadata_link_script)
-            
-            # Set results back to datasets
-            for ds in self.datasets:
-                if linked_metadata[ds.dataset_name].empty:
-                    log.error(f"Linking metadata resulted in empty table for {ds.dataset_name}. Please check your metadata linking script and input metadata files.")
-                    sys.exit(1)
-                ds.linked_metadata = linked_metadata[ds.dataset_name]
-                log.info(f"Created linked_metadata for {ds.dataset_name} with {ds.linked_metadata.shape[0]} samples and {ds.linked_metadata.shape[1]} metadata fields.")
-                log.info(f"Created table: {ds._linked_metadata_filename}")
-                log.info("Created attribute: linked_metadata")
+    def plot_pca_all_datasets(self, overwrite: bool = False, show_plot: bool = True, **kwargs) -> None:
+        """Plot PCA for all datasets in the analysis."""
+        log.info("Plotting Individual PCAs and Grid")
+        for ds in self.datasets:
+            log.info(f"Plotting PCA for {ds.dataset_name} dataset...")
+            ds.plot_pca(overwrite=self.overwrite,
+                        analysis_outdir=self.output_dir,
+                        show_plot=show_plot,
+                        **kwargs)
 
-        if show_progress:
-            self.workflow_tracker.set_current_step('link_metadata')
-            _link_metadata_method()
-            self._complete_tracking('link_metadata')
-            return
-        else:
-            _link_metadata_method()
+    def link_data(self, overlap_only: bool = True, overwrite: bool = False) -> None:
+        """Rename raw quantitative sample columns using the master link table."""
+        log.info("Linking analysis datasets along shared samples")
+
+        # Check if all datasets already have linked data
+        datasets_to_process = [
+            ds for ds in self.datasets
+            if not ds.check_and_load_attribute('linked_data', ds._linked_data_filename, self.overwrite)
+        ]
+        if not datasets_to_process:
             return
 
-    def link_data(self, overlap_only: bool = True, overwrite: bool = False, show_progress: bool = True) -> None:
-        """Hybrid: Class orchestration + external hlp.link_data_across_datasets function."""
-        def _link_data_method():
-            log.info("Linking analysis datasets along shared samples")
+        # The master link table is loaded during Analysis initialization.
+        for ds in self.datasets:
+            if not hasattr(ds, 'linked_metadata') or ds.linked_metadata.empty:
+                raise ValueError(f"Dataset {ds.dataset_name} lacks link-table metadata.")
 
-            # Check if all datasets already have linked data
-            datasets_to_process = [
-                ds for ds in self.datasets 
-                if not ds.check_and_load_attribute('linked_data', ds._linked_data_filename, self.overwrite)
-            ]
-            if not datasets_to_process:
-                return
+        # Call external function
+        linked_data = hlp.link_data_across_datasets(datasets=self.datasets,
+                                                       overlap_only=overlap_only)
 
-            # Ensure that all datasets have linked metadata
-            for ds in self.datasets:
-                if not hasattr(ds, 'linked_metadata') or ds.linked_metadata.empty:
-                    raise ValueError(f"Dataset {ds.dataset_name} lacks linked_metadata. Cannot proceed with data linking.")
-
-            # Call external function
-            linked_data = hlp.link_data_across_datasets(datasets=self.datasets,
-                                                           overlap_only=overlap_only)
-
-            # Set results back to datasets
-            for ds in self.datasets:
-                if linked_data[ds.dataset_name].empty:
-                    log.error(f"Linking data resulted in empty table for {ds.dataset_name}. Please check your datasets and linked metadata.")
-                    sys.exit(1)
-                ds.linked_data = linked_data[ds.dataset_name]
-                log.info(f"Created linked_data for {ds.dataset_name} with {ds.linked_data.shape[1]} samples and {ds.linked_data.shape[0]} features.")
-                log.info(f"Created table: {ds._linked_data_filename}")
-                log.info("Created attribute: linked_data")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('link_data')
-            _link_data_method()
-            self._complete_tracking('link_data')
-            return
-        else:
-            _link_data_method()
-            return
+        # Set results back to datasets
+        for ds in self.datasets:
+            if linked_data[ds.dataset_name].empty:
+                log.error(f"Linking data resulted in empty table for {ds.dataset_name}. Please check your datasets and linked metadata.")
+                sys.exit(1)
+            ds.linked_data = linked_data[ds.dataset_name]
+            log.info(f"Created linked_data for {ds.dataset_name} with {ds.linked_data.shape[1]} samples and {ds.linked_data.shape[0]} features.")
+            log.info(f"Created table: {ds._linked_data_filename}")
+            log.info("Created attribute: linked_data")
 
     def plot_dataset_distributions(
         self,
         bins: int = 50,
         transparency: float = 0.5,
-        xlog: bool = False, 
-        ylog: bool = False, 
-        show_progress: bool = True
+        xlog: bool = False,
+        ylog: bool = False,
     ) -> None:
         """Plot histograms of feature values for each dataset in the analysis."""
-        def _plot_distributions_method():
-            log.info("Plotting feature value distributions for all datasets")
-            dataframes = {ds.dataset_name: ds.scaled_data for ds in self.datasets if hasattr(ds, "scaled_data")}
+        log.info("Plotting feature value distributions for all datasets")
+        dataframes = {ds.dataset_name: ds.scaled_data for ds in self.datasets if hasattr(ds, "scaled_data")}
 
-            hlp.plot_data_variance_histogram(
-                dataframes=dataframes,
-                output_dir=self.output_dir,
-                bins=bins,
-                transparency=transparency,
-                xlog=xlog,
-                ylog=ylog
-            )
+        hlp.plot_data_variance_histogram(
+            dataframes=dataframes,
+            output_dir=self.output_dir,
+            bins=bins,
+            transparency=transparency,
+            xlog=xlog,
+            ylog=ylog
+        )
 
-        _plot_distributions_method()
-        return
-
-    def plot_integrated_pca(self, show_progress: bool = True) -> None:
+    def plot_integrated_pca(self) -> None:
         """Plot histograms of feature values for each dataset in the analysis."""
-        def _plot_integrated_pca():
-            log.info("Plotting PCA of integrated features")
+        log.info("Plotting PCA of integrated features")
 
-            hlp.plot_simple_pca(
-                df=self.integrated_data_selected,
-                metadata=self.integrated_metadata,
-                title="Integrated Data PCA",
-                output_dir=self.output_dir,
-            )
-
-        _plot_integrated_pca()
-        return
+        hlp.plot_simple_pca(
+            df=self.integrated_data_selected,
+            metadata=self.integrated_metadata,
+            title="Integrated Data PCA",
+            output_dir=self.output_dir,
+        )
 
     def integrate_metadata(
         self,
         group_col: str = "group",
         overlap_only: bool = True,
         overwrite: bool = False,
-        show_progress: bool = True
     ) -> None:
         """Hybrid: Class validation + external hlp.integrate_metadata function."""
-        def _integrate_metadata_method():
-            track = self.integration_mode
-            log.info(f"Integrating metadata across data types (track='{track}')")
+        track = self.integration_mode
+        log.info(f"Integrating metadata across data types (track='{track}')")
 
-            # sample_resolution produces sample-level metadata; reuse cache safely
-            can_reuse_cached = (
-                track == "sample_resolution"
-                and self.check_and_load_attribute(
-                    "integrated_metadata",
-                    self._integrated_metadata_filename,
-                    overwrite or self.overwrite
-                )
+        # sample_resolution produces sample-level metadata; reuse cache safely
+        can_reuse_cached = (
+            track == "sample_resolution"
+            and self.check_and_load_attribute(
+                "integrated_metadata",
+                self._integrated_metadata_filename,
+                overwrite or self.overwrite
             )
-            if can_reuse_cached:
-                log.info(
-                    f"\tIntegrated metadata object 'integrated_metadata' with "
-                    f"{self.integrated_metadata.shape[0]} rows and {self.integrated_metadata.shape[1]} columns."
-                )
-                return
-
-            # Map new track names to the helper's method parameter
-            helper_method = 'replicate_matched' if track == 'sample_resolution' else 'lfc'
-
-            result = hlp.integrate_metadata(
-                datasets=self.datasets,
-                metadata_vars=self.project.study_variables,
-                unifying_col="unique_group",
-                output_filename=self._integrated_metadata_filename,
-                output_dir=self.output_dir,
-                method=helper_method,
-                group_col=group_col,
-                overlap_only=overlap_only,
-            )
-
-            if result.empty:
-                log.error("Integrating metadata resulted in empty table. Please check datasets and parameters.")
-                sys.exit(1)
-
-            self.integrated_metadata = result
+        )
+        if can_reuse_cached:
             log.info(
-                f"Created integrated metadata table with {self.integrated_metadata.shape[0]} rows "
-                f"and {self.integrated_metadata.shape[1]} columns."
+                f"\tIntegrated metadata object 'integrated_metadata' with "
+                f"{self.integrated_metadata.shape[0]} rows and {self.integrated_metadata.shape[1]} columns."
             )
-            log.info(f"Created table: {self._integrated_metadata_filename}")
-            log.info("Created attribute: integrated_metadata")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step("integrate_metadata")
-            _integrate_metadata_method()
-            self._complete_tracking("integrate_metadata")
             return
-        _integrate_metadata_method()
-        return
 
+        # Map new track names to the helper's method parameter
+        helper_method = 'replicate_matched' if track == 'sample_resolution' else 'lfc'
+
+        result = hlp.integrate_metadata(
+            datasets=self.datasets,
+            metadata_vars=self.project.study_variables,
+            unifying_col="unique_group",
+            output_filename=self._integrated_metadata_filename,
+            output_dir=self.output_dir,
+            method=helper_method,
+            group_col=group_col,
+            overlap_only=overlap_only,
+        )
+
+        if result.empty:
+            log.error("Integrating metadata resulted in empty table. Please check datasets and parameters.")
+            sys.exit(1)
+
+        self.integrated_metadata = result
+        log.info(
+            f"Created integrated metadata table with {self.integrated_metadata.shape[0]} rows "
+            f"and {self.integrated_metadata.shape[1]} columns."
+        )
+        log.info(f"Created table: {self._integrated_metadata_filename}")
+        log.info("Created attribute: integrated_metadata")
 
     def integrate_data(
         self,
         overlap_only: bool = True,
         overwrite: bool = False,
-        show_progress: bool = True
     ) -> None:
         """
         Concatenate per-dataset scaled matrices into a single integrated matrix.
@@ -1978,102 +1417,83 @@ class Analysis(BaseDataHandler):
         * **condition_resolution** — concatenates ``ds.scaled_data``
           (features x contrasts) across datasets.
         """
-        def _integrate_data_method():
-            track = self.integration_mode
+        track = self.integration_mode
 
-            if self.check_and_load_attribute(
-                "integrated_data",
-                self._integrated_data_filename,
-                overwrite or self.overwrite
-            ):
-                log.info(
-                    f"\tIntegrated data object 'integrated_data' with "
-                    f"{self.integrated_data.shape[0]} features and {self.integrated_data.shape[1]} columns."
-                )
-                self.integration_mode = track
-                return
-
-            if track == 'sample_resolution':
-                data_attr = 'scaled_data'
-                log.info("Integrating data matrices (sample_resolution: concatenating scaled_data)...")
-                for ds in self.datasets:
-                    if not hasattr(ds, 'scaled_data') or ds.scaled_data is None or ds.scaled_data.empty:
-                        raise RuntimeError(
-                            f"Dataset '{ds.dataset_name}' has no scaled_data. "
-                            "Run analysis.scale_all_datasets() before integrate_data()."
-                        )
-            else:
-                data_attr = 'scaled_data'
-                log.info("Integrating data matrices (condition_resolution: concatenating scaled_data)...")
-                for ds in self.datasets:
-                    if not hasattr(ds, 'scaled_data') or ds.scaled_data is None or ds.scaled_data.empty:
-                        raise RuntimeError(
-                            f"Dataset '{ds.dataset_name}' has no scaled_data. "
-                            "Run analysis.scale_all_datasets() before integrate_data()."
-                        )
-
-            result = hlp.integrate_data(
-                datasets=self.datasets,
-                overlap_only=overlap_only,
-                output_filename=self._integrated_data_filename,
-                output_dir=self.output_dir,
-                data_attr=data_attr,
-            )
-
-            if result.empty:
-                log.error("Integrating data resulted in empty table. Please check datasets and parameters.")
-                sys.exit(1)
-
-            self.integrated_data = result
-            self.integration_mode = track
+        if self.check_and_load_attribute(
+            "integrated_data",
+            self._integrated_data_filename,
+            overwrite or self.overwrite
+        ):
             log.info(
-                f"Created integrated data table with {self.integrated_data.shape[0]} features "
-                f"and {self.integrated_data.shape[1]} columns."
+                f"\tIntegrated data object 'integrated_data' with "
+                f"{self.integrated_data.shape[0]} features and {self.integrated_data.shape[1]} columns."
             )
-            log.info(f"track set to '{self.integration_mode}'")
-            log.info(f"Created table: {self._integrated_data_filename}")
-            log.info("Created attribute: integrated_data")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step("integrate_data")
-            _integrate_data_method()
-            self._complete_tracking("integrate_data")
+            self.integration_mode = track
             return
-        _integrate_data_method()
-        return
 
-    def annotate_integrated_features(self, overlap_only: bool = True, overwrite: bool = False, show_progress: bool = False) -> pd.DataFrame:
-        """Hybrid: Class orchestration + external annotate_integrated_features function."""
-        def _annotate_integrated_features_method():
-            log.info("Annotating integrated features")
-            if self.check_and_load_attribute('feature_annotation_table', self._feature_annotation_table_filename, self.overwrite):
-                log.info(f"\tAnnotated features object 'feature_annotation_table' with {self.feature_annotation_table.shape[0]} features and {self.feature_annotation_table.shape[1]} samples.")
-                return
-            
-            annotation_df = hlp.annotate_integrated_features(
-                integrated_data=self.integrated_data,
-                datasets=self.datasets,
-                output_dir=self.output_dir,
-                cache_dir=self.project.cache_dir,
-                output_filename=self._feature_annotation_table_filename,
-            )
-
-            if annotation_df.empty:
-                log.error(f"Annotating integrated features resulted in empty table. Please check your datasets and annotation maps.")
-                sys.exit(1)
-            self.feature_annotation_table = annotation_df
-            log.info(f"Created an annotated integrated features table with {self.feature_annotation_table.shape[0]} entries ({len(self.feature_annotation_table['feature_id'].unique())} unique features) and {self.feature_annotation_table.shape[1]} samples.")
-            log.info(f"Created table: {self._feature_annotation_table_filename}")
-            log.info("Created attribute: feature_annotation_table")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('annotate_integrated_features')
-            _annotate_integrated_features_method()
-            self._complete_tracking('annotate_integrated_features')
-            return
+        if track == 'sample_resolution':
+            data_attr = 'scaled_data'
+            log.info("Integrating data matrices (sample_resolution: concatenating scaled_data)...")
+            for ds in self.datasets:
+                if not hasattr(ds, 'scaled_data') or ds.scaled_data is None or ds.scaled_data.empty:
+                    raise RuntimeError(
+                        f"Dataset '{ds.dataset_name}' has no scaled_data. "
+                        "Run analysis.scale_all_datasets() before integrate_data()."
+                    )
         else:
-            _annotate_integrated_features_method()
+            data_attr = 'scaled_data'
+            log.info("Integrating data matrices (condition_resolution: concatenating scaled_data)...")
+            for ds in self.datasets:
+                if not hasattr(ds, 'scaled_data') or ds.scaled_data is None or ds.scaled_data.empty:
+                    raise RuntimeError(
+                        f"Dataset '{ds.dataset_name}' has no scaled_data. "
+                        "Run analysis.scale_all_datasets() before integrate_data()."
+                    )
+
+        result = hlp.integrate_data(
+            datasets=self.datasets,
+            overlap_only=overlap_only,
+            output_filename=self._integrated_data_filename,
+            output_dir=self.output_dir,
+            data_attr=data_attr,
+        )
+
+        if result.empty:
+            log.error("Integrating data resulted in empty table. Please check datasets and parameters.")
+            sys.exit(1)
+
+        self.integrated_data = result
+        self.integration_mode = track
+        log.info(
+            f"Created integrated data table with {self.integrated_data.shape[0]} features "
+            f"and {self.integrated_data.shape[1]} columns."
+        )
+        log.info(f"track set to '{self.integration_mode}'")
+        log.info(f"Created table: {self._integrated_data_filename}")
+        log.info("Created attribute: integrated_data")
+
+    def annotate_integrated_features(self, overlap_only: bool = True, overwrite: bool = False) -> pd.DataFrame:
+        """Hybrid: Class orchestration + external annotate_integrated_features function."""
+        log.info("Annotating integrated features")
+        if self.check_and_load_attribute('feature_annotation_table', self._feature_annotation_table_filename, self.overwrite):
+            log.info(f"\tAnnotated features object 'feature_annotation_table' with {self.feature_annotation_table.shape[0]} features and {self.feature_annotation_table.shape[1]} samples.")
             return
+
+        annotation_df = hlp.annotate_integrated_features(
+            integrated_data=self.integrated_data,
+            datasets=self.datasets,
+            output_dir=self.output_dir,
+            cache_dir=self.project.cache_dir,
+            output_filename=self._feature_annotation_table_filename,
+        )
+
+        if annotation_df.empty:
+            log.error(f"Annotating integrated features resulted in empty table. Please check your datasets and annotation maps.")
+            sys.exit(1)
+        self.feature_annotation_table = annotation_df
+        log.info(f"Created an annotated integrated features table with {self.feature_annotation_table.shape[0]} entries ({len(self.feature_annotation_table['feature_id'].unique())} unique features) and {self.feature_annotation_table.shape[1]} samples.")
+        log.info(f"Created table: {self._feature_annotation_table_filename}")
+        log.info("Created attribute: feature_annotation_table")
 
     def plot_individual_feature(self, feature_id: str, metadata_cat: str = 'group', save_plot: bool = True) -> None:
         """Plot individual feature abundance by metadata."""
@@ -2098,44 +1518,34 @@ class Analysis(BaseDataHandler):
             save_plot=save_plot
         )
 
-    def perform_feature_selection(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+    def perform_feature_selection(self, overwrite: bool = False, **kwargs) -> None:
         """Hybrid: Class parameter setup + external hlp.perform_feature_selection function."""
-        def _feature_selection_method():
-            if self.check_and_load_attribute('integrated_data_selected', self._integrated_data_selected_filename, self.overwrite):
-                log.info(f"\tFeature selection data object 'integrated_data_selected' with {self.integrated_data_selected.shape[0]} features and {self.integrated_data_selected.shape[1]} samples.")
-                return
-
-            feature_selection_params = self.analysis_parameters.get('feature_selection', {})
-            log.info(f"Subsetting Features using the {feature_selection_params.get('method', 'unspecified')} method with parameters: {feature_selection_params.get('params', {})}")
-            call_params = {
-                'data': self.integrated_data,
-                'metadata': self.integrated_metadata,
-                'config': feature_selection_params,
-                'output_dir': self.output_dir,
-                'output_filename': self._integrated_data_selected_filename,
-            }
-            call_params.update(kwargs)
-
-            result = hlp.perform_feature_selection(**call_params)
-
-            if result.empty:
-                log.error(f"Feature selection resulted in empty table. Please check your integrated data and feature selection parameters.")
-                sys.exit(1)
-            self.integrated_data_selected = result
-            log.info(f"Created a subset of the integrated data with {self.integrated_data_selected.shape[0]} samples and {self.integrated_data_selected.shape[1]} features for network analysis.")
-            log.info(f"Created table: {self._integrated_data_selected_filename}")
-            log.info("Created attribute: integrated_data_selected")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('feature_selection')
-            _feature_selection_method()
-            self._complete_tracking('feature_selection')
-            return
-        else:
-            _feature_selection_method()
+        if self.check_and_load_attribute('integrated_data_selected', self._integrated_data_selected_filename, self.overwrite):
+            log.info(f"\tFeature selection data object 'integrated_data_selected' with {self.integrated_data_selected.shape[0]} features and {self.integrated_data_selected.shape[1]} samples.")
             return
 
-    def run_full_network_analyzer(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+        feature_selection_params = self.analysis_parameters.get('feature_selection', {})
+        log.info(f"Subsetting Features using the {feature_selection_params.get('method', 'unspecified')} method with parameters: {feature_selection_params.get('params', {})}")
+        call_params = {
+            'data': self.integrated_data,
+            'metadata': self.integrated_metadata,
+            'config': feature_selection_params,
+            'output_dir': self.output_dir,
+            'output_filename': self._integrated_data_selected_filename,
+        }
+        call_params.update(kwargs)
+
+        result = hlp.perform_feature_selection(**call_params)
+
+        if result.empty:
+            log.error(f"Feature selection resulted in empty table. Please check your integrated data and feature selection parameters.")
+            sys.exit(1)
+        self.integrated_data_selected = result
+        log.info(f"Created a subset of the integrated data with {self.integrated_data_selected.shape[0]} samples and {self.integrated_data_selected.shape[1]} features for network analysis.")
+        log.info(f"Created table: {self._integrated_data_selected_filename}")
+        log.info("Created attribute: integrated_data_selected")
+
+    def run_full_network_analyzer(self, overwrite: bool = False, **kwargs) -> None:
         grouping_params = self.analysis_parameters.get('feature_grouping', {}).get('params', {})
         output_dir = os.path.join(self.output_dir, "network_analyzer_results")
         results = hlp.compare_network_topologies(
@@ -2151,139 +1561,119 @@ class Analysis(BaseDataHandler):
 
         return results
 
-    def calculate_correlated_features(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+    def calculate_correlated_features(self, overwrite: bool = False, **kwargs) -> None:
         """Hybrid: Class validation + external hlp.calculate_correlated_features function."""
-        def _correlation_method():
-            log.info("Calculating Correlated Features")
+        log.info("Calculating Correlated Features")
 
-            feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
-            selected_method = feature_grouping_params.get('method', 'network_modules')
-            correlation_params = feature_grouping_params.get('params', {})
+        feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
+        selected_method = feature_grouping_params.get('method', 'network_modules')
+        correlation_params = feature_grouping_params.get('params', {})
 
-            if selected_method != 'network_modules':
-                log.info(f"Selected feature grouping method is '{selected_method}'; skipping correlation computation (not required).")
-                return
-
-            if self.check_and_load_attribute('feature_correlation_table', self._feature_correlation_table_filename, self.overwrite):
-                log.info(f"\tFeature correlation table object 'feature_correlation_table' with {self.feature_correlation_table.shape[0]} feature pairs.")
-                return
-
-            call_params = {
-                'data': self.integrated_data_selected,
-                'output_filename': self._feature_correlation_table_filename,
-                'output_dir': self.output_dir,
-                'feature_prefixes': [ds.dataset_name + "_" for ds in self.datasets],
-                'method': correlation_params.get('corr_method', 'pearson'),
-                'cutoff': correlation_params.get('corr_cutoff', 0.5),
-                'keep_negative': correlation_params.get('keep_negative', False),
-                'block_size': correlation_params.get('block_size', 500),
-                'n_jobs': correlation_params.get('cores', -1),
-                'corr_mode': correlation_params.get('corr_mode', 'bipartite'),
-                'calculate_r2': True
-            }
-            call_params.update(kwargs)
-            
-            result = hlp.calculate_correlated_features(**call_params)
-
-            if result.empty:
-                log.error(f"Calculating correlated features resulted in empty table. Please check your integrated data and correlation parameters.")
-                sys.exit(1)
-            self.feature_correlation_table = result
-            log.info(f"Created a feature correlation table with {self.feature_correlation_table.shape[0]} feature pairs.")
-            log.info(f"Created table: {self._feature_correlation_table_filename}")
-            log.info("Created attribute: feature_correlation_table")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('calculate_correlations')
-            _correlation_method()
-            self._complete_tracking('calculate_correlations')
-            return
-        else:
-            _correlation_method()
+        if selected_method != 'network_modules':
+            log.info(f"Selected feature grouping method is '{selected_method}'; skipping correlation computation (not required).")
             return
 
-    def group_features_step(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+        if self.check_and_load_attribute('feature_correlation_table', self._feature_correlation_table_filename, self.overwrite):
+            log.info(f"\tFeature correlation table object 'feature_correlation_table' with {self.feature_correlation_table.shape[0]} feature pairs.")
+            return
+
+        call_params = {
+            'data': self.integrated_data_selected,
+            'output_filename': self._feature_correlation_table_filename,
+            'output_dir': self.output_dir,
+            'feature_prefixes': [ds.dataset_name + "_" for ds in self.datasets],
+            'method': correlation_params.get('corr_method', 'pearson'),
+            'cutoff': correlation_params.get('corr_cutoff', 0.5),
+            'keep_negative': correlation_params.get('keep_negative', False),
+            'block_size': correlation_params.get('block_size', 500),
+            'n_jobs': correlation_params.get('cores', -1),
+            'corr_mode': correlation_params.get('corr_mode', 'bipartite'),
+            'calculate_r2': True
+        }
+        call_params.update(kwargs)
+
+        result = hlp.calculate_correlated_features(**call_params)
+
+        if result.empty:
+            log.error(f"Calculating correlated features resulted in empty table. Please check your integrated data and correlation parameters.")
+            sys.exit(1)
+        self.feature_correlation_table = result
+        log.info(f"Created a feature correlation table with {self.feature_correlation_table.shape[0]} feature pairs.")
+        log.info(f"Created table: {self._feature_correlation_table_filename}")
+        log.info("Created attribute: feature_correlation_table")
+
+    def group_features_step(self, overwrite: bool = False, **kwargs) -> None:
         """Unified feature grouping dispatcher supporting network_modules, hierarchical_clustering, hdbscan, nmf, leiden_knn, wgcna."""
-        def _group_method():
-            log.info("Grouping Features")
-            submodule_subdir = "submodules"
-            submodule_dir = os.path.join(self.output_dir, submodule_subdir)
-            os.makedirs(submodule_dir, exist_ok=True)
+        log.info("Grouping Features")
+        submodule_subdir = "submodules"
+        submodule_dir = os.path.join(self.output_dir, submodule_subdir)
+        os.makedirs(submodule_dir, exist_ok=True)
 
-            feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
-            selected_method = feature_grouping_params.get('method', 'network_modules')
-            method_params = feature_grouping_params.get('params', {})
+        feature_grouping_params = self.analysis_parameters.get('feature_grouping', {})
+        selected_method = feature_grouping_params.get('method', 'network_modules')
+        method_params = feature_grouping_params.get('params', {})
 
-            # Check if outputs already exist
-            if self.check_and_load_attribute('feature_network_node_table', self._feature_network_node_table_filename, self.overwrite) and \
-                self.check_and_load_attribute('feature_network_edge_table', self._feature_network_edge_table_filename, self.overwrite):
-                if selected_method == 'network_modules':
-                    log.info("Displaying existing network visualization...")
-                    hlp.display_existing_network(
-                        graph_file=self._feature_network_graph_filename,
-                        node_table=self.feature_network_node_table,
-                        edge_table=self.feature_network_edge_table,
-                        network_layout=method_params.get('network_layout', None)
-                    )
-                else:
-                    log.info(f"Feature grouping table already exists ({selected_method}). Loaded from disk.")
-                return
-            else:
-                hlp.clear_directory(submodule_dir)
-
-            output_filenames = {
-                'graph': self._feature_network_graph_filename,
-                'node_table': self._feature_network_node_table_filename,
-                'edge_table': self._feature_network_edge_table_filename,
-                'submodule_path': submodule_dir
-            }
-
-            # For network_modules, feature_correlation_table must exist
-            feature_correlation_table = None
+        # Check if outputs already exist
+        if self.check_and_load_attribute('feature_network_node_table', self._feature_network_node_table_filename, self.overwrite) and \
+            self.check_and_load_attribute('feature_network_edge_table', self._feature_network_edge_table_filename, self.overwrite):
             if selected_method == 'network_modules':
-                if not hasattr(self, 'feature_correlation_table') or self.feature_correlation_table is None:
-                    log.error("feature_correlation_table is required for network_modules grouping. Run calculate_correlated_features() first.")
-                    sys.exit(1)
-                feature_correlation_table = self.feature_correlation_table
-
-            call_params = {
-                'data': self.integrated_data_selected,
-                'method': selected_method,
-                'method_params': method_params,
-                'output_dir': self.output_dir,
-                'output_filenames': output_filenames,
-                'datasets': self.datasets,
-                'annotation_df': self.feature_annotation_table,
-                'integrated_data': self.integrated_data_selected,
-                'integrated_metadata': self.integrated_metadata,
-                'feature_correlation_table': feature_correlation_table,
-            }
-            call_params.update(kwargs)
-
-            node_table, edge_table = hlp.group_features(**call_params)
-
-            if node_table.empty:
-                log.error(f"Feature grouping resulted in empty node table. Please check your data and grouping parameters.")
-                sys.exit(1)
-
-            self.feature_network_node_table = node_table
-            self.feature_network_edge_table = edge_table
-
-            log.info(f"Created table: {self._feature_network_node_table_filename}")
-            log.info("Created attribute: feature_network_node_table")
-            log.info(f"Created table: {self._feature_network_edge_table_filename}")
-            log.info("Created attribute: feature_network_edge_table")
-
-        if show_progress:
-            self.workflow_tracker.set_current_step('plot_correlation_network')
-            _group_method()
-            self._complete_tracking('plot_correlation_network')
+                log.info("Displaying existing network visualization...")
+                hlp.display_existing_network(
+                    graph_file=self._feature_network_graph_filename,
+                    node_table=self.feature_network_node_table,
+                    edge_table=self.feature_network_edge_table,
+                    network_layout=method_params.get('network_layout', None)
+                )
+            else:
+                log.info(f"Feature grouping table already exists ({selected_method}). Loaded from disk.")
             return
         else:
-            _group_method()
-            return
+            hlp.clear_directory(submodule_dir)
 
-    def group_features(self, overwrite: bool = False, show_progress: bool = True, **kwargs) -> None:
+        output_filenames = {
+            'graph': self._feature_network_graph_filename,
+            'node_table': self._feature_network_node_table_filename,
+            'edge_table': self._feature_network_edge_table_filename,
+            'submodule_path': submodule_dir
+        }
+
+        # For network_modules, feature_correlation_table must exist
+        feature_correlation_table = None
+        if selected_method == 'network_modules':
+            if not hasattr(self, 'feature_correlation_table') or self.feature_correlation_table is None:
+                log.error("feature_correlation_table is required for network_modules grouping. Run calculate_correlated_features() first.")
+                sys.exit(1)
+            feature_correlation_table = self.feature_correlation_table
+
+        call_params = {
+            'data': self.integrated_data_selected,
+            'method': selected_method,
+            'method_params': method_params,
+            'output_dir': self.output_dir,
+            'output_filenames': output_filenames,
+            'datasets': self.datasets,
+            'annotation_df': self.feature_annotation_table,
+            'integrated_data': self.integrated_data_selected,
+            'integrated_metadata': self.integrated_metadata,
+            'feature_correlation_table': feature_correlation_table,
+        }
+        call_params.update(kwargs)
+
+        node_table, edge_table = hlp.group_features(**call_params)
+
+        if node_table.empty:
+            log.error(f"Feature grouping resulted in empty node table. Please check your data and grouping parameters.")
+            sys.exit(1)
+
+        self.feature_network_node_table = node_table
+        self.feature_network_edge_table = edge_table
+
+        log.info(f"Created table: {self._feature_network_node_table_filename}")
+        log.info("Created attribute: feature_network_node_table")
+        log.info(f"Created table: {self._feature_network_edge_table_filename}")
+        log.info("Created attribute: feature_network_edge_table")
+
+    def group_features(self, overwrite: bool = False, **kwargs) -> None:
         """
         Public entry point for feature grouping.
 
@@ -2324,9 +1714,9 @@ class Analysis(BaseDataHandler):
             if not hasattr(self, 'feature_correlation_table') or \
                (hasattr(self, 'feature_correlation_table') and self.feature_correlation_table.empty):
                 log.info("network_modules selected — running calculate_correlated_features() first...")
-                self.calculate_correlated_features(overwrite=overwrite, show_progress=show_progress)
+                self.calculate_correlated_features(overwrite=overwrite)
 
-        self.group_features_step(overwrite=overwrite, show_progress=show_progress, **kwargs)
+        self.group_features_step(overwrite=overwrite, **kwargs)
 
     def compare_groups_to_pathways(self, **override_kwargs) -> dict:
         """

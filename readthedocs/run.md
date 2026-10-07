@@ -1,5 +1,7 @@
 # **Running the JGI Integration Workflow**
 
+Before starting, stage the raw data and metadata link table using the directory layout and file requirements in [setup.md](setup.md#input-directory-layout). The workflow expects these inputs under `input_data/raw_data` and `input_data/link_table.csv`.
+
 ## **Overview**
 
 The general stages of the workflow are:

@@ -3900,8 +3900,105 @@ def get_mx_data(
 
     else:
         log.warning(f"MX data file matching pattern {mx_data_pattern} not found.")
-        log.warning("Have you run _get_raw_metadata() to extract the MX data files?")
-        return None
+        log.warning(
+            "Place the MX results file(s) under the chromatography directory "
+            f"({input_dir}/{chromatography}/) before running the workflow."
+        )
+        return pd.DataFrame()
+
+
+def load_raw_metadata(
+    input_dir: str,
+    output_dir: str,
+    output_filename: str = "raw_metadata.csv",
+) -> pd.DataFrame:
+    """Load a pre-staged dataset metadata table from ``raw_metadata.csv``."""
+    metadata_path = Path(input_dir) / "raw_metadata.csv"
+    if not metadata_path.is_file():
+        log.warning(
+            "Required raw metadata file is missing: %s. "
+            "Stage it before running the workflow.",
+            metadata_path,
+        )
+        raise FileNotFoundError(f"Required raw metadata file not found: {metadata_path}")
+
+    metadata = pd.read_csv(metadata_path)
+    if metadata.empty:
+        log.warning("Raw metadata file is empty: %s", metadata_path)
+        raise ValueError(f"Raw metadata file is empty: {metadata_path}")
+
+    write_integration_file(
+        data=metadata,
+        output_dir=output_dir,
+        filename=output_filename,
+        indexing=False,
+    )
+    log.info("Raw metadata loaded from %s", metadata_path)
+    return metadata
+
+
+def load_mx_metadata(
+    input_dir: str,
+    chromatography: str,
+    output_dir: str,
+    output_filename: str = "raw_metadata.csv",
+) -> pd.DataFrame:
+    """Load and merge pre-staged MX metadata files for all polarities.
+
+    The data-gathering workflow may stage one polarity-specific metadata file
+    such as ``*_positive_metadata.tab`` and ``*_negative_metadata.tab`` below
+    the chromatography directory. A single ``raw_metadata.csv`` is also
+    accepted for compatibility. Metadata is normalized using the original MX
+    transformations, concatenated, and de-duplicated before being cached.
+    """
+    chromatography_dir = Path(input_dir) / chromatography
+    metadata_files = sorted(chromatography_dir.glob("**/*_metadata.tab"))
+    metadata_sep = "\t"
+    if not metadata_files:
+        metadata_files = sorted((Path(input_dir)).glob("raw_metadata.csv"))
+        metadata_sep = None
+    if not metadata_files:
+        log.warning(
+            "No MX metadata files found under %s. Expected polarity-specific "
+            "*_metadata.tab files or raw_metadata.csv.",
+            chromatography_dir,
+        )
+        raise FileNotFoundError(
+            f"No MX raw_metadata.csv files found under {chromatography_dir}"
+        )
+
+    metadata_tables = []
+    for metadata_path in metadata_files:
+        metadata = pd.read_csv(
+            metadata_path,
+            sep=metadata_sep if metadata_sep is not None else None,
+            engine="python",
+        )
+        metadata.columns = metadata.columns.str.replace(
+            "ATTRIBUTE_sampletype", "full_sample_metadata"
+        )
+        if "filename" in metadata.columns:
+            metadata["filename"] = metadata["filename"].astype(str).str.replace(
+                ".mzML", "", regex=False
+            )
+        if "file" not in metadata.columns and len(metadata.columns) > 0:
+            metadata = metadata.rename(columns={metadata.columns[0]: "file"})
+        metadata_tables.append(metadata)
+
+    merged_metadata = pd.concat(metadata_tables, axis=0, ignore_index=True)
+    merged_metadata = merged_metadata.drop_duplicates().reset_index(drop=True)
+    if "ix" in merged_metadata.columns:
+        merged_metadata = merged_metadata.drop(columns="ix")
+    merged_metadata.insert(0, "ix", merged_metadata.index + 1)
+
+    write_integration_file(
+        data=merged_metadata,
+        output_dir=output_dir,
+        filename=output_filename,
+        indexing=False,
+    )
+    log.info("Merged MX metadata from %s", metadata_files)
+    return merged_metadata
 
 def get_mx_metadata(
     output_filename: str,
@@ -3984,13 +4081,9 @@ def get_tx_data(
         pd.DataFrame: TX data matrix.
     """
 
-    tx_data_pattern = f"{input_dir}/{type}.txt"
+    tx_data_pattern = f"{input_dir}/{type}.csv"
     tx_data_files = glob.glob(os.path.expanduser(tx_data_pattern))
-    tx_data_files_sep = "\t"
-    if not tx_data_files:
-        tx_data_pattern = f"{input_dir}/{type}.csv"
-        tx_data_files = glob.glob(os.path.expanduser(tx_data_pattern))
-        tx_data_files_sep = ","
+    tx_data_files_sep = ","
     
     if tx_data_files:
         if len(tx_data_files) > 1:
@@ -3999,10 +4092,12 @@ def get_tx_data(
             return None
         tx_data_filename = tx_data_files[0]  # Assuming you want the first (and only) match
         tx_data = pd.read_csv(tx_data_filename, sep=tx_data_files_sep)
-        tx_data = tx_data.rename(columns={tx_data.columns[0]: 'GeneID'})
+        identifier_column = tx_data.columns[0]
         
         # Add prefix 'tx_' if not already present
-        tx_data['GeneID'] = tx_data['GeneID'].apply(lambda x: x if str(x).startswith('tx_') else f'tx_{x}')
+        tx_data[identifier_column] = tx_data[identifier_column].apply(
+            lambda x: x if str(x).startswith('tx_') else f'tx_{x}'
+        )
         
         log.info(f"TX data loaded from {tx_data_filename} and processing...")
         write_integration_file(data=tx_data, output_dir=output_dir, filename=output_filename, indexing=False)
@@ -4119,16 +4214,17 @@ def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.Data
     
     Args:
         annotation_df (pd.DataFrame): Annotation table with transcriptome_id column
-        raw_data (pd.DataFrame): Raw transcriptomics data with gene IDs as GeneID column
+        raw_data (pd.DataFrame): Raw transcriptomics data with IDs in its first column
     """
-    
+    identifier_column = raw_data.columns[0]
+
     # If "tx_" prefix is used in raw data, ensure annotation gene IDs also have it
-    if all(str(gid).startswith('tx_') for gid in raw_data['GeneID']):
+    if all(str(gid).startswith('tx_') for gid in raw_data[identifier_column]):
         if not all(str(gid).startswith('tx_') for gid in annotation_df['transcriptome_id']):
             annotation_df['transcriptome_id'] = annotation_df['transcriptome_id'].apply(lambda x: f'tx_{x}')
 
     # Get gene IDs from both datasets
-    raw_data_genes = set(raw_data['GeneID'].tolist())
+    raw_data_genes = set(raw_data[identifier_column].tolist())
     annotation_genes = set(annotation_df['transcriptome_id'].tolist())
     
     # Calculate overlap statistics
@@ -4148,15 +4244,29 @@ def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.Data
         log.warning(f"Low gene ID overlap ({overlap_pct:.1f}%) between raw data and annotations")
     if overlap_pct == 0:
         log.info("Raw data GeneIDs:")
-        log.info(raw_data['GeneID'].tolist()[:10])
+        log.info(raw_data[identifier_column].tolist()[:10])
         log.info("Annotation transcriptome_ids:")
         log.info(annotation_df['transcriptome_id'].tolist()[:10])
         raise ValueError("No matching gene IDs found between raw data and annotations, something is wrong.")
 
+def _validate_annotation_identifier_header(
+    df: pd.DataFrame,
+    file_path: str,
+    identifier_column: str,
+) -> None:
+    if not len(df.columns) or df.columns[0] != identifier_column:
+        actual_header = df.columns[0] if len(df.columns) else "<no columns>"
+        raise ValueError(
+            f"Annotation file {os.path.basename(file_path)} must have "
+            f"'{identifier_column}' as its first column; found '{actual_header}'."
+        )
+
+
 def _process_microbe_annotations(
     raw_data_dir: str,
     output_dir: str,
-    output_filename: str
+    output_filename: str,
+    identifier_column: str,
 ) -> pd.DataFrame:
     """
     Process microbe annotation files and merge into a single table.
@@ -4187,7 +4297,7 @@ def _process_microbe_annotations(
     # Process each annotation file
     processed_dfs = []
     for file_path in annotation_files:
-        df = _read_and_select_microbe_annotations(file_path)
+        df = _read_and_select_microbe_annotations(file_path, identifier_column)
         if df is not None and not df.empty:
             agg_df = _aggregate_gene_annotations(df)
             processed_dfs.append(agg_df)
@@ -4210,7 +4320,12 @@ def _process_microbe_annotations(
     merged_df = merged_df.fillna('')
     
     # Add protein ID mapping from GFF3 file if available
-    merged_df = _add_protein_id_mapping(merged_df, raw_data_dir, "microbe")
+    merged_df = _add_protein_id_mapping(
+        merged_df,
+        raw_data_dir,
+        "microbe",
+        identifier_attribute=identifier_column,
+    )
     
     # Compress the dataframe to ensure one gene per row with semicolon-separated annotations
     final_df = _compress_annotation_table(merged_df)
@@ -4249,7 +4364,8 @@ def _aggregate_gene_annotations(df: pd.DataFrame) -> pd.DataFrame:
 def _process_algal_annotations(
     raw_data_dir: str,
     output_dir: str,
-    output_filename: str
+    output_filename: str,
+    identifier_column: str,
 ) -> pd.DataFrame:
     """
     Process algal annotation files and merge into a single table.
@@ -4281,7 +4397,7 @@ def _process_algal_annotations(
     # Process each annotation file
     processed_dfs = []
     for file_path in annotation_files:
-        df = _read_and_select_algal_annotations(file_path)
+        df = _read_and_select_algal_annotations(file_path, identifier_column)
         if df is not None and not df.empty:
             agg_df = _aggregate_algal_annotations(df)
             processed_dfs.append(agg_df)
@@ -4305,7 +4421,12 @@ def _process_algal_annotations(
     merged_df = merged_df.fillna('')
     
     # Add transcriptome_id mapping from GFF3 file (protein_id -> transcriptome_id)
-    merged_df = _add_protein_id_mapping(merged_df, raw_data_dir, "algal")
+    merged_df = _add_protein_id_mapping(
+        merged_df,
+        raw_data_dir,
+        "algal",
+        identifier_attribute=identifier_column,
+    )
     
     # Compress the dataframe to ensure one gene per row with semicolon-separated annotations
     final_df = _compress_annotation_table(merged_df)
@@ -4320,7 +4441,8 @@ def _process_algal_annotations(
 def _process_plant_annotations(
     raw_data_dir: str,
     output_dir: str,
-    output_filename: str
+    output_filename: str,
+    identifier_column: str,
 ) -> pd.DataFrame:
     """
     Process plant (Phytozome) annotation files and merge into a single table.
@@ -4360,22 +4482,26 @@ def _process_plant_annotations(
 
     log.info(f"Found annotation file: {os.path.basename(annotation_file)}")
 
-    df = _read_and_select_plant_annotations(annotation_file)
+    df = _read_and_select_plant_annotations(annotation_file, identifier_column)
     if df is None or df.empty:
         log.warning(f"No valid data in {os.path.basename(annotation_file)}")
         empty_df = pd.DataFrame(columns=['transcriptome_id'])
         write_integration_file(empty_df, output_dir, output_filename, indexing=False)
         return empty_df
 
-    # Aggregate to one row per locus (handles any duplicate locusName rows)
+    # Aggregate repeated annotation rows by the shared transcriptome identifier.
     agg_df = _aggregate_plant_annotations(df)
-    log.info(f"  Processed {os.path.basename(annotation_file)}: {len(agg_df)} loci")
+    log.info(f"  Processed {os.path.basename(annotation_file)}: {len(agg_df)} identifiers")
 
     # Fill NaN values with empty strings for consistency
     agg_df = agg_df.fillna('')
 
-    # Map locus_name -> GFF3 gene ID= to set transcriptome_id matching raw data
-    merged_df = _add_protein_id_mapping(agg_df, raw_data_dir, "plant")
+    merged_df = _add_protein_id_mapping(
+        agg_df,
+        raw_data_dir,
+        "plant",
+        identifier_attribute=identifier_column,
+    )
 
     # Compress to one gene per row with semicolon-separated annotations
     final_df = _compress_annotation_table(merged_df)
@@ -4388,7 +4514,10 @@ def _process_plant_annotations(
     return final_df
 
 
-def _read_and_select_plant_annotations(file_path: str) -> pd.DataFrame:
+def _read_and_select_plant_annotations(
+    file_path: str,
+    identifier_column: str,
+) -> pd.DataFrame:
     """
     Read and select relevant columns from the plant Phytozome
     ``kegg_annotation_table.tsv`` annotation file.
@@ -4423,14 +4552,11 @@ def _read_and_select_plant_annotations(file_path: str) -> pd.DataFrame:
     try:
         df = pd.read_csv(file_path, sep='\t', comment=None, low_memory=False)
 
-        # The header line starts with '#pacId'; strip leading '#' from column names
-        df.columns = [c.lstrip('#') for c in df.columns]
+        _validate_annotation_identifier_header(df, file_path, identifier_column)
 
-        required_cols = ['pacId', 'transcriptName']
-        missing = [c for c in required_cols if c not in df.columns]
-        if missing:
-            log.warning(f"Missing required columns {missing} in {os.path.basename(file_path)}")
-            return None
+        # Strip the source-format marker after validating the literal header.
+        df.columns = [c.lstrip('#') for c in df.columns]
+        source_identifier = identifier_column.lstrip('#')
 
         # Map source columns to standardised output names; only keep columns
         # that are actually present in the file.
@@ -4450,18 +4576,24 @@ def _read_and_select_plant_annotations(file_path: str) -> pd.DataFrame:
         }
 
         available_map = {src: dst for src, dst in col_map.items() if src in df.columns}
+        if source_identifier not in df.columns:
+            raise ValueError(
+                f"Identifier column '{identifier_column}' was not found in "
+                f"{os.path.basename(file_path)} after header normalization."
+            )
+        available_map[source_identifier] = 'transcriptome_id'
         df = df[list(available_map.keys())].copy()
         df.rename(columns=available_map, inplace=True)
 
-        # Ensure protein_id is stored as string (pacId is numeric in the file)
-        df['protein_id'] = df['protein_id'].astype(str)
-
-        # Drop rows where the locus name is missing (primary join key)
-        df = df.dropna(subset=['locus_name'])
-        df = df[df['locus_name'].astype(str).str.strip() != '']
+        df['transcriptome_id'] = df['transcriptome_id'].astype(str)
+        df = df[df['transcriptome_id'].str.strip() != '']
+        if 'protein_id' in df.columns:
+            df['protein_id'] = df['protein_id'].astype(str)
 
         return df
 
+    except ValueError:
+        raise
     except Exception as e:
         log.warning(f"Error reading plant annotation file {file_path}: {e}")
         return None
@@ -4469,11 +4601,7 @@ def _read_and_select_plant_annotations(file_path: str) -> pd.DataFrame:
 
 def _aggregate_plant_annotations(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Aggregate plant annotations by ``locus_name``, collapsing any duplicate
-    rows for the same locus into ``;;``-separated strings.
-
-    ``locus_name`` (from the ``locusName`` column) is the gene-level identifier
-    that matches the raw transcriptomics data GeneIDs after GFF3 ID mapping.
+    Aggregate plant annotations by ``transcriptome_id``.
 
     Args:
         df (pd.DataFrame): Annotation dataframe with a ``locus_name`` column
@@ -4491,9 +4619,9 @@ def _aggregate_plant_annotations(df: pd.DataFrame) -> pd.DataFrame:
         })
         return ';;'.join(unique_vals) if unique_vals else ''
 
-    annotation_columns = [col for col in df.columns if col != 'locus_name']
+    annotation_columns = [col for col in df.columns if col != 'transcriptome_id']
     aggregated_df = (
-        df.groupby('locus_name')[annotation_columns]
+        df.groupby('transcriptome_id')[annotation_columns]
         .agg(join_unique_values)
         .reset_index()
     )
@@ -4501,7 +4629,10 @@ def _aggregate_plant_annotations(df: pd.DataFrame) -> pd.DataFrame:
     return aggregated_df
 
 
-def _read_and_select_microbe_annotations(file_path: str) -> pd.DataFrame:
+def _read_and_select_microbe_annotations(
+    file_path: str,
+    identifier_column: str,
+) -> pd.DataFrame:
     """
     Read and select relevant columns from microbe annotation files.
     
@@ -4514,34 +4645,35 @@ def _read_and_select_microbe_annotations(file_path: str) -> pd.DataFrame:
     
     try:
         df = pd.read_csv(file_path, sep='\t')
+        _validate_annotation_identifier_header(df, file_path, identifier_column)
         
         # Determine annotation type based on filename
         filename = os.path.basename(file_path)
         
         if 'cog_annotation_table' in filename:
-            selected_cols = ['gene_oid', 'cog_id', 'cog_name']
+            selected_cols = [identifier_column, 'cog_id', 'cog_name']
             df = df[selected_cols].copy()
-            df.rename(columns={'gene_oid': 'transcriptome_id', 'cog_id': 'cog_acc', 'cog_name': 'cog_desc'}, inplace=True)
+            df.rename(columns={identifier_column: 'transcriptome_id', 'cog_id': 'cog_acc', 'cog_name': 'cog_desc'}, inplace=True)
             
         elif 'ipr_annotation_table' in filename:
-            selected_cols = ['gene_oid', 'iprid', 'iprdesc', 'go_info']
+            selected_cols = [identifier_column, 'iprid', 'iprdesc', 'go_info']
             df = df[selected_cols].copy()
-            df.rename(columns={'gene_oid': 'transcriptome_id', 'iprid': 'ipr_acc', 'iprdesc': 'ipr_desc', 'go_info': 'go_acc'}, inplace=True)
+            df.rename(columns={identifier_column: 'transcriptome_id', 'iprid': 'ipr_acc', 'iprdesc': 'ipr_desc', 'go_info': 'go_acc'}, inplace=True)
             
         elif 'kegg_annotation_table' in filename:
-            selected_cols = ['gene_oid', 'ko_id', 'ko_name']
+            selected_cols = [identifier_column, 'ko_id', 'ko_name']
             df = df[selected_cols].copy()
-            df.rename(columns={'gene_oid': 'transcriptome_id', 'ko_id': 'kegg_acc', 'ko_name': 'kegg_desc'}, inplace=True)
+            df.rename(columns={identifier_column: 'transcriptome_id', 'ko_id': 'kegg_acc', 'ko_name': 'kegg_desc'}, inplace=True)
             
         elif 'pfam_annotation_table' in filename:
-            selected_cols = ['gene_oid', 'pfam_id', 'pfam_name']
+            selected_cols = [identifier_column, 'pfam_id', 'pfam_name']
             df = df[selected_cols].copy()
-            df.rename(columns={'gene_oid': 'transcriptome_id', 'pfam_id': 'pfam_acc', 'pfam_name': 'pfam_desc'}, inplace=True)
+            df.rename(columns={identifier_column: 'transcriptome_id', 'pfam_id': 'pfam_acc', 'pfam_name': 'pfam_desc'}, inplace=True)
             
         elif 'tigrfam_annotation_table' in filename:
-            selected_cols = ['gene_oid', 'tigrfam_id', 'tigrfam_name']
+            selected_cols = [identifier_column, 'tigrfam_id', 'tigrfam_name']
             df = df[selected_cols].copy()
-            df.rename(columns={'gene_oid': 'transcriptome_id', 'tigrfam_id': 'tigrfam_acc', 'tigrfam_name': 'tigrfam_desc'}, inplace=True)
+            df.rename(columns={identifier_column: 'transcriptome_id', 'tigrfam_id': 'tigrfam_acc', 'tigrfam_name': 'tigrfam_desc'}, inplace=True)
             
         else:
             log.warning(f"Unknown annotation file type: {filename}")
@@ -4549,11 +4681,16 @@ def _read_and_select_microbe_annotations(file_path: str) -> pd.DataFrame:
             
         return df
         
+    except ValueError:
+        raise
     except Exception as e:
         log.warning(f"Error reading file {file_path}: {e}")
         return None
 
-def _read_and_select_algal_annotations(file_path: str) -> pd.DataFrame:
+def _read_and_select_algal_annotations(
+    file_path: str,
+    identifier_column: str,
+) -> pd.DataFrame:
     """
     Read and select relevant columns from algal annotation files.
     
@@ -4566,16 +4703,17 @@ def _read_and_select_algal_annotations(file_path: str) -> pd.DataFrame:
     
     try:
         df = pd.read_csv(file_path, sep='\t')
+        _validate_annotation_identifier_header(df, file_path, identifier_column)
         
         # Determine annotation type based on filename
         filename = os.path.basename(file_path)
         
         if 'go_annotation_table' in filename:
             # Select proteinId and GO annotation columns
-            selected_cols = ['#proteinId', 'gotermId', 'goName', 'gotermType', 'goAcc']
+            selected_cols = [identifier_column, 'gotermId', 'goName', 'gotermType', 'goAcc']
             df = df[selected_cols].copy()
             df.rename(columns={
-                '#proteinId': 'protein_id',
+                identifier_column: 'protein_id',
                 'gotermId': 'go_id',
                 'goName': 'go_name',
                 'gotermType': 'go_type',
@@ -4584,10 +4722,10 @@ def _read_and_select_algal_annotations(file_path: str) -> pd.DataFrame:
             
         elif 'ipr_annotation_table' in filename:
             # Select proteinId and InterPro annotation columns
-            selected_cols = ['#proteinId', 'iprId', 'iprDesc']
+            selected_cols = [identifier_column, 'iprId', 'iprDesc']
             df = df[selected_cols].copy()
             df.rename(columns={
-                '#proteinId': 'protein_id',
+                identifier_column: 'protein_id',
                 'iprId': 'ipr_acc',
                 'iprDesc': 'ipr_desc',
                 'goAcc': 'go_acc'
@@ -4595,20 +4733,20 @@ def _read_and_select_algal_annotations(file_path: str) -> pd.DataFrame:
             
         elif 'kegg_annotation_table' in filename:
             # Select proteinId and KEGG annotation columns
-            selected_cols = ['#proteinId', 'ecNum', 'definition']
+            selected_cols = [identifier_column, 'ecNum', 'definition']
             df = df[selected_cols].copy()
             df.rename(columns={
-                '#proteinId': 'protein_id',
+                identifier_column: 'protein_id',
                 'ecNum': 'kegg_acc',
                 'definition': 'kegg_desc'
             }, inplace=True)
             
         elif 'kog_annotation_table' in filename:
             # Select proteinId and KOG annotation columns
-            selected_cols = ['proteinId', 'kogid', 'kogdefline']
+            selected_cols = [identifier_column, 'kogid', 'kogdefline']
             df = df[selected_cols].copy()
             df.rename(columns={
-                'proteinId': 'protein_id',
+                identifier_column: 'protein_id',
                 'kogid': 'kog_acc',
                 'kogdefline': 'kog_desc'
             }, inplace=True)
@@ -4619,6 +4757,8 @@ def _read_and_select_algal_annotations(file_path: str) -> pd.DataFrame:
             
         return df
         
+    except ValueError:
+        raise
     except Exception as e:
         log.warning(f"Error reading file {file_path}: {e}")
         return None
@@ -4653,15 +4793,17 @@ def _aggregate_algal_annotations(df: pd.DataFrame) -> pd.DataFrame:
 def _add_protein_id_mapping(
     merged_df: pd.DataFrame,
     raw_data_dir: str,
-    genome_type: str
+    genome_type: str,
+    identifier_attribute: str = None,
 ) -> pd.DataFrame:
     """
-    Add protein ID mapping and display name from GFF3 file to the merged annotation table.
+    Resolve the selected GFF3 identifier and display name for annotation rows.
     
     Args:
         merged_df (pd.DataFrame): Merged annotation dataframe
         raw_data_dir (str): Directory containing GFF3 file
         genome_type (str): Genome type ("microbe", "algal", etc.)
+        identifier_attribute (str): GFF3 attribute selected by the counts header
         
     Returns:
         pd.DataFrame: Annotation dataframe with protein ID and display_name columns added
@@ -4673,18 +4815,24 @@ def _add_protein_id_mapping(
         gff_files = glob.glob(os.path.join(raw_data_dir, "genes.gff3"))
     
     if not gff_files:
-        log.warning("No GFF3 file found for protein ID mapping")
-        merged_df['protein_id'] = ''
-        merged_df['transcriptome_id'] = ''
-        merged_df['display_name'] = ''
-        return merged_df
+        raise FileNotFoundError(
+            f"No GFF3 file found in {raw_data_dir} for identifier "
+            f"'{identifier_attribute}'."
+        )
     
     gff_file = gff_files[0]  # Use first GFF3 file found
     log.info(f"Adding protein ID mapping and display names from {os.path.basename(gff_file)}")
     
-    # Parse GFF3 file to create gene_id -> protein_id mapping and product mapping
-    gene_to_protein = {}
-    gene_to_product = {}
+    feature_types = {
+        "algal": ("gene", "product_name"),
+        "microbe": ("CDS", "product"),
+        "plant": ("mRNA", "Name"),
+    }
+    feature_type, display_attribute = feature_types.get(
+        genome_type, ("gene", "product")
+    )
+    identifier_attribute = identifier_attribute or "ID"
+    identifier_to_display = {}
     
     with open(gff_file, 'r') as f:
         for line in f:
@@ -4695,110 +4843,49 @@ def _add_protein_id_mapping(
             if len(fields) < 9:
                 continue
             
-            # Set feature type, protein attribute, and display attribute based on genome type
-            if genome_type == "algal":
-                feature_type = 'gene'
-                protein_attribute = 'proteinId'
-                display_attribute = 'product_name'
-            elif genome_type == "microbe":
-                feature_type = 'CDS'
-                protein_attribute = 'locus_tag'
-                display_attribute = 'product'
-            elif genome_type == "plant":
-                feature_type = 'mRNA'
-                protein_attribute = 'pacid'
-                display_attribute = 'Name'
-            else:
-                # For other genome types, try gene first, then CDS
-                feature_type = 'gene'
-                protein_attribute = 'proteinId'
-                display_attribute = 'product'
-            
             if fields[2] == feature_type:
                 attributes = fields[8]
-                
-                # Extract gene ID
-                gene_match = re.search(r'ID=([^;]+)', attributes)
-                if not gene_match:
+                identifier_match = re.search(
+                    rf"(?:^|;){re.escape(identifier_attribute)}=([^;]+)",
+                    attributes,
+                )
+                if not identifier_match:
                     continue
-                gene_id = gene_match.group(1)
-                
-                # Extract protein ID using the appropriate attribute
-                protein_id = None
-                pattern = rf"{re.escape(protein_attribute)}=([^;]+)"
-                protein_match = re.search(pattern, attributes)
-                if protein_match:
-                    protein_id = protein_match.group(1)
-                
-                # Extract product information from the appropriate display attribute
-                product = ''
-                display_pattern = rf"{re.escape(display_attribute)}=([^;]+)"
-                product_match = re.search(display_pattern, attributes)
-                if product_match:
-                    product = product_match.group(1).strip()
-                
-                if protein_id:
-                    gene_to_protein[gene_id] = protein_id
-                
-                # Store product information regardless of whether protein_id exists
-                if product:
-                    gene_to_product[gene_id] = product
-    
-    log.info(f"Found {len(gene_to_protein)} gene-to-protein mappings")
 
-    if genome_type == "plant":
-        # For plant data the annotation table uses locusName (e.g. LOC_Os01g04030)
-        # as the gene-level key, while the raw transcriptomics data uses the GFF3
-        # gene feature ID= value (e.g. LOC_Os01g04030.MSUv7.0).
-        # gene_to_protein here maps GFF3 gene ID= -> pacid (protein_attribute='pacid'
-        # is set on mRNA features, so gene_to_protein is actually empty for plant
-        # when feature_type='mRNA' was used above).
-        #
-        # Re-parse the GFF3 gene features to build locus_name (Name=) -> gene_id (ID=).
-        locus_to_gene_id = {}
-        gene_id_to_display = {}
-        gff_files_plant = glob.glob(os.path.join(raw_data_dir, "*.gff3"))
-        if not gff_files_plant:
-            gff_files_plant = glob.glob(os.path.join(raw_data_dir, "genes.gff3"))
-        if gff_files_plant:
-            with open(gff_files_plant[0], 'r') as _gf:
-                for _line in _gf:
-                    if _line.startswith('#') or not _line.strip():
-                        continue
-                    _fields = _line.strip().split('\t')
-                    if len(_fields) < 9 or _fields[2] != 'gene':
-                        continue
-                    _attrs = _fields[8]
-                    _id_m = re.search(r'ID=([^;]+)', _attrs)
-                    _name_m = re.search(r'Name=([^;]+)', _attrs)
-                    if _id_m and _name_m:
-                        _gene_id = _id_m.group(1)
-                        _locus = _name_m.group(1)
-                        locus_to_gene_id[_locus] = _gene_id
-                        gene_id_to_display[_gene_id] = _locus
+                identifier = identifier_match.group(1)
+                display_match = re.search(
+                    rf"(?:^|;){re.escape(display_attribute)}=([^;]+)",
+                    attributes,
+                )
+                identifier_to_display[identifier] = (
+                    display_match.group(1).strip() if display_match else identifier
+                )
 
-        merged_df['locus_name'] = merged_df['locus_name'].astype(str)
-        # Map locus_name -> GFF3 gene ID= (the transcriptome_id used in raw data)
-        merged_df['transcriptome_id'] = merged_df['locus_name'].map(locus_to_gene_id).fillna(
-            merged_df['locus_name']
+    log.info(
+        f"Found {len(identifier_to_display)} {feature_type} records with "
+        f"GFF3 identifier '{identifier_attribute}'"
+    )
+    if not identifier_to_display:
+        raise ValueError(
+            f"No GFF3 {feature_type} records contain the requested identifier "
+            f"attribute '{identifier_attribute}'. Check the first-column "
+            "header in counts.csv."
         )
-        merged_df['display_name'] = merged_df['transcriptome_id'].map(gene_id_to_display).fillna(
-            merged_df['locus_name']
+
+    if genome_type == "algal" and 'protein_id' in merged_df.columns:
+        merged_df['transcriptome_id'] = merged_df['protein_id'].astype(str)
+    if 'transcriptome_id' not in merged_df.columns:
+        raise ValueError(
+            f"Annotation table for {genome_type} is missing the selected "
+            "transcriptome identifier."
         )
-        # protein_id comes from pacId in the annotation file; keep as-is
-        if 'protein_id' not in merged_df.columns:
-            merged_df['protein_id'] = ''
-    elif 'transcriptome_id' in merged_df.columns and 'protein_id' not in merged_df.columns:
-        merged_df['transcriptome_id'] = merged_df['transcriptome_id'].astype(str)
-        merged_df['protein_id'] = merged_df['transcriptome_id'].map(gene_to_protein).fillna('')
-        merged_df['display_name'] = merged_df['transcriptome_id'].map(gene_to_product).fillna('')
-    elif 'protein_id' in merged_df.columns and 'transcriptome_id' not in merged_df.columns:
-        merged_df['protein_id'] = merged_df['protein_id'].astype(str)
-        protein_to_gene = {str(v): k for k, v in gene_to_protein.items()}
-        merged_df['transcriptome_id'] = merged_df['protein_id'].map(protein_to_gene).fillna(merged_df['protein_id'])
-        merged_df['display_name'] = merged_df['transcriptome_id'].map(gene_to_product).fillna('')
-    else:
-        log.error("Merged dataframe either has both columns or neither - check your data structure")
+
+    merged_df['transcriptome_id'] = merged_df['transcriptome_id'].astype(str)
+    merged_df['display_name'] = merged_df['transcriptome_id'].map(
+        identifier_to_display
+    ).fillna('')
+    if 'protein_id' not in merged_df.columns:
+        merged_df['protein_id'] = ''
 
     return merged_df
 
@@ -5683,6 +5770,7 @@ def generate_tx_annotation_table(
     genome_type: str,
     output_dir: str,
     output_filename: str,
+    identifier_column: str = None,
 ) -> pd.DataFrame:
     """
     Generate a merged gene annotation table from multiple annotation files.
@@ -5698,17 +5786,28 @@ def generate_tx_annotation_table(
         pd.DataFrame: Merged annotation table with transcriptome_id and annotation columns
     """
 
+    identifier_column = identifier_column or raw_data.columns[0]
+
     if genome_type == "microbe":
-        annotation_df = _process_microbe_annotations(raw_data_dir, output_dir, output_filename)
+        annotation_df = _process_microbe_annotations(
+            raw_data_dir, output_dir, output_filename, identifier_column
+        )
     elif genome_type == "algal":
-        annotation_df = _process_algal_annotations(raw_data_dir, output_dir, output_filename)
+        annotation_df = _process_algal_annotations(
+            raw_data_dir,
+            output_dir,
+            output_filename,
+            identifier_column=identifier_column,
+        )
     elif genome_type == "metagenome":
         log.info(f"Annotation processing for '{genome_type}' genome type is not yet implemented.")
         empty_df = pd.DataFrame(columns=['transcriptome_id'])
         write_integration_file(empty_df, output_dir, output_filename, indexing=False)
         return empty_df
     elif genome_type == "plant":
-        annotation_df = _process_plant_annotations(raw_data_dir, output_dir, output_filename)
+        annotation_df = _process_plant_annotations(
+            raw_data_dir, output_dir, output_filename, identifier_column
+        )
     else:
         raise ValueError(f"Invalid genome_type '{genome_type}'. Must be one of: 'microbe', 'algal', 'metagenome', 'plant'")
 
@@ -6425,6 +6524,80 @@ def link_metadata_with_custom_script(
 
     return linked_metadata
 
+
+def load_link_table_metadata(
+    datasets: list,
+    link_table_path: Union[str, Path],
+) -> dict[str, pd.DataFrame]:
+    """Load per-dataset metadata and raw-sample mappings from a link table.
+
+    The link table must contain one raw sample-name column for every dataset
+    name. Blank cells mean that a shared sample is absent from that datatype.
+    One shared-name column is required (``unique_group``, ``shared_sample``,
+    ``shared_name``, or ``sample``); all remaining columns are categories.
+    """
+    path = Path(link_table_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Metadata link table not found: {path}")
+
+    link_table = pd.read_csv(path, sep=None, engine="python")
+    dataset_names = [ds.dataset_name for ds in datasets]
+    missing_columns = [name for name in dataset_names if name not in link_table.columns]
+    if missing_columns:
+        raise ValueError(
+            f"Metadata link table is missing dataset columns: {missing_columns}. "
+            f"Expected columns for {dataset_names}."
+        )
+
+    shared_candidates = [
+        column for column in ("unique_group", "shared_sample", "shared_name", "sample")
+        if column in link_table.columns and column not in dataset_names
+    ]
+    if not shared_candidates:
+        raise ValueError(
+            "Metadata link table must contain a shared sample-name column: "
+            "unique_group, shared_sample, shared_name, or sample."
+        )
+    shared_column = shared_candidates[0]
+    if shared_column != "unique_group":
+        link_table = link_table.rename(columns={shared_column: "unique_group"})
+
+    linked_metadata = {}
+    for ds in datasets:
+        sample_column = ds.dataset_name
+        table = link_table.copy()
+        table[sample_column] = table[sample_column].replace(r"^\s*$", pd.NA, regex=True)
+        table = table.dropna(subset=[sample_column]).copy()
+        table[sample_column] = table[sample_column].astype(str)
+
+        if table[sample_column].duplicated().any():
+            duplicates = table.loc[
+                table[sample_column].duplicated(keep=False), sample_column
+            ].unique().tolist()
+            raise ValueError(
+                f"Metadata link table has duplicate {ds.dataset_name} sample names: "
+                f"{duplicates}"
+            )
+
+        table["unique_group"] = table["unique_group"].astype(str).str.strip()
+        if (table["unique_group"] == "").any() or table["unique_group"].eq("nan").any():
+            raise ValueError("Metadata link table contains a blank shared sample name.")
+
+        table = table.set_index("unique_group", drop=False)
+        linked_metadata[ds.dataset_name] = table
+        write_integration_file(
+            data=table,
+            output_dir=ds.output_dir,
+            filename=ds._linked_metadata_filename,
+            indexing=True,
+        )
+        log.info(
+            "Linked %d %s samples from %s",
+            len(table), ds.dataset_name, path,
+        )
+
+    return linked_metadata
+
 def _data_colnames_to_replace(metadata, data):
     """Find the metadata column that matches data column names."""
     data_columns = data.columns.tolist()
@@ -6436,7 +6609,7 @@ def _data_colnames_to_replace(metadata, data):
 
 def link_data_across_datasets(
     datasets: list,
-    overlap_only: bool = True
+    overlap_only: bool = True,
 ) -> dict:
     """
     Integrate multiple omics datasets by matching sample names using metadata mapping.
@@ -6455,15 +6628,21 @@ def link_data_across_datasets(
     for ds in datasets:
         log.info(f"Processing {ds.dataset_name} metadata and data...")
 
-        # Find the column that maps data columns to unified sample names
-        unifying_col = 'unique_group'
-        sample_col = _data_colnames_to_replace(ds.linked_metadata, ds.raw_data)
-        if sample_col is None:
-            raise ValueError(f"Could not find matching column between metadata and data for {ds.dataset_name}")
+        # Link-table columns are named after dataset names and contain the raw
+        # quantitative-table sample names.
+        unifying_col = "unique_group"
+        sample_col = ds.dataset_name
+        if sample_col not in ds.linked_metadata.columns:
+            raise ValueError(
+                f"Link table metadata is missing raw sample column '{sample_col}'."
+            )
         
         # Get library names and create data subset
-        library_names = ds.linked_metadata[sample_col].tolist()
-        data_subset = ds.raw_data[[ds.raw_data.columns[0]] + [col for col in ds.raw_data.columns if col in library_names]].copy()
+        library_names = ds.linked_metadata[sample_col].dropna().tolist()
+        data_subset = ds.raw_data[
+            [ds.raw_data.columns[0]]
+            + [col for col in ds.raw_data.columns if col in library_names]
+        ].copy()
         
         # Create mapping from library names to unified group names
         mapping = dict(zip(ds.linked_metadata[sample_col], ds.linked_metadata[unifying_col]))
@@ -6474,7 +6653,7 @@ def link_data_across_datasets(
             data_subset = data_subset.T.groupby(data_subset.columns).sum().T
         
         unified_data[ds.dataset_name] = data_subset
-        sample_sets[ds.dataset_name] = set(data_subset.columns)
+        sample_sets[ds.dataset_name] = set(data_subset.columns[1:])
 
     # Restrict to overlapping samples if requested
     if overlap_only and len(unified_data) > 1:
@@ -6484,12 +6663,11 @@ def link_data_across_datasets(
         if not overlapping_columns:
             raise ValueError("No overlapping samples found across datasets.")
         
-        # Preserve the first column (feature IDs) and overlapping sample columns
-        first_cols = ["GeneID", "CompoundID"]  # Potential feature ID column names
-        overlapping_columns = first_cols + list(overlapping_columns)
-        
         for name, data_subset in unified_data.items():
-            cols = [col for col in overlapping_columns if col in data_subset.columns]
+            feature_id_column = data_subset.columns[0]
+            cols = [feature_id_column] + [
+                col for col in overlapping_columns if col in data_subset.columns
+            ]
             unified_data[name] = data_subset[cols]
 
     # Save results if output directory provided
