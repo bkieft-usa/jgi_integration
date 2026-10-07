@@ -5008,19 +5008,32 @@ def _get_modelseed_reactions(cache_path: Path) -> pd.DataFrame:
     each re-read and re-process the same TSV from disk.
     """
 
-    _MODELSEED_REACTIONS_URL = (
+    # Dev branch splits reactions across reaction_00.tsv, reaction_01.tsv, ...
+    _MODELSEED_REACTION_PART_URL = (
         "https://raw.githubusercontent.com/ModelSEED/ModelSEEDDatabase/"
-        "master/Biochemistry/reactions.tsv"
+        "dev/Biochemistry/reaction_{:02d}.tsv"
     )
 
     if cache_path.exists():
         log.info(f"Loading ModelSEED reactions from local cache: {cache_path}")
     else:
-        log.info(f"Fetching ModelSEED reactions table from {_MODELSEED_REACTIONS_URL}")
-        resp = requests.get(_MODELSEED_REACTIONS_URL, timeout=30)
-        resp.raise_for_status()
+        parts = []
+        part_idx = 0
+        while True:
+            url = _MODELSEED_REACTION_PART_URL.format(part_idx)
+            resp = requests.get(url, timeout=30)
+            if resp.status_code == 404:  # first missing index marks the end
+                break
+            resp.raise_for_status()
+            parts.append(pd.read_csv(io.StringIO(resp.text), sep="\t", low_memory=False))
+            part_idx += 1
+
+        if not parts:
+            raise RuntimeError("No ModelSEED reaction_##.tsv files found on the dev branch.")
+
+        log.info(f"Fetched and concatenated {len(parts)} ModelSEED reaction part files")
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(resp.text, encoding="utf-8")
+        pd.concat(parts, ignore_index=True).to_csv(cache_path, sep="\t", index=False)
         log.info(f"Saved ModelSEED reactions cache to {cache_path}")
 
     reactions_df = pd.read_csv(cache_path, sep="\t", low_memory=False)
