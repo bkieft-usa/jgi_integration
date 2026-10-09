@@ -1,48 +1,66 @@
 datasets:
   tx:
     dataset_dir: transcriptomics # Do not change
+    input_state: raw             # raw (integer-like counts) | prenormalized (already normalized and/or log-transformed; scale is auto-detected)
     normalization_parameters:
-      filtering:
-        method: minimum          # minimum | proportion | none
-        params:
-          value: 10             # minimum: minimum count threshold; proportion: minimum fraction of samples with non-zero value (0–1)
-      devariancing:
+      filtering:                 # raw presence/magnitude filters; ignored for prenormalized input. Use null to skip a filter.
+        presence_min_percent: 20 # keep features with raw value > 0 in at least this % of samples
+        magnitude_min_mean: 10   # keep features whose mean raw value across all samples is > this value
+      sample_normalization: auto # auto (tx: median_of_ratios) | median_of_ratios | pqn | median | tic | none; raw input only
+      pseudocount: 1             # tx only: log2(count / size_factor + pseudocount)
+      recenter_samples: false    # prenormalized input only: align per-sample medians on the log scale
+      devariancing:              # log-scale variance filter (also applies to prenormalized input)
         method: percent          # percent | none
         params:
-          value: 25              # percent: bottom N% of variance removed
-      replicate_handling:
-        method: variance         # variance | none
+          value: 25              # bottom N% of features removed
+          mean_adjusted: true    # rank variance relative to features of similar mean level
+      replicate_handling:        # within-group reliability filter on the log scale
+        method: sd               # sd | none
         params:
-          value: 0.5                # variance: max allowed coefficient of variation (std/mean) within a group before flagging as unreliable
-      scaling:
-        method: modified_zscore                # lfc | moderated_lfc | zscore | vst | vsn | rank_normal | modified_zscore | none
-        # For sample_resolution track:
-        #   zscore          — log2(x+1) then column-wise Z-score
-        #   modified_zscore — log2(x+1) then median/MAD Z-score (robust to outliers)
-        #   vst             — arcsinh(sqrt(x)) + Z-score; better for counts near zero
-        #   vsn             — parametric variance-stabilizing normalization
-        #   rank_normal     — rank-based inverse normal; distribution-agnostic
-        #   none            — pass-through (no scaling)
-        # For condition_resolution track:
-        #   lfc             — log2(x+1) → group medians → all-pairwise LFC
-        #   moderated_lfc   — same as lfc but applies empirical-Bayes shrinkage to reduce noise for low-replicate features
+          sd_threshold: 1.0      # log2-scale within-group standard deviation considered unreliable
+          majority_fraction: 0.5 # drop a feature when unreliable in more than this fraction of evaluable groups
+          min_replicates: 2      # a group is evaluated only if the feature is detected in at least this many replicates
 
   mx:
     dataset_dir: metabolomics # Do not change
     chromatography: HILIC
     polarity: multipolarity
+    input_state: raw             # raw (peak heights) | prenormalized
     normalization_parameters:
       filtering:
-        method: minimum          # minimum | proportion | none
-        params:
-          value: 1000
+        presence_min_percent: 20
+        magnitude_min_mean: 1000
+      sample_normalization: auto # auto (mx: pqn, per polarity) | pqn | median | tic | median_of_ratios | none
+      recenter_samples: false
       devariancing:
-        method: percent          # percent | none
+        method: percent
         params:
           value: 25
+          mean_adjusted: true
       replicate_handling:
-        method: variance         # variance | none
+        method: sd
         params:
-          value: 0.8
-      scaling:
-        method: vst                   # lfc | moderated_lfc | zscore | vst | vsn | rank_normal | modified_zscore | none
+          sd_threshold: 1.0
+          majority_fraction: 0.5
+          min_replicates: 2
+
+  px:                            # optional proteomics dataset; uses the same annotation files/formats as tx
+    dataset_dir: proteomics      # Do not change
+    input_state: raw             # raw (peak heights) | prenormalized
+    normalization_parameters:
+      filtering:
+        presence_min_percent: 20
+        magnitude_min_mean: 1000
+      sample_normalization: auto # auto (px: pqn) | pqn | median | tic | median_of_ratios | none
+      recenter_samples: false
+      devariancing:
+        method: percent
+        params:
+          value: 25
+          mean_adjusted: true
+      replicate_handling:
+        method: sd
+        params:
+          sd_threshold: 1.0
+          majority_fraction: 0.5
+          min_replicates: 2

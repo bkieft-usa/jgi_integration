@@ -1,5 +1,8 @@
 analysis:
 
+  replicate_pairing: paired   # paired: replicates are matched across data types (columns = samples, per-sample z-scores)
+                              # unpaired: replicates are independent (columns = conditions, z-scored group medians on the log scale)
+
   feature_grouping:
     method: hierarchical_clustering  # network_modules | hierarchical_clustering | hdbscan | nmf | leiden_knn | wgcna
     params:
@@ -52,7 +55,8 @@ analysis:
 
       ### variance
       top_n: 12000            # number of top-variance features to keep
-      max_features: 12000    # hard cap on features passed to grouping step
+      max_features: 12000    # hard cap on features passed to grouping step (shared across datasets)
+      block_scale: true      # weight each dataset block so all data types carry equal total variance
 
       ### feature_list
       feature_list_file:
