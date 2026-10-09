@@ -81,6 +81,10 @@ Place polarity metadata as tab-separated `*_metadata.tab` files anywhere beneath
 
 FBMN compound annotations are optional and are read from `*/*library-results.tsv` under the MX raw-data directory. The table must include `#Scan#` for matching IDs; fields such as `Compound_Name`, `INCHI`, `InChiKey`, `molecular_formula`, and class fields supply annotations. Without a matching library-results row, the metabolite is retained but its compound annotation fields are unassigned.
 
+## **Proteomics Input (optional)**
+
+The `px` dataset uses `raw_data/<px dataset_dir>/peak-height.csv` (default `dataset_dir: proteomics`) with the same layout as the other tables: first column is the protein/feature ID, remaining columns are samples. Place a `raw_metadata.csv` beside it as for transcriptomics. Annotation files and formats are identical to the transcriptomics ones (see above) and depend on `project.genome_type`; the first column header of each annotation file must equal the first column header of `peak-height.csv`. Add a `px` column to the link table and a `px` block to `data_processing.yml`, then create the dataset with `objs.PX(project)`.
+
 ## **Metadata Link Table**
 
 Set `project.link_table` in `config/project.yml` to the master table, normally `/home/jovyan/work/input_data/link_table.csv`. This CSV/TSV maps raw sample names from each quantitative table to a shared sample name. Use dataset names (`tx`, `mx`) as the column headers, not the raw-data folder names.

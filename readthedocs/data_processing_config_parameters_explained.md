@@ -4,190 +4,132 @@
 
 ## Overview
 
-This document describes the practical effect of each option in the **data processing** configuration file (`/input_data/config/data_processing.yml`). This file contains parameters that affect the four normalization steps applied to each omics dataset: filtering, devariancing, scaling, and replicate handling. Each option lists available methods, their parameters, default values, and a short description.
+This document describes the practical effect of each option in the **data processing** configuration file (`/input_data/config/data_processing.yml`). Each omics dataset (`tx` counts, `mx` peak heights, `px` peak heights) declares whether its input is `raw` or `prenormalized`, then passes through: raw filtering, sample normalization, imputation and log transform, variance filtering, and replicate-reliability filtering. How the processed data are represented for integration (per-sample or per-condition) is set separately by `analysis.replicate_pairing` in the analysis config.
 
 ---
 
 ## Table of Contents
 - [Configuration](#configuration)  
+- [Input State](#input-state)  
 - [Normalization Parameters](#normalization-parameters)  
-  - [2.1 Filtering](#filtering)  
-  - [2.2 Devariancing](#devariancing)  
-  - [2.3 Scaling](#scaling)  
-  - [2.4 Replicate Handling](#replicate-handling)  
+  - [Filtering](#filtering)  
+  - [Sample normalization, imputation and log transform](#sample-normalization)  
+  - [Devariancing](#devariancing)  
+  - [Replicate Handling](#replicate-handling)  
 - [Example Configuration](#example-configuration)  
+- [Processing Order and Outputs](#outputs)  
 
 ---
 
 ## Configuration <a id="configuration"></a>
 
-The workflow automatically generates a **data processing hash** based on the parameters in the config file. When you change any parameter (filtering thresholds, scaling methods, etc.), a new hash is generated, ensuring:
+The workflow automatically generates a **data processing hash** based on the parameters in the config file. When you change any parameter (filtering thresholds, normalization methods, etc.), a new hash is generated, ensuring:
 
 - Fresh calculations with new parameters
 - Preservation of previous results
 - No accidental mixing of results from different parameter sets
 
-Example: Changing the filtering method (see below) from `minimum` to `proportion` will generate a new hash like `x9y8z7w6`, creating a new directory `Dataset_Processing--x9y8z7w6/`. All results generated with the new parameter set are saved in their own folder. To re-produce the exact results of the data processing steps again, use the configuration file path that was produced during the previous run.
+Example: Changing the filtering threshold (see below) will generate a new hash like `x9y8z7w6`, creating a new directory `Dataset_Processing--x9y8z7w6/`. All results generated with the new parameter set are saved in their own folder. To re-produce the exact results of the data processing steps again, use the configuration file path that was produced during the previous run.
+
+---
+
+## Input State <a id="input-state"></a>
+
+`datasets.<dataset_name>.input_state` (default `raw`):
+
+| Value | Meaning |
+|-------|---------|
+| `raw` | Counts (`tx`) or peak heights (`mx`, `px`). Values must be non-negative and linear; negative or log-like values stop the run with an error. Non-integer `tx` counts (e.g. expected counts) are accepted with a warning. |
+| `prenormalized` | Already normalized and/or transformed. The scale is detected automatically (linear, log, or already feature-scaled) from the fraction of negative values and zeros, the value range, skewness, and whether features are centered with unit variance. The report is logged and written to `input_report.json` in the dataset output folder. Raw filters and sample normalization are never applied; a log transform is applied only if the data are detected as linear. |
 
 ---
 
 ## Normalization Parameters <a id="normalization-parameters"></a>
 
-All normalization sub‑sections share the same path pattern: `datasets.<dataset_name>.normalization_parameters.<step>`.
+All normalization sub-sections share the same path pattern: `datasets.<dataset_name>.normalization_parameters.<step>`.
 
 ### Filtering <a id="filtering"></a>
 
+Raw filters (raw input only; each can be `null` to skip):
+
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `method` | string | `"minimum"` | Filtering method. Options: `minimum`, `proportion`, `none`. |
-| `value` | number | — | Threshold for the chosen method. <br>• **minimum** – real > 0 (abundance value). Mean abundance (across all samples) of features must be above this value. <br>• **proportion** – real 0‑100 (percentage of samples). Proportion of total samples where a feature must be observed above background. <br>• **none** – ignored. |
+| `presence_min_percent` | number 0-100 | `null` | Keep features with a raw value > 0 in at least this percentage of samples. |
+| `magnitude_min_mean` | number | `null` | Keep features whose mean raw value across all samples is greater than this value. |
+
+### Sample normalization, imputation and log transform <a id="sample-normalization"></a>
+
+Applied by `analysis.normalize_all_datasets()`.
+
+| Config key | Type | Default | Description |
+|------------|------|---------|-------------|
+| `sample_normalization` | string | `auto` | Raw input only. `auto` uses median-of-ratios size factors for `tx` and probabilistic quotient normalization (PQN) for `mx`/`px` (`mx` is normalized separately per polarity). Other options: `median_of_ratios`, `pqn`, `median`, `tic`, `none`. |
+| `pseudocount` | number | `1` | `tx` only. Counts are transformed as `log2(count / size_factor + pseudocount)`. |
+| `recenter_samples` | boolean | `false` | Prenormalized input only. Aligns per-sample medians on the log scale. A warning is logged when sample medians differ by more than one log2 unit. |
+
+For `mx` and `px`, zeros are treated as missing and replaced after normalization by each feature's minimum observed value, then `log2` is applied. `tx` is never imputed. Prenormalized data detected as log or feature-scaled are not transformed again.
 
 ### Devariancing <a id="devariancing"></a>
 
-| Config key | Type | Default | Description |
-|------------|------|---------|-------------|
-| `method` | string | `"percent"` | Devariancing method. Options: `percent`, `none`. |
-| `value` | number | — | Percent of features with lowest variance to drop (0‑100). Ignored when method is `none`. |
-
-### Scaling <a id="scaling"></a>
+Applied to the log-scale matrix (also for prenormalized input).
 
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `log2` | boolean | `true` | If `true`, apply `log2(x + 1)` to all values before scaling. Note: Not applied for log-fold-change methods as they include log2 transformation. |
-| `method` | string | `"modified_zscore"` | Scaling method. Options: `modified_zscore`, `zscore`, `logfc_mean`, `logfc_median`, `logfc_geometric_mean`, `none`. <br>• **modified_zscore** – Median‑MAD based standardization: `(x - median) * 0.6745 / MAD` (robust to outliers). <br>• **zscore** – Mean‑std standardization: `(x - mean) / std`. <br>• **logfc_mean** – Log2 fold-change relative to row mean: `log2((x+1) / mean(row+1))`. <br>• **logfc_median** – Log2 fold-change relative to row median: `log2((x+1) / median(row+1))`. <br>• **logfc_geometric_mean** – Log2 fold-change relative to geometric mean: `log2((x+1) / geometric_mean(row+1))`. <br>• **none** – Raw values (not recommended for integration). |
+| `method` | string | `"none"` | `percent` or `none`. |
+| `params.value` | number | — | Percent of features with the lowest variance to drop (0-100). |
+| `params.mean_adjusted` | boolean | `true` | Rank variance relative to features of similar mean level instead of absolute variance. |
 
 ### Replicate Handling <a id="replicate-handling"></a>
 
+Applied to the log-scale matrix (also for prenormalized input). Replicate groups come from the `group` column of the linked metadata.
+
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `method` | string | `"variance"` | Replicate‑handling method. Options: `variance`, `none`. |
-| `group` | string | `"group"` | Metadata column used to define replicate groups (must be listed in `user_settings.variable_list`). Ignored when method is `none`. |
-| `value` | number | `0.5` | Maximum allowed within‑group variability (e.g., variance or MAD). Features exceeding this threshold are removed. Ignored when method is `none`. |
+| `method` | string | `"none"` | `sd` or `none`. |
+| `params.sd_threshold` | number | `1.0` | Within-group standard deviation (log2 scale) above which a group is considered unreliable for a feature. |
+| `params.majority_fraction` | number | `0.5` | A feature is removed when it is unreliable in more than this fraction of evaluable groups. |
+| `params.min_replicates` | integer | `2` | A group is evaluated for a feature only if the feature is detected in at least this many of its replicates. |
 
 ---
 
 ## Example Configuration <a id="example-configuration"></a>
 
-Below is a minimal yet complete `datasets` block for a transcriptomics dataset (`tx`). The same structure can be duplicated for other omics types (e.g., `mx`).
+A minimal `datasets` block for a transcriptomics dataset (`tx`). The same structure applies to `mx` and `px` (the `px` dataset uses the same annotation files and formats as `tx`).
 
 ```yaml
 datasets:
   tx:
     dataset_dir: transcriptomics
+    input_state: raw
     normalization_parameters:
       filtering:
-        method: minimum
-        value: 10
+        presence_min_percent: 20
+        magnitude_min_mean: 10
+      sample_normalization: auto
+      pseudocount: 1
       devariancing:
         method: percent
-        value: 20
-      scaling:
-        log2: true
-        method: modified_zscore
+        params:
+          value: 25
+          mean_adjusted: true
       replicate_handling:
-        method: variance
-        group: group
-        value: 0.5
+        method: sd
+        params:
+          sd_threshold: 1.0
+          majority_fraction: 0.5
+          min_replicates: 2
 ```
 
-And the following transcriptomics dataset (features as rows, samples as columns), with two sample groupings (high or low):
+---
 
-| Feature | High_1 | High_2 | High_3 | High_4 | High_5 | Low_1 | Low_2 | Low_3 | Low_4 | Low_5 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| FeatureA | 900 | 850 | 920 | 870 | 910 | 20 | 25 | 22 | 18 | 24 |
-| FeatureB | 5 | 8 | 7 | 6 | 9 | 4 | 3 | 5 | 6 | 4 |
-| FeatureC | 100 | 120 | 110 | 130 | 115 | 90 | 95 | 85 | 100 | 92 |
-| FeatureD | 500 | 520 | 510 | 530 | 515 | 480 | 490 | 470 | 495 | 485 |
-| FeatureE | 10 | 10 | 10 | 10 | 10 | 10 | 10 | 10 | 10 | 10 |
-| FeatureF | 700 | 750 | 720 | 710 | 740 | 680 | 690 | 670 | 700 | 685 |
-| FeatureG | 50 | 55 | 52 | 54 | 53 | 51 | 56 | 53 | 55 | 52 |
-| FeatureH | 15 | 18 | 17 | 16 | 19 | 14 | 13 | 15 | 16 | 14 |
-| FeatureI | 300 | 320 | 310 | 330 | 315 | 290 | 295 | 285 | 300 | 292 |
-| FeatureJ | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 1 |
+## Processing Order and Outputs <a id="outputs"></a>
 
-### Step 1: Filtering
+| Step | Notebook call | Output file |
+|------|---------------|-------------|
+| Raw filters | `analysis.filter_all_datasets()` | `filtered_data.csv` |
+| Normalize, impute, log2 | `analysis.normalize_all_datasets()` | `normalized_data.csv`, `detected_mask.csv`, `log_data.csv` |
+| Variance filter | `analysis.devariance_all_datasets()` | `devarianced_data.csv` |
+| Replicate filter | `analysis.replicability_test_all_datasets()` | `replicate_filtered_data.csv` |
+| Representation | `analysis.scale_all_datasets()` | `scaled_data_paired.csv` or `scaled_data_unpaired.csv` |
 
-  * **method:** minimum, **value:** 10  
-    Remove features whose average observed value is below 10.  
-    _Result_: Remove FeatureB (average observed = 5.7, below threshold)
-
-| Feature | High_1 | High_2 | High_3 | High_4 | High_5 | Low_1 | Low_2 | Low_3 | Low_4 | Low_5 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| FeatureA | 900 | 850 | 920 | 870 | 910 | 20 | 25 | 22 | 18 | 24 |
-| FeatureC | 100 | 120 | 110 | 130 | 115 | 90 | 95 | 85 | 100 | 92 |
-| FeatureD | 500 | 520 | 510 | 530 | 515 | 480 | 490 | 470 | 495 | 485 |
-| FeatureE | 10 | 10 | 10 | 10 | 10 | 10 | 10 | 10 | 10 | 10 |
-| FeatureF | 700 | 750 | 720 | 710 | 740 | 680 | 690 | 670 | 700 | 685 |
-| FeatureG | 50 | 55 | 52 | 54 | 53 | 51 | 56 | 53 | 55 | 52 |
-| FeatureH | 15 | 18 | 17 | 16 | 19 | 14 | 13 | 15 | 16 | 14 |
-| FeatureI | 300 | 320 | 310 | 330 | 315 | 290 | 295 | 285 | 300 | 292 |
-| FeatureJ | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 1 |
-
-### Step 2: Devariancing
-
-  * **method:** percent, **value:** 20  
-    Remove 20% of features with the lowest variance (rounded down, i.e., 1 feature).  
-    _Result_: Remove FeatureE (variance = 0)
-
-| Feature | High_1 | High_2 | High_3 | High_4 | High_5 | Low_1 | Low_2 | Low_3 | Low_4 | Low_5 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| FeatureA | 900 | 850 | 920 | 870 | 910 | 20 | 25 | 22 | 18 | 24 |
-| FeatureC | 100 | 120 | 110 | 130 | 115 | 90 | 95 | 85 | 100 | 92 |
-| FeatureD | 500 | 520 | 510 | 530 | 515 | 480 | 490 | 470 | 495 | 485 |
-| FeatureF | 700 | 750 | 720 | 710 | 740 | 680 | 690 | 670 | 700 | 685 |
-| FeatureG | 50 | 55 | 52 | 54 | 53 | 51 | 56 | 53 | 55 | 52 |
-| FeatureH | 15 | 18 | 17 | 16 | 19 | 14 | 13 | 15 | 16 | 14 |
-| FeatureI | 300 | 320 | 310 | 330 | 315 | 290 | 295 | 285 | 300 | 292 |
-| FeatureJ | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 12 | 1 |
-
-### Step 3: Scaling
-
-  * **log2:** true, **method:** modified_zscore  
-    First, apply log2(x+1) transformation to all values.  
-    Then, apply modified z-score standardization.
-
-**First, apply log2(x+1) transformation:**
-
-| Feature | High_1 | High_2 | High_3 | High_4 | High_5 | Low_1 | Low_2 | Low_3 | Low_4 | Low_5 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| FeatureA | 9.813 | 9.741 | 9.842 | 9.770 | 9.831 | 4.392 | 4.700 | 4.523 | 4.247 | 4.643 |
-| FeatureC | 6.658 | 6.918 | 6.797 | 7.044 | 6.857 | 6.507 | 6.614 | 6.426 | 6.658 | 6.523 |
-| FeatureD | 8.967 | 9.025 | 8.995 | 9.053 | 9.010 | 8.918 | 8.965 | 8.888 | 8.977 | 8.931 |
-| FeatureF | 9.454 | 9.561 | 9.492 | 9.470 | 9.545 | 9.419 | 9.453 | 9.398 | 9.454 | 9.423 |
-| FeatureG | 5.672 | 5.807 | 5.700 | 5.779 | 5.740 | 5.700 | 5.857 | 5.740 | 5.807 | 5.700 |
-| FeatureH | 4.000 | 4.322 | 4.247 | 4.170 | 4.392 | 3.907 | 3.807 | 4.000 | 4.170 | 3.907 |
-| FeatureI | 8.233 | 8.330 | 8.285 | 8.375 | 8.309 | 8.201 | 8.236 | 8.154 | 8.233 | 8.207 |
-| FeatureJ | 3.700 | 3.700 | 3.700 | 3.700 | 3.700 | 3.700 | 3.700 | 3.700 | 3.700 | 1.000 |
-
-**Then, apply modified z-score:**
-
-| Feature | High_1 | High_2 | High_3 | High_4 | High_5 | Low_1 | Low_2 | Low_3 | Low_4 | Low_5 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| FeatureA | 0.009 | -0.009 | 0.034 | -0.028 | 0.025 | -1.022 | -0.622 | -0.883 | -1.263 | -0.713 |
-| FeatureC | 0.073 | 0.442 | 0.253 | 0.701 | 0.326 | -0.179 | 0.011 | -0.357 | 0.073 | -0.126 |
-| FeatureD | 0.025 | 0.093 | 0.062 | 0.130 | 0.087 | -0.025 | 0.022 | -0.055 | 0.034 | -0.012 |
-| FeatureF | 0.044 | 0.186 | 0.089 | 0.047 | 0.179 | -0.022 | 0.044 | -0.067 | 0.044 | -0.015 |
-| FeatureG | -0.067 | 0.179 | -0.022 | 0.134 | 0.067 | -0.022 | 0.224 | 0.067 | 0.179 | -0.022 |
-| FeatureH | -0.134 | 0.224 | 0.134 | 0.044 | 0.313 | -0.224 | -0.313 | -0.134 | 0.044 | -0.224 |
-| FeatureI | 0.044 | 0.186 | 0.089 | 0.228 | 0.120 | -0.022 | 0.044 | -0.067 | 0.044 | -0.015 |
-| FeatureJ | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | -2.494 |
-
-### Step 4: Replicate Handling
-
-  * **method:** variance, **group:** group, **value:** 0.5  
-    Remove features with high within-group variance (threshold = 0.5).  
-    _Result_: Remove FeatureJ (Low_5 sample value is an outlier, causing high within-group variance in "low" group)
-
-| Feature | High_1 | High_2 | High_3 | High_4 | High_5 | Low_1 | Low_2 | Low_3 | Low_4 | Low_5 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| FeatureA | 0.009 | -0.009 | 0.034 | -0.028 | 0.025 | -1.022 | -0.622 | -0.883 | -1.263 | -0.713 |
-| FeatureC | 0.073 | 0.442 | 0.253 | 0.701 | 0.326 | -0.179 | 0.011 | -0.357 | 0.073 | -0.126 |
-| FeatureD | 0.025 | 0.093 | 0.062 | 0.130 | 0.087 | -0.025 | 0.022 | -0.055 | 0.034 | -0.012 |
-| FeatureF | 0.044 | 0.186 | 0.089 | 0.047 | 0.179 | -0.022 | 0.044 | -0.067 | 0.044 | -0.015 |
-| FeatureG | -0.067 | 0.179 | -0.022 | 0.134 | 0.067 | -0.022 | 0.224 | 0.067 | 0.179 | -0.022 |
-| FeatureH | -0.134 | 0.224 | 0.134 | 0.044 | 0.313 | -0.224 | -0.313 | -0.134 | 0.044 | -0.224 |
-| FeatureI | 0.044 | 0.186 | 0.089 | 0.228 | 0.120 | -0.022 | 0.044 | -0.067 | 0.044 | -0.015 |
-
-**Final Output:**
-
-After all normalization steps, the dataset contains 7 features and all 10 samples, with all values log2-transformed and modified z-score standardized. This dataset now has a quality-controlled and standardized quantitative distribution and can be integrated with other datasets that have undergone the same treatment. Any changes made to the example config above will generate a new set of results that are saved in a new output folder.
+The representation is per-feature z-scores across samples (`paired`) or per-feature z-scored condition medians (`unpaired`), chosen by `analysis.replicate_pairing`.

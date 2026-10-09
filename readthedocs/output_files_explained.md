@@ -54,10 +54,14 @@ Both `metabolomics/` and `transcriptomics/` directories contain the same file st
 | `raw_metadata.csv` | Original sample metadata with experimental conditions and groupings |
 | `linked_data.csv` | Feature data after linking samples between datasets (only samples present in both omics types) |
 | `linked_metadata.csv` | Metadata after linking samples between datasets |
-| `filtered_data.csv` | Data after removing rare features based on presence/absence thresholds (optional step) |
-| `devarianced_data.csv` | Data after removing low-variance features (optional step) |
-| `scaled_data.csv` | Data after log2 transformation and scaling |
-| `normalized_data.csv` | Fully processed data after optional replicability filtering |
+| `filtered_data.csv` | Data after raw presence/magnitude filtering (raw input only) |
+| `normalized_data.csv` | Size-factor normalized data on the linear scale (zeros kept as missing for `mx`/`px`) |
+| `detected_mask.csv` | Boolean table marking which values were actually observed |
+| `log_data.csv` | Normalized, imputed (`mx`/`px`) and log2-transformed data |
+| `devarianced_data.csv` | Log-scale data after removing low-variance features (optional step) |
+| `replicate_filtered_data.csv` | Log-scale data after removing features with unreliable replicates (optional step) |
+| `scaled_data_paired.csv` / `scaled_data_unpaired.csv` | Representation used for integration: per-feature z-scores per sample (`paired`) or z-scored condition medians (`unpaired`) |
+| `input_report.json` | Input scale detection report for the dataset |
 | `annotation_table.csv` | Feature annotations including functional classifications, pathways, and identifiers |
 
 ### PCA Plots (`pca_plots/`)
