@@ -8,6 +8,7 @@ import shutil
 from typing import Dict, Any, List, Optional, Tuple
 from IPython import get_ipython
 import tools.helpers as hlp
+import tools.preprocessing as prep
 import logging
 import time
 import hashlib
@@ -454,7 +455,9 @@ class BaseDataHandler:
         file_path = os.path.join(self.output_dir, filename)
   
         # Check cache first
-        if attribute_name in self._cache and not overwrite:
+        cached = self._cache.get(attribute_name)
+        cache_valid = cached is not None and not (isinstance(cached, pd.DataFrame) and cached.empty)
+        if cache_valid and not overwrite:
             setattr(self, attribute_name, self._cache[attribute_name])
             if hasattr(self, 'dataset_name'):
                 log.info(f"{attribute_name} already loaded in memory for {self.dataset_name}. Using cached attribute.")
@@ -489,7 +492,7 @@ class BaseDataHandler:
 class Dataset(BaseDataHandler):
     """Simplified Dataset class using hash-based tagging."""
 
-    def __init__(self, dataset_name: str, project: Project, overwrite: bool = False, superuser: bool = False):
+    def __init__(self, dataset_name: str, project: Project, overwrite: bool = False):
         self.project = project
         log.info("Initializing Datasets")
         self.dataset_name = dataset_name
@@ -516,8 +519,16 @@ class Dataset(BaseDataHandler):
         self._setup_dataset_filenames()
 
         # Configuration
-        self.normalization_params = self.dataset_config.get('normalization_parameters', {})
-        self.superuser = superuser
+        self.normalization_params = self.dataset_config.get('normalization_parameters', {}) or {}
+        self.data_type = dataset_name
+        if self.data_type not in prep.DATA_TYPES:
+            raise ValueError(f"Dataset name must be one of {list(prep.DATA_TYPES)}, got '{dataset_name}'.")
+        self.input_state = self.dataset_config.get('input_state', 'raw')
+        if self.input_state not in prep.INPUT_STATES:
+            raise ValueError(
+                f"datasets.{dataset_name}.input_state must be one of {list(prep.INPUT_STATES)}, got '{self.input_state}'."
+            )
+        self._input_report = None
 
     @staticmethod
     def set_up_dataset_outdir(project: Project, data_processing_tag: str, dataset_config: dict, dataset_name: str, overwrite: bool = False) -> str:
@@ -542,9 +553,12 @@ class Dataset(BaseDataHandler):
             'linked_data': 'linked_data.csv',
             'linked_metadata': 'linked_metadata.csv',
             'filtered_data': 'filtered_data.csv',
+            'normalized_data': 'normalized_data.csv',
+            'detected_mask': 'detected_mask.csv',
+            'log_data': 'log_data.csv',
             'devarianced_data': 'devarianced_data.csv',
-            'scaled_data': 'scaled_data.csv',
             'replicate_filtered_data': 'replicate_filtered_data.csv',
+            'scaled_data': 'scaled_data.csv',
             'pca_grid': 'pca_grid.pdf',
             'annotation_table': 'annotation_table.csv'
         }
@@ -577,24 +591,44 @@ class Dataset(BaseDataHandler):
             self.save_data(df, self.output_dir, filename, indexing=True)
         self._cache[key] = df
 
+    def get_input_report(self) -> dict:
+        """Validate input_state against linked_data and detect its value scale (cached as input_report.json)."""
+        if self._input_report is not None:
+            return self._input_report
+        report_path = os.path.join(self.output_dir, "input_report.json")
+        if os.path.exists(report_path) and not self.overwrite:
+            with open(report_path) as fh:
+                report = json.load(fh)
+            if report.get("input_state") == self.input_state:
+                self._input_report = report
+                return report
+        report = prep.inspect_input(self.linked_data, self.data_type, self.input_state)
+        with open(report_path, "w") as fh:
+            json.dump(report, fh, indent=2)
+        self._input_report = report
+        return report
+
+    @property
+    def sample_to_group(self) -> dict:
+        """Mapping of linked sample name (unique_group) to its condition label."""
+        meta = self.linked_metadata
+        return dict(zip(meta['unique_group'], meta['group']))
+
+    def _require(self, attr: str, step: str) -> pd.DataFrame:
+        df = getattr(self, attr)
+        if df is None or df.empty:
+            log.error(f"Dataset '{self.dataset_name}' has no {attr}. Run {step} first.")
+            sys.exit(1)
+        return df
+
     def filter_data(self, overwrite: bool = False, **kwargs) -> None:
-        """Hybrid: Class validation + external hlp.filter_data function."""
+        """Validate/detect the input scale, then apply raw presence/magnitude filters (raw input only)."""
         if self.check_and_load_attribute('filtered_data', self._filtered_data_filename, self.overwrite):
             return
 
-        step = self.normalization_params.get('filtering', {})
-        p = step.get('params', step)   # new layout: step['params']; old layout: step itself
-        call_params = {
-            'data': self.linked_data,
-            'dataset_name': self.dataset_name,
-            'data_type': self.datatype,
-            'output_filename': self._filtered_data_filename,
-            'output_dir': self.output_dir,
-            'filter_method': step.get('method', 'minimum'),
-            'filter_value': p.get('value', 0)
-        }
-        call_params.update(kwargs)
-        result = hlp.filter_data(**call_params)
+        report = self.get_input_report()
+        log.info(f"{self.dataset_name}: input_state='{self.input_state}', detected scale='{report['detected_scale']}'")
+        result = prep.run_filter(self.linked_data, self.input_state, self.normalization_params, self.dataset_name)
         if result.empty:
             log.error(f"Filtering resulted in empty dataset for {self.dataset_name}. Please adjust filtering parameters.")
             sys.exit(1)
@@ -602,24 +636,34 @@ class Dataset(BaseDataHandler):
         log.info(f"Created table: {self._filtered_data_filename}")
         log.info("Created attribute: filtered_data")
 
+    def normalize_data(self, overwrite: bool = False, **kwargs) -> None:
+        """Sample normalization (raw only), mx/px imputation, and log transform into log_data."""
+        if self.check_and_load_attribute('log_data', self._log_data_filename, self.overwrite):
+            self.check_and_load_attribute('normalized_data', self._normalized_data_filename, False)
+            self.check_and_load_attribute('detected_mask', self._detected_mask_filename, False)
+            return
+
+        report = self.get_input_report()
+        result = prep.run_normalize(
+            self._require('filtered_data', 'filter_data()'),
+            self.data_type, self.input_state, report['detected_scale'], self.normalization_params,
+        )
+        self.normalized_data = result['normalized']
+        self.detected_mask = result['detected']
+        self.log_data = result['log']
+        log.info(f"Created tables: {self._normalized_data_filename}, {self._detected_mask_filename}, {self._log_data_filename}")
+        log.info("Created attributes: normalized_data, detected_mask, log_data")
+
     def devariance_data(self, overwrite: bool = False, **kwargs) -> None:
-        """Remove low-variance features using external helper function with class integration."""
+        """Remove low-variance features on the log-scale matrix."""
         if self.check_and_load_attribute('devarianced_data', self._devarianced_data_filename, self.overwrite):
             return
 
-        step = self.normalization_params.get('devariancing', {})
-        p = step.get('params', step)   # new layout: step['params']; old layout: step itself
-        call_params = {
-            'data': self.filtered_data,
-            'filter_value': p.get('value', 0),
-            'dataset_name': self.dataset_name,
-            'output_filename': self._devarianced_data_filename,
-            'output_dir': self.output_dir,
-            'devariance_mode': step.get('method', 'none')
-        }
-        call_params.update(kwargs)
-
-        result = hlp.devariance_data(**call_params)
+        report = self.get_input_report()
+        result = prep.run_devariance(
+            self._require('log_data', 'normalize_data()'),
+            report['detected_scale'], self.normalization_params, self.dataset_name,
+        )
         if result.empty:
             log.error(f"Devariancing resulted in empty dataset for {self.dataset_name}. Please adjust devariancing parameters.")
             sys.exit(1)
@@ -627,84 +671,39 @@ class Dataset(BaseDataHandler):
         log.info(f"Created table: {self._devarianced_data_filename}")
         log.info("Created attribute: devarianced_data")
 
-    def scale_data(self, overwrite: bool = False, **kwargs) -> None:
-        """
-        Per-dataset scaling step for replicate_matched mode.
-
-        Reads ``replicate_filtered_data``, applies the scaling method configured in
-        ``data_processing.yml`` under ``normalization_parameters.scaling``, and writes
-        the result to ``scaled_data``.
-
-        This step is only meaningful in **replicate_matched** mode.  In **lfc** mode,
-        ``Analysis.scale_all_datasets()`` skips this step automatically because LFC
-        computation is scale-invariant (ratios cancel absolute differences).
-
-        Supported scaling methods (set in data_processing.yml → scaling.method):
-        - ``"vst"``            : arcsinh(sqrt(x)) variance-stabilising transform + z-score
-        - ``"zscore"``         : log2(x+1) then z-score per sample
-        - ``"modified_zscore"``: log2(x+1) then modified z-score per sample
-        - ``"rank_normal"``    : rank-based inverse normal transformation
-        - ``"quantile"``       : quantile normalisation (forces identical distributions)
-        - ``"none"``           : pass-through (no scaling applied)
-        """
-        if self.check_and_load_attribute('scaled_data', self._scaled_data_filename, self.overwrite):
-            log.info(f"\tScaled data already exists for {self.dataset_name}.")
-            return
-
-        step = self.normalization_params.get('scaling', {})
-        p = step.get('params', step)   # new layout: step['params']; old layout: step itself
-        norm_method = step.get('method', 'vst')
-        log2 = True
-
-        log.info(f"Scaling {self.dataset_name} data using method='{norm_method}'...")
-
-        call_params = {
-            'df': self.replicate_filtered_data,
-            'output_filename': self._scaled_data_filename,
-            'output_dir': self.output_dir,
-            'dataset_name': self.dataset_name,
-            'log2': log2,
-            'norm_method': norm_method,
-        }
-        call_params.update(kwargs)
-
-        result = hlp.scale_data(**call_params)
-        if result is None or result.empty:
-            log.error(f"Scaling resulted in empty dataset for {self.dataset_name}. Check scaling parameters.")
-            sys.exit(1)
-        self.scaled_data = result
-        log.info(f"Created table: {self._scaled_data_filename}")
-        log.info("Created attribute: scaled_data")
-
     def remove_low_replicable_features(self, overwrite: bool = False, **kwargs) -> None:
-        """Hybrid: Class validation + external hlp.remove_low_replicable_features function."""
+        """Remove features with unreliable within-group log-scale SD."""
         if self.check_and_load_attribute('replicate_filtered_data', self._replicate_filtered_data_filename, self.overwrite):
             return
 
-        step = self.normalization_params.get('replicate_handling', {})
-        p = step.get('params', step)
-        call_params = {
-            'data': self.devarianced_data,
-            'metadata': self.linked_metadata,
-            'dataset_name': self.dataset_name,
-            'output_filename': self._replicate_filtered_data_filename,
-            'output_dir': self.output_dir,
-            'method': step.get('method', 'variance'),
-            'group_col': 'group',
-            'threshold': p.get('value', 0.5),
-            'normalize': True,
-            'normalization_scale': 1000000,
-            'min_replicates': 2,
-        }
-        call_params.update(kwargs)
-
-        result = hlp.remove_low_replicable_features(**call_params)
+        result = prep.run_replicate_filter(
+            self._require('devarianced_data', 'devariance_data()'),
+            self._require('detected_mask', 'normalize_data()'),
+            self.sample_to_group, self.normalization_params, self.dataset_name,
+        )
         if result.empty:
             log.error(f"Replicability filtering resulted in empty dataset for {self.dataset_name}. Please adjust replicability parameters.")
             sys.exit(1)
         self.replicate_filtered_data = result
         log.info(f"Created table: {self._replicate_filtered_data_filename}")
         log.info("Created attribute: replicate_filtered_data")
+
+    def scale_data(self, pairing: str, robust: bool = False, overwrite: bool = False, **kwargs) -> None:
+        """Build the integration representation: sample z-scores (paired) or condition profiles (unpaired)."""
+        self._scaled_data_filename = f"scaled_data_{pairing}.csv"
+        self.clear_cache('scaled_data')
+        if self.check_and_load_attribute('scaled_data', self._scaled_data_filename, self.overwrite):
+            log.info(f"\tScaled data already exists for {self.dataset_name} ({pairing}).")
+            return
+
+        result = prep.represent(
+            self._require('replicate_filtered_data', 'remove_low_replicable_features()'),
+            pairing, self.sample_to_group, robust=robust,
+        )
+        self.scaled_data = result
+        log.info(f"Created table: {self._scaled_data_filename} "
+                 f"({result.shape[0]} features x {result.shape[1]} {'samples' if pairing == 'paired' else 'conditions'})")
+        log.info("Created attribute: scaled_data")
 
     def plot_pca(self, overwrite: bool = False, analysis_outdir = None, show_plot = True, **kwargs) -> None:
         """Hybrid: Class setup + external hlp.plot_pca function."""
@@ -733,9 +732,12 @@ manual_file_storage = {
     'linked_data': 'linked_data.csv',
     'linked_metadata': 'linked_metadata.csv',
     'filtered_data': 'filtered_data.csv',
+    'normalized_data': 'normalized_data.csv',
+    'detected_mask': 'detected_mask.csv',
+    'log_data': 'log_data.csv',
     'devarianced_data': 'devarianced_data.csv',
-    'scaled_data': 'scaled_data.csv',
     'replicate_filtered_data': 'replicate_filtered_data.csv',
+    'scaled_data': 'scaled_data.csv',
     'pca_grid': 'pca_grid.pdf',
     'annotation_table': 'annotation_table.csv'
 }
@@ -745,8 +747,8 @@ for attr, filename in manual_file_storage.items():
 
 class MX(Dataset):
     """Metabolomics dataset with specific configuration."""
-    def __init__(self, project: Project, overwrite: bool = False, last: bool = False, superuser: bool = False):
-        super().__init__("mx", project, overwrite, superuser)
+    def __init__(self, project: Project, overwrite: bool = False):
+        super().__init__("mx", project, overwrite)
         self.chromatography = self.dataset_config['chromatography']
         self.polarity = self.dataset_config['polarity']
         self.mode = "untargeted" # Currently only untargeted supported, not configurable
@@ -779,29 +781,12 @@ class MX(Dataset):
                 f"{self.chromatography} for polarity={self.polarity}."
             )
 
-        # Normalize raw data sample-wise using median-of-ratios method
-        log.info("Normalizing MX raw data using median-of-ratios method")
-        scale = 1.0
-        feature_col_name = result.columns[0]
-        result = result.set_index(feature_col_name)
-        min_dataset_value = result[result > 0].min().min()
-        mask = (result > min_dataset_value).any(axis=1)
-        counts_pos = result.loc[mask]
-        # Replace zeros with a small positive value to avoid log(0) warning
-        counts_pos = counts_pos.replace(0, np.finfo(float).eps)
-        log_counts = np.log(counts_pos)
-        geo_means = np.exp(log_counts.mean(axis=1))
-        ratios = counts_pos.divide(geo_means, axis=0)
-        size_factors = ratios.median(axis=0)
-        norm_counts = result.div(size_factors, axis=1) * scale
-        norm_counts = norm_counts.reset_index()
-
-        self.raw_data = norm_counts
+        self.raw_data = result
         log.info(f"\tCreated raw data for MX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
         log.info(f"Created table: {self._raw_data_filename}")
         log.info("Created attribute: raw_data")
 
-    def _get_raw_metadata(self, overwrite: bool = False, superuser: bool = False) -> None:
+    def _get_raw_metadata(self, overwrite: bool = False) -> None:
         log.info("Getting Raw Metadata (MX)")
         if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, self.overwrite):
             log.info(f"\t{self.dataset_name} metadata file with {self.raw_metadata.shape[0]} samples and {self.raw_metadata.shape[1]} metadata fields.")
@@ -843,8 +828,8 @@ class MX(Dataset):
 
 class TX(Dataset):
     """Transcriptomics dataset with specific configuration."""
-    def __init__(self, project: Project, overwrite: bool = False, last: bool = False, superuser: bool = False):
-        super().__init__("tx", project, overwrite, superuser)
+    def __init__(self, project: Project, overwrite: bool = False):
+        super().__init__("tx", project, overwrite)
         self.index = 1 # Currently only index 1 supported, not configurable
         self.apid = None
         self.genome_type = self.project.config['project']['genome_type']
@@ -878,30 +863,12 @@ class TX(Dataset):
                 f"No TX {self.datatype} file found under {self.dataset_raw_dir}."
             )
         self.identifier_column = result.columns[0]
-        # Normalize raw data sample-wise using median-of-ratios method
-        log.info("Normalizing TX raw data using median-of-ratios method")
-        scale = 1.0
-        feature_col_name = result.columns[0]
-        result = result.set_index(feature_col_name)
-        min_dataset_value = result[result > 0].min().min()
-        mask = (result > min_dataset_value).any(axis=1)
-        counts_pos = result.loc[mask]
-        counts_pos = counts_pos.replace(0, np.finfo(float).eps)
-        log_counts = np.log(counts_pos)
-        geo_means = np.exp(log_counts.mean(axis=1))
-        ratios = counts_pos.divide(geo_means, axis=0)
-        size_factors = ratios.median(axis=0)
-        norm_counts = result.div(size_factors, axis=1) * scale
-        norm_counts = norm_counts.reset_index()
-        norm_counts = result.div(size_factors, axis=1) * scale
-        norm_counts = norm_counts.reset_index()
-
-        self.raw_data = norm_counts
+        self.raw_data = result
         log.info(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
         log.info(f"Created table: {self._raw_data_filename}")
         log.info("Created attribute: raw_data")
 
-    def _get_raw_metadata(self, overwrite: bool = False, superuser: bool = False) -> None:
+    def _get_raw_metadata(self, overwrite: bool = False) -> None:
         log.info("Getting Raw Metadata (TX)")
         if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, self.overwrite):
             self.apid = self.raw_metadata['APID'].iloc[0] if 'APID' in self.raw_metadata.columns else None
@@ -943,6 +910,77 @@ class TX(Dataset):
         log.info(f"Created table: {self._annotation_table_filename}")
         log.info("Created attribute: annotation_table")
 
+class PX(Dataset):
+    """Proteomics (peak-height) dataset; same layout as MX data and same annotation files/formats as TX."""
+    def __init__(self, project: Project, overwrite: bool = False):
+        super().__init__("px", project, overwrite)
+        self.apid = None
+        self.genome_type = self.project.config['project']['genome_type']
+        self.datatype = "peak-height"
+        self._get_raw_data(overwrite=self.overwrite)
+        self._generate_annotation_table(overwrite=self.overwrite)
+
+    def _get_raw_data(self, overwrite: bool = False) -> None:
+        log.info("Getting Raw Data (PX)")
+        px_path = Path(self.dataset_raw_dir) / f"{self.datatype}.csv"
+        self.identifier_column = (
+            pd.read_csv(px_path, nrows=0).columns[0] if px_path.is_file() else None
+        )
+        if self.check_and_load_attribute('raw_data', self._raw_data_filename, self.overwrite):
+            if self.identifier_column is None:
+                self.identifier_column = self.raw_data.columns[0]
+            log.info(f"\t{self.dataset_name} data file with {self.raw_data.shape[0]} features and {self.raw_data.shape[1]} columns.")
+            return
+
+        result = hlp.get_px_data(
+            input_dir=self.dataset_raw_dir,
+            output_dir=self.output_dir,
+            output_filename=self._raw_data_filename,
+            datatype=self.datatype,
+        )
+        if result is None or result.empty:
+            raise FileNotFoundError(f"No PX {self.datatype}.csv file found under {self.dataset_raw_dir}.")
+        self.identifier_column = result.columns[0]
+        self.raw_data = result
+        log.info(f"\tCreated raw data for PX with {self.raw_data.shape[1]} columns and {self.raw_data.shape[0]} features.")
+        log.info(f"Created table: {self._raw_data_filename}")
+        log.info("Created attribute: raw_data")
+
+    def _get_raw_metadata(self, overwrite: bool = False) -> None:
+        log.info("Getting Raw Metadata (PX)")
+        if self.check_and_load_attribute('raw_metadata', self._raw_metadata_filename, self.overwrite):
+            return
+        self.raw_metadata = hlp.load_raw_metadata(
+            input_dir=self.dataset_raw_dir,
+            output_dir=self.output_dir,
+            output_filename=self._raw_metadata_filename,
+        )
+        log.info(f"Created table: {self._raw_metadata_filename}")
+        log.info("Created attribute: raw_metadata")
+
+    def _generate_annotation_table(self, overwrite: bool = False) -> None:
+        """Generate protein annotation table using the TX annotation files and formats."""
+        log.info("Generating Protein Annotation Table")
+        if self.check_and_load_attribute('annotation_table', self._annotation_table_filename, self.overwrite):
+            log.info(f"\tAnnotation table with {self.annotation_table.shape[0]} rows and {self.annotation_table.shape[1]} columns.")
+            return
+
+        result = hlp.generate_tx_annotation_table(
+            raw_data=self.raw_data,
+            raw_data_dir=self.dataset_raw_dir,
+            genome_type=self.genome_type,
+            output_dir=self.output_dir,
+            output_filename=self._annotation_table_filename,
+            identifier_column=self.identifier_column,
+            prefix="px",
+        )
+        if result.empty:
+            log.error("No annotation table generated for PX dataset. Please check your annotation files.")
+            sys.exit(1)
+        self.annotation_table = result
+        log.info(f"Created table: {self._annotation_table_filename}")
+        log.info("Created attribute: annotation_table")
+
 class Analysis(BaseDataHandler):
     """Analysis class with hash-based tagging."""
     
@@ -974,90 +1012,32 @@ class Analysis(BaseDataHandler):
         self.datasets = datasets or []
         if not self.link_table:
             raise ValueError("project.link_table must point to the master link table.")
-        linked_metadata = hlp.load_link_table_metadata(
+        linked_metadata, self.link_table_metadata = hlp.load_link_table_metadata(
             datasets=self.datasets,
             link_table_path=self.link_table,
+            return_link_table=True,
         )
         for ds in self.datasets:
             ds.linked_metadata = linked_metadata[ds.dataset_name]
 
-        # Derive integration_mode from the scaling.method configured for each dataset
-        # in data_processing.yml.  lfc / moderated_lfc → condition_resolution;
-        # everything else → sample_resolution.
-        self._integration_mode: str = self._infer_integration_mode(self.datasets, self.datasets_config)
+        # The track is set by the global analysis.replicate_pairing flag.
+        self.replicate_pairing = self.analysis_config.get('replicate_pairing')
+        if self.replicate_pairing not in prep.PAIRINGS:
+            raise ValueError(
+                f"analysis.replicate_pairing must be one of {list(prep.PAIRINGS)}, got '{self.replicate_pairing}'."
+            )
+        self._integration_mode: str = (
+            "sample_resolution" if self.replicate_pairing == "paired" else "condition_resolution"
+        )
+        log.info(f"replicate_pairing='{self.replicate_pairing}' -> track '{self._integration_mode}'")
+        self.integrated_metadata = self.link_table_metadata.copy()
+        for ds in self.datasets:
+            ds._scaled_data_filename = f"scaled_data_{self.replicate_pairing}.csv"
+            ds.clear_cache('scaled_data')
 
-        log.info(f"Track inferred as '{self._integration_mode}' from data_processing.yml scaling.method")
-    
         log.info(f"Created analysis with {len(self.datasets)} datasets.")
         for ds in self.datasets:
             log.info(f"\t- {ds.dataset_name} with output directory: {ds.output_dir}")
-
-    # ── LFC scaling methods that imply condition_resolution ──────────────────
-    _LFC_METHODS: frozenset = frozenset({"lfc", "moderated_lfc"})
-
-    @staticmethod
-    def _infer_integration_mode(datasets: list, datasets_config: dict) -> str:
-        """Infer the integration track from each dataset's ``scaling.method``.
-
-        Rules
-        -----
-        * If **all** datasets use ``lfc`` or ``moderated_lfc`` → ``"condition_resolution"``
-        * If **all** datasets use any other method → ``"sample_resolution"``
-        * If datasets are **mixed** (some LFC, some not) → ``ValueError``
-        * If no datasets are present yet (empty list) → fall back to
-          ``"sample_resolution"`` (safe default; will be re-evaluated once
-          datasets are attached).
-
-        Parameters
-        ----------
-        datasets : list
-            Dataset objects already attached to the Analysis.
-        datasets_config : dict
-            The ``datasets`` sub-dict from the project config (used as fallback
-            when a dataset object is not yet fully initialised).
-        """
-        lfc_methods = Analysis._LFC_METHODS
-
-        if not datasets:
-            # No datasets attached yet — cannot infer; default to sample_resolution
-            log.warning(
-                "No datasets attached to Analysis — defaulting to 'sample_resolution'. "
-                "Call Analysis again with datasets= to infer the correct track."
-            )
-            return "sample_resolution"
-
-        modes: list[str] = []
-        for ds in datasets:
-            # Read scaling.method from the dataset's normalization_params
-            scaling_method = (
-                ds.normalization_params.get("scaling", {}).get("method", "zscore")
-                if hasattr(ds, "normalization_params")
-                else datasets_config.get(ds.dataset_name, {})
-                    .get("normalization_parameters", {})
-                    .get("scaling", {})
-                    .get("method", "zscore")
-            )
-            mode = "condition_resolution" if scaling_method in lfc_methods else "sample_resolution"
-            modes.append(mode)
-
-        unique_modes = set(modes)
-        if len(unique_modes) > 1:
-            details = {
-                ds.dataset_name: (
-                    ds.normalization_params.get("scaling", {}).get("method", "zscore")
-                    if hasattr(ds, "normalization_params") else "unknown"
-                )
-                for ds in datasets
-            }
-            raise ValueError(
-                "Inconsistent scaling methods across datasets — all datasets must use "
-                "either LFC-based methods (lfc, moderated_lfc) for condition_resolution "
-                "or non-LFC methods for sample_resolution. "
-                f"Found: {details}. "
-                "Fix data_processing.yml so all datasets use the same scaling family."
-            )
-
-        return unique_modes.pop()
 
     @property
     def analysis_parameters(self) -> dict:
@@ -1070,15 +1050,12 @@ class Analysis(BaseDataHandler):
     @property
     def integration_mode(self) -> str:
         """
-        The workflow track detected from analysis.yml → analysis.track.
+        Track derived from ``analysis.replicate_pairing``.
 
-        * ``"sample_resolution"``    — replicates are paired across data types.
-          Columns are aligned by Sample ID, row-wise Z-score is applied per
-          dataset, matrices are concatenated, and Pearson/Spearman correlation
-          followed by HDBSCAN or network clustering identifies co-varying modules.
-        * ``"condition_resolution"`` — replicates are not paired.  Replicates are
-          collapsed to per-condition means (centroid or LFC sub-approach), then
-          row-wise Z-score, concatenation, and clustering are applied.
+        * ``paired`` -> ``"sample_resolution"``: replicates are matched across data types;
+          columns are samples and each dataset is z-scored per feature across samples.
+        * ``unpaired`` -> ``"condition_resolution"``: replicates are not matched; columns are
+          conditions (per-feature z-scored group medians on the log scale).
 
         All downstream methods use ``self.integrated_data_selected`` as their
         quantitative input regardless of which track is active.
@@ -1091,6 +1068,39 @@ class Analysis(BaseDataHandler):
         if value not in valid:
             raise ValueError(f"integration_mode must be one of {valid}, got '{value}'")
         self._integration_mode = value
+
+    def _metadata_for_integrated_data(self) -> pd.DataFrame:
+        """Align the sample-level link table to sample or condition columns."""
+        metadata = self.integrated_metadata.reset_index(drop=True)
+        key_column = "unique_group" if self.integration_mode == "sample_resolution" else "group"
+        if key_column not in metadata.columns:
+            raise ValueError(f"Integrated metadata is missing required column '{key_column}'.")
+
+        data = self.integrated_data
+        keys = (
+            set(data.columns.astype(str))
+            if isinstance(data, pd.DataFrame) and not data.empty
+            else set(metadata[key_column].dropna().astype(str))
+        )
+        metadata[key_column] = metadata[key_column].astype(str)
+        rows = []
+        for key, subset in metadata[metadata[key_column].isin(keys)].groupby(key_column, sort=True):
+            row = {}
+            for column in metadata.columns:
+                values = subset[column].dropna().unique()
+                row[column] = values[0] if len(values) == 1 else np.nan
+            row[key_column] = key
+            rows.append(row)
+
+        aligned = pd.DataFrame(rows)
+        if rows:
+            aligned = aligned.set_index(key_column, drop=False)
+        else:
+            aligned.index = pd.Index([])
+        if key_column == "group":
+            aligned["unique_group"] = aligned["group"]
+        aligned.index.name = None
+        return aligned
 
     @staticmethod
     def _set_up_analysis_outdir(project: Project, data_processing_tag: str, analysis_tag: str, overwrite: bool = False) -> str:
@@ -1162,113 +1172,37 @@ class Analysis(BaseDataHandler):
             log.info(f"Devariancing {ds.dataset_name} dataset...")
             ds.devariance_data(overwrite=self.overwrite, **kwargs)
 
+    def normalize_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
+        """Sample-normalize, impute (mx/px) and log-transform all datasets."""
+        log.info("Normalizing and Transforming Data")
+        for ds in self.datasets:
+            log.info(f"Normalizing {ds.dataset_name} dataset (input_state='{ds.input_state}')...")
+            ds.normalize_data(overwrite=self.overwrite, **kwargs)
+
     def scale_all_datasets(
         self,
         overwrite: bool = False,
-        group_col: str = "group",
-        sample_col: str = "unique_group",
-        min_reps_for_se: int = 2,
+        robust: bool = False,
         **kwargs,
     ) -> None:
         """
-        Apply per-dataset scaling — the transformation step before concatenation.
+        Build each dataset's integration representation from its log-scale filtered matrix.
 
-        Both tracks are handled here symmetrically:
+        * **paired** — per-feature z-score across samples (``ds.scaled_data``: features x samples).
+        * **unpaired** — per-condition medians on the log scale, z-scored across conditions
+          (``ds.scaled_data``: features x conditions).
 
-        * **sample_resolution** — each dataset is log2-transformed and row-wise
-          Z-scored independently → ``ds.scaled_data`` (features x samples).
-
-        * **condition_resolution** — each dataset is log2-transformed, replicates
-          are collapsed to per-condition medians, and all unique pairwise LFC
-          contrasts are computed → ``ds.scaled_data`` (features x contrasts).
-
-        After this step, ``integrate_data()`` simply concatenates the appropriate
-        per-dataset attribute across all datasets.
+        ``robust=True`` uses a MAD-based z-score (scale floored at half the SD).
+        After this step, ``integrate_data()`` concatenates ``scaled_data`` across datasets.
         """
-        def _scale_method():
-            for ds in self.datasets:
-                if ds.check_and_load_attribute(
-                    'scaled_data', ds._scaled_data_filename, overwrite or self.overwrite
-                ):
-                    log.info(
-                        f"  [{ds.dataset_name}] scaled_data already exists "
-                        f"({ds.scaled_data.shape[0]} features x {ds.scaled_data.shape[1]} contrasts). "
-                        "Skipping."
-                    )
-                    continue
-                if not hasattr(ds, 'replicate_filtered_data') or ds.replicate_filtered_data.empty:
-                    raise RuntimeError(
-                        f"Dataset '{ds.dataset_name}' has no replicate_filtered_data. "
-                        "Run replicability_test_all_datasets() first."
-                    )
-                if not hasattr(ds, 'linked_metadata') or ds.linked_metadata is None or ds.linked_metadata.empty:
-                    raise RuntimeError(
-                        f"Dataset '{ds.dataset_name}' has no linked_metadata. "
-                        "Run link_metadata() first."
-                    )
-
-                step = ds.normalization_params.get('scaling', {})
-                method = step.get('method', 'zscore')
-                params = step.get('params', {})
-
-                if method == 'lfc':
-                    log.info(f"  [{ds.dataset_name}] Scaling: log2 → group medians → pairwise LFC...")
-                    result = hlp.scale_data_lfc(
-                        data=ds.replicate_filtered_data,
-                        metadata=ds.linked_metadata,
-                        dataset_name=ds.dataset_name,
-                        output_filename=ds._scaled_data_filename,
-                        output_dir=ds.output_dir,
-                        group_col=group_col,
-                        sample_col=sample_col,
-                    )
-                    if result is None or result.empty:
-                        raise RuntimeError(
-                            f"LFC scaling produced an empty result for '{ds.dataset_name}'."
-                        )
-                    ds.scaled_data = result
-                    log.info(
-                        f"  [{ds.dataset_name}] scaled_data: "
-                        f"{result.shape[0]} features × {result.shape[1]} contrasts"
-                    )
-
-                elif method == 'moderated_lfc':
-                    log.info(
-                        f"  [{ds.dataset_name}] Scaling: log2 → group medians → "
-                        "moderated (shrinkage) pairwise LFC..."
-                    )
-                    result = hlp.scale_data_moderated_lfc(
-                        data=ds.replicate_filtered_data,
-                        metadata=ds.linked_metadata,
-                        dataset_name=ds.dataset_name,
-                        output_filename=ds._scaled_data_filename,
-                        output_dir=ds.output_dir,
-                        group_col=group_col,
-                        sample_col=sample_col,
-                        min_reps_for_se=min_reps_for_se
-                    )
-                    if result is None or result.empty:
-                        raise RuntimeError(
-                            f"Moderated LFC scaling produced an empty result for '{ds.dataset_name}'."
-                        )
-                    ds.scaled_data = result
-                    log.info(
-                        f"  [{ds.dataset_name}] scaled_data: "
-                        f"{result.shape[0]} features × {result.shape[1]} contrasts (moderated)"
-                    )
-
-                else:
-                    # sample_resolution methods: zscore, vst, vsn, rank_normal, modified_zscore, none
-                    log.info(f"  [{ds.dataset_name}] Scaling: method='{method}'...")
-                    ds.scale_data(
-                        overwrite=overwrite,
-                        norm_method=method,
-                        log2=True,
-                        **kwargs
-                    )
-
-        _scale_method()
-        return
+        log.info(f"Scaling Data (replicate_pairing='{self.replicate_pairing}')")
+        for ds in self.datasets:
+            ds.scale_data(
+                pairing=self.replicate_pairing,
+                robust=robust,
+                overwrite=overwrite or self.overwrite,
+                **kwargs,
+            )
 
     def replicability_test_all_datasets(self, overwrite: bool = False, **kwargs) -> None:
         """Remove low replicable features from all datasets in the analysis."""
@@ -1344,62 +1278,10 @@ class Analysis(BaseDataHandler):
 
         hlp.plot_simple_pca(
             df=self.integrated_data_selected,
-            metadata=self.integrated_metadata,
+            metadata=self._metadata_for_integrated_data(),
             title="Integrated Data PCA",
             output_dir=self.output_dir,
         )
-
-    def integrate_metadata(
-        self,
-        group_col: str = "group",
-        overlap_only: bool = True,
-        overwrite: bool = False,
-    ) -> None:
-        """Hybrid: Class validation + external hlp.integrate_metadata function."""
-        track = self.integration_mode
-        log.info(f"Integrating metadata across data types (track='{track}')")
-
-        # sample_resolution produces sample-level metadata; reuse cache safely
-        can_reuse_cached = (
-            track == "sample_resolution"
-            and self.check_and_load_attribute(
-                "integrated_metadata",
-                self._integrated_metadata_filename,
-                overwrite or self.overwrite
-            )
-        )
-        if can_reuse_cached:
-            log.info(
-                f"\tIntegrated metadata object 'integrated_metadata' with "
-                f"{self.integrated_metadata.shape[0]} rows and {self.integrated_metadata.shape[1]} columns."
-            )
-            return
-
-        # Map new track names to the helper's method parameter
-        helper_method = 'replicate_matched' if track == 'sample_resolution' else 'lfc'
-
-        result = hlp.integrate_metadata(
-            datasets=self.datasets,
-            metadata_vars=self.project.study_variables,
-            unifying_col="unique_group",
-            output_filename=self._integrated_metadata_filename,
-            output_dir=self.output_dir,
-            method=helper_method,
-            group_col=group_col,
-            overlap_only=overlap_only,
-        )
-
-        if result.empty:
-            log.error("Integrating metadata resulted in empty table. Please check datasets and parameters.")
-            sys.exit(1)
-
-        self.integrated_metadata = result
-        log.info(
-            f"Created integrated metadata table with {self.integrated_metadata.shape[0]} rows "
-            f"and {self.integrated_metadata.shape[1]} columns."
-        )
-        log.info(f"Created table: {self._integrated_metadata_filename}")
-        log.info("Created attribute: integrated_metadata")
 
     def integrate_data(
         self,
@@ -1433,22 +1315,16 @@ class Analysis(BaseDataHandler):
 
         if track == 'sample_resolution':
             data_attr = 'scaled_data'
-            log.info("Integrating data matrices (sample_resolution: concatenating scaled_data)...")
-            for ds in self.datasets:
-                if not hasattr(ds, 'scaled_data') or ds.scaled_data is None or ds.scaled_data.empty:
-                    raise RuntimeError(
-                        f"Dataset '{ds.dataset_name}' has no scaled_data. "
-                        "Run analysis.scale_all_datasets() before integrate_data()."
-                    )
+            log.info("Integrating data matrices (paired: concatenating per-sample scaled_data)...")
         else:
             data_attr = 'scaled_data'
-            log.info("Integrating data matrices (condition_resolution: concatenating scaled_data)...")
-            for ds in self.datasets:
-                if not hasattr(ds, 'scaled_data') or ds.scaled_data is None or ds.scaled_data.empty:
-                    raise RuntimeError(
-                        f"Dataset '{ds.dataset_name}' has no scaled_data. "
-                        "Run analysis.scale_all_datasets() before integrate_data()."
-                    )
+            log.info("Integrating data matrices (unpaired: concatenating per-condition scaled_data)...")
+        for ds in self.datasets:
+            if not hasattr(ds, 'scaled_data') or ds.scaled_data is None or ds.scaled_data.empty:
+                raise RuntimeError(
+                    f"Dataset '{ds.dataset_name}' has no scaled_data. "
+                    "Run analysis.scale_all_datasets() before integrate_data()."
+                )
 
         result = hlp.integrate_data(
             datasets=self.datasets,
@@ -1499,7 +1375,7 @@ class Analysis(BaseDataHandler):
         """Plot individual feature abundance by metadata."""
         hlp.plot_feature_abundance_by_metadata(
             data=self.integrated_data,
-            metadata=self.integrated_metadata,
+            metadata=self._metadata_for_integrated_data(),
             feature=feature_id,
             metadata_group=metadata_cat,
             output_dir=self.output_dir,
@@ -1510,7 +1386,7 @@ class Analysis(BaseDataHandler):
         """Plot average abundance of features in submodules across metadata groups."""
         hlp.plot_submodule_abundance_by_metadata(
             data=self.integrated_data_selected,
-            metadata=self.integrated_metadata,
+            metadata=self._metadata_for_integrated_data(),
             node_table=self.feature_network_node_table,
             submodule_name=submodule_name,
             metadata_group=metadata_cat,
@@ -1532,6 +1408,7 @@ class Analysis(BaseDataHandler):
             'config': feature_selection_params,
             'output_dir': self.output_dir,
             'output_filename': self._integrated_data_selected_filename,
+            'datasets': self.datasets,
         }
         call_params.update(kwargs)
 
@@ -1654,7 +1531,7 @@ class Analysis(BaseDataHandler):
             'datasets': self.datasets,
             'annotation_df': self.feature_annotation_table,
             'integrated_data': self.integrated_data_selected,
-            'integrated_metadata': self.integrated_metadata,
+            'integrated_metadata': self._metadata_for_integrated_data(),
             'feature_correlation_table': feature_correlation_table,
         }
         call_params.update(kwargs)
@@ -1755,17 +1632,15 @@ class Analysis(BaseDataHandler):
         # Retrieve config block
         pe = self.analysis_parameters.get('pathway_enrichment', {})
 
-        # We pass the dataframes and the config dict directly to the orchestrator.
-        # The orchestrator will merge pe with override_kwargs.
         call_params = {
             'node_table':        self.feature_network_node_table,
             'quant_df':          self.integrated_data_selected,
-            'metadata_df':       self.integrated_metadata,
+            'metadata_df':       self._metadata_for_integrated_data(),
             'output_dir':        self.output_dir,
             'pe':                pe,
         }
         
-        # Allow user to override any pe parameter or orchestration setting
+        # Allow user to override complex plot settings
         call_params.update(override_kwargs)
 
         return hlp.compare_groups_to_pathways(**call_params)

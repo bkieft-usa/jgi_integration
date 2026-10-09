@@ -30,7 +30,7 @@ from rapidfuzz import fuzz, process
 from IPython.display import display, Image
 
 # --- Typing ---
-from typing import List, Tuple, Union, Optional, Dict, Any, Callable, Literal
+from typing import List, Tuple, Union, Optional, Dict, Any, Callable
 from collections import defaultdict
 
 # --- Scientific computing & data analysis ---
@@ -95,6 +95,9 @@ from joblib import Parallel, delayed
 import plotly.graph_objects as go
 import plotly.io as pio
 #pio.kaleido.scope.mathjax = None
+
+# --- Pure preprocessing functions ---
+import tools.preprocessing as prep
 
 # ====================================
 # Helper functions for various tasks
@@ -292,7 +295,6 @@ def load_project_config(config_path: str = None) -> dict:
 
 def variance_selection(
     data: pd.DataFrame,
-    top_n: int = None,
     max_features: int = 5000,
 ) -> pd.DataFrame:
     """
@@ -302,8 +304,6 @@ def variance_selection(
     ----------
     data : pd.DataFrame
         Feature-by-sample (or feature-by-condition) matrix.
-    top_n : int, optional
-        Alias for ``max_features`` (kept for config compatibility).
     max_features : int
         Number of top-variance features to retain.
 
@@ -312,10 +312,9 @@ def variance_selection(
     pd.DataFrame
         Subset of ``data`` containing only the top-variance features.
     """
-    n_keep = top_n if top_n is not None else max_features
     var_series = data.var(axis=1).sort_values(ascending=False)
-    top_idx = var_series.index[:n_keep]
-    log.info(f"Variance selection: keeping top {n_keep} most variable features.")
+    top_idx = var_series.index[:max_features]
+    log.info(f"Variance selection: keeping top {max_features} most variable features.")
     return data.loc[top_idx]
 
 
@@ -360,13 +359,18 @@ def perform_feature_selection(
     config: Dict[str, Any],
     output_dir: str = None,
     output_filename: str = None,
+    datasets: List = None,
 ) -> pd.DataFrame:
     """
     Apply feature selection to the integrated matrix.
 
     Supported methods (set ``analysis.feature_selection.method`` in ``analysis.yml``):
 
-    * ``"variance"``     — keep the top-N most variable features (row-wise variance).
+    * ``"variance"``     — keep the most variable features. When ``datasets`` is given, each
+      dataset's mean-adjusted log-scale variance (from ``replicate_filtered_data``) is ranked
+      separately within a shared ``max_features`` budget; the z-scored integrated matrix itself
+      has uniform variance and cannot be ranked. Selected blocks are then weighted so every
+      dataset carries equal total variance (disable with ``params.block_scale: false``).
     * ``"feature_list"`` — keep only features present in a user-supplied text file.
 
     Parameters
@@ -406,8 +410,21 @@ def perform_feature_selection(
     log.info(f"Performing feature selection using method '{method}'.")
 
     if method == "variance":
-        top_n = params_block.get("top_n", max_features)
-        subset = variance_selection(data, top_n=top_n, max_features=max_features)
+        if datasets:
+            blocks = {}
+            for ds in datasets:
+                df = ds.replicate_filtered_data.copy()
+                if not df.index.astype(str).str.startswith(f"{ds.dataset_name}_").all():
+                    df.index = [f"{ds.dataset_name}_{i}" for i in df.index]
+                blocks[ds.dataset_name] = df.loc[df.index.isin(data.index)]
+            chosen = prep.select_top_variable(blocks, max_features)
+            selected = [f for feats in chosen.values() for f in feats]
+            subset = data.loc[selected]
+            if params_block.get("block_scale", True):
+                subset, weights = prep.block_scale(subset, tuple(f"{ds.dataset_name}_" for ds in datasets))
+                log.info(f"Block weights applied per dataset: {weights}")
+        else:
+            subset = variance_selection(data, max_features=max_features)
     else:  # feature_list
         feature_list_file = params_block.get("feature_list_file")
         if not feature_list_file:
@@ -936,12 +953,28 @@ def _set_up_matrix(
     scale : float
         Multiplicative factor that must be applied to the dot-product
         `Z_i.T @ Z_j` to obtain the final similarity.
-        For Pearson / Spearman / bicor   → 1/(n_samples-1)
-        For Cosine / Centered-Cosine   → 1
+        For Pearson / Spearman   → 1/(n_samples-1)
+        For Bicor / Cosine / Centered-Cosine   → 1
     """
     n = X.shape[0]
-    
-    if method in ["pearson", "spearman", "bicor"]:
+
+    if method == "bicor":
+        # Biweight midcorrelation: median/MAD-based weights, then unit-norm columns
+        med = np.median(X, axis=0, keepdims=True)
+        dev = X - med
+        mad = np.median(np.abs(dev), axis=0, keepdims=True)
+        mad[mad == 0] = np.inf  # constant feature -> zero vector
+        u = dev / (9.0 * mad)
+        w = (1.0 - u ** 2) ** 2 * (np.abs(u) < 1.0)
+        Xt = dev * w
+        norm = np.linalg.norm(Xt, axis=0, keepdims=True)
+        norm[norm == 0] = 1.0
+        return Xt / norm, 1.0
+
+    if method == "spearman":
+        X = rankdata(X, axis=0)
+
+    if method in ["pearson", "spearman"]:
         # Even if data is already z-scored, we need to:
         # 1. Center (mean = 0)
         # 2. Normalize by std (std = 1)
@@ -2503,11 +2536,11 @@ def group_features_wgcna(
     # ── Step 3: Adjacency matrix ──────────────────────────────────────────────
     log.info(f"WGCNA: Building {'signed' if signed else 'unsigned'} adjacency (β={chosen_power})...")
     if signed:
-        _adj_check = ((1.0 + cor_mat) / 2.0) ** chosen_power
+        adj = ((1.0 + cor_mat) / 2.0) ** chosen_power
     else:
-        _adj_check = np.abs(cor_mat) ** chosen_power
-    np.fill_diagonal(_adj_check, 0.0)
-    _mean_k = _adj_check.sum(axis=1).mean()
+        adj = np.abs(cor_mat) ** chosen_power
+    np.fill_diagonal(adj, 0.0)
+    _mean_k = adj.sum(axis=1).mean()
     log.info(f"WGCNA: β={chosen_power} → mean connectivity={_mean_k:.2f} "
              f"(max possible={n_features - 1}); "
              f"{'network looks near-complete, consider raising β' if _mean_k > 0.3 * (n_features - 1) else 'OK'}")
@@ -3274,10 +3307,11 @@ def _nx_to_plotly_widget(
             if mx_display_name != "Unassigned":
                 display_text = mx_display_name
 
-        # Check for transcriptomics annotation and name
-        elif str(n).startswith('tx_'):
-            tx_go_acc = data.get("tx_go_acc", "Unassigned")
-            tx_display_name = data.get('tx_display_name', "Unassigned")
+        # Check for transcriptomics / proteomics annotation and name
+        elif str(n).startswith(('tx_', 'px_')):
+            ds_prefix = str(n)[:2]
+            tx_go_acc = data.get(f"{ds_prefix}_go_acc", "Unassigned")
+            tx_display_name = data.get(f"{ds_prefix}_display_name", "Unassigned")
             if tx_go_acc != "Unassigned":
                 annotation_text = tx_go_acc
             if tx_display_name != "Unassigned":
@@ -3400,413 +3434,396 @@ def _annotate_and_save_submodules(
 # Dataset acquisition functions
 # ====================================     
 
-def find_mx_parent_folder(
-    pid: str,
-    pi_name: str,
-    mx_dir: str,
-    polarity: str,
-    datatype: str,
-    chromatography: str,
-    filtered_mx: bool = True,
-    overwrite: bool = False,
-    superuser: bool = False
-) -> str:
-    """
-    Find the parent folder for metabolomics (MX) data on Google Drive using rclone.
+# def find_mx_parent_folder(
+#     pid: str,
+#     pi_name: str,
+#     mx_dir: str,
+#     polarity: str,
+#     datatype: str,
+#     chromatography: str,
+#     filtered_mx: bool = True,
+#     overwrite: bool = False,
+# ) -> str:
+#     """
+#     Find the parent folder for metabolomics (MX) data on Google Drive using rclone.
 
-    Args:
-        pid (str): Proposal ID.
-        pi_name (str): PI name.
-        mx_dir (str): Local MX data directory.
-        polarity (str): Polarity ('positive', 'negative', 'multipolarity').
-        datatype (str): Data type ('peak-height', 'peak-area', etc.).
-        chromatography (str): Chromatography type.
-        filtered_mx (bool): Whether to use filtered data.
-        overwrite (bool): Overwrite existing results.
+#     Args:
+#         pid (str): Proposal ID.
+#         pi_name (str): PI name.
+#         mx_dir (str): Local MX data directory.
+#         polarity (str): Polarity ('positive', 'negative', 'multipolarity').
+#         datatype (str): Data type ('peak-height', 'peak-area', etc.).
+#         chromatography (str): Chromatography type.
+#         filtered_mx (bool): Whether to use filtered data.
+#         overwrite (bool): Overwrite existing results.
 
-    Returns:
-        str: Path to the final results folder, or None if not found.
-    """
+#     Returns:
+#         str: Path to the final results folder, or None if not found.
+#     """
     
-    if datatype == "peak-area":
-        datatype = "quant"
-    if filtered_mx and datatype == "quant":
-        log.info("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
-        return None
-    if polarity == "multipolarity":
-        mx_data_pattern = f"{mx_dir}/*{chromatography}*/*_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*_{datatype}.csv"
-    elif polarity in ["positive", "negative"]:
-        mx_data_pattern = f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}.csv"
-    else:
-        log.info(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
-        return None
-    if glob.glob(os.path.expanduser(mx_data_pattern)) and not overwrite:
-        log.info("MX folder already downloaded and linked.")
-        return None
-    elif glob.glob(os.path.expanduser(mx_data_pattern)) and overwrite:
-        if not superuser:
-            raise ValueError("You are not currently authorized to download or overwrite metabolomics data from source. Please contact your JGI project manager for access.")
-        elif superuser:
-            log.info("MX folder already downloaded and linked. Overwriting as per user request...")
-    elif not glob.glob(os.path.expanduser(mx_data_pattern)):
-        if not superuser:
-            raise ValueError("MX folder not found locally. Exiting...")
-        elif superuser:
-            log.info("MX folder not found locally. Proceeding to find and link MX data from Google Drive...")
+#     if datatype == "peak-area":
+#         datatype = "quant"
+#     if filtered_mx and datatype == "quant":
+#         log.info("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
+#         return None
+#     if polarity == "multipolarity":
+#         mx_data_pattern = f"{mx_dir}/*{chromatography}*/*_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*_{datatype}.csv"
+#     elif polarity in ["positive", "negative"]:
+#         mx_data_pattern = f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}.csv"
+#     else:
+#         log.info(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
+#         return None
+#     if glob.glob(os.path.expanduser(mx_data_pattern)) and not overwrite:
+#         log.info("MX folder already downloaded and linked.")
+#         return None
+#     elif glob.glob(os.path.expanduser(mx_data_pattern)) and overwrite:
+#         log.info("MX folder already downloaded and linked. Overwriting as per user request...")
+#     elif not glob.glob(os.path.expanduser(mx_data_pattern)):
+#         log.info("MX folder not found locally. Proceeding to find and link MX data from Google Drive...")
 
-    # Find project folder
-    cmd = f"rclone lsd JGI_Metabolomics_Projects: | grep -E '{pid}|{pi_name}'"
-    log.info("Finding MX parent folders...")
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+#     # Find project folder
+#     cmd = f"rclone lsd JGI_Metabolomics_Projects: | grep -E '{pid}|{pi_name}'"
+#     log.info("Finding MX parent folders...")
+#     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     
-    if result.stdout:
-        data = [line.split()[:5] for line in result.stdout.strip().split('\n')]
-        mx_parent = pd.DataFrame(data, columns=["dir", "date", "time", "size", "folder"])
-        mx_parent = mx_parent[["date", "time", "folder"]]
-        mx_parent["ix"] = range(1, len(mx_parent) + 1)
-        mx_parent = mx_parent[["ix", "date", "time", "folder"]]
-        mx_final_folders = []
-        # For each possible project folder (some will not be the right "final" folder)
-        log.info("Finding MX final folders...")
-        for project_folder in mx_parent["folder"].values:
-            cmd = f"rclone lsd --max-depth 2 JGI_Metabolomics_Projects:{project_folder}"
-            try:
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            except:
-                continue
-            if result.stdout or result.stderr:
-                output = result.stdout if result.stdout else result.stderr
-                data = [line.split()[:5] for line in output.strip().split('\n')]
-                mx_final = pd.DataFrame(data, columns=["dir", "date", "time", "size", "folder"])
-                mx_final = mx_final[["date", "time", "folder"]]
-                mx_final["ix"] = range(1, len(mx_final) + 1)
-                mx_final = mx_final[["ix", "date", "time", "folder"]]
-                mx_final['parent_folder'] = project_folder
-                mx_final_folders.append(mx_final)
-            else:
-                return None
+#     if result.stdout:
+#         data = [line.split()[:5] for line in result.stdout.strip().split('\n')]
+#         mx_parent = pd.DataFrame(data, columns=["dir", "date", "time", "size", "folder"])
+#         mx_parent = mx_parent[["date", "time", "folder"]]
+#         mx_parent["ix"] = range(1, len(mx_parent) + 1)
+#         mx_parent = mx_parent[["ix", "date", "time", "folder"]]
+#         mx_final_folders = []
+#         # For each possible project folder (some will not be the right "final" folder)
+#         log.info("Finding MX final folders...")
+#         for project_folder in mx_parent["folder"].values:
+#             cmd = f"rclone lsd --max-depth 2 JGI_Metabolomics_Projects:{project_folder}"
+#             try:
+#                 result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+#             except:
+#                 continue
+#             if result.stdout or result.stderr:
+#                 output = result.stdout if result.stdout else result.stderr
+#                 data = [line.split()[:5] for line in output.strip().split('\n')]
+#                 mx_final = pd.DataFrame(data, columns=["dir", "date", "time", "size", "folder"])
+#                 mx_final = mx_final[["date", "time", "folder"]]
+#                 mx_final["ix"] = range(1, len(mx_final) + 1)
+#                 mx_final = mx_final[["ix", "date", "time", "folder"]]
+#                 mx_final['parent_folder'] = project_folder
+#                 mx_final_folders.append(mx_final)
+#             else:
+#                 return None
 
-        mx_final_combined = pd.concat(mx_final_folders, ignore_index=True)
-        untargeted_mx_final = mx_final_combined[
-            mx_final_combined["folder"].str.contains("Untargeted", case=False) & 
-            mx_final_combined["folder"].str.contains("final", case=False) & 
-            ~mx_final_combined["folder"].str.contains("pilot", case=False)
-        ]
-        if untargeted_mx_final.shape[0] > 1:
-            log.info("Warning! Multiple untargeted MX final folders found:")
-            log.info(untargeted_mx_final)
-            return None
-        elif untargeted_mx_final.shape[0] == 0:
-            log.info("Warning! No untargeted MX final folders found.")
-            return None
-        else:
-            final_results_folder = f"{untargeted_mx_final['parent_folder'].values[0]}/{untargeted_mx_final['folder'].values[0]}"
+#         mx_final_combined = pd.concat(mx_final_folders, ignore_index=True)
+#         untargeted_mx_final = mx_final_combined[
+#             mx_final_combined["folder"].str.contains("Untargeted", case=False) & 
+#             mx_final_combined["folder"].str.contains("final", case=False) & 
+#             ~mx_final_combined["folder"].str.contains("pilot", case=False)
+#         ]
+#         if untargeted_mx_final.shape[0] > 1:
+#             log.info("Warning! Multiple untargeted MX final folders found:")
+#             log.info(untargeted_mx_final)
+#             return None
+#         elif untargeted_mx_final.shape[0] == 0:
+#             log.info("Warning! No untargeted MX final folders found.")
+#             return None
+#         else:
+#             final_results_folder = f"{untargeted_mx_final['parent_folder'].values[0]}/{untargeted_mx_final['folder'].values[0]}"
 
-        script_dir = f"{mx_dir}/scripts"
-        os.makedirs(script_dir, exist_ok=True)
-        script_name = f"{script_dir}/find_mx_files.sh"
-        with open(script_name, "w") as script_file:
-            script_file.write(f"cd {script_dir}/\n")
-            script_file.write(f"rclone lsd --max-depth 2 JGI_Metabolomics_Projects:{untargeted_mx_final['parent_folder'].values[0]}")
+#         script_dir = f"{mx_dir}/scripts"
+#         os.makedirs(script_dir, exist_ok=True)
+#         script_name = f"{script_dir}/find_mx_files.sh"
+#         with open(script_name, "w") as script_file:
+#             script_file.write(f"cd {script_dir}/\n")
+#             script_file.write(f"rclone lsd --max-depth 2 JGI_Metabolomics_Projects:{untargeted_mx_final['parent_folder'].values[0]}")
         
-        log.info("Using the following metabolomics final results folder for further analysis:")
-        log.info(untargeted_mx_final)
-        return final_results_folder
-    else:
-        log.info(f"Warning! No folders could be found with rclone lsd command: {cmd}")
-        return None
+#         log.info("Using the following metabolomics final results folder for further analysis:")
+#         log.info(untargeted_mx_final)
+#         return final_results_folder
+#     else:
+#         log.info(f"Warning! No folders could be found with rclone lsd command: {cmd}")
+#         return None
 
-def gather_mx_files(
-    mx_untargeted_remote: str,
-    mx_dir: str,
-    polarity: str,
-    datatype: str,
-    chromatography: str,
-    filtered_mx: bool = True,
-    extract: bool = False,
-    overwrite: bool = False
-) -> tuple:
-    """
-    Link MX files from Google Drive to the local directory using rclone, and optionally extract them.
+# def gather_mx_files(
+#     mx_untargeted_remote: str,
+#     mx_dir: str,
+#     polarity: str,
+#     datatype: str,
+#     chromatography: str,
+#     filtered_mx: bool = True,
+#     extract: bool = False,
+#     overwrite: bool = False
+# ) -> tuple:
+#     """
+#     Link MX files from Google Drive to the local directory using rclone, and optionally extract them.
 
-    Args:
-        mx_untargeted_remote (str): Remote MX folder path.
-        mx_dir (str): Local MX data directory.
-        polarity (str): Polarity.
-        datatype (str): Data type.
-        chromatography (str): Chromatography type.
-        filtered_mx (bool): Use filtered data.
-        extract (bool): Extract archives after linking.
-        overwrite (bool): Overwrite existing results.
+#     Args:
+#         mx_untargeted_remote (str): Remote MX folder path.
+#         mx_dir (str): Local MX data directory.
+#         polarity (str): Polarity.
+#         datatype (str): Data type.
+#         chromatography (str): Chromatography type.
+#         filtered_mx (bool): Use filtered data.
+#         extract (bool): Extract archives after linking.
+#         overwrite (bool): Overwrite existing results.
 
-    Returns:
-        tuple: DataFrames of archives and extractions, or None.
-    """
+#     Returns:
+#         tuple: DataFrames of archives and extractions, or None.
+#     """
     
-    if datatype == "peak-area":
-        datatype = "quant"
-    if filtered_mx and datatype == "quant":
-        log.info("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
-        return None
-    if polarity == "multipolarity":
-        mx_data_pattern = f"{mx_dir}/*{chromatography}*/*_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*_{datatype}.csv"
-    elif polarity in ["positive", "negative"]:
-        mx_data_pattern = f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}.csv"
-    else:
-        log.info(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
-        return None
-    if glob.glob(os.path.expanduser(mx_data_pattern)) and not overwrite:
-        log.info("MX data already linked.")
-        return "Archive already linked", "Archive already extracted"
-    else:
-        if superuser:
-            log.info("You are a superuser. Proceeding with the download...")
-        else:
-            raise ValueError("You are not currently authorized to download metabolomics data from source. Please contact your JGI project manager for access.")
+#     if datatype == "peak-area":
+#         datatype = "quant"
+#     if filtered_mx and datatype == "quant":
+#         log.info("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
+#         return None
+#     if polarity == "multipolarity":
+#         mx_data_pattern = f"{mx_dir}/*{chromatography}*/*_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*_{datatype}.csv"
+#     elif polarity in ["positive", "negative"]:
+#         mx_data_pattern = f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}.csv"
+#     else:
+#         log.info(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
+#         return None
+#     if glob.glob(os.path.expanduser(mx_data_pattern)) and not overwrite:
+#         log.info("MX data already linked.")
+#         return "Archive already linked", "Archive already extracted"
+#     else:
+#         raise ValueError("You are not currently authorized to download metabolomics data from source. Please contact your JGI project manager for access.")
     
-    script_dir = f"{mx_dir}/scripts"
-    os.makedirs(script_dir, exist_ok=True)
-    script_name = f"{script_dir}/gather_mx_files.sh"
-    if chromatography == "C18":
-        chromatography = "C18_" # This (hopefully) removes C18-Lipid
+#     script_dir = f"{mx_dir}/scripts"
+#     os.makedirs(script_dir, exist_ok=True)
+#     script_name = f"{script_dir}/gather_mx_files.sh"
+#     if chromatography == "C18":
+#         chromatography = "C18_" # This (hopefully) removes C18-Lipid
 
-    # Create the script to link MX files
-    with open(script_name, "w") as script_file:
-        script_file.write(f"cd {script_dir}/\n")
-        script_file.write(f"rclone copy --include '*{chromatography}*.zip' --stats-one-line -v --max-depth 1 JGI_Metabolomics_Projects:{mx_untargeted_remote} {mx_dir};")
+#     # Create the script to link MX files
+#     with open(script_name, "w") as script_file:
+#         script_file.write(f"cd {script_dir}/\n")
+#         script_file.write(f"rclone copy --include '*{chromatography}*.zip' --stats-one-line -v --max-depth 1 JGI_Metabolomics_Projects:{mx_untargeted_remote} {mx_dir};")
     
-    log.info("Linking MX files...")
-    result = subprocess.run(f"chmod +x {script_name} && {script_name}", shell=True, check=True, capture_output=True, text=True)
+#     log.info("Linking MX files...")
+#     result = subprocess.run(f"chmod +x {script_name} && {script_name}", shell=True, check=True, capture_output=True, text=True)
 
-    if result.stdout or result.stderr:
-        output = result.stdout if result.stdout else result.stderr
-        data = [line.split() for line in output.strip().split('\n')]
-        archives = pd.DataFrame(data)
-        if extract is True:
-            extractions = extract_mx_archives(mx_dir, chromatography)
-            display(extractions)
-            return archives, extractions
-        else:
-            return archives
-    else:
-        log.info(f"Warning! No files could be found with rclone copy command in {script_name}")
-        return None
+#     if result.stdout or result.stderr:
+#         output = result.stdout if result.stdout else result.stderr
+#         data = [line.split() for line in output.strip().split('\n')]
+#         archives = pd.DataFrame(data)
+#         if extract is True:
+#             extractions = extract_mx_archives(mx_dir, chromatography)
+#             display(extractions)
+#             return archives, extractions
+#         else:
+#             return archives
+#     else:
+#         log.info(f"Warning! No files could be found with rclone copy command in {script_name}")
+#         return None
 
-def extract_mx_archives(mx_dir: str, chromatography: str) -> pd.DataFrame:
-    """
-    Extract MX zip archives in the specified directory.
+# def extract_mx_archives(mx_dir: str, chromatography: str) -> pd.DataFrame:
+#     """
+#     Extract MX zip archives in the specified directory.
 
-    Args:
-        mx_dir (str): Directory containing MX archives.
-        chromatography (str): Chromatography type.
+#     Args:
+#         mx_dir (str): Directory containing MX archives.
+#         chromatography (str): Chromatography type.
 
-    Returns:
-        pd.DataFrame: DataFrame of extracted files.
-    """
+#     Returns:
+#         pd.DataFrame: DataFrame of extracted files.
+#     """
     
-    cmd = f"for archive in {mx_dir}/*{chromatography}*zip; do newdir={mx_dir}/$(basename $archive .zip); rm -rf $newdir; mkdir -p $newdir; unzip -j $archive -d $newdir; done"
-    log.info("Extracting the following archive to be used for MX data input:")
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+#     cmd = f"for archive in {mx_dir}/*{chromatography}*zip; do newdir={mx_dir}/$(basename $archive .zip); rm -rf $newdir; mkdir -p $newdir; unzip -j $archive -d $newdir; done"
+#     log.info("Extracting the following archive to be used for MX data input:")
+#     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     
-    if result.stdout:
-        data = [line.split() for line in result.stdout.strip().split('\n')]
-        df = pd.DataFrame(data)
-        df = df[df.iloc[:, 0].str.contains('Archive', na=False)]
-        df.iloc[:, 1] = df.iloc[:, 1].str.replace(f"{mx_dir}/", "", regex=False)
-        return df
-    else:
-        log.info(f"No archives could be decompressed with unzip command: {cmd}")
-        return None
+#     if result.stdout:
+#         data = [line.split() for line in result.stdout.strip().split('\n')]
+#         df = pd.DataFrame(data)
+#         df = df[df.iloc[:, 0].str.contains('Archive', na=False)]
+#         df.iloc[:, 1] = df.iloc[:, 1].str.replace(f"{mx_dir}/", "", regex=False)
+#         return df
+#     else:
+#         log.info(f"No archives could be decompressed with unzip command: {cmd}")
+#         return None
 
 
-def find_tx_files(
-    pid: str,
-    tx_dir: str,
-    tx_index: int,
-    overwrite: bool = False,
-    superuser: bool = False
-) -> pd.DataFrame:
-    """
-    Find TX files for a project using JAMO report select.
+# def find_tx_files(
+#     pid: str,
+#     tx_dir: str,
+#     tx_index: int,
+#     overwrite: bool = False,
+# ) -> pd.DataFrame:
+#     """
+#     Find TX files for a project using JAMO report select.
 
-    Args:
-        pid (str): Proposal ID.
-        tx_dir (str): TX data directory.
-        tx_index (int): Index of analysis project to use.
-        overwrite (bool): Overwrite existing results.
+#     Args:
+#         pid (str): Proposal ID.
+#         tx_dir (str): TX data directory.
+#         tx_index (int): Index of analysis project to use.
+#         overwrite (bool): Overwrite existing results.
 
-    Returns:
-        pd.DataFrame: DataFrame of TX file information.
-    """
+#     Returns:
+#         pd.DataFrame: DataFrame of TX file information.
+#     """
     
-    if os.path.exists(f"{tx_dir}/all_tx_portal_files.txt") and overwrite is False:
-        log.info("TX files already found.")
-        return pd.DataFrame()
-    else:
-        if superuser:
-            log.info("You are a superuser. Proceeding with finding TX files...")
-        else:
-            raise ValueError("You are not currently authorized to download transcriptomics data from source. Please contact your JGI project manager for access.")
+#     if os.path.exists(f"{tx_dir}/all_tx_portal_files.txt") and overwrite is False:
+#         log.info("TX files already found.")
+#         return pd.DataFrame()
+#     else:
+#         raise ValueError("You are not currently authorized to download transcriptomics data from source. Please contact your JGI project manager for access.")
     
-    file_list = f"{tx_dir}/all_tx_portal_files.txt"
-    script_dir = f"{tx_dir}/scripts"
-    os.makedirs(script_dir, exist_ok=True)
-    script_name = f"{script_dir}/find_tx_files.sh"
+#     file_list = f"{tx_dir}/all_tx_portal_files.txt"
+#     script_dir = f"{tx_dir}/scripts"
+#     os.makedirs(script_dir, exist_ok=True)
+#     script_name = f"{script_dir}/find_tx_files.sh"
 
-    if not os.path.exists(os.path.dirname(file_list)):
-        os.makedirs(os.path.dirname(file_list))
-    if not os.path.exists(os.path.dirname(script_name)):
-        os.makedirs(os.path.dirname(script_name))
+#     if not os.path.exists(os.path.dirname(file_list)):
+#         os.makedirs(os.path.dirname(file_list))
+#     if not os.path.exists(os.path.dirname(script_name)):
+#         os.makedirs(os.path.dirname(script_name))
     
-    log.info("Creating script to find TX files...")
-    script_content = (
-        f"jamo report select _id,metadata.analysis_project.analysis_project_id,metadata.library_name,metadata.analysis_project.status_name where "
-        f"metadata.proposal_id={pid} file_name=counts.txt "
-        f"| sed 's/\\[//g' | sed 's/\\]//g' | sed 's/u'\\''//g' | sed 's/'\\''//g' | sed 's/ //g' > {file_list}"
-    )
+#     log.info("Creating script to find TX files...")
+#     script_content = (
+#         f"jamo report select _id,metadata.analysis_project.analysis_project_id,metadata.library_name,metadata.analysis_project.status_name where "
+#         f"metadata.proposal_id={pid} file_name=counts.txt "
+#         f"| sed 's/\\[//g' | sed 's/\\]//g' | sed 's/u'\\''//g' | sed 's/'\\''//g' | sed 's/ //g' > {file_list}"
+#     )
 
-    log.info("Finding TX files...")
-    subprocess.run(
-        f"echo \"{script_content}\" > {script_name} && chmod +x {script_name} && module load jamo && source {script_name}",
-        shell=True, check=True
-    )
+#     log.info("Finding TX files...")
+#     subprocess.run(
+#         f"echo \"{script_content}\" > {script_name} && chmod +x {script_name} && module load jamo && source {script_name}",
+#         shell=True, check=True
+#     )
     
-    files = pd.read_csv(file_list, header=None, sep="\t")
-    files.columns = ["fileID.counts", "APID", "libIDs", "status"]
-    files["nLibs"] = files["libIDs"].apply(lambda ll: len(ll.split(",")))
+#     files = pd.read_csv(file_list, header=None, sep="\t")
+#     files.columns = ["fileID.counts", "APID", "libIDs", "status"]
+#     files["nLibs"] = files["libIDs"].apply(lambda ll: len(ll.split(",")))
     
-    def get_tpm_file_id(apid):
-        result = subprocess.run(
-            f"module load jamo; jamo report select _id where file_name=tpm_counts.txt,metadata.analysis_project.analysis_project_id={apid}",
-            shell=True, capture_output=True, text=True
-        )
-        return result.stdout.strip()
+#     def get_tpm_file_id(apid):
+#         result = subprocess.run(
+#             f"module load jamo; jamo report select _id where file_name=tpm_counts.txt,metadata.analysis_project.analysis_project_id={apid}",
+#             shell=True, capture_output=True, text=True
+#         )
+#         return result.stdout.strip()
     
-    files["fileID.tpm"] = files["APID"].apply(get_tpm_file_id)
+#     files["fileID.tpm"] = files["APID"].apply(get_tpm_file_id)
     
-    def fetch_refs(apid):
-        try:
-            cmd = (
-                f"x=$(curl https://rqc.jgi.lbl.gov/api/seq_jat_import/apid_to_ref/{apid}); "
-                f"echo $(echo $x | jq .name)','$(echo $x | jq .Genome[].file_path)','$(echo $x | jq .Transcriptome[].file_path)','$(echo $x | jq .Annotation[].file_path)','$(echo $x | jq .KEGG[].file_path)"
-            )
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            ref_data = pd.read_csv(io.StringIO(result.stdout), header=None, sep=",")
-            ref_data.columns = ["ref_name", "ref_genome", "ref_transcriptome", "ref_gff", "ref_protein_kegg"]
-            ref_data["APID"] = apid
-            return ref_data
-        except Exception as e:
-            log.info(f"Error fetching refs for {apid}: {e}")
-            return pd.DataFrame({"ref_name": [np.nan], "ref_genome": [np.nan], "ref_transcriptome": [np.nan], "ref_gff": [np.nan], "ref_protein_kegg": [np.nan], "APID": [apid]})
+#     def fetch_refs(apid):
+#         try:
+#             cmd = (
+#                 f"x=$(curl https://rqc.jgi.lbl.gov/api/seq_jat_import/apid_to_ref/{apid}); "
+#                 f"echo $(echo $x | jq .name)','$(echo $x | jq .Genome[].file_path)','$(echo $x | jq .Transcriptome[].file_path)','$(echo $x | jq .Annotation[].file_path)','$(echo $x | jq .KEGG[].file_path)"
+#             )
+#             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+#             ref_data = pd.read_csv(io.StringIO(result.stdout), header=None, sep=",")
+#             ref_data.columns = ["ref_name", "ref_genome", "ref_transcriptome", "ref_gff", "ref_protein_kegg"]
+#             ref_data["APID"] = apid
+#             return ref_data
+#         except Exception as e:
+#             log.info(f"Error fetching refs for {apid}: {e}")
+#             return pd.DataFrame({"ref_name": [np.nan], "ref_genome": [np.nan], "ref_transcriptome": [np.nan], "ref_gff": [np.nan], "ref_protein_kegg": [np.nan], "APID": [apid]})
     
-    refs = pd.concat([fetch_refs(apid) for apid in files["APID"].unique()], ignore_index=True)
-    files = files.merge(refs, on="APID", how="left").sort_values(by=["ref_name", "APID"]).reset_index(drop=True)
-    files["ix"] = files.index + 1
-    # Move "ix" column to the beginning
-    cols = ["ix"] + [col for col in files.columns if col != "ix"]
-    files = files[cols]
-    files.reset_index(drop=True)
+#     refs = pd.concat([fetch_refs(apid) for apid in files["APID"].unique()], ignore_index=True)
+#     files = files.merge(refs, on="APID", how="left").sort_values(by=["ref_name", "APID"]).reset_index(drop=True)
+#     files["ix"] = files.index + 1
+#     # Move "ix" column to the beginning
+#     cols = ["ix"] + [col for col in files.columns if col != "ix"]
+#     files = files[cols]
+#     files.reset_index(drop=True)
     
-    if files.shape[0] > 0:
-        log.info(f"Using the value of 'tx_index' ({tx_index}) from the config file to choose the correct 'ix' column (change if incorrect): ")
-        files.to_csv(f"{tx_dir}/all_tx_portal_files.txt", sep="\t", index=False)
-        display(files)
-        return files
-    else:
-        log.info("No files found.")
-        return None
+#     if files.shape[0] > 0:
+#         log.info(f"Using the value of 'tx_index' ({tx_index}) from the config file to choose the correct 'ix' column (change if incorrect): ")
+#         files.to_csv(f"{tx_dir}/all_tx_portal_files.txt", sep="\t", index=False)
+#         display(files)
+#         return files
+#     else:
+#         log.info("No files found.")
+#         return None
 
-def gather_tx_files(
-    file_list: pd.DataFrame,
-    tx_index: int = None,
-    tx_dir: str = None,
-    overwrite: bool = False
-) -> str:
-    """
-    Link TX files to the working directory using JAMO.
+# def gather_tx_files(
+#     file_list: pd.DataFrame,
+#     tx_index: int = None,
+#     tx_dir: str = None,
+#     overwrite: bool = False
+# ) -> str:
+#     """
+#     Link TX files to the working directory using JAMO.
 
-    Args:
-        file_list (pd.DataFrame): DataFrame of TX file information.
-        tx_index (int): Index of analysis project to use.
-        tx_dir (str): TX data directory.
-        overwrite (bool): Overwrite existing results.
+#     Args:
+#         file_list (pd.DataFrame): DataFrame of TX file information.
+#         tx_index (int): Index of analysis project to use.
+#         tx_dir (str): TX data directory.
+#         overwrite (bool): Overwrite existing results.
 
-    Returns:
-        str: Analysis project ID (APID).
-    """
+#     Returns:
+#         str: Analysis project ID (APID).
+#     """
 
-    if glob.glob(f"{tx_dir}/*counts.txt") and os.path.exists(f"{tx_dir}/all_tx_portal_files.txt") and overwrite is False:
-        log.info("TX files already linked.")
-        tx_files = pd.read_csv(f"{tx_dir}/all_tx_portal_files.txt", sep="\t")
-        apid = int(tx_files.iloc[tx_index-1:,2].values)
-        return apid
-    else:
-        if superuser:
-            log.info("You are a superuser. Proceeding with linking TX files...")
-        else:
-            raise ValueError("You are not currently authorized to download transcriptomics data from source. Please contact your JGI project manager for access.")
+#     if glob.glob(f"{tx_dir}/*counts.txt") and os.path.exists(f"{tx_dir}/all_tx_portal_files.txt") and overwrite is False:
+#         log.info("TX files already linked.")
+#         tx_files = pd.read_csv(f"{tx_dir}/all_tx_portal_files.txt", sep="\t")
+#         apid = int(tx_files.iloc[tx_index-1:,2].values)
+#         return apid
+#     else:
+#         raise ValueError("You are not currently authorized to download transcriptomics data from source. Please contact your JGI project manager for access.")
 
 
-    if tx_index is None:
-        log.info("There may be multiple APIDS or analyses for a given PI/Proposal ID and you have not specified which one to use!")
-        log.info("Please set 'tx_index' in the project config file by choosing the correct row from the table above.")
-        sys.exit(1)
+#     if tx_index is None:
+#         log.info("There may be multiple APIDS or analyses for a given PI/Proposal ID and you have not specified which one to use!")
+#         log.info("Please set 'tx_index' in the project config file by choosing the correct row from the table above.")
+#         sys.exit(1)
 
-    script_dir = f"{tx_dir}/scripts"
-    os.makedirs(script_dir, exist_ok=True)
-    script_name = f"{script_dir}/gather_tx_files.sh"
-    log.info("Linking TX files...")
+#     script_dir = f"{tx_dir}/scripts"
+#     os.makedirs(script_dir, exist_ok=True)
+#     script_name = f"{script_dir}/gather_tx_files.sh"
+#     log.info("Linking TX files...")
 
-    with open(script_name, "w") as script_file:
-        script_file.write(f"cd {script_dir}/\n")
+#     with open(script_name, "w") as script_file:
+#         script_file.write(f"cd {script_dir}/\n")
         
-        file_list = file_list[file_list["ix"] == tx_index]
-        apid = file_list["APID"].values[0]
-        for _, row in file_list.iterrows():
-            for file_type in ["counts","tpm"]: # "tpm_counts" may be needed for older projects
-                file_id = row[f"fileID.{file_type}"]
-                apid = row['APID']
-                filename = f"{tx_dir}/{row['ix']}_{apid}.{file_type}.txt"
-                if file_type == "tpm":
-                    file_type = "tpm_counts"
-                script_file.write(f"""
-                    module load jamo;
-                    if [ $(jamo info id {file_id} | cut -f3 -d' ') == 'PURGED' ]; then 
-                        echo file purged! fetching {file_id} - rerun later to link; jamo fetch id {file_id} 2>&1 > /dev/null
-                    else 
-                        if [ $(jamo info id {file_id} | cut -f3 -d' ') == 'RESTORE_IN_PROGRESS' ]; then 
-                            echo restore in progress for file id {file_id} - rerun later to link
-                        else
-                            echo "\t{file_type} file for APID {apid} with ID {file_id} linked to {filename}";
-                            jamo link id {file_id} 2>&1 > /dev/null;
-                            mv {file_id}.{file_type}.txt {filename}
-                        fi
-                    fi
-                    """)
-            for file_type in ["genome","transcriptome","gff","protein_kegg"]:
-                file_path = row[f"ref_{file_type}"]
-                try:
-                    apid = row['APID']
-                    filename = f"{tx_dir}/{os.path.basename(file_path)}"
-                    if file_path:
-                        script_file.write(f"""
-                            echo "\t{file_type} file for APID {apid} to {file_path}";
-                            ln -sf {file_path} {tx_dir}/
-                        """)
-                except:
-                    log.info(f"\tError linking {file_type} file for APID {apid}. File does not exist or you may need to wait for files to be restored.")
-                    continue
+#         file_list = file_list[file_list["ix"] == tx_index]
+#         apid = file_list["APID"].values[0]
+#         for _, row in file_list.iterrows():
+#             for file_type in ["counts","tpm"]: # "tpm_counts" may be needed for older projects
+#                 file_id = row[f"fileID.{file_type}"]
+#                 apid = row['APID']
+#                 filename = f"{tx_dir}/{row['ix']}_{apid}.{file_type}.txt"
+#                 if file_type == "tpm":
+#                     file_type = "tpm_counts"
+#                 script_file.write(f"""
+#                     module load jamo;
+#                     if [ $(jamo info id {file_id} | cut -f3 -d' ') == 'PURGED' ]; then 
+#                         echo file purged! fetching {file_id} - rerun later to link; jamo fetch id {file_id} 2>&1 > /dev/null
+#                     else 
+#                         if [ $(jamo info id {file_id} | cut -f3 -d' ') == 'RESTORE_IN_PROGRESS' ]; then 
+#                             echo restore in progress for file id {file_id} - rerun later to link
+#                         else
+#                             echo "\t{file_type} file for APID {apid} with ID {file_id} linked to {filename}";
+#                             jamo link id {file_id} 2>&1 > /dev/null;
+#                             mv {file_id}.{file_type}.txt {filename}
+#                         fi
+#                     fi
+#                     """)
+#             for file_type in ["genome","transcriptome","gff","protein_kegg"]:
+#                 file_path = row[f"ref_{file_type}"]
+#                 try:
+#                     apid = row['APID']
+#                     filename = f"{tx_dir}/{os.path.basename(file_path)}"
+#                     if file_path:
+#                         script_file.write(f"""
+#                             echo "\t{file_type} file for APID {apid} to {file_path}";
+#                             ln -sf {file_path} {tx_dir}/
+#                         """)
+#                 except:
+#                     log.info(f"\tError linking {file_type} file for APID {apid}. File does not exist or you may need to wait for files to be restored.")
+#                     continue
 
-    subprocess.run(f"chmod +x {script_name} && {script_name}", shell=True, check=True)
+#     subprocess.run(f"chmod +x {script_name} && {script_name}", shell=True, check=True)
     
-    if apid:
-        with open(f"{tx_dir}/apid.txt", "w") as f:
-            f.write(str(apid))
-        log.info(f"Working with APID: {apid} from tx_index {tx_index}.")
-        return apid
-    else:
-        log.info("Warning: Did not find APID. Check the index you selected from the tx_files object.")
-        return None
+#     if apid:
+#         with open(f"{tx_dir}/apid.txt", "w") as f:
+#             f.write(str(apid))
+#         log.info(f"Working with APID: {apid} from tx_index {tx_index}.")
+#         return apid
+#     else:
+#         log.info("Warning: Did not find APID. Check the index you selected from the tx_files object.")
+#         return None
 
 def get_mx_data(
     input_dir: str,
@@ -3816,7 +3833,6 @@ def get_mx_data(
     polarity: str,
     datatype: str = "peak-height",
     filtered_mx: bool = True,
-    superuser: bool = False,
 ) -> pd.DataFrame:
     """
     Load MX data from extracted files, optionally filtered.
@@ -4108,13 +4124,38 @@ def get_tx_data(
         log.warning("Have you run _get_raw_metadata() to link the TX data files?")
         return None
     
+def get_px_data(
+    input_dir: str,
+    output_dir: str,
+    output_filename: str,
+    datatype: str = "peak-height",
+) -> pd.DataFrame:
+    """
+    Load PX (proteomics) peak-height data from ``<input_dir>/<datatype>.csv``.
+
+    Layout matches the other tables: first column is the feature (protein) ID, remaining
+    columns are samples. Feature IDs are prefixed with ``px_`` when not already present.
+    """
+    px_files = glob.glob(os.path.expanduser(f"{input_dir}/{datatype}.csv"))
+    if not px_files:
+        log.warning(f"PX data file {input_dir}/{datatype}.csv not found.")
+        return None
+    px_data = pd.read_csv(px_files[0])
+    identifier_column = px_data.columns[0]
+    px_data[identifier_column] = px_data[identifier_column].apply(
+        lambda x: x if str(x).startswith('px_') else f'px_{x}'
+    )
+    log.info(f"PX data loaded from {px_files[0]}")
+    write_integration_file(data=px_data, output_dir=output_dir, filename=output_filename, indexing=False)
+    return px_data
+
+
 def get_tx_metadata(
     tx_files: pd.DataFrame,
     output_dir: str,
     proposal_ID: str,
     apid: str,
     overwrite: bool = False,
-    superuser: bool = False
 ) -> pd.DataFrame:
     """
     Extract TX metadata using JAMO report select.
@@ -4135,11 +4176,8 @@ def get_tx_metadata(
         tx_metadata = pd.read_csv(f"{output_dir}/portal_metadata.csv")
         return tx_metadata
     else:
-        if superuser:
-            log.info("You are a superuser. Proceeding with pulling TX metadata from source...")
-        else:
-            log.info(f"Source file {output_dir}/portal_metadata.csv does not exist.")
-            raise ValueError("You are not currently authorized to download transcriptomics metadata from source. Please contact your JGI project manager for access.")
+        log.info(f"Source file {output_dir}/portal_metadata.csv does not exist.")
+        raise ValueError("You are not currently authorized to download transcriptomics metadata from source. Please contact your JGI project manager for access.")
 
     myfields = [
         "metadata.proposal_id",
@@ -4208,20 +4246,22 @@ def get_tx_metadata(
 # Feature annotation functions
 # ====================================
 
-def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.DataFrame) -> None:
+def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.DataFrame, prefix: str = "tx") -> None:
     """
     Validate that gene IDs in annotation table match those in raw data.
     
     Args:
         annotation_df (pd.DataFrame): Annotation table with transcriptome_id column
-        raw_data (pd.DataFrame): Raw transcriptomics data with IDs in its first column
+        raw_data (pd.DataFrame): Raw data with feature IDs in its first column
+        prefix (str): Dataset prefix ("tx" or "px") applied to feature IDs
     """
     identifier_column = raw_data.columns[0]
+    tag = f"{prefix}_"
 
-    # If "tx_" prefix is used in raw data, ensure annotation gene IDs also have it
-    if all(str(gid).startswith('tx_') for gid in raw_data[identifier_column]):
-        if not all(str(gid).startswith('tx_') for gid in annotation_df['transcriptome_id']):
-            annotation_df['transcriptome_id'] = annotation_df['transcriptome_id'].apply(lambda x: f'tx_{x}')
+    # If the prefix is used in raw data, ensure annotation gene IDs also have it
+    if all(str(gid).startswith(tag) for gid in raw_data[identifier_column]):
+        if not all(str(gid).startswith(tag) for gid in annotation_df['transcriptome_id']):
+            annotation_df['transcriptome_id'] = annotation_df['transcriptome_id'].apply(lambda x: f'{tag}{x}')
 
     # Get gene IDs from both datasets
     raw_data_genes = set(raw_data[identifier_column].tolist())
@@ -4737,7 +4777,7 @@ def _read_and_select_algal_annotations(
             df = df[selected_cols].copy()
             df.rename(columns={
                 identifier_column: 'protein_id',
-                'ecNum': 'kegg_acc',
+                'ecNum': 'kegg_ec',
                 'definition': 'kegg_desc'
             }, inplace=True)
             
@@ -5227,18 +5267,31 @@ def _get_modelseed_compounds(cache_path: Path) -> pd.DataFrame:
     independent lookup builders (`_build_inchikey_to_cpd`, `_build_inchikey_prefix_to_cpd`,
     `_build_fuzzy_name_candidates`).
     """
-    _MODELSEED_COMPOUNDS_URL = (
+    # Dev branch splits compounds across compound_00.tsv, compound_01.tsv, ...
+    _MODELSEED_COMPOUND_PART_URL = (
         "https://raw.githubusercontent.com/ModelSEED/ModelSEEDDatabase/"
-        "master/Biochemistry/compounds.tsv"
+        "dev/Biochemistry/compound_{:02d}.tsv"
     )
     if cache_path.exists():
         log.info(f"Loading ModelSEED compounds from local cache: {cache_path}")
     else:
-        log.info(f"Fetching ModelSEED compounds table from {_MODELSEED_COMPOUNDS_URL}")
-        resp = requests.get(_MODELSEED_COMPOUNDS_URL, timeout=30)
-        resp.raise_for_status()
+        parts = []
+        part_idx = 0
+        while True:
+            url = _MODELSEED_COMPOUND_PART_URL.format(part_idx)
+            resp = requests.get(url, timeout=30)
+            if resp.status_code == 404:  # first missing index marks the end
+                break
+            resp.raise_for_status()
+            parts.append(pd.read_csv(io.StringIO(resp.text), sep="\t", low_memory=False))
+            part_idx += 1
+
+        if not parts:
+            raise RuntimeError("No ModelSEED compound_##.tsv files found on the dev branch.")
+
+        log.info(f"Fetched and concatenated {len(parts)} ModelSEED compound part files")
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(resp.text, encoding="utf-8")
+        pd.concat(parts, ignore_index=True).to_csv(cache_path, sep="\t", index=False)
         log.info(f"Saved ModelSEED compounds cache to {cache_path}")
 
     return pd.read_csv(cache_path, sep="\t", low_memory=False)
@@ -5468,13 +5521,16 @@ def add_modelseed_pathway_column(
     rxn_to_pathways = _build_rxn_to_pathways(cache_path)
     cpd_to_pathways = _build_cpd_to_pathways(cache_path)
 
-    if rxn_col not in df.columns:
-        candidates = [c for c in df.columns if c.endswith("_modelseed_rxn") or c == "modelseed_rxn"]
-        if candidates:
-            log.info(f"'{rxn_col}' not found; auto-detected transcript rxn column(s): {candidates}")
-            rxn_col = candidates[0]
-        else:
-            rxn_col = None
+    if rxn_col in df.columns:
+        rxn_cols = [rxn_col]
+    else:
+        rxn_cols = []
+    # Use every reaction column (tx_ and px_ share the TX annotation format)
+    rxn_cols = list(dict.fromkeys(
+        rxn_cols + [c for c in df.columns if c.endswith("_modelseed_rxn") or c == "modelseed_rxn"]
+    ))
+    if rxn_cols:
+        log.info(f"Using reaction column(s) for pathway assignment: {rxn_cols}")
 
     if cpd_col not in df.columns:
         candidates = [c for c in df.columns if c.endswith("_modelseed_id") or c == "modelseed_id"]
@@ -5507,8 +5563,8 @@ def add_modelseed_pathway_column(
 
     def _row_pathway(row: pd.Series) -> str:
         pathways: set[str] = set()
-        if rxn_col is not None:
-            pathways |= _resolve(row[rxn_col], rxn_to_pathways)
+        for col in rxn_cols:
+            pathways |= _resolve(row[col], rxn_to_pathways)
         if cpd_col is not None:
             pathways |= _resolve(row[cpd_col], cpd_to_pathways)
         return sep.join(sorted(pathways)) if pathways else missing_token
@@ -5519,8 +5575,8 @@ def add_modelseed_pathway_column(
     n_mapped = (out[out_col] != missing_token).sum()
 
     n_tx_mapped = (
-        (~out[rxn_col].apply(_is_missing) & (out[out_col] != missing_token)).sum()
-        if rxn_col is not None else 0
+        (~out[rxn_cols].apply(lambda s: s.apply(_is_missing)).all(axis=1) & (out[out_col] != missing_token)).sum()
+        if rxn_cols else 0
     )
     n_mx_mapped = (
         (~out[cpd_col].apply(_is_missing) & (out[out_col] != missing_token)).sum()
@@ -5784,9 +5840,13 @@ def generate_tx_annotation_table(
     output_dir: str,
     output_filename: str,
     identifier_column: str = None,
+    prefix: str = "tx",
 ) -> pd.DataFrame:
     """
     Generate a merged gene annotation table from multiple annotation files.
+
+    The same annotation files/formats serve tx and px data; ``prefix`` selects the
+    feature-ID prefix ("tx" or "px") used to match annotations to the data.
 
     Args:
         raw_data (pd.DataFrame): Raw transcriptomics data with gene IDs as index
@@ -5825,7 +5885,7 @@ def generate_tx_annotation_table(
         raise ValueError(f"Invalid genome_type '{genome_type}'. Must be one of: 'microbe', 'algal', 'metagenome', 'plant'")
 
     if not raw_data.empty and not annotation_df.empty:
-        _validate_annotation_gene_ids(annotation_df, raw_data)
+        _validate_annotation_gene_ids(annotation_df, raw_data, prefix)
     else:
         raise ValueError("Either input raw_data or computed annotation_df is empty. Cannot validate gene IDs.")
 
@@ -6221,17 +6281,25 @@ def add_compound_pathway_column(
 
 def get_ec_or_ko_ids(
     row: pd.Series,
-    ec_col: str = "tx_kegg_ec",
-    ko_col: str = "tx_ko_acc",
+    ec_col: Union[str, List[str]] = "tx_kegg_ec",
+    ko_col: Union[str, List[str]] = "tx_ko_acc",
 ) -> Tuple[List[str], Optional[str]]:
     """
-    Return (ids, source) for a row, using ec_col if present, falling back
-    to ko_col. source is 'ec', 'ko', or None if neither has values.
+    Return (ids, source) for a row, using the EC column(s) if present, falling back
+    to the KO column(s). source is 'ec', 'ko', or None if neither has values.
+    Each argument may be one column name or a list (e.g. tx_ and px_ columns).
     """
-    ec_ids = split_list_cell(row.get(ec_col), delimiter=",", drop_sentinel="Unassigned", keep_empty=False)
+    def _collect(cols) -> List[str]:
+        cols = [cols] if isinstance(cols, str) else list(cols or [])
+        ids: List[str] = []
+        for c in cols:
+            ids += split_list_cell(row.get(c), delimiter=",", drop_sentinel="Unassigned", keep_empty=False)
+        return list(dict.fromkeys(ids))
+
+    ec_ids = _collect(ec_col)
     if ec_ids:
         return ec_ids, "ec"
-    ko_ids = split_list_cell(row.get(ko_col), delimiter=",", drop_sentinel="Unassigned", keep_empty=False)
+    ko_ids = _collect(ko_col)
     if ko_ids:
         return ko_ids, "ko"
     return [], None
@@ -6239,8 +6307,8 @@ def get_ec_or_ko_ids(
 
 def add_ec_ko_pathway_column(
     df: pd.DataFrame,
-    ec_col: str = "tx_kegg_ec",
-    ko_col: str = "tx_ko_acc",
+    ec_col: Union[str, List[str]] = "tx_kegg_ec",
+    ko_col: Union[str, List[str]] = "tx_ko_acc",
     pathway_col: str = "kegg_pathway",
     pathway_sep: str = ";",
     delay: float = 0.2,
@@ -6362,6 +6430,10 @@ def add_kegg_pathway_name_column(
     df[new_col] = df[pathway_col].apply(map_cell)
     return df
 
+def _find_columns(df: pd.DataFrame, suffixes: List[str]) -> List[str]:
+    """All columns whose name ends with any of the given suffixes (case-insensitive)."""
+    return [c for c in df.columns if any(c.lower().endswith(s.lower()) for s in suffixes)]
+
 def _find_column(df: pd.DataFrame, suffixes: List[str]) -> Optional[str]:
     """Find the first column whose name ends with any of the given suffixes (case-insensitive)."""
     for col in df.columns:
@@ -6398,8 +6470,8 @@ def add_kegg_pathway_annotations(
     cache_dir = Path(cache_dir) if cache_dir else None
 
     inchikey_col = _find_column(df, list(inchikey_suffixes))
-    ec_col = _find_column(df, list(ec_suffixes))
-    ko_col = _find_column(df, list(ko_suffixes))
+    ec_col = _find_columns(df, list(ec_suffixes))
+    ko_col = _find_columns(df, list(ko_suffixes))
 
     if inchikey_col:
         log.info(f"KEGG annotation: using InChIKey column '{inchikey_col}'")
@@ -6541,7 +6613,8 @@ def link_metadata_with_custom_script(
 def load_link_table_metadata(
     datasets: list,
     link_table_path: Union[str, Path],
-) -> dict[str, pd.DataFrame]:
+    return_link_table: bool = False,
+) -> dict[str, pd.DataFrame] | tuple[dict[str, pd.DataFrame], pd.DataFrame]:
     """Load per-dataset metadata and raw-sample mappings from a link table.
 
     The link table must contain one raw sample-name column for every dataset
@@ -6553,7 +6626,8 @@ def load_link_table_metadata(
     if not path.is_file():
         raise FileNotFoundError(f"Metadata link table not found: {path}")
 
-    link_table = pd.read_csv(path, sep=None, engine="python")
+    link_table = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+    link_table.columns = link_table.columns.astype(str).str.strip()
     dataset_names = [ds.dataset_name for ds in datasets]
     missing_columns = [name for name in dataset_names if name not in link_table.columns]
     if missing_columns:
@@ -6574,6 +6648,9 @@ def load_link_table_metadata(
     shared_column = shared_candidates[0]
     if shared_column != "unique_group":
         link_table = link_table.rename(columns={shared_column: "unique_group"})
+    link_table["unique_group"] = link_table["unique_group"].astype(str).str.strip()
+    if (link_table["unique_group"] == "").any() or link_table["unique_group"].eq("nan").any():
+        raise ValueError("Metadata link table contains a blank shared sample name.")
 
     linked_metadata = {}
     for ds in datasets:
@@ -6592,10 +6669,6 @@ def load_link_table_metadata(
                 f"{duplicates}"
             )
 
-        table["unique_group"] = table["unique_group"].astype(str).str.strip()
-        if (table["unique_group"] == "").any() or table["unique_group"].eq("nan").any():
-            raise ValueError("Metadata link table contains a blank shared sample name.")
-
         table = table.set_index("unique_group", drop=False)
         linked_metadata[ds.dataset_name] = table
         write_integration_file(
@@ -6609,6 +6682,8 @@ def load_link_table_metadata(
             len(table), ds.dataset_name, path,
         )
 
+    if return_link_table:
+        return linked_metadata, link_table
     return linked_metadata
 
 def _data_colnames_to_replace(metadata, data):
@@ -6740,115 +6815,6 @@ def _build_group_means(
     )
     return group_means
 
-def integrate_metadata(
-    datasets: list,
-    metadata_vars: List[str] = [],
-    unifying_col: str = "unique_group",
-    output_filename: str = "integrated_metadata",
-    output_dir: str = None,
-    method: Literal["replicate_matched", "lfc"] = "replicate_matched",
-    group_col: str = "group",
-    overlap_only: bool = True,
-) -> pd.DataFrame:
-    """
-    Integrate metadata across datasets.
-
-    Parameters
-    ----------
-    method : ``"replicate_matched"`` (sample_resolution track)
-        Merges per-dataset linked_metadata on ``unifying_col`` to produce a
-        single sample-level metadata table.
-    method : ``"lfc"`` (condition_resolution track)
-        Builds a contrast-level metadata table where each row is a
-        ``groupA_vs_groupB`` contrast derived from all unique pairwise
-        combinations of condition labels.
-    """
-    if method not in {"replicate_matched", "lfc"}:
-        raise ValueError("method must be 'replicate_matched' or 'lfc'.")
-
-    # ── sample_resolution: sample-level metadata ──────────────────────────────
-    if method == "replicate_matched":
-        log.info("Creating integrated sample-level metadata table (sample_resolution)...")
-
-        metadata_tables = [ds.linked_metadata for ds in datasets if hasattr(ds, "linked_metadata")]
-        if not metadata_tables:
-            raise ValueError("No datasets with linked_metadata available.")
-
-        subset_cols = metadata_vars + [unifying_col]
-        integrated_metadata = metadata_tables[0][subset_cols].copy()
-
-        for i, table in enumerate(metadata_tables[1:], start=2):
-            integrated_metadata = integrated_metadata.merge(
-                table[subset_cols],
-                on=unifying_col,
-                suffixes=(None, f"_{i}"),
-                how="outer",
-            )
-            for column in metadata_vars:
-                col2 = f"{column}_{i}"
-                if col2 in integrated_metadata.columns:
-                    integrated_metadata[column] = integrated_metadata[column].combine_first(
-                        integrated_metadata[col2]
-                    )
-                    integrated_metadata.drop(columns=[col2], inplace=True)
-
-        integrated_metadata.rename(columns={unifying_col: "sample"}, inplace=True)
-        integrated_metadata.sort_values("sample", inplace=True)
-        integrated_metadata.drop_duplicates(inplace=True)
-        integrated_metadata.set_index("sample", inplace=True)
-
-        if output_dir:
-            log.info("Writing integrated metadata table...")
-            write_integration_file(data=integrated_metadata, output_dir=output_dir, filename=output_filename)
-
-        return integrated_metadata
-
-    # ── condition_resolution: contrast-level metadata ─────────────────────────
-    log.info("Creating integrated contrast-level metadata table (condition_resolution)...")
-
-    group_sets = []
-    for ds in datasets:
-        if not hasattr(ds, "linked_metadata") or ds.linked_metadata is None or ds.linked_metadata.empty:
-            raise ValueError(f"Dataset {ds.dataset_name} missing linked_metadata.")
-        if group_col not in ds.linked_metadata.columns:
-            raise ValueError(
-                f"Dataset {ds.dataset_name} linked_metadata missing group column '{group_col}'."
-            )
-        ds_groups = set(ds.linked_metadata[group_col].dropna().astype(str).unique())
-        if len(ds_groups) < 2:
-            raise ValueError(
-                f"Dataset {ds.dataset_name} has fewer than 2 groups in '{group_col}'."
-            )
-        group_sets.append(ds_groups)
-
-    if not group_sets:
-        raise ValueError("No valid datasets available to build contrast metadata.")
-
-    groups = sorted(list(
-        set.intersection(*group_sets) if overlap_only and len(group_sets) > 1
-        else set.union(*group_sets)
-    ))
-    if len(groups) < 2:
-        raise ValueError("Not enough groups available to build pairwise contrasts.")
-
-    pairs = list(combinations(groups, 2))
-    rows = [
-        {"sample": f"{a}_vs_{b}", "contrast": f"{a}_vs_{b}", "group_a": a, "group_b": b, group_col: f"{a}_vs_{b}"}
-        for a, b in pairs
-    ]
-    integrated_metadata = pd.DataFrame(rows).drop_duplicates(subset=["sample"]).set_index("sample")
-
-    for col in metadata_vars:
-        if col not in integrated_metadata.columns:
-            integrated_metadata[col] = np.nan
-
-    if output_dir:
-        log.info("Writing integrated metadata table...")
-        write_integration_file(data=integrated_metadata, output_dir=output_dir, filename=output_filename)
-
-    return integrated_metadata
-
-
 def integrate_data(
     datasets: list,
     overlap_only: bool = True,
@@ -6938,117 +6904,117 @@ def integrate_data(
     return integrated_data
 
 
-def scale_data_lfc(
-    data: pd.DataFrame,
-    metadata: pd.DataFrame,
-    dataset_name: str,
-    output_filename: str,
-    output_dir: str,
-    group_col: str = "group",
-    sample_col: str = "unique_group",
-) -> pd.DataFrame:
-    """
-    Per-dataset LFC scaling for the **condition_resolution** track.
+# def scale_data_lfc(
+#     data: pd.DataFrame,
+#     metadata: pd.DataFrame,
+#     dataset_name: str,
+#     output_filename: str,
+#     output_dir: str,
+#     group_col: str = "group",
+#     sample_col: str = "unique_group",
+# ) -> pd.DataFrame:
+#     """
+#     Per-dataset LFC scaling for the **condition_resolution** track.
 
-    Transforms a raw feature x sample matrix into a feature x contrasts matrix
-    by applying the following steps in order:
+#     Transforms a raw feature x sample matrix into a feature x contrasts matrix
+#     by applying the following steps in order:
 
-    1. **log2 transform** — ``log2(x + 1)``
-    2. **Low-variance filter** — drop features with zero variance across all
-       samples (prevents noise amplification).
-    3. **Collapse replicates to per-condition medians** — group samples by
-       condition label from ``metadata`` and compute the median per condition.
-    4. **All-pairwise LFC** — for every unique pair of conditions (A, B),
-       compute ``log2_median[A] − log2_median[B]``.  Each pair becomes one
-       column named ``A_vs_B``.
+#     1. **log2 transform** — ``log2(x + 1)``
+#     2. **Low-variance filter** — drop features with zero variance across all
+#        samples (prevents noise amplification).
+#     3. **Collapse replicates to per-condition medians** — group samples by
+#        condition label from ``metadata`` and compute the median per condition.
+#     4. **All-pairwise LFC** — for every unique pair of conditions (A, B),
+#        compute ``log2_median[A] − log2_median[B]``.  Each pair becomes one
+#        column named ``A_vs_B``.
 
-    The result is written to disk and returned.
+#     The result is written to disk and returned.
 
-    Parameters
-    ----------
-    data : pd.DataFrame
-        Raw feature x sample matrix (``replicate_filtered_data``).
-    metadata : pd.DataFrame
-        Sample metadata with at least ``sample_col`` and ``group_col`` columns.
-    dataset_name : str
-        Dataset name prefix (used for logging and feature-name prefixing).
-    output_filename : str
-        Output CSV filename (without extension).
-    output_dir : str
-        Directory to write the output file.
-    group_col : str
-        Metadata column containing condition/group labels.
-    sample_col : str
-        Metadata column containing sample identifiers matching data columns.
+#     Parameters
+#     ----------
+#     data : pd.DataFrame
+#         Raw feature x sample matrix (``replicate_filtered_data``).
+#     metadata : pd.DataFrame
+#         Sample metadata with at least ``sample_col`` and ``group_col`` columns.
+#     dataset_name : str
+#         Dataset name prefix (used for logging and feature-name prefixing).
+#     output_filename : str
+#         Output CSV filename (without extension).
+#     output_dir : str
+#         Directory to write the output file.
+#     group_col : str
+#         Metadata column containing condition/group labels.
+#     sample_col : str
+#         Metadata column containing sample identifiers matching data columns.
 
-    Returns
-    -------
-    pd.DataFrame
-        Feature x contrasts matrix.  Columns are contrast names of the form
-        ``"groupA_vs_groupB"``.
-    """
-    # ── Step 1: log2 transform ────────────────────────────────────────────────
-    log.info(f"  [{dataset_name}] Applying log2(x+1) transform...")
-    log2_df = np.log2(data.astype(float) + 1)
+#     Returns
+#     -------
+#     pd.DataFrame
+#         Feature x contrasts matrix.  Columns are contrast names of the form
+#         ``"groupA_vs_groupB"``.
+#     """
+#     # ── Step 1: log2 transform ────────────────────────────────────────────────
+#     log.info(f"  [{dataset_name}] Applying log2(x+1) transform...")
+#     log2_df = np.log2(data.astype(float) + 1)
 
-    # ── Step 2: low-variance filter ───────────────────────────────────────────
-    row_var = log2_df.var(axis=1)
-    low_var_mask = row_var > 0.0
-    n_dropped = (~low_var_mask).sum()
-    if n_dropped:
-        log.info(f"  [{dataset_name}] Dropped {n_dropped} zero-variance features after log2.")
-    log2_df = log2_df.loc[low_var_mask]
+#     # ── Step 2: low-variance filter ───────────────────────────────────────────
+#     row_var = log2_df.var(axis=1)
+#     low_var_mask = row_var > 0.0
+#     n_dropped = (~low_var_mask).sum()
+#     if n_dropped:
+#         log.info(f"  [{dataset_name}] Dropped {n_dropped} zero-variance features after log2.")
+#     log2_df = log2_df.loc[low_var_mask]
 
-    # ── Step 3: collapse replicates to per-condition medians ──────────────────
-    if sample_col in metadata.columns:
-        sample_to_group = metadata.set_index(sample_col)[group_col].to_dict()
-    else:
-        sample_to_group = metadata[group_col].to_dict()
+#     # ── Step 3: collapse replicates to per-condition medians ──────────────────
+#     if sample_col in metadata.columns:
+#         sample_to_group = metadata.set_index(sample_col)[group_col].to_dict()
+#     else:
+#         sample_to_group = metadata[group_col].to_dict()
 
-    common_samples = [c for c in log2_df.columns if c in sample_to_group]
-    if not common_samples:
-        raise ValueError(
-            f"Dataset '{dataset_name}': no overlap between data columns and "
-            f"metadata '{sample_col}' values."
-        )
-    log2_df = log2_df[common_samples]
+#     common_samples = [c for c in log2_df.columns if c in sample_to_group]
+#     if not common_samples:
+#         raise ValueError(
+#             f"Dataset '{dataset_name}': no overlap between data columns and "
+#             f"metadata '{sample_col}' values."
+#         )
+#     log2_df = log2_df[common_samples]
 
-    condition_labels = pd.Series(
-        [sample_to_group[s] for s in common_samples],
-        index=common_samples,
-        name=group_col,
-    )
-    condition_medians = log2_df.T.groupby(condition_labels).median().T  # features x conditions
+#     condition_labels = pd.Series(
+#         [sample_to_group[s] for s in common_samples],
+#         index=common_samples,
+#         name=group_col,
+#     )
+#     condition_medians = log2_df.T.groupby(condition_labels).median().T  # features x conditions
 
-    n_conditions = condition_medians.shape[1]
-    log.info(
-        f"  [{dataset_name}] Collapsed {len(common_samples)} samples → "
-        f"{n_conditions} condition medians."
-    )
-    if n_conditions < 2:
-        raise ValueError(
-            f"Dataset '{dataset_name}': need at least 2 conditions for pairwise LFC, "
-            f"found {n_conditions}: {condition_medians.columns.tolist()}"
-        )
+#     n_conditions = condition_medians.shape[1]
+#     log.info(
+#         f"  [{dataset_name}] Collapsed {len(common_samples)} samples → "
+#         f"{n_conditions} condition medians."
+#     )
+#     if n_conditions < 2:
+#         raise ValueError(
+#             f"Dataset '{dataset_name}': need at least 2 conditions for pairwise LFC, "
+#             f"found {n_conditions}: {condition_medians.columns.tolist()}"
+#         )
 
-    # ── Step 4: all-pairwise LFC ──────────────────────────────────────────────
-    pairs = list(combinations(condition_medians.columns.tolist(), 2))
-    log.info(f"  [{dataset_name}] Computing {len(pairs)} pairwise LFC contrasts...")
+#     # ── Step 4: all-pairwise LFC ──────────────────────────────────────────────
+#     pairs = list(combinations(condition_medians.columns.tolist(), 2))
+#     log.info(f"  [{dataset_name}] Computing {len(pairs)} pairwise LFC contrasts...")
 
-    lfc_df = pd.DataFrame(index=condition_medians.index)
-    for a, b in pairs:
-        lfc_df[f"{a}_vs_{b}"] = condition_medians[a] - condition_medians[b]
+#     lfc_df = pd.DataFrame(index=condition_medians.index)
+#     for a, b in pairs:
+#         lfc_df[f"{a}_vs_{b}"] = condition_medians[a] - condition_medians[b]
 
-    # Prefix feature names with dataset name
-    if not lfc_df.index.astype(str).str.startswith(f"{dataset_name}_").all():
-        lfc_df.index = [f"{dataset_name}_{idx}" for idx in lfc_df.index]
+#     # Prefix feature names with dataset name
+#     if not lfc_df.index.astype(str).str.startswith(f"{dataset_name}_").all():
+#         lfc_df.index = [f"{dataset_name}_{idx}" for idx in lfc_df.index]
 
-    log.info(
-        f"  [{dataset_name}]: {lfc_df.shape[0]} features x {lfc_df.shape[1]} contrasts"
-    )
+#     log.info(
+#         f"  [{dataset_name}]: {lfc_df.shape[0]} features x {lfc_df.shape[1]} contrasts"
+#     )
 
-    write_integration_file(lfc_df, output_dir, output_filename, indexing=True)
-    return lfc_df
+#     write_integration_file(lfc_df, output_dir, output_filename, indexing=True)
+#     return lfc_df
 
 
 def scale_data_moderated_lfc(
@@ -7291,498 +7257,498 @@ def remove_uniform_percent_low_variance_features(data: pd.DataFrame, filter_perc
     return filtered_df
 
 
-def filter_data(
-    data: pd.DataFrame,
-    dataset_name: str,
-    data_type: str,
-    output_dir: str,
-    output_filename: str,
-    filter_method: str,
-    filter_value: float,
-) -> pd.DataFrame:
-    """
-    Filter features from a dataset based on a minimum average obs value or proportion of samples with feature.
+# def filter_data(
+#     data: pd.DataFrame,
+#     dataset_name: str,
+#     data_type: str,
+#     output_dir: str,
+#     output_filename: str,
+#     filter_method: str,
+#     filter_value: float,
+# ) -> pd.DataFrame:
+#     """
+#     Filter features from a dataset based on a minimum average obs value or proportion of samples with feature.
 
-    Args:
-        data (pd.DataFrame): Feature matrix (features x samples).
-        dataset_name (str): Name of the dataset (used for output).
-        data_type (str): Data type ('counts', 'abundance', etc.).
-        output_dir (str): Output directory.
-        filter_method (str): Filtering method ('minimum', 'proportion', or 'none').
-        filter_value (float): Threshold value for filtering.
+#     Args:
+#         data (pd.DataFrame): Feature matrix (features x samples).
+#         dataset_name (str): Name of the dataset (used for output).
+#         data_type (str): Data type ('counts', 'abundance', etc.).
+#         output_dir (str): Output directory.
+#         filter_method (str): Filtering method ('minimum', 'proportion', or 'none').
+#         filter_value (float): Threshold value for filtering.
 
-    Returns:
-        pd.DataFrame: Filtered feature matrix.
-    """
+#     Returns:
+#         pd.DataFrame: Filtered feature matrix.
+#     """
 
-    # Filter data based on the specified method
-    if filter_method == "minimum":
-        row_means = data.mean(axis=1)
-        log.info(f"Filtering out features with {filter_method} method in {dataset_name} that have an average {data_type} value less than {filter_value} across samples...")
-        filtered_data = data[row_means >= filter_value]
-        log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - filtered_data.shape[0]} to keep {filtered_data.shape[0]}.")
-    elif filter_method == "proportion":
-        log.info(f"Filtering out features with {filter_method} method in {dataset_name} that were observed in fewer than {filter_value}% samples...")
-        global_min = data.values.min()
-        min_count = (data <= global_min).sum(axis=1)
-        min_proportion = min_count / data.shape[1]
-        filtered_data = data[min_proportion < filter_value / 100]
-        log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - filtered_data.shape[0]} to keep {filtered_data.shape[0]}.")
-    elif filter_method == "none":
-        log.info("Not filtering any features.")
-        log.info(f"Keeping all {data.shape[0]} features.")
-        filtered_data = data
-    else:
-        log.info(f"Invalid filter method '{filter_method}'. Please choose 'minimum', 'proportion', or 'none'.")
-        return None
+#     # Filter data based on the specified method
+#     if filter_method == "minimum":
+#         row_means = data.mean(axis=1)
+#         log.info(f"Filtering out features with {filter_method} method in {dataset_name} that have an average {data_type} value less than {filter_value} across samples...")
+#         filtered_data = data[row_means >= filter_value]
+#         log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - filtered_data.shape[0]} to keep {filtered_data.shape[0]}.")
+#     elif filter_method == "proportion":
+#         log.info(f"Filtering out features with {filter_method} method in {dataset_name} that were observed in fewer than {filter_value}% samples...")
+#         global_min = data.values.min()
+#         min_count = (data <= global_min).sum(axis=1)
+#         min_proportion = min_count / data.shape[1]
+#         filtered_data = data[min_proportion < filter_value / 100]
+#         log.info(f"Started with {data.shape[0]} features; filtered out {data.shape[0] - filtered_data.shape[0]} to keep {filtered_data.shape[0]}.")
+#     elif filter_method == "none":
+#         log.info("Not filtering any features.")
+#         log.info(f"Keeping all {data.shape[0]} features.")
+#         filtered_data = data
+#     else:
+#         log.info(f"Invalid filter method '{filter_method}'. Please choose 'minimum', 'proportion', or 'none'.")
+#         return None
 
-    log.info(f"Saving filtered data for {dataset_name}...")
-    write_integration_file(filtered_data, output_dir, output_filename, indexing=True)
-    return filtered_data
+#     log.info(f"Saving filtered data for {dataset_name}...")
+#     write_integration_file(filtered_data, output_dir, output_filename, indexing=True)
+#     return filtered_data
 
-def devariance_data(
-    data: pd.DataFrame,
-    filter_value: float,
-    dataset_name: str,
-    output_filename: str,
-    output_dir: str,
-    devariance_mode: str = "none",
-) -> pd.DataFrame | None:
-    """
-    Remove low-variance features from a dataset using various strategies.
+# def devariance_data(
+#     data: pd.DataFrame,
+#     filter_value: float,
+#     dataset_name: str,
+#     output_filename: str,
+#     output_dir: str,
+#     devariance_mode: str = "none",
+# ) -> pd.DataFrame | None:
+#     """
+#     Remove low-variance features from a dataset using various strategies.
 
-    Args:
-        data (pd.DataFrame): Feature matrix (features x samples).
-        filter_value (float): Uniform percent of features to remove.
-        dataset_name (str): Name for output file.
-        output_dir (str): Output directory.
-        devariance_mode (str): Devariance method ('percent', 'none').
+#     Args:
+#         data (pd.DataFrame): Feature matrix (features x samples).
+#         filter_value (float): Uniform percent of features to remove.
+#         dataset_name (str): Name for output file.
+#         output_dir (str): Output directory.
+#         devariance_mode (str): Devariance method ('percent', 'none').
 
-    Returns:
-        pd.DataFrame or None: Filtered feature matrix, or None if variance is too low.
-    """
+#     Returns:
+#         pd.DataFrame or None: Filtered feature matrix, or None if variance is too low.
+#     """
 
-    if devariance_mode == "percent":
-        log.info(f"Removing {filter_value}% of features with the lowest variance in {dataset_name}...")
-        data_filtered = remove_uniform_percent_low_variance_features(data=data, filter_percent=filter_value)
-    elif devariance_mode == "none":
-        log.info(f"\tNot removing any features based on variance in {dataset_name}. Retaining all {data.shape[0]} features.")
-        log.info(f"Saving devarianced data for {dataset_name}...")
-        data_filtered = data
-    else:
-        log.info(f"Invalid devariance mode '{devariance_mode}'. Please choose 'percent' or 'none'.")
-        return None
+#     if devariance_mode == "percent":
+#         log.info(f"Removing {filter_value}% of features with the lowest variance in {dataset_name}...")
+#         data_filtered = remove_uniform_percent_low_variance_features(data=data, filter_percent=filter_value)
+#     elif devariance_mode == "none":
+#         log.info(f"\tNot removing any features based on variance in {dataset_name}. Retaining all {data.shape[0]} features.")
+#         log.info(f"Saving devarianced data for {dataset_name}...")
+#         data_filtered = data
+#     else:
+#         log.info(f"Invalid devariance mode '{devariance_mode}'. Please choose 'percent' or 'none'.")
+#         return None
     
-    log.info(f"Saving devarianced data for {dataset_name}...")
-    write_integration_file(data_filtered, output_dir, output_filename, indexing=True)
-    return data_filtered
+#     log.info(f"Saving devarianced data for {dataset_name}...")
+#     write_integration_file(data_filtered, output_dir, output_filename, indexing=True)
+#     return data_filtered
 
-def scale_data(
-    df: pd.DataFrame,
-    output_filename: str = None,
-    output_dir: str = None,
-    dataset_name: str = None,
-    log2: bool = True,
-    norm_method: str = "modified_zscore"
-) -> pd.DataFrame:
-    """
-    Normalize and scale feature matrix with multiple methods.
+# def scale_data(
+#     df: pd.DataFrame,
+#     output_filename: str = None,
+#     output_dir: str = None,
+#     dataset_name: str = None,
+#     log2: bool = True,
+#     norm_method: str = "modified_zscore"
+# ) -> pd.DataFrame:
+#     """
+#     Normalize and scale feature matrix with multiple methods.
     
-    New norm_methods:
-    - 'quantile': Force identical distributions across all features
-    - 'rank_normal': Rank-based inverse normal transformation
-    - 'vst': Variance stabilizing transformation + z-score
-    - 'vsn': Variance Stabilizing Normalization
-    """
+#     New norm_methods:
+#     - 'quantile': Force identical distributions across all features
+#     - 'rank_normal': Rank-based inverse normal transformation
+#     - 'vst': Variance stabilizing transformation + z-score
+#     - 'vsn': Variance Stabilizing Normalization
+#     """
     
-    if norm_method == "none":
-        log.info("Not scaling data.")
-        return df
+#     if norm_method == "none":
+#         log.info("Not scaling data.")
+#         return df
     
-    # Convert to numeric
-    df = df.apply(pd.to_numeric, errors='coerce')
+#     # Convert to numeric
+#     df = df.apply(pd.to_numeric, errors='coerce')
     
-    # Quantile normalization (forces identical distribution)
-    if norm_method == "quantile":
-        log.info(f"Applying quantile normalization to {dataset_name}...")
+#     # Quantile normalization (forces identical distribution)
+#     if norm_method == "quantile":
+#         log.info(f"Applying quantile normalization to {dataset_name}...")
         
-        # Get reference distribution (sorted values of all data)
-        reference = np.sort(df.values.flatten())
+#         # Get reference distribution (sorted values of all data)
+#         reference = np.sort(df.values.flatten())
         
-        # Apply to each column
-        scaled_values = np.zeros_like(df.values)
-        for j in range(df.shape[1]):
-            ranks = rankdata(df.iloc[:, j], method='average')
-            for i in range(df.shape[0]):
-                idx = int(ranks[i]) - 1
-                scaled_values[i, j] = reference[idx]
+#         # Apply to each column
+#         scaled_values = np.zeros_like(df.values)
+#         for j in range(df.shape[1]):
+#             ranks = rankdata(df.iloc[:, j], method='average')
+#             for i in range(df.shape[0]):
+#                 idx = int(ranks[i]) - 1
+#                 scaled_values[i, j] = reference[idx]
         
-        scaled_df = pd.DataFrame(scaled_values, index=df.index, columns=df.columns)
+#         scaled_df = pd.DataFrame(scaled_values, index=df.index, columns=df.columns)
     
-    # Rank-based inverse normal transformation
-    elif norm_method == "rank_normal":
-        log.info(f"Applying rank-based inverse normal transformation to {dataset_name}...")
+#     # Rank-based inverse normal transformation
+#     elif norm_method == "rank_normal":
+#         log.info(f"Applying rank-based inverse normal transformation to {dataset_name}...")
         
-        def transform_col(col):
-            ranks = rankdata(col, method='average')
-            quantiles = ranks / (len(ranks) + 1)
-            return norm.ppf(quantiles)
+#         def transform_col(col):
+#             ranks = rankdata(col, method='average')
+#             quantiles = ranks / (len(ranks) + 1)
+#             return norm.ppf(quantiles)
         
-        scaled_df = df.apply(transform_col, axis=0)
+#         scaled_df = df.apply(transform_col, axis=0)
     
-    # VST + z-score (good for count data)
-    elif norm_method == "vst":
-        log.info(f"Applying VST transformation to {dataset_name}...")
-        vst_df = np.arcsinh(np.sqrt(df))
-        scaled_df = vst_df.sub(vst_df.mean(axis=1), axis=0).div(vst_df.std(axis=1), axis=0)
+#     # VST + z-score (good for count data)
+#     elif norm_method == "vst":
+#         log.info(f"Applying VST transformation to {dataset_name}...")
+#         vst_df = np.arcsinh(np.sqrt(df))
+#         scaled_df = vst_df.sub(vst_df.mean(axis=1), axis=0).div(vst_df.std(axis=1), axis=0)
     
-    # VSN - Variance Stabilizing Normalization
-    elif norm_method == "vsn":
-        log.info(f"Applying VSN transformation to {dataset_name}...")
+#     # VSN - Variance Stabilizing Normalization
+#     elif norm_method == "vsn":
+#         log.info(f"Applying VSN transformation to {dataset_name}...")
         
-        # Convert to numpy array
-        X = df.values.astype(float)
+#         # Convert to numpy array
+#         X = df.values.astype(float)
         
-        # VSN transformation function
-        def _vsn_transform(x: np.ndarray, lam: float) -> np.ndarray:
-            """Element-wise VSN transform: g_λ(x) = log2[(x + sqrt(x² + λ)) / 2]"""
-            x = np.where(x < 0, 0.0, x)
-            return np.log2((x + np.sqrt(x * x + lam)) / 2.0)
+#         # VSN transformation function
+#         def _vsn_transform(x: np.ndarray, lam: float) -> np.ndarray:
+#             """Element-wise VSN transform: g_λ(x) = log2[(x + sqrt(x² + λ)) / 2]"""
+#             x = np.where(x < 0, 0.0, x)
+#             return np.log2((x + np.sqrt(x * x + lam)) / 2.0)
         
-        # Estimate lambda by minimizing variance of transformed data
-        def _objective(lam_candidate: float) -> float:
-            if lam_candidate <= 0:
-                return np.inf
-            Y = _vsn_transform(X, lam_candidate)
-            return np.nanvar(Y)
+#         # Estimate lambda by minimizing variance of transformed data
+#         def _objective(lam_candidate: float) -> float:
+#             if lam_candidate <= 0:
+#                 return np.inf
+#             Y = _vsn_transform(X, lam_candidate)
+#             return np.nanvar(Y)
         
-        # Use scipy's bounded minimizer to find optimal lambda
-        res = minimize_scalar(
-            _objective,
-            bounds=(1e-6, 1e6),
-            method='bounded',
-            options={'xatol': 1e-8}
-        )
+#         # Use scipy's bounded minimizer to find optimal lambda
+#         res = minimize_scalar(
+#             _objective,
+#             bounds=(1e-6, 1e6),
+#             method='bounded',
+#             options={'xatol': 1e-8}
+#         )
         
-        if not res.success:
-            raise RuntimeError(
-                f"λ estimation failed for VSN: {res.message}. "
-                "Try a different normalization method."
-            )
+#         if not res.success:
+#             raise RuntimeError(
+#                 f"λ estimation failed for VSN: {res.message}. "
+#                 "Try a different normalization method."
+#             )
         
-        lam = res.x
-        log.info(f"  Estimated λ = {lam:.6f} for VSN transformation")
+#         lam = res.x
+#         log.info(f"  Estimated λ = {lam:.6f} for VSN transformation")
         
-        # Apply transformation with estimated lambda
-        Y = _vsn_transform(X, lam)
-        scaled_df = pd.DataFrame(Y, index=df.index, columns=df.columns)
+#         # Apply transformation with estimated lambda
+#         Y = _vsn_transform(X, lam)
+#         scaled_df = pd.DataFrame(Y, index=df.index, columns=df.columns)
     
-    elif norm_method in ["zscore", "modified_zscore", "logfc_mean", "logfc_median", "logfc_geometric_mean"]:
-        if log2 and norm_method not in ["logfc_mean", "logfc_median", "logfc_geometric_mean"]:
-            df = np.log2(df + 1)
-        if norm_method == "zscore":
-            scaled_df = df.sub(df.mean(axis=1), axis=0).div(df.std(axis=1), axis=0)
-        elif norm_method == "modified_zscore":
-            med = df.median(axis=1)
-            centered = df.sub(med, axis=0)
-            mad = centered.abs().median(axis=1)
-            scaled_df = centered.multiply(0.6745).div(mad, axis=0)
-        elif norm_method == "logfc_mean":
-            log.info(f"Scaling {dataset_name} data using log2 fold-change relative to mean...")
-            df_pseudocount = df + 1
-            log_values = np.log2(df_pseudocount)
-            mean_log = log_values.mean(axis=1, skipna=True)
-            scaled_df = log_values.subtract(mean_log, axis=0)
-        elif norm_method == "logfc_median":
-            log.info(f"Scaling {dataset_name} data using log2 fold-change relative to median...")
-            df_pseudocount = df + 1
-            log_values = np.log2(df_pseudocount)
-            median_log = log_values.median(axis=1, skipna=True)
-            scaled_df = log_values.subtract(median_log, axis=0)
-        elif norm_method == "logfc_geometric_mean":
-            log.info(f"Scaling {dataset_name} data using log2 fold-change relative to geometric mean...")
-            df_pseudocount = df + 1
-            geometric_means = df_pseudocount.apply(lambda row: gmean(row.dropna()), axis=1)
-            scaled_df = np.log2(df_pseudocount.divide(geometric_means, axis=0))
-        else:
-            raise ValueError("Please select a valid norm_method: 'zscore', 'modified_zscore', 'logfc_mean', 'logfc_median', or 'logfc_geometric_mean'.")
-    else:
-        raise ValueError(f"Unknown norm_method: {norm_method}")
+#     elif norm_method in ["zscore", "modified_zscore", "logfc_mean", "logfc_median", "logfc_geometric_mean"]:
+#         if log2 and norm_method not in ["logfc_mean", "logfc_median", "logfc_geometric_mean"]:
+#             df = np.log2(df + 1)
+#         if norm_method == "zscore":
+#             scaled_df = df.sub(df.mean(axis=1), axis=0).div(df.std(axis=1), axis=0)
+#         elif norm_method == "modified_zscore":
+#             med = df.median(axis=1)
+#             centered = df.sub(med, axis=0)
+#             mad = centered.abs().median(axis=1)
+#             scaled_df = centered.multiply(0.6745).div(mad, axis=0)
+#         elif norm_method == "logfc_mean":
+#             log.info(f"Scaling {dataset_name} data using log2 fold-change relative to mean...")
+#             df_pseudocount = df + 1
+#             log_values = np.log2(df_pseudocount)
+#             mean_log = log_values.mean(axis=1, skipna=True)
+#             scaled_df = log_values.subtract(mean_log, axis=0)
+#         elif norm_method == "logfc_median":
+#             log.info(f"Scaling {dataset_name} data using log2 fold-change relative to median...")
+#             df_pseudocount = df + 1
+#             log_values = np.log2(df_pseudocount)
+#             median_log = log_values.median(axis=1, skipna=True)
+#             scaled_df = log_values.subtract(median_log, axis=0)
+#         elif norm_method == "logfc_geometric_mean":
+#             log.info(f"Scaling {dataset_name} data using log2 fold-change relative to geometric mean...")
+#             df_pseudocount = df + 1
+#             geometric_means = df_pseudocount.apply(lambda row: gmean(row.dropna()), axis=1)
+#             scaled_df = np.log2(df_pseudocount.divide(geometric_means, axis=0))
+#         else:
+#             raise ValueError("Please select a valid norm_method: 'zscore', 'modified_zscore', 'logfc_mean', 'logfc_median', or 'logfc_geometric_mean'.")
+#     else:
+#         raise ValueError(f"Unknown norm_method: {norm_method}")
 
-    # Ensure output is float, and replace NA/inf/-inf with 0
-    scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan).fillna(0).astype(float)
+#     # Ensure output is float, and replace NA/inf/-inf with 0
+#     scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan).fillna(0).astype(float)
 
-    if output_dir:
-        log.info(f"Saving scaled data for {dataset_name}...")
-        write_integration_file(scaled_df, output_dir, output_filename, indexing=True)
+#     if output_dir:
+#         log.info(f"Saving scaled data for {dataset_name}...")
+#         write_integration_file(scaled_df, output_dir, output_filename, indexing=True)
 
-    return scaled_df
+#     return scaled_df
 
-def remove_low_replicable_features(
-    data: pd.DataFrame,
-    metadata: pd.DataFrame,
-    dataset_name: str,
-    output_filename: str,
-    output_dir: str,
-    method: str = "variance",
-    group_col: str = "group",
-    threshold: float = 0.5,
-    normalize: bool = True,
-    normalization_scale: float = 1_000_000.0,
-    min_replicates: int = 2,
-):
-    """
-    Remove features (rows) from `data` with high within-group variability
-    across replicates.
+# def remove_low_replicable_features(
+#     data: pd.DataFrame,
+#     metadata: pd.DataFrame,
+#     dataset_name: str,
+#     output_filename: str,
+#     output_dir: str,
+#     method: str = "variance",
+#     group_col: str = "group",
+#     threshold: float = 0.5,
+#     normalize: bool = True,
+#     normalization_scale: float = 1_000_000.0,
+#     min_replicates: int = 2,
+# ):
+#     """
+#     Remove features (rows) from `data` with high within-group variability
+#     across replicates.
 
-    Variability is assessed on a column-normalized copy of `data` (each
-    sample column scaled to sum to `normalization_scale`, e.g. CPM-style
-    normalization) so that differences in sample magnitude/depth don't
-    drive apparent within-group variability. The *original* (unnormalized)
-    values are what get filtered and returned/written.
+#     Variability is assessed on a column-normalized copy of `data` (each
+#     sample column scaled to sum to `normalization_scale`, e.g. CPM-style
+#     normalization) so that differences in sample magnitude/depth don't
+#     drive apparent within-group variability. The *original* (unnormalized)
+#     values are what get filtered and returned/written.
 
-    Parameters
-    ----------
-    method : {"none", "variance"}
-        - "none": no filtering, keep all features.
-        - "variance": flag a feature if its within-group coefficient of
-          variation (CV = std / mean) exceeds `threshold` in ANY group.
-    normalize : bool
-        If True (default), column-normalize samples before computing CV
-        (recommended when samples differ in scale / depth). Filtering is
-        still applied to the original `data`.
-    normalization_scale : float
-        Target sum for each sample column after normalization (default
-        1,000,000; use 1.0 for fractional/proportion scale, 100.0 for %).
-    min_replicates : int
-        Minimum number of samples a group must have to be evaluated
-        (groups with fewer are skipped / not used to flag features).
-    """
+#     Parameters
+#     ----------
+#     method : {"none", "variance"}
+#         - "none": no filtering, keep all features.
+#         - "variance": flag a feature if its within-group coefficient of
+#           variation (CV = std / mean) exceeds `threshold` in ANY group.
+#     normalize : bool
+#         If True (default), column-normalize samples before computing CV
+#         (recommended when samples differ in scale / depth). Filtering is
+#         still applied to the original `data`.
+#     normalization_scale : float
+#         Target sum for each sample column after normalization (default
+#         1,000,000; use 1.0 for fractional/proportion scale, 100.0 for %).
+#     min_replicates : int
+#         Minimum number of samples a group must have to be evaluated
+#         (groups with fewer are skipped / not used to flag features).
+#     """
 
-    def _normalize_columns(df: pd.DataFrame, scale: float) -> pd.DataFrame:
-        col_sums = df.sum(axis=0, skipna=True)
-        col_sums_safe = col_sums.replace(0, np.nan)
-        return df.divide(col_sums_safe, axis=1) * scale
+#     def _normalize_columns(df: pd.DataFrame, scale: float) -> pd.DataFrame:
+#         col_sums = df.sum(axis=0, skipna=True)
+#         col_sums_safe = col_sums.replace(0, np.nan)
+#         return df.divide(col_sums_safe, axis=1) * scale
 
-    def _build_group_sample_map(meta: pd.DataFrame, cols: pd.Index) -> dict:
-        groups = meta[group_col].unique()
-        return {
-            group: [
-                s for s in meta.loc[meta[group_col] == group, "unique_group"].tolist()
-                if s in cols
-            ]
-            for group in groups
-        }
+#     def _build_group_sample_map(meta: pd.DataFrame, cols: pd.Index) -> dict:
+#         groups = meta[group_col].unique()
+#         return {
+#             group: [
+#                 s for s in meta.loc[meta[group_col] == group, "unique_group"].tolist()
+#                 if s in cols
+#             ]
+#             for group in groups
+#         }
 
-    if method == "none":
-        log.info(
-            f"\tNot removing any features based on replicability in {dataset_name}. "
-            f"Retaining all {data.shape[0]} features."
-        )
-        replicable_data = data
-        log.info(f"Saving replicable data for {dataset_name}...")
-        write_integration_file(replicable_data, output_dir, output_filename, indexing=True)
-        return replicable_data
+#     if method == "none":
+#         log.info(
+#             f"\tNot removing any features based on replicability in {dataset_name}. "
+#             f"Retaining all {data.shape[0]} features."
+#         )
+#         replicable_data = data
+#         log.info(f"Saving replicable data for {dataset_name}...")
+#         write_integration_file(replicable_data, output_dir, output_filename, indexing=True)
+#         return replicable_data
 
-    if method != "variance":
-        raise ValueError(
-            "Currently only 'variance' or 'none' methods are supported for "
-            "removing low replicable features."
-        )
+#     if method != "variance":
+#         raise ValueError(
+#             "Currently only 'variance' or 'none' methods are supported for "
+#             "removing low replicable features."
+#         )
 
-    if group_col not in metadata.columns:
-        raise ValueError(f"Column '{group_col}' not found in metadata.")
+#     if group_col not in metadata.columns:
+#         raise ValueError(f"Column '{group_col}' not found in metadata.")
 
-    log.info(
-        f"Removing features with high within-group variability "
-        f"(threshold={threshold}, normalize={normalize})..."
-    )
+#     log.info(
+#         f"Removing features with high within-group variability "
+#         f"(threshold={threshold}, normalize={normalize})..."
+#     )
 
-    group_sample_map = _build_group_sample_map(metadata, data.columns)
-    valid_groups = {k: v for k, v in group_sample_map.items() if len(v) >= min_replicates}
+#     group_sample_map = _build_group_sample_map(metadata, data.columns)
+#     valid_groups = {k: v for k, v in group_sample_map.items() if len(v) >= min_replicates}
 
-    if not valid_groups:
-        log.info(
-            f"No groups with sufficient replicates (>={min_replicates}) found. "
-            f"Keeping all features."
-        )
-        replicable_data = data
-    else:
-        # Compute CV on normalized data so sample-level scale/depth
-        # differences don't drive apparent within-group variance.
-        stats_data = _normalize_columns(data, normalization_scale) if normalize else data
+#     if not valid_groups:
+#         log.info(
+#             f"No groups with sufficient replicates (>={min_replicates}) found. "
+#             f"Keeping all features."
+#         )
+#         replicable_data = data
+#     else:
+#         # Compute CV on normalized data so sample-level scale/depth
+#         # differences don't drive apparent within-group variance.
+#         stats_data = _normalize_columns(data, normalization_scale) if normalize else data
 
-        keep_mask = pd.Series(True, index=data.index)
+#         keep_mask = pd.Series(True, index=data.index)
 
-        for group, samples in valid_groups.items():
-            group_data = stats_data[samples]
-            group_mean = group_data.mean(axis=1, skipna=True)
-            group_std = group_data.std(axis=1, skipna=True, ddof=1)
-            group_mean_safe = group_mean.replace(0, np.nan)
+#         for group, samples in valid_groups.items():
+#             group_data = stats_data[samples]
+#             group_mean = group_data.mean(axis=1, skipna=True)
+#             group_std = group_data.std(axis=1, skipna=True, ddof=1)
+#             group_mean_safe = group_mean.replace(0, np.nan)
 
-            cv = (group_std / group_mean_safe).abs()
-            high_var_in_group = cv > threshold
+#             cv = (group_std / group_mean_safe).abs()
+#             high_var_in_group = cv > threshold
 
-            keep_mask = keep_mask & (~high_var_in_group)
+#             keep_mask = keep_mask & (~high_var_in_group)
 
-        replicable_data = data.loc[keep_mask]
+#         replicable_data = data.loc[keep_mask]
 
-    log.info(
-        f"Started with {data.shape[0]} features; filtered out "
-        f"{data.shape[0] - replicable_data.shape[0]} to keep {replicable_data.shape[0]}."
-    )
+#     log.info(
+#         f"Started with {data.shape[0]} features; filtered out "
+#         f"{data.shape[0] - replicable_data.shape[0]} to keep {replicable_data.shape[0]}."
+#     )
 
-    log.info(f"Saving replicable data for {dataset_name}...")
-    write_integration_file(replicable_data, output_dir, output_filename, indexing=True)
-    return replicable_data
+#     log.info(f"Saving replicable data for {dataset_name}...")
+#     write_integration_file(replicable_data, output_dir, output_filename, indexing=True)
+#     return replicable_data
 
 
-def normalize_integrated_data(
-    data: pd.DataFrame,
-    method: str,
-    metadata: pd.DataFrame,
-    output_filename: str,
-    output_dir: str,
-    log2: bool = True,
-    group_col: str = "group",
-    sample_col: str = "unique_group",
-    pseudocount: float = 1.0,
-    lfc_pairs: list = None,
-) -> pd.DataFrame:
-    """
-    Normalize the integrated feature matrix (features x samples, all datasets combined)
-    after integration.
+# def normalize_integrated_data(
+#     data: pd.DataFrame,
+#     method: str,
+#     metadata: pd.DataFrame,
+#     output_filename: str,
+#     output_dir: str,
+#     log2: bool = True,
+#     group_col: str = "group",
+#     sample_col: str = "unique_group",
+#     pseudocount: float = 1.0,
+#     lfc_pairs: list = None,
+# ) -> pd.DataFrame:
+#     """
+#     Normalize the integrated feature matrix (features x samples, all datasets combined)
+#     after integration.
 
-    This is the post-integration normalization step that replaces the old per-dataset
-    ``scale_data()`` step. It operates on the combined matrix so that all features
-    are normalized on the same scale.
+#     This is the post-integration normalization step that replaces the old per-dataset
+#     ``scale_data()`` step. It operates on the combined matrix so that all features
+#     are normalized on the same scale.
 
-    Parameters
-    ----------
-    data : pd.DataFrame
-        Integrated feature matrix (features x samples). Rows = features, columns = samples.
-        Should be the replicate-filtered devarianced data concatenated across datasets.
-    method : str
-        Normalization method:
-        - ``"lfc"``            : log2 fold-change of group medians vs. all-group median.
-                                 Produces a features x contrasts matrix where each column
-                                 is a pairwise group comparison (groupA_vs_groupB).
-        - ``"vst"``            : variance-stabilizing transformation (arcsinh(sqrt(x))) + z-score.
-        - ``"zscore"``         : log2(x+1) then z-score per sample (column-wise).
-        - ``"modified_zscore"``: log2(x+1) then modified z-score (median-based) per sample.
-        - ``"rank_normal"``    : rank-based inverse normal transformation per sample.
-    metadata : pd.DataFrame
-        Sample metadata. Required for ``"lfc"`` method (needs ``group_col`` and ``sample_col``).
-        For other methods, pass the integrated metadata for reference.
-    output_filename : str
-        Output filename (without extension).
-    output_dir : str
-        Output directory.
-    log2 : bool, default True
-        Whether to log2-transform before scaling. Used by vst/zscore/modified_zscore methods.
-        Ignored for lfc (which computes its own log2 ratios).
-    group_col : str, default "group"
-        Metadata column containing group labels. Used by ``"lfc"`` method.
-    sample_col : str, default "unique_group"
-        Metadata column containing sample identifiers matching data columns. Used by ``"lfc"``.
-    pseudocount : float, default 1.0
-        Pseudocount added before log2 transformation in lfc mode to avoid log(0).
-    lfc_pairs : list of [str, str], optional
-        Specific pairwise contrasts to compute for ``"lfc"`` method.
-        Each element is [groupA, groupB] and the LFC is log2(median_A / median_B).
-        If None, all pairwise combinations are computed.
+#     Parameters
+#     ----------
+#     data : pd.DataFrame
+#         Integrated feature matrix (features x samples). Rows = features, columns = samples.
+#         Should be the replicate-filtered devarianced data concatenated across datasets.
+#     method : str
+#         Normalization method:
+#         - ``"lfc"``            : log2 fold-change of group medians vs. all-group median.
+#                                  Produces a features x contrasts matrix where each column
+#                                  is a pairwise group comparison (groupA_vs_groupB).
+#         - ``"vst"``            : variance-stabilizing transformation (arcsinh(sqrt(x))) + z-score.
+#         - ``"zscore"``         : log2(x+1) then z-score per sample (column-wise).
+#         - ``"modified_zscore"``: log2(x+1) then modified z-score (median-based) per sample.
+#         - ``"rank_normal"``    : rank-based inverse normal transformation per sample.
+#     metadata : pd.DataFrame
+#         Sample metadata. Required for ``"lfc"`` method (needs ``group_col`` and ``sample_col``).
+#         For other methods, pass the integrated metadata for reference.
+#     output_filename : str
+#         Output filename (without extension).
+#     output_dir : str
+#         Output directory.
+#     log2 : bool, default True
+#         Whether to log2-transform before scaling. Used by vst/zscore/modified_zscore methods.
+#         Ignored for lfc (which computes its own log2 ratios).
+#     group_col : str, default "group"
+#         Metadata column containing group labels. Used by ``"lfc"`` method.
+#     sample_col : str, default "unique_group"
+#         Metadata column containing sample identifiers matching data columns. Used by ``"lfc"``.
+#     pseudocount : float, default 1.0
+#         Pseudocount added before log2 transformation in lfc mode to avoid log(0).
+#     lfc_pairs : list of [str, str], optional
+#         Specific pairwise contrasts to compute for ``"lfc"`` method.
+#         Each element is [groupA, groupB] and the LFC is log2(median_A / median_B).
+#         If None, all pairwise combinations are computed.
 
-    Returns
-    -------
-    pd.DataFrame
-        Normalized feature matrix. For ``"lfc"``, columns are contrast names
-        (e.g. ``"groupA_vs_groupB"``). For all other methods, columns are sample names.
-    """
-    valid_methods = {"lfc", "vst", "zscore", "modified_zscore", "rank_normal"}
-    if method not in valid_methods:
-        raise ValueError(f"method must be one of {valid_methods}, got '{method}'")
+#     Returns
+#     -------
+#     pd.DataFrame
+#         Normalized feature matrix. For ``"lfc"``, columns are contrast names
+#         (e.g. ``"groupA_vs_groupB"``). For all other methods, columns are sample names.
+#     """
+#     valid_methods = {"lfc", "vst", "zscore", "modified_zscore", "rank_normal"}
+#     if method not in valid_methods:
+#         raise ValueError(f"method must be one of {valid_methods}, got '{method}'")
 
-    log.info(f"Normalizing integrated data using method='{method}' ({data.shape[0]} features x {data.shape[1]} samples)...")
+#     log.info(f"Normalizing integrated data using method='{method}' ({data.shape[0]} features x {data.shape[1]} samples)...")
 
-    if method == "lfc":
-        # Build group medians from the integrated matrix
-        if group_col not in metadata.columns:
-            raise ValueError(f"group_col '{group_col}' not found in metadata columns: {metadata.columns.tolist()}")
+#     if method == "lfc":
+#         # Build group medians from the integrated matrix
+#         if group_col not in metadata.columns:
+#             raise ValueError(f"group_col '{group_col}' not found in metadata columns: {metadata.columns.tolist()}")
 
-        # Map sample → group
-        if sample_col in metadata.columns:
-            sample_to_group = metadata.set_index(sample_col)[group_col].to_dict()
-        else:
-            sample_to_group = metadata[group_col].to_dict()
+#         # Map sample → group
+#         if sample_col in metadata.columns:
+#             sample_to_group = metadata.set_index(sample_col)[group_col].to_dict()
+#         else:
+#             sample_to_group = metadata[group_col].to_dict()
 
-        # Restrict to samples present in data
-        common_samples = [s for s in data.columns if s in sample_to_group]
-        if not common_samples:
-            raise ValueError("No samples in data match the metadata index/sample_col.")
+#         # Restrict to samples present in data
+#         common_samples = [s for s in data.columns if s in sample_to_group]
+#         if not common_samples:
+#             raise ValueError("No samples in data match the metadata index/sample_col.")
 
-        data_common = data[common_samples]
-        groups = sorted(set(sample_to_group[s] for s in common_samples))
+#         data_common = data[common_samples]
+#         groups = sorted(set(sample_to_group[s] for s in common_samples))
 
-        # Compute per-group medians (features x groups)
-        group_medians = pd.DataFrame(index=data.index)
-        for grp in groups:
-            grp_samples = [s for s in common_samples if sample_to_group[s] == grp]
-            if grp_samples:
-                group_medians[grp] = data_common[grp_samples].median(axis=1)
+#         # Compute per-group medians (features x groups)
+#         group_medians = pd.DataFrame(index=data.index)
+#         for grp in groups:
+#             grp_samples = [s for s in common_samples if sample_to_group[s] == grp]
+#             if grp_samples:
+#                 group_medians[grp] = data_common[grp_samples].median(axis=1)
 
-        # Determine contrasts
-        if lfc_pairs is None:
-            contrasts = list(combinations(groups, 2))
-        else:
-            contrasts = [tuple(p) for p in lfc_pairs]
+#         # Determine contrasts
+#         if lfc_pairs is None:
+#             contrasts = list(combinations(groups, 2))
+#         else:
+#             contrasts = [tuple(p) for p in lfc_pairs]
 
-        # Compute log2 fold-changes
-        lfc_df = pd.DataFrame(index=data.index)
-        for grp_a, grp_b in contrasts:
-            col_name = f"{grp_a}_vs_{grp_b}"
-            med_a = group_medians[grp_a] + pseudocount
-            med_b = group_medians[grp_b] + pseudocount
-            lfc_df[col_name] = np.log2(med_a / med_b)
+#         # Compute log2 fold-changes
+#         lfc_df = pd.DataFrame(index=data.index)
+#         for grp_a, grp_b in contrasts:
+#             col_name = f"{grp_a}_vs_{grp_b}"
+#             med_a = group_medians[grp_a] + pseudocount
+#             med_b = group_medians[grp_b] + pseudocount
+#             lfc_df[col_name] = np.log2(med_a / med_b)
 
-        normalized = lfc_df
-        log.info(f"LFC normalization complete: {normalized.shape[0]} features x {normalized.shape[1]} contrasts")
+#         normalized = lfc_df
+#         log.info(f"LFC normalization complete: {normalized.shape[0]} features x {normalized.shape[1]} contrasts")
 
-    else:
-        # Sample-wise scaling methods
-        df = data.copy().astype(float)
+#     else:
+#         # Sample-wise scaling methods
+#         df = data.copy().astype(float)
 
-        if log2 and method in {"vst", "zscore", "modified_zscore"}:
-            df = np.log2(df + 1)
+#         if log2 and method in {"vst", "zscore", "modified_zscore"}:
+#             df = np.log2(df + 1)
 
-        if method == "vst":
-            # Variance-stabilizing transformation: arcsinh(sqrt(x)) then z-score per sample
-            df = np.arcsinh(np.sqrt(df.clip(lower=0)))
-            normalized = df.apply(lambda col: (col - col.mean()) / col.std() if col.std() > 0 else col, axis=0)
+#         if method == "vst":
+#             # Variance-stabilizing transformation: arcsinh(sqrt(x)) then z-score per sample
+#             df = np.arcsinh(np.sqrt(df.clip(lower=0)))
+#             normalized = df.apply(lambda col: (col - col.mean()) / col.std() if col.std() > 0 else col, axis=0)
 
-        elif method == "zscore":
-            # Z-score per sample (column-wise)
-            normalized = df.apply(lambda col: (col - col.mean()) / col.std() if col.std() > 0 else col, axis=0)
+#         elif method == "zscore":
+#             # Z-score per sample (column-wise)
+#             normalized = df.apply(lambda col: (col - col.mean()) / col.std() if col.std() > 0 else col, axis=0)
 
-        elif method == "modified_zscore":
-            # Modified z-score (median-based) per sample
-            def _modified_zscore(col):
-                med = col.median()
-                mad = (col - med).abs().median()
-                if mad > 0:
-                    return 0.6745 * (col - med) / mad
-                return col - med
-            normalized = df.apply(_modified_zscore, axis=0)
+#         elif method == "modified_zscore":
+#             # Modified z-score (median-based) per sample
+#             def _modified_zscore(col):
+#                 med = col.median()
+#                 mad = (col - med).abs().median()
+#                 if mad > 0:
+#                     return 0.6745 * (col - med) / mad
+#                 return col - med
+#             normalized = df.apply(_modified_zscore, axis=0)
 
-        elif method == "rank_normal":
-            # Rank-based inverse normal transformation per sample
-            arr = quantile_transform(df.values, n_quantiles=min(df.shape[0], 1000),
-                                     output_distribution='normal', random_state=0)
-            normalized = pd.DataFrame(arr, index=df.index, columns=df.columns)
+#         elif method == "rank_normal":
+#             # Rank-based inverse normal transformation per sample
+#             arr = quantile_transform(df.values, n_quantiles=min(df.shape[0], 1000),
+#                                      output_distribution='normal', random_state=0)
+#             normalized = pd.DataFrame(arr, index=df.index, columns=df.columns)
 
-        log.info(f"{method} normalization complete: {normalized.shape[0]} features x {normalized.shape[1]} samples")
+#         log.info(f"{method} normalization complete: {normalized.shape[0]} features x {normalized.shape[1]} samples")
 
-    write_integration_file(normalized, output_dir, output_filename, indexing=True)
-    return normalized
+#     write_integration_file(normalized, output_dir, output_filename, indexing=True)
+#     return normalized
 
 
 # ====================================
@@ -8588,7 +8554,7 @@ def get_trend_values(quant_df, mapping_df, group_col, metadata_df, sort_by, coll
         collapsed_samples = quant_df.T.groupby(meta[collapse_by]).agg(agg).T
 
         if sort_by and sort_by in metadata_df.columns:
-            sort_order = metadata_df.groupby(collapse_by)[sort_by].mean().sort_values().index
+            sort_order = metadata_df.groupby(collapse_by)[sort_by].sort_values().index
             sort_order = [c for c in sort_order if c in collapsed_samples.columns]
             collapsed_samples = collapsed_samples.reindex(columns=sort_order)
     else:
@@ -9012,11 +8978,13 @@ def compare_groups_to_pathways(
     else:
         if pe.get('rank_by') == 'summed_significance':
             rank_scores = -np.log10(padj_mat.clip(lower=1e-300)).sum(axis=1).sort_values(ascending=False)
-        else:
+        elif pe.get('rank_by') == 'feature_count':
             rank_scores = (
                 exploded[exploded['pathway'] != missing_token]
                 .groupby('pathway').size().sort_values(ascending=False)
             )
+        else:
+            raise ValueError(f"Unknown rank_by method: {pe.get('rank_by')}")
         chosen_pathways = rank_scores.head(pe['top_n']).index.tolist()
         kept_groups = sorted(exploded['group'].unique())
 
