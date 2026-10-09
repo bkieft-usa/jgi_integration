@@ -6626,7 +6626,7 @@ def load_link_table_metadata(
     if not path.is_file():
         raise FileNotFoundError(f"Metadata link table not found: {path}")
 
-    link_table = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+    link_table = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig", dtype=str)
     link_table.columns = link_table.columns.astype(str).str.strip()
     dataset_names = [ds.dataset_name for ds in datasets]
     missing_columns = [name for name in dataset_names if name not in link_table.columns]
@@ -8551,12 +8551,14 @@ def get_trend_values(quant_df, mapping_df, group_col, metadata_df, sort_by, coll
                 f"e.g. quant_df cols: {list(quant_df.columns[:3])} vs "
                 f"metadata_df index: {list(metadata_df.index[:3])}"
             )
+
         collapsed_samples = quant_df.T.groupby(meta[collapse_by]).agg(agg).T
 
         if sort_by and sort_by in metadata_df.columns:
-            sort_order = metadata_df.groupby(collapse_by)[sort_by].sort_values().index
+            sort_order = metadata_df.groupby(collapse_by)[sort_by].first().sort_values().index
             sort_order = [c for c in sort_order if c in collapsed_samples.columns]
             collapsed_samples = collapsed_samples.reindex(columns=sort_order)
+
     else:
         collapsed_samples = quant_df
 

@@ -1,19 +1,6 @@
-"""Pure preprocessing functions for tx (counts), mx (peak heights) and px (peak heights).
-
-All matrices are features x samples DataFrames. Nothing in this module touches
-disk or the Project/Dataset objects, so every stage can be unit-tested directly.
-
-Stages (see ``preprocess_dataset`` for the full chain):
-    1. inspect_input          validate input_state and detect the value scale
-    2. filter_features        raw presence / magnitude filters (raw input only)
-    3. normalize_samples      size-factor sample normalization (raw input only)
-    4. impute_feature_minimum mx/px zeros -> missing -> feature minimum
-    5. log_transform          tx log2(x + prior); mx/px log2(x)
-    6. filter_low_variance / filter_unreliable_features (log scale)
-    7. zscore_samples / condition_profiles   representation for paired / unpaired
-"""
 import logging
 import re
+import sys
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -21,6 +8,12 @@ import pandas as pd
 from scipy import stats
 
 log = logging.getLogger(__name__)
+if not log.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    fmt = "\033[47m%(levelname)s - %(message)s\033[0m"
+    handler.setFormatter(logging.Formatter(fmt))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
 
 DATA_TYPES = ("tx", "mx", "px")
 INPUT_STATES = ("raw", "prenormalized")
@@ -29,19 +22,11 @@ SAMPLE_NORMALIZATIONS = ("auto", "median_of_ratios", "pqn", "median", "tic", "no
 _DEFAULT_NORMALIZATION = {"tx": "median_of_ratios", "mx": "pqn", "px": "pqn"}
 _POLARITY_RE = re.compile(r"_(positive|negative)$")
 
-# Linear-scale data whose max is below this and whose skew is low is treated as log-scaled.
-_LOG_MAX_VALUE = 40.0
-_LOG_MAX_SKEW = 3.0
-
 
 def _check_choice(value: Any, choices: Tuple[str, ...], name: str) -> None:
     if value not in choices:
         raise ValueError(f"{name} must be one of {list(choices)}, got '{value}'.")
 
-
-# ---------------------------------------------------------------------------
-# Stage 1: validation and scale detection
-# ---------------------------------------------------------------------------
 
 def inspect_input(data: pd.DataFrame, data_type: str, input_state: str) -> Dict[str, Any]:
     """Validate the declared input_state and classify the value scale.
@@ -50,6 +35,10 @@ def inspect_input(data: pd.DataFrame, data_type: str, input_state: str) -> Dict[
     e.g. voom log-CPM) or ``scaled`` (per-feature centered and unit variance).
     Raw input must be non-negative and linear; a contradiction raises ValueError.
     """
+
+    _LOG_MAX_VALUE = 40.0
+    _LOG_MAX_SKEW = 3.0
+
     _check_choice(data_type, DATA_TYPES, "data_type")
     _check_choice(input_state, INPUT_STATES, "input_state")
 
@@ -118,10 +107,6 @@ def inspect_input(data: pd.DataFrame, data_type: str, input_state: str) -> Dict[
     return report
 
 
-# ---------------------------------------------------------------------------
-# Stage 2: raw presence / magnitude filters
-# ---------------------------------------------------------------------------
-
 def filter_features(
     data: pd.DataFrame,
     input_state: str,
@@ -146,10 +131,6 @@ def filter_features(
     log.info(f"{dataset_name}: raw filters kept {out.shape[0]} of {data.shape[0]} features.")
     return out
 
-
-# ---------------------------------------------------------------------------
-# Stage 3: sample normalization
-# ---------------------------------------------------------------------------
 
 def _center_factors(sf: pd.Series) -> pd.Series:
     bad = ~np.isfinite(sf.to_numpy(dtype=float)) | (sf.to_numpy(dtype=float) <= 0)
@@ -232,10 +213,6 @@ def normalize_samples(
     return pd.DataFrame(values, index=X.index, columns=X.columns), pd.DataFrame(factors)
 
 
-# ---------------------------------------------------------------------------
-# Stages 4-5: imputation and log transform
-# ---------------------------------------------------------------------------
-
 def impute_feature_minimum(data: pd.DataFrame) -> pd.DataFrame:
     """Treat zeros/NaN as missing and fill with each feature's minimum observed value.
 
@@ -304,10 +281,6 @@ def normalize_and_transform(
                     "consider recenter_samples: true.")
     return {"normalized": normalized, "detected": detected, "log": logm}
 
-
-# ---------------------------------------------------------------------------
-# Stage 6: log-scale quality filters
-# ---------------------------------------------------------------------------
 
 def variance_score(data: pd.DataFrame) -> pd.Series:
     """Log variance minus the median log variance of features with similar mean level."""
@@ -384,10 +357,6 @@ def filter_unreliable_features(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Stage 7: representation and block weighting
-# ---------------------------------------------------------------------------
-
 def zscore_samples(data: pd.DataFrame, robust: bool = False) -> pd.DataFrame:
     """Per-feature z-score across columns. ``robust`` uses median/MAD with the scale floored at 0.5*SD."""
     X = data.astype(float)
@@ -459,18 +428,18 @@ def block_scale(data: pd.DataFrame, prefixes: Tuple[str, ...]) -> Tuple[pd.DataF
     return out, weights
 
 
-# ---------------------------------------------------------------------------
-# Stage runners (config-driven) and full dispatcher
-# ---------------------------------------------------------------------------
-
 def run_filter(data: pd.DataFrame, input_state: str, params: Dict[str, Any], dataset_name: str = "") -> pd.DataFrame:
     p = params.get("filtering", {}) or {}
-    return filter_features(
+    log.info(f"Running filter stage for dataset: {dataset_name} with input state: {input_state}")
+    log.info(f"Starting dataset: {data.shape[0]} features and {data.shape[1]} samples")
+    filtered_data = filter_features(
         data, input_state,
         presence_min_percent=p.get("presence_min_percent"),
         magnitude_min_mean=p.get("magnitude_min_mean"),
         dataset_name=dataset_name,
     )
+    log.info(f"Filtered dataset: {filtered_data.shape[0]} features and {filtered_data.shape[1]} samples")
+    return filtered_data
 
 
 def run_normalize(
@@ -487,10 +456,14 @@ def run_normalize(
 def run_devariance(data: pd.DataFrame, scale: str, params: Dict[str, Any], dataset_name: str = "") -> pd.DataFrame:
     step = params.get("devariancing", {}) or {}
     p = step.get("params", {}) or {}
-    return filter_low_variance(
+    log.info(f"Running devariance stage for dataset: {dataset_name} with scale: {scale}")
+    log.info(f"Starting dataset: {data.shape[0]} features and {data.shape[1]} samples")
+    devarianced_data = filter_low_variance(
         data, method=step.get("method", "none"), percent=p.get("value"),
         mean_adjusted=bool(p.get("mean_adjusted", True)), scale=scale, dataset_name=dataset_name,
     )
+    log.info(f"Devarianced dataset: {devarianced_data.shape[0]} features and {devarianced_data.shape[1]} samples")
+    return devarianced_data
 
 
 def run_replicate_filter(
@@ -503,13 +476,17 @@ def run_replicate_filter(
     if step["method"] != "sd":
         raise ValueError("replicate_handling method must be 'sd' or 'none'.")
     p = step.get("params", {}) or {}
-    return filter_unreliable_features(
+    log.info(f"Running replicate filter stage for dataset: {dataset_name}")
+    log.info(f"Starting dataset: {data.shape[0]} features and {data.shape[1]} samples")
+    replicate_filtered_data = filter_unreliable_features(
         data, detected, sample_to_group,
         sd_threshold=p.get("sd_threshold", 1.0),
         majority_fraction=float(p.get("majority_fraction", 0.5)),
         min_replicates=int(p.get("min_replicates", 2)),
         dataset_name=dataset_name,
     )
+    log.info(f"Replicate filtered dataset: {replicate_filtered_data.shape[0]} features and {replicate_filtered_data.shape[1]} samples")
+    return replicate_filtered_data
 
 
 def preprocess_dataset(
