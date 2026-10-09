@@ -36,6 +36,9 @@ RUN uv sync --locked
 ENV VIRTUAL_ENV=${WORK}/.venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
+######## Test tooling (kept outside the locked environment)
+RUN uv pip install pytest
+
 ######## Set up user workflow environment
 RUN python -m ipykernel install --user \
     --name=jgi-integration \
