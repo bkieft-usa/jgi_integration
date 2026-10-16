@@ -18,8 +18,10 @@ if not log.handlers:
 DATA_TYPES = ("tx", "mx", "px")
 INPUT_STATES = ("raw", "prenormalized")
 PAIRINGS = ("paired", "unpaired")
-SAMPLE_NORMALIZATIONS = ("auto", "median_of_ratios", "pqn", "median", "tic", "none")
+normalization_methodS = ("auto", "median_of_ratios", "pqn", "median", "tic", "none")
+LOG_TRANSFORMS = ("auto", "vst", "log2")
 _DEFAULT_NORMALIZATION = {"tx": "median_of_ratios", "mx": "pqn", "px": "pqn"}
+_DEFAULT_LOG_TRANSFORM = {"tx": "vst", "mx": "log2", "px": "log2"}
 _POLARITY_RE = re.compile(r"_(positive|negative)$")
 
 
@@ -139,7 +141,7 @@ def _center_factors(sf: pd.Series) -> pd.Series:
     return sf / np.exp(np.log(sf).mean())
 
 
-def median_of_ratios_size_factors(counts: pd.DataFrame, min_features: int = 10) -> pd.Series:
+def median_of_ratios_size_factors(counts: pd.DataFrame, min_features: int = 1) -> pd.Series:
     """DESeq2-style size factors from features positive in all samples (poscounts-style fallback)."""
     X = counts.where(counts > 0)
     all_pos = X.notna().all(axis=1)
@@ -196,7 +198,7 @@ def normalize_samples(
     data: pd.DataFrame, method: str = "auto", data_type: str = "tx"
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Divide each sample by its size factor. Returns (normalized, size_factors[samples x groups])."""
-    _check_choice(method, SAMPLE_NORMALIZATIONS, "sample_normalization")
+    _check_choice(method, normalization_methodS, "normalization_method")
     if method == "auto":
         method = _DEFAULT_NORMALIZATION[data_type]
     X = data.astype(float)
@@ -227,10 +229,61 @@ def impute_feature_minimum(data: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(arr, index=X.index, columns=X.columns)
 
 
-def log_transform(data: pd.DataFrame, data_type: str, pseudocount: float = 1.0) -> pd.DataFrame:
-    """tx: log2(x + pseudocount) on size-factor-normalized counts; mx/px: log2(x)."""
+# Conversion constant so VST output is on a comparable scale to log2
+_ARCSINH_TO_LOG2 = 1.0 / np.log(2)
+
+
+def log_transform(
+    data: pd.DataFrame,
+    data_type: str,
+    pseudocount: float = 1.0,
+    transformation_method: str = "auto",
+) -> pd.DataFrame:
+    """Transform size-factor-normalized values to a log-like scale.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Size-factor-normalized values (linear scale).
+    data_type : str
+        One of ``"tx"``, ``"mx"``, ``"px"``.
+    pseudocount : float
+        Added before log2 for ``tx`` when ``transformation_method="log2"``
+        (default 1.0).  Ignored for VST and for ``mx``/``px``.
+    transformation_method : str
+        ``"auto"``  — use the data-type default (``"vst"`` for tx, ``"log2"``
+                      for mx/px).
+        ``"vst"``   — variance-stabilising transform for tx:
+                      ``arcsinh(sqrt(x + pseudocount - 1)) / ln(2)``.
+                      Stabilises variance across the full count range,
+                      including low-count genes where ``log2(x+1)`` still
+                      shows strong mean–variance dependence.  Output is on
+                      an approximately log2 scale for high counts.
+        ``"log2"``  — ``log2(x + pseudocount)`` for tx; ``log2(x)`` for
+                      mx/px (requires strictly positive values after
+                      imputation).
+    """
+    _check_choice(transformation_method, LOG_TRANSFORMS, "transformation_method")
+    if transformation_method == "auto":
+        transformation_method = _DEFAULT_LOG_TRANSFORM[data_type]
+
     if data_type == "tx":
-        return np.log2(data + pseudocount)
+        if transformation_method == "vst":
+            # arcsinh(sqrt(x)) / ln(2) — parameter-free VST for Poisson/NB counts.
+            # For large x: arcsinh(sqrt(x)) ≈ log(2*sqrt(x)) ≈ 0.5*log(x) + const,
+            # so output is on a half-log2 scale; dividing by ln(2) keeps it
+            # comparable to log2 units.  pseudocount shifts the argument so that
+            # x=0 maps to arcsinh(sqrt(pseudocount-1)) rather than 0 when pc>1.
+            shifted = data + max(pseudocount - 1.0, 0.0)
+            return pd.DataFrame(
+                np.arcsinh(np.sqrt(shifted.to_numpy(dtype=float))) * _ARCSINH_TO_LOG2,
+                index=data.index,
+                columns=data.columns,
+            )
+        else:  # log2
+            return np.log2(data + pseudocount)
+
+    # mx / px — always log2 after imputation
     if not (data > 0).all().all():
         raise ValueError(f"{data_type}: log2 requires strictly positive values; impute first.")
     return np.log2(data)
@@ -241,20 +294,29 @@ def normalize_and_transform(
     data_type: str,
     input_state: str,
     scale: str,
-    sample_normalization: str = "auto",
+    normalization_method: str = "auto",
     recenter_samples: bool = False,
     pseudocount: float = 1.0,
+    transformation_method: str = "auto",
 ) -> Dict[str, pd.DataFrame]:
     """Sample normalization, imputation (mx/px) and log transform.
 
     Returns dict with ``normalized`` (linear scale, zeros kept as NaN for mx/px),
     ``detected`` (boolean observed mask) and ``log`` (analysis-ready log matrix).
+
+    Parameters
+    ----------
+    transformation_method : str
+        ``"auto"`` uses the data-type default (``"vst"`` for tx, ``"log2"`` for
+        mx/px).  ``"vst"`` applies the arcsinh-sqrt variance-stabilising transform
+        to tx data.  ``"log2"`` applies ``log2(x + pseudocount)`` for tx and
+        ``log2(x)`` for mx/px.  Ignored for prenormalized input.
     """
     X = data.apply(pd.to_numeric, errors="coerce").astype(float)
     if input_state == "raw":
-        normalized, _ = normalize_samples(X, sample_normalization, data_type)
+        normalized, _ = normalize_samples(X, normalization_method, data_type)
     else:
-        if sample_normalization not in ("auto", "none"):
+        if normalization_method not in ("auto", "none"):
             log.info("Sample normalization is ignored for prenormalized input.")
         normalized = X
 
@@ -263,13 +325,13 @@ def normalize_and_transform(
         logm = normalized
     elif data_type == "tx":
         detected = normalized > 0
-        logm = log_transform(normalized, "tx", pseudocount)
+        logm = log_transform(normalized, "tx", pseudocount, transformation_method)
     else:
         missing_form = normalized.where(normalized > 0)
         imputed = impute_feature_minimum(missing_form)
         normalized = missing_form.loc[imputed.index]
         detected = normalized.notna()
-        logm = log_transform(imputed, data_type)
+        logm = log_transform(imputed, data_type, transformation_method=transformation_method)
 
     medians = logm.median(axis=0)
     spread = float(medians.max() - medians.min())
@@ -447,9 +509,10 @@ def run_normalize(
 ) -> Dict[str, pd.DataFrame]:
     return normalize_and_transform(
         data, data_type, input_state, scale,
-        sample_normalization=params.get("sample_normalization", "auto"),
+        normalization_method=params.get("normalization_method", "auto"),
         recenter_samples=bool(params.get("recenter_samples", False)),
         pseudocount=float(params.get("pseudocount", 1.0)),
+        transformation_method=params.get("transformation_method", "auto"),
     )
 
 

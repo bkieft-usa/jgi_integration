@@ -8,7 +8,6 @@ project:
   dataset_list:
     - tx
     - mx
-  genome_type: plant
   PI_name: Bartley
   proposal_ID: 511319
   results_path: /home/jovyan/work/output_data

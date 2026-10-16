@@ -2,12 +2,24 @@ datasets:
   tx:
     dataset_dir: transcriptomics # Do not change
     input_state: raw             # raw (integer-like counts) | prenormalized (already normalized and/or log-transformed; scale is auto-detected)
+    gff_quant_id: locus_tag      # GFF9 attribute that matches the first column of counts.csv (e.g. locus_tag, ID, Name)
+    gff_annot_id: locus_tag      # GFF9 attribute that matches the first column of the annotation files (can be the same as gff_quant_id)
+    annotation_columns:          # Required: exact column headers in the TX annotation table files
+      ec_number_col: EC          # Column header containing EC numbers (e.g. EC, ECnum, ec_number)
+      kegg_id_col: KEGG_ko       # Column header containing KEGG IDs / KO accessions (e.g. KEGG_ko, KO, ko_acc)
+      ec_delimiter: ","          # Delimiter used to split multiple EC numbers within a single cell
+      kegg_id_delimiter: ","     # Delimiter used to split multiple KEGG IDs within a single cell
     normalization_parameters:
       filtering:                 # raw presence/magnitude filters; ignored for prenormalized input. Use null to skip a filter.
         presence_min_percent: 20 # keep features with raw value > 0 in at least this % of samples
         magnitude_min_mean: 10   # keep features whose mean raw value across all samples is > this value
-      sample_normalization: auto # auto (tx: median_of_ratios) | median_of_ratios | pqn | median | tic | none; raw input only
-      pseudocount: 1             # tx only: log2(count / size_factor + pseudocount)
+      normalization_method: auto # auto (tx: median_of_ratios) | median_of_ratios | pqn | median | tic | none; raw input only
+      transformation_method: auto # auto (tx: vst) | vst | log2; raw input only
+                                 #   vst:  arcsinh(sqrt(x)) / ln(2) — variance-stabilising transform; stabilises
+                                 #         mean-variance dependence across the full count range (recommended for tx)
+                                 #   log2: log2(x + pseudocount) — classic log transform
+      pseudocount: 1             # added before transform: vst uses max(pseudocount-1, 0) as a count offset;
+                                 # log2 uses log2(x + pseudocount)
       recenter_samples: false    # prenormalized input only: align per-sample medians on the log scale
       devariancing:              # log-scale variance filter (also applies to prenormalized input)
         method: percent          # percent | none
@@ -26,11 +38,14 @@ datasets:
     chromatography: HILIC
     polarity: multipolarity
     input_state: raw             # raw (peak heights) | prenormalized
+    annotation_columns:          # Required: exact column header in the MX annotation/library-results file
+      inchikey_col: InChIKey     # Column header containing InChIKey values (e.g. InChIKey, InChiKey, inchikey)
     normalization_parameters:
       filtering:
         presence_min_percent: 20
         magnitude_min_mean: 1000
-      sample_normalization: auto # auto (mx: pqn, per polarity) | pqn | median | tic | median_of_ratios | none
+      normalization_method: auto # auto (mx: pqn, per polarity) | pqn | median | tic | median_of_ratios | none
+      transformation_method: auto # auto (mx: log2) | log2; vst is not applicable to peak heights
       recenter_samples: false
       devariancing:
         method: percent
@@ -47,11 +62,19 @@ datasets:
   px:                            # optional proteomics dataset; uses the same annotation files/formats as tx
     dataset_dir: proteomics      # Do not change
     input_state: raw             # raw (peak heights) | prenormalized
+    gff_quant_id: locus_tag      # GFF9 attribute that matches the first column of peak-height.csv (e.g. locus_tag, ID, Name)
+    gff_annot_id: locus_tag      # GFF9 attribute that matches the first column of the annotation files (can be the same as gff_quant_id)
+    annotation_columns:          # Required: exact column headers in the PX annotation table files (same format as tx)
+      ec_number_col: EC          # Column header containing EC numbers (e.g. EC, ECnum, ec_number)
+      kegg_id_col: KEGG_ko       # Column header containing KEGG IDs / KO accessions (e.g. KEGG_ko, KO, ko_acc)
+      ec_delimiter: ","          # Delimiter used to split multiple EC numbers within a single cell
+      kegg_id_delimiter: ","     # Delimiter used to split multiple KEGG IDs within a single cell
     normalization_parameters:
       filtering:
         presence_min_percent: 20
         magnitude_min_mean: 1000
-      sample_normalization: auto # auto (px: pqn) | pqn | median | tic | median_of_ratios | none
+      normalization_method: auto # auto (px: pqn) | pqn | median | tic | median_of_ratios | none
+      transformation_method: auto # auto (px: log2) | log2; vst is not applicable to peak heights
       recenter_samples: false
       devariancing:
         method: percent

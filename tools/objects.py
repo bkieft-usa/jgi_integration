@@ -758,6 +758,14 @@ class MX(Dataset):
             log.info(f"Using only metabolite fraction '{self.metabolite_fraction}' for MX dataset.")
         else:
             self.metabolite_fraction = None
+        ann_cols = self.dataset_config.get('annotation_columns', {})
+        if not ann_cols or 'inchikey_col' not in ann_cols:
+            raise ValueError(
+                "MX dataset config is missing required 'annotation_columns' key: "
+                "'inchikey_col' must be specified under "
+                "datasets.mx.annotation_columns in data_processing.yml."
+            )
+        self.inchikey_col = ann_cols['inchikey_col']
         self._get_raw_data(overwrite=self.overwrite)
         self._generate_annotation_table(overwrite=self.overwrite)
 
@@ -815,7 +823,8 @@ class MX(Dataset):
             'dataset_raw_dir': self.dataset_raw_dir,
             'polarity': self.polarity,
             'output_dir': self.output_dir,
-            'output_filename': self._annotation_table_filename
+            'output_filename': self._annotation_table_filename,
+            'inchikey_col': self.inchikey_col,
         }
 
         result = hlp.generate_mx_annotation_table(**call_params)
@@ -832,19 +841,35 @@ class TX(Dataset):
         super().__init__("tx", project, overwrite)
         self.index = 1 # Currently only index 1 supported, not configurable
         self.apid = None
-        self.genome_type = self.project.config['project']['genome_type']
         self.datatype = "counts" # Currently only counts supported, not configurable
+        self.gff_quant_id = self.dataset_config.get('gff_quant_id', None)
+        self.gff_annot_id = self.dataset_config.get('gff_annot_id', None)
+        ann_cols = self.dataset_config.get('annotation_columns', {})
+        if not ann_cols or 'ec_number_col' not in ann_cols or 'kegg_id_col' not in ann_cols:
+            raise ValueError(
+                "TX dataset config is missing required 'annotation_columns' keys: "
+                "'ec_number_col' and 'kegg_id_col' must both be specified under "
+                "datasets.tx.annotation_columns in data_processing.yml."
+            )
+        self.ec_number_col = ann_cols['ec_number_col']
+        self.kegg_id_col = ann_cols['kegg_id_col']
+        self.ec_delimiter = ann_cols.get('ec_delimiter', ',')
+        self.kegg_id_delimiter = ann_cols.get('kegg_id_delimiter', ',')
         self._get_raw_data(overwrite=self.overwrite)
         self._generate_annotation_table(overwrite=self.overwrite)
 
     def _get_raw_data(self, overwrite: bool = False) -> None:
         log.info("Getting Raw Data (TX)")
         counts_path = Path(self.dataset_raw_dir) / f"{self.datatype}.csv"
-        self.identifier_column = (
-            pd.read_csv(counts_path, nrows=0).columns[0]
-            if counts_path.is_file()
-            else None
-        )
+        # gff_quant_id from config takes precedence; fall back to the counts.csv first-column header
+        if self.gff_quant_id:
+            self.identifier_column = self.gff_quant_id
+        else:
+            self.identifier_column = (
+                pd.read_csv(counts_path, nrows=0).columns[0]
+                if counts_path.is_file()
+                else None
+            )
         if self.check_and_load_attribute('raw_data', self._raw_data_filename, self.overwrite):
             if self.identifier_column is None:
                 self.identifier_column = self.raw_data.columns[0]
@@ -862,7 +887,8 @@ class TX(Dataset):
             raise FileNotFoundError(
                 f"No TX {self.datatype} file found under {self.dataset_raw_dir}."
             )
-        self.identifier_column = result.columns[0]
+        if self.identifier_column is None:
+            self.identifier_column = result.columns[0]
         self.raw_data = result
         log.info(f"\tCreated raw data for TX with {self.raw_data.shape[1]} samples and {self.raw_data.shape[0]} features.")
         log.info(f"Created table: {self._raw_data_filename}")
@@ -896,10 +922,14 @@ class TX(Dataset):
         call_params = {
             'raw_data': self.raw_data,
             'raw_data_dir': self.dataset_raw_dir,
-            'genome_type': self.genome_type,
             'output_dir': self.output_dir,
             'output_filename': self._annotation_table_filename,
-            'identifier_column': self.identifier_column,
+            'gff_quant_id': self.gff_quant_id or self.identifier_column,
+            'gff_annot_id': self.gff_annot_id or self.gff_quant_id or self.identifier_column,
+            'ec_number_col': self.ec_number_col,
+            'kegg_id_col': self.kegg_id_col,
+            'ec_delimiter': self.ec_delimiter,
+            'kegg_id_delimiter': self.kegg_id_delimiter,
         }
 
         result = hlp.generate_tx_annotation_table(**call_params)
@@ -915,17 +945,33 @@ class PX(Dataset):
     def __init__(self, project: Project, overwrite: bool = False):
         super().__init__("px", project, overwrite)
         self.apid = None
-        self.genome_type = self.project.config['project']['genome_type']
         self.datatype = "peak-height"
+        self.gff_quant_id = self.dataset_config.get('gff_quant_id', None)
+        self.gff_annot_id = self.dataset_config.get('gff_annot_id', None)
+        ann_cols = self.dataset_config.get('annotation_columns', {})
+        if not ann_cols or 'ec_number_col' not in ann_cols or 'kegg_id_col' not in ann_cols:
+            raise ValueError(
+                "PX dataset config is missing required 'annotation_columns' keys: "
+                "'ec_number_col' and 'kegg_id_col' must both be specified under "
+                "datasets.px.annotation_columns in data_processing.yml."
+            )
+        self.ec_number_col = ann_cols['ec_number_col']
+        self.kegg_id_col = ann_cols['kegg_id_col']
+        self.ec_delimiter = ann_cols.get('ec_delimiter', ',')
+        self.kegg_id_delimiter = ann_cols.get('kegg_id_delimiter', ',')
         self._get_raw_data(overwrite=self.overwrite)
         self._generate_annotation_table(overwrite=self.overwrite)
 
     def _get_raw_data(self, overwrite: bool = False) -> None:
         log.info("Getting Raw Data (PX)")
         px_path = Path(self.dataset_raw_dir) / f"{self.datatype}.csv"
-        self.identifier_column = (
-            pd.read_csv(px_path, nrows=0).columns[0] if px_path.is_file() else None
-        )
+        # gff_quant_id from config takes precedence; fall back to the peak-height.csv first-column header
+        if self.gff_quant_id:
+            self.identifier_column = self.gff_quant_id
+        else:
+            self.identifier_column = (
+                pd.read_csv(px_path, nrows=0).columns[0] if px_path.is_file() else None
+            )
         if self.check_and_load_attribute('raw_data', self._raw_data_filename, self.overwrite):
             if self.identifier_column is None:
                 self.identifier_column = self.raw_data.columns[0]
@@ -940,7 +986,8 @@ class PX(Dataset):
         )
         if result is None or result.empty:
             raise FileNotFoundError(f"No PX {self.datatype}.csv file found under {self.dataset_raw_dir}.")
-        self.identifier_column = result.columns[0]
+        if self.identifier_column is None:
+            self.identifier_column = result.columns[0]
         self.raw_data = result
         log.info(f"\tCreated raw data for PX with {self.raw_data.shape[1]} columns and {self.raw_data.shape[0]} features.")
         log.info(f"Created table: {self._raw_data_filename}")
@@ -968,10 +1015,14 @@ class PX(Dataset):
         result = hlp.generate_tx_annotation_table(
             raw_data=self.raw_data,
             raw_data_dir=self.dataset_raw_dir,
-            genome_type=self.genome_type,
             output_dir=self.output_dir,
             output_filename=self._annotation_table_filename,
-            identifier_column=self.identifier_column,
+            gff_quant_id=self.gff_quant_id or self.identifier_column,
+            gff_annot_id=self.gff_annot_id or self.gff_quant_id or self.identifier_column,
+            ec_number_col=self.ec_number_col,
+            kegg_id_col=self.kegg_id_col,
+            ec_delimiter=self.ec_delimiter,
+            kegg_id_delimiter=self.kegg_id_delimiter,
             prefix="px",
         )
         if result.empty:
@@ -1279,6 +1330,7 @@ class Analysis(BaseDataHandler):
         hlp.plot_simple_pca(
             df=self.integrated_data_selected,
             metadata=self._metadata_for_integrated_data(),
+            metadata_variables=self.project.study_variables,
             title="Integrated Data PCA",
             output_dir=self.output_dir,
         )

@@ -129,6 +129,59 @@ def test_raw_filters_semantics():
     assert prep.filter_features(df, "prenormalized", presence_min_percent=99, magnitude_min_mean=1e9).shape == df.shape
 
 
+def test_vst_log_transform():
+    """VST output properties: non-negative, finite, variance more stable than log2 across count levels."""
+    rng = np.random.default_rng(42)
+    # Simulate counts spanning low (mean~1) to high (mean~1000) range
+    low_counts = pd.DataFrame(rng.poisson(1, (50, 10)), index=[f"low_{i}" for i in range(50)], dtype=float)
+    high_counts = pd.DataFrame(rng.poisson(1000, (50, 10)), index=[f"high_{i}" for i in range(50)], dtype=float)
+    data = pd.concat([low_counts, high_counts])
+
+    vst_out = prep.log_transform(data, "tx", pseudocount=1.0, log_transform_method="vst")
+    log2_out = prep.log_transform(data, "tx", pseudocount=1.0, log_transform_method="log2")
+
+    # VST output must be finite and non-negative (arcsinh(sqrt(x>=0)) >= 0)
+    assert np.isfinite(vst_out.to_numpy()).all()
+    assert (vst_out.to_numpy() >= 0).all()
+
+    # VST should have lower variance spread across mean levels than log2
+    # (coefficient of variation of per-feature variance should be smaller for VST)
+    vst_var = vst_out.var(axis=1)
+    log2_var = log2_out.var(axis=1)
+    vst_cv = vst_var.std() / vst_var.mean()
+    log2_cv = log2_var.std() / log2_var.mean()
+    assert vst_cv < log2_cv, "VST should have more uniform variance across count levels than log2"
+
+    # auto for tx should resolve to vst
+    auto_out = prep.log_transform(data, "tx", pseudocount=1.0, log_transform_method="auto")
+    pd.testing.assert_frame_equal(auto_out, vst_out)
+
+    # auto for mx/px should resolve to log2 (requires positive values)
+    mx_data = pd.DataFrame(rng.lognormal(10, 1, (20, 10)), index=[f"mx_{i}" for i in range(20)])
+    auto_mx = prep.log_transform(mx_data, "mx", log_transform_method="auto")
+    log2_mx = prep.log_transform(mx_data, "mx", log_transform_method="log2")
+    pd.testing.assert_frame_equal(auto_mx, log2_mx)
+
+
+def test_vst_default_in_pipeline(synthetic):
+    """VST is the default log transform for raw tx data; log2 remains available."""
+    params_vst = {**BASE_PARAMS}  # auto → vst for tx
+    params_log2 = {**BASE_PARAMS, "log_transform_method": "log2"}
+
+    res_vst = prep.preprocess_dataset(synthetic["tx"], "tx", "raw", params_vst, SAMPLE_TO_GROUP, dataset_name="tx")
+    res_log2 = prep.preprocess_dataset(synthetic["tx"], "tx", "raw", params_log2, SAMPLE_TO_GROUP, dataset_name="tx")
+
+    # Both produce finite log matrices
+    assert np.isfinite(res_vst["log"].to_numpy()).all()
+    assert np.isfinite(res_log2["log"].to_numpy()).all()
+
+    # VST and log2 produce different log matrices
+    assert not np.allclose(res_vst["log"].to_numpy(), res_log2["log"].to_numpy())
+
+    # VST output is non-negative (arcsinh(sqrt(x>=0)) >= 0)
+    assert (res_vst["log"].to_numpy() >= 0).all()
+
+
 def test_impute_feature_minimum():
     df = pd.DataFrame([[0, 4.0, 2.0], [3.0, 0, 0], [0, 0, 0]], index=list("abc"))
     out = prep.impute_feature_minimum(df)

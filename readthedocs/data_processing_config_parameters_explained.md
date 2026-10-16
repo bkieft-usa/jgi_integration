@@ -9,15 +9,16 @@ This document describes the practical effect of each option in the **data proces
 ---
 
 ## Table of Contents
-- [Configuration](#configuration)  
-- [Input State](#input-state)  
-- [Normalization Parameters](#normalization-parameters)  
-  - [Filtering](#filtering)  
-  - [Sample normalization, imputation and log transform](#sample-normalization)  
-  - [Devariancing](#devariancing)  
-  - [Replicate Handling](#replicate-handling)  
-- [Example Configuration](#example-configuration)  
-- [Processing Order and Outputs](#outputs)  
+- [Configuration](#configuration)
+- [Input State](#input-state)
+- [GFF Identifier Fields](#gff-identifier-fields)
+- [Normalization Parameters](#normalization-parameters)
+  - [Filtering](#filtering)
+  - [Sample normalization, imputation and log transform](#sample-normalization)
+  - [Devariancing](#devariancing)
+  - [Replicate Handling](#replicate-handling)
+- [Example Configuration](#example-configuration)
+- [Processing Order and Outputs](#outputs)
 
 ---
 
@@ -41,6 +42,30 @@ Example: Changing the filtering threshold (see below) will generate a new hash l
 |-------|---------|
 | `raw` | Counts (`tx`) or peak heights (`mx`, `px`). Values must be non-negative and linear; negative or log-like values stop the run with an error. Non-integer `tx` counts (e.g. expected counts) are accepted with a warning. |
 | `prenormalized` | Already normalized and/or transformed. The scale is detected automatically (linear, log, or already feature-scaled) from the fraction of negative values and zeros, the value range, skewness, and whether features are centered with unit variance. The report is logged and written to `input_report.json` in the dataset output folder. Raw filters and sample normalization are never applied; a log transform is applied only if the data are detected as linear. |
+
+---
+
+## GFF Identifier Fields <a id="gff-identifier-fields"></a>
+
+`datasets.<dataset_name>.gff_quant_id` and `datasets.<dataset_name>.gff_annot_id` apply to `tx` and `px` datasets only.
+
+These two keys tell the pipeline which attribute in column 9 of the GFF3 file corresponds to the feature IDs used in each input file.  They are independent so that datasets where the quantitative data and the annotation files use different GFF attributes can be handled without any pre-processing.
+
+| Config key | Type | Default | Description |
+|------------|------|---------|-------------|
+| `gff_quant_id` | string | first column header of `counts.csv` / `peak-height.csv` | GFF9 attribute whose values appear as the **first column of the quantitative data file** (e.g. `counts.csv`). These values become the `transcriptome_id` entries in the annotation table and must match the feature IDs in the integrated data matrix. |
+| `gff_annot_id` | string | same as `gff_quant_id` | GFF9 attribute whose values appear as the **first column of the annotation files** (e.g. `*_annotation_table.tsv`). When this differs from `gff_quant_id`, the GFF3 is scanned to build a bridge that re-keys each annotation row to the corresponding quant-data identifier before the annotation table is written. |
+
+**Common examples**
+
+| Scenario | `gff_quant_id` | `gff_annot_id` |
+|----------|---------------|----------------|
+| Both files use the same locus tag | `locus_tag` | `locus_tag` |
+| Counts use `locus_tag`, annotations use `ID` | `locus_tag` | `ID` |
+| Counts use `Name`, annotations use `protein_id` | `Name` | `protein_id` |
+| Both files use the GFF `ID` attribute | `ID` | `ID` |
+
+When both keys are omitted the pipeline falls back to reading the first column header of the quantitative data file, which preserves the previous behaviour.
 
 ---
 
@@ -94,19 +119,43 @@ Applied to the log-scale matrix (also for prenormalized input). Replicate groups
 
 ## Example Configuration <a id="example-configuration"></a>
 
-A minimal `datasets` block for a transcriptomics dataset (`tx`). The same structure applies to `mx` and `px` (the `px` dataset uses the same annotation files and formats as `tx`).
+A minimal `datasets` block for a transcriptomics dataset (`tx`). The same structure applies to `px` (the `px` dataset uses the same annotation files and formats as `tx`). `mx` does not use GFF identifier fields.
 
 ```yaml
 datasets:
   tx:
     dataset_dir: transcriptomics
     input_state: raw
+    gff_quant_id: locus_tag   # GFF9 attribute matching the first column of counts.csv
+    gff_annot_id: locus_tag   # GFF9 attribute matching the first column of annotation files
     normalization_parameters:
       filtering:
         presence_min_percent: 20
         magnitude_min_mean: 10
       sample_normalization: auto
       pseudocount: 1
+      devariancing:
+        method: percent
+        params:
+          value: 25
+          mean_adjusted: true
+      replicate_handling:
+        method: sd
+        params:
+          sd_threshold: 1.0
+          majority_fraction: 0.5
+          min_replicates: 2
+
+  px:
+    dataset_dir: proteomics
+    input_state: raw
+    gff_quant_id: locus_tag   # GFF9 attribute matching the first column of peak-height.csv
+    gff_annot_id: protein_id  # GFF9 attribute matching the first column of annotation files
+    normalization_parameters:
+      filtering:
+        presence_min_percent: 20
+        magnitude_min_mean: 1000
+      sample_normalization: auto
       devariancing:
         method: percent
         params:

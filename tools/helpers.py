@@ -1631,7 +1631,7 @@ def plot_correlation_network(
     annotation_df: Optional[pd.DataFrame] = None,
     submodule_mode: str = "louvain",
     module_resolution: float = 1.0,
-    max_module_size: int = 100,
+    max_module_size: int = 400,
     network_layout: str = None,
     show_network_plot: bool = False,
 ) -> None:
@@ -4289,676 +4289,235 @@ def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.Data
         log.info(annotation_df['transcriptome_id'].tolist()[:10])
         raise ValueError("No matching gene IDs found between raw data and annotations, something is wrong.")
 
-def _validate_annotation_identifier_header(
-    df: pd.DataFrame,
-    file_path: str,
-    identifier_column: str,
+def _validate_gff_attributes(
+    raw_data_dir: str,
+    gff_quant_id: str,
+    gff_annot_id: str,
 ) -> None:
-    if not len(df.columns) or df.columns[0] != identifier_column:
-        actual_header = df.columns[0] if len(df.columns) else "<no columns>"
-        raise ValueError(
-            f"Annotation file {os.path.basename(file_path)} must have "
-            f"'{identifier_column}' as its first column; found '{actual_header}'."
+    """
+    Validate that ``gff_quant_id`` and ``gff_annot_id`` appear as GFF3
+    info-column attributes in the GFF3 file found under ``raw_data_dir``.
+
+    When ``gff_quant_id == gff_annot_id`` no ID bridging is required and no
+    GFF3 file is needed, so this function returns immediately without reading
+    any file.  A GFF3 file is only required (and validated) when the two IDs
+    differ, because that is the only case where the GFF3 is actually used to
+    build the ``annot_id -> quant_id`` mapping.
+
+    Args:
+        raw_data_dir (str): Directory that may contain a ``*.gff3`` file.
+        gff_quant_id (str): GFF9 attribute expected in counts.csv first column.
+        gff_annot_id (str): GFF9 attribute expected in annotation file first column.
+
+    Raises:
+        FileNotFoundError: If ``gff_quant_id != gff_annot_id`` and no GFF3
+            file is found in ``raw_data_dir``.
+        ValueError: If either attribute is absent from all GFF3 info columns
+            (only checked when ``gff_quant_id != gff_annot_id``).
+    """
+    if gff_quant_id == gff_annot_id:
+        log.info(
+            f"gff_quant_id == gff_annot_id ('{gff_quant_id}'); "
+            "no GFF3 ID bridge needed -- skipping GFF3 validation."
         )
+        return
 
-
-def _process_microbe_annotations(
-    raw_data_dir: str,
-    output_dir: str,
-    output_filename: str,
-    identifier_column: str,
-) -> pd.DataFrame:
-    """
-    Process microbe annotation files and merge into a single table.
-    
-    Args:
-        raw_data_dir (str): Directory containing annotation files
-        output_dir (str): Output directory
-        output_filename (str): Output filename
-        
-    Returns:
-        pd.DataFrame: Merged annotation table
-    """
-    
-    log.info(f"Processing microbe annotations from {raw_data_dir}")
-    
-    # Find all annotation table files
-    annotation_files = glob.glob(os.path.join(raw_data_dir, "*_annotation_table.tsv"))
-    
-    if not annotation_files:
-        log.warning(f"No *_annotation_table.tsv files found in {raw_data_dir}")
-        empty_df = pd.DataFrame(columns=['transcriptome_id'])
-        return empty_df
-    
-    log.info(f"Found {len(annotation_files)} annotation files:")
-    for file in annotation_files:
-        log.info(f"  {os.path.basename(file)}")
-    
-    # Process each annotation file
-    processed_dfs = []
-    for file_path in annotation_files:
-        df = _read_and_select_microbe_annotations(file_path, identifier_column)
-        if df is not None and not df.empty:
-            agg_df = _aggregate_gene_annotations(df)
-            processed_dfs.append(agg_df)
-            log.info(f"  Processed {os.path.basename(file_path)}: {len(agg_df)} genes")
-        else:
-            log.warning(f"  Skipped {os.path.basename(file_path)}: no valid data")
-    
-    if not processed_dfs:
-        log.warning("No valid annotation data found in any files")
-        empty_df = pd.DataFrame(columns=['transcriptome_id'])
-        return empty_df
-    
-    # Merge all annotation dataframes
-    merged_df = reduce(
-        lambda left, right: pd.merge(left, right, on='transcriptome_id', how='outer'), 
-        processed_dfs
-    )
-    
-    # Fill NaN values with empty strings for consistency
-    merged_df = merged_df.fillna('')
-    
-    # Add protein ID mapping from GFF3 file if available
-    merged_df = _add_protein_id_mapping(
-        merged_df,
-        raw_data_dir,
-        "microbe",
-        identifier_attribute=identifier_column,
-    )
-    
-    # Compress the dataframe to ensure one gene per row with semicolon-separated annotations
-    final_df = _compress_annotation_table(merged_df)
-    
-    log.info(f"Final annotation table: {len(final_df)} genes with {len(final_df.columns)} annotation columns")    
-    
-    return final_df
-
-def _aggregate_gene_annotations(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate microbe annotations by transcriptome_id, handling multiple annotations per gene.
-    
-    Args:
-        df (pd.DataFrame): Annotation dataframe with transcriptome_id column
-        
-    Returns:
-        pd.DataFrame: Aggregated dataframe with one row per transcriptome_id
-    """
-    
-    def join_unique_values(series):
-        """Join unique non-empty values with double semicolon"""
-        unique_vals = sorted({
-            str(x).strip() for x in series.dropna() 
-            if str(x).strip() and str(x).strip().lower() not in ['nan', 'none', '']
-        })
-        return ';;'.join(unique_vals) if unique_vals else ''
-    
-    # Group by transcriptome_id and aggregate all other columns
-    annotation_columns = [col for col in df.columns if col != 'transcriptome_id']
-    
-    # Group by transcriptome_id and aggregate
-    aggregated_df = df.groupby('transcriptome_id')[annotation_columns].agg(join_unique_values).reset_index()
-    
-    return aggregated_df
-
-def _process_algal_annotations(
-    raw_data_dir: str,
-    output_dir: str,
-    output_filename: str,
-    identifier_column: str,
-) -> pd.DataFrame:
-    """
-    Process algal annotation files and merge into a single table.
-    
-    Args:
-        raw_data_dir (str): Directory containing annotation files
-        output_dir (str): Output directory
-        output_filename (str): Output filename
-        
-    Returns:
-        pd.DataFrame: Merged annotation table
-    """
-    
-    log.info(f"Processing algal annotations from {raw_data_dir}")
-    
-    # Find all annotation table files
-    annotation_files = glob.glob(os.path.join(raw_data_dir, "*_annotation_table.tsv"))
-    
-    if not annotation_files:
-        log.warning(f"No *_annotation_table.tsv files found in {raw_data_dir}")
-        empty_df = pd.DataFrame(columns=['transcriptome_id'])
-        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
-        return empty_df
-    
-    log.info(f"Found {len(annotation_files)} annotation files:")
-    for file in annotation_files:
-        log.info(f"  {os.path.basename(file)}")
-    
-    # Process each annotation file
-    processed_dfs = []
-    for file_path in annotation_files:
-        df = _read_and_select_algal_annotations(file_path, identifier_column)
-        if df is not None and not df.empty:
-            agg_df = _aggregate_algal_annotations(df)
-            processed_dfs.append(agg_df)
-            log.info(f"  Processed {os.path.basename(file_path)}: {len(agg_df)} proteins")
-        else:
-            log.warning(f"  Skipped {os.path.basename(file_path)}: no valid data")
-    
-    if not processed_dfs:
-        log.warning("No valid annotation data found in any files")
-        empty_df = pd.DataFrame(columns=['transcriptome_id'])
-        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
-        return empty_df
-    
-    # Merge all annotation dataframes based on protein_id
-    merged_df = reduce(
-        lambda left, right: pd.merge(left, right, on='protein_id', how='outer'), 
-        processed_dfs
-    )
-    
-    # Fill NaN values with empty strings for consistency
-    merged_df = merged_df.fillna('')
-    
-    # Add transcriptome_id mapping from GFF3 file (protein_id -> transcriptome_id)
-    merged_df = _add_protein_id_mapping(
-        merged_df,
-        raw_data_dir,
-        "algal",
-        identifier_attribute=identifier_column,
-    )
-    
-    # Compress the dataframe to ensure one gene per row with semicolon-separated annotations
-    final_df = _compress_annotation_table(merged_df)
-    
-    log.info(f"Final annotation table: {len(final_df)} genes with {len(final_df.columns)} annotation columns")
-    
-    # Save the merged annotation table
-    write_integration_file(final_df, output_dir, output_filename, indexing=False)
-    
-    return final_df
-
-def _process_plant_annotations(
-    raw_data_dir: str,
-    output_dir: str,
-    output_filename: str,
-    identifier_column: str,
-) -> pd.DataFrame:
-    """
-    Process plant (Phytozome) annotation files and merge into a single table.
-
-    Plant data has a single annotation file called ``kegg_annotation_table.tsv``
-    whose columns are::
-
-        #pacId  locusName  transcriptName  peptideName  Pfam  Panther  KOG
-        KEGG/ec  KO  GO  Best-hit-arabi-name  arabi-symbol  arabi-defline
-
-    The ``transcriptName`` column (e.g. ``LOC_Os01g04030.1``) is used as the
-    primary identifier and is mapped to ``transcriptome_id`` via the GFF3
-    ``mRNA`` feature ``Name`` attribute.  ``pacId`` is stored as ``protein_id``
-    (it is the numeric Phytozome protein/pacid identifier).
-
-    Args:
-        raw_data_dir (str): Directory containing ``kegg_annotation_table.tsv``
-            and optionally a ``genes.gff3`` file.
-        output_dir (str): Output directory for the merged annotation table.
-        output_filename (str): Filename for the output annotation table.
-
-    Returns:
-        pd.DataFrame: Merged annotation table with ``transcriptome_id`` and
-            annotation columns.
-    """
-
-    log.info(f"Processing plant annotations from {raw_data_dir}")
-
-    # Plant has exactly one annotation file
-    annotation_file = os.path.join(raw_data_dir, "kegg_annotation_table.tsv")
-
-    if not os.path.isfile(annotation_file):
-        log.warning(f"kegg_annotation_table.tsv not found in {raw_data_dir}")
-        empty_df = pd.DataFrame(columns=['transcriptome_id'])
-        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
-        return empty_df
-
-    log.info(f"Found annotation file: {os.path.basename(annotation_file)}")
-
-    df = _read_and_select_plant_annotations(annotation_file, identifier_column)
-    if df is None or df.empty:
-        log.warning(f"No valid data in {os.path.basename(annotation_file)}")
-        empty_df = pd.DataFrame(columns=['transcriptome_id'])
-        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
-        return empty_df
-
-    # Aggregate repeated annotation rows by the shared transcriptome identifier.
-    agg_df = _aggregate_plant_annotations(df)
-    log.info(f"  Processed {os.path.basename(annotation_file)}: {len(agg_df)} identifiers")
-
-    # Fill NaN values with empty strings for consistency
-    agg_df = agg_df.fillna('')
-
-    merged_df = _add_protein_id_mapping(
-        agg_df,
-        raw_data_dir,
-        "plant",
-        identifier_attribute=identifier_column,
-    )
-
-    # Compress to one gene per row with semicolon-separated annotations
-    final_df = _compress_annotation_table(merged_df)
-
-    log.info(f"Final annotation table: {len(final_df)} genes with {len(final_df.columns)} annotation columns")
-
-    # Save the merged annotation table
-    write_integration_file(final_df, output_dir, output_filename, indexing=False)
-
-    return final_df
-
-
-def _read_and_select_plant_annotations(
-    file_path: str,
-    identifier_column: str,
-) -> pd.DataFrame:
-    """
-    Read and select relevant columns from the plant Phytozome
-    ``kegg_annotation_table.tsv`` annotation file.
-
-    The file uses a ``#``-prefixed header line and tab separation.  The
-    following source columns are extracted and renamed:
-
-    ==================  =================
-    Source column       Output column
-    ==================  =================
-    ``#pacId``          ``protein_id``
-    ``transcriptName``  ``transcriptome_id``
-    ``Pfam``            ``pfam_acc``
-    ``Panther``         ``panther_acc``
-    ``KOG``             ``kog_acc``
-    ``KEGG/ec``         ``kegg_ec``
-    ``KO``              ``ko_acc``
-    ``GO``              ``go_acc``
-    ``Best-hit-arabi-name`` ``arabi_hit``
-    ``arabi-symbol``    ``arabi_symbol``
-    ``arabi-defline``   ``arabi_defline``
-    ==================  =================
-
-    Args:
-        file_path (str): Path to ``kegg_annotation_table.tsv``.
-
-    Returns:
-        pd.DataFrame or None: Processed annotation dataframe, or ``None`` on
-            error.
-    """
-
-    try:
-        df = pd.read_csv(file_path, sep='\t', comment=None, low_memory=False)
-
-        _validate_annotation_identifier_header(df, file_path, identifier_column)
-
-        # Strip the source-format marker after validating the literal header.
-        df.columns = [c.lstrip('#') for c in df.columns]
-        source_identifier = identifier_column.lstrip('#')
-
-        # Map source columns to standardised output names; only keep columns
-        # that are actually present in the file.
-        col_map = {
-            'pacId':               'protein_id',
-            'locusName':           'locus_name',
-            'transcriptName':      'transcript_name',
-            'Pfam':                'pfam_acc',
-            'Panther':             'panther_acc',
-            'KOG':                 'kog_acc',
-            'KEGG/ec':             'kegg_ec',
-            'KO':                  'ko_acc',
-            'GO':                  'go_acc',
-            'Best-hit-arabi-name': 'arabi_hit',
-            'arabi-symbol':        'arabi_symbol',
-            'arabi-defline':       'arabi_defline',
-        }
-
-        available_map = {src: dst for src, dst in col_map.items() if src in df.columns}
-        if source_identifier not in df.columns:
-            raise ValueError(
-                f"Identifier column '{identifier_column}' was not found in "
-                f"{os.path.basename(file_path)} after header normalization."
-            )
-        available_map[source_identifier] = 'transcriptome_id'
-        df = df[list(available_map.keys())].copy()
-        df.rename(columns=available_map, inplace=True)
-
-        df['transcriptome_id'] = df['transcriptome_id'].astype(str)
-        df = df[df['transcriptome_id'].str.strip() != '']
-        if 'protein_id' in df.columns:
-            df['protein_id'] = df['protein_id'].astype(str)
-
-        return df
-
-    except ValueError:
-        raise
-    except Exception as e:
-        log.warning(f"Error reading plant annotation file {file_path}: {e}")
-        return None
-
-
-def _aggregate_plant_annotations(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate plant annotations by ``transcriptome_id``.
-
-    Args:
-        df (pd.DataFrame): Annotation dataframe with a ``locus_name`` column
-            produced by :func:`_read_and_select_plant_annotations`.
-
-    Returns:
-        pd.DataFrame: Aggregated dataframe with one row per ``locus_name``.
-    """
-
-    def join_unique_values(series):
-        """Join unique non-empty values with double semicolon."""
-        unique_vals = sorted({
-            str(x).strip() for x in series.dropna()
-            if str(x).strip() and str(x).strip().lower() not in ['nan', 'none', '']
-        })
-        return ';;'.join(unique_vals) if unique_vals else ''
-
-    annotation_columns = [col for col in df.columns if col != 'transcriptome_id']
-    aggregated_df = (
-        df.groupby('transcriptome_id')[annotation_columns]
-        .agg(join_unique_values)
-        .reset_index()
-    )
-
-    return aggregated_df
-
-
-def _read_and_select_microbe_annotations(
-    file_path: str,
-    identifier_column: str,
-) -> pd.DataFrame:
-    """
-    Read and select relevant columns from microbe annotation files.
-    
-    Args:
-        file_path (str): Path to annotation file
-        
-    Returns:
-        pd.DataFrame: Processed annotation dataframe
-    """
-    
-    try:
-        df = pd.read_csv(file_path, sep='\t')
-        _validate_annotation_identifier_header(df, file_path, identifier_column)
-        
-        # Determine annotation type based on filename
-        filename = os.path.basename(file_path)
-        
-        if 'cog_annotation_table' in filename:
-            selected_cols = [identifier_column, 'cog_id', 'cog_name']
-            df = df[selected_cols].copy()
-            df.rename(columns={identifier_column: 'transcriptome_id', 'cog_id': 'cog_acc', 'cog_name': 'cog_desc'}, inplace=True)
-            
-        elif 'ipr_annotation_table' in filename:
-            selected_cols = [identifier_column, 'iprid', 'iprdesc', 'go_info']
-            df = df[selected_cols].copy()
-            df.rename(columns={identifier_column: 'transcriptome_id', 'iprid': 'ipr_acc', 'iprdesc': 'ipr_desc', 'go_info': 'go_acc'}, inplace=True)
-            
-        elif 'kegg_annotation_table' in filename:
-            selected_cols = [identifier_column, 'ko_id', 'ko_name']
-            df = df[selected_cols].copy()
-            df.rename(columns={identifier_column: 'transcriptome_id', 'ko_id': 'kegg_acc', 'ko_name': 'kegg_desc'}, inplace=True)
-            
-        elif 'pfam_annotation_table' in filename:
-            selected_cols = [identifier_column, 'pfam_id', 'pfam_name']
-            df = df[selected_cols].copy()
-            df.rename(columns={identifier_column: 'transcriptome_id', 'pfam_id': 'pfam_acc', 'pfam_name': 'pfam_desc'}, inplace=True)
-            
-        elif 'tigrfam_annotation_table' in filename:
-            selected_cols = [identifier_column, 'tigrfam_id', 'tigrfam_name']
-            df = df[selected_cols].copy()
-            df.rename(columns={identifier_column: 'transcriptome_id', 'tigrfam_id': 'tigrfam_acc', 'tigrfam_name': 'tigrfam_desc'}, inplace=True)
-            
-        else:
-            log.warning(f"Unknown annotation file type: {filename}")
-            return None
-            
-        return df
-        
-    except ValueError:
-        raise
-    except Exception as e:
-        log.warning(f"Error reading file {file_path}: {e}")
-        return None
-
-def _read_and_select_algal_annotations(
-    file_path: str,
-    identifier_column: str,
-) -> pd.DataFrame:
-    """
-    Read and select relevant columns from algal annotation files.
-    
-    Args:
-        file_path (str): Path to annotation file
-        
-    Returns:
-        pd.DataFrame: Processed annotation dataframe
-    """
-    
-    try:
-        df = pd.read_csv(file_path, sep='\t')
-        _validate_annotation_identifier_header(df, file_path, identifier_column)
-        
-        # Determine annotation type based on filename
-        filename = os.path.basename(file_path)
-        
-        if 'go_annotation_table' in filename:
-            # Select proteinId and GO annotation columns
-            selected_cols = [identifier_column, 'gotermId', 'goName', 'gotermType', 'goAcc']
-            df = df[selected_cols].copy()
-            df.rename(columns={
-                identifier_column: 'protein_id',
-                'gotermId': 'go_id',
-                'goName': 'go_name',
-                'gotermType': 'go_type',
-                'goAcc': 'go_acc'
-            }, inplace=True)
-            
-        elif 'ipr_annotation_table' in filename:
-            # Select proteinId and InterPro annotation columns
-            selected_cols = [identifier_column, 'iprId', 'iprDesc']
-            df = df[selected_cols].copy()
-            df.rename(columns={
-                identifier_column: 'protein_id',
-                'iprId': 'ipr_acc',
-                'iprDesc': 'ipr_desc',
-                'goAcc': 'go_acc'
-            }, inplace=True)
-            
-        elif 'kegg_annotation_table' in filename:
-            # Select proteinId and KEGG annotation columns
-            selected_cols = [identifier_column, 'ecNum', 'definition']
-            df = df[selected_cols].copy()
-            df.rename(columns={
-                identifier_column: 'protein_id',
-                'ecNum': 'kegg_ec',
-                'definition': 'kegg_desc'
-            }, inplace=True)
-            
-        elif 'kog_annotation_table' in filename:
-            # Select proteinId and KOG annotation columns
-            selected_cols = [identifier_column, 'kogid', 'kogdefline']
-            df = df[selected_cols].copy()
-            df.rename(columns={
-                identifier_column: 'protein_id',
-                'kogid': 'kog_acc',
-                'kogdefline': 'kog_desc'
-            }, inplace=True)
-            
-        else:
-            log.warning(f"Unknown annotation file type: {filename}")
-            return None
-            
-        return df
-        
-    except ValueError:
-        raise
-    except Exception as e:
-        log.warning(f"Error reading file {file_path}: {e}")
-        return None
-
-def _aggregate_algal_annotations(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate algal annotations by protein_id, handling multiple annotations per protein.
-    
-    Args:
-        df (pd.DataFrame): Annotation dataframe with protein_id column
-        
-    Returns:
-        pd.DataFrame: Aggregated dataframe with one row per protein_id
-    """
-    
-    def join_unique_values(series):
-        """Join unique non-empty values with double semicolon"""
-        unique_vals = sorted({
-            str(x).strip() for x in series.dropna() 
-            if str(x).strip() and str(x).strip().lower() not in ['nan', 'none', '']
-        })
-        return ';;'.join(unique_vals) if unique_vals else ''
-    
-    # Group by protein_id and aggregate all other columns
-    annotation_columns = [col for col in df.columns if col != 'protein_id']
-    
-    # Group by protein_id and aggregate
-    aggregated_df = df.groupby('protein_id')[annotation_columns].agg(join_unique_values).reset_index()
-    
-    return aggregated_df
-
-def _add_protein_id_mapping(
-    merged_df: pd.DataFrame,
-    raw_data_dir: str,
-    genome_type: str,
-    identifier_attribute: str = None,
-) -> pd.DataFrame:
-    """
-    Resolve the selected GFF3 identifier and display name for annotation rows.
-    
-    Args:
-        merged_df (pd.DataFrame): Merged annotation dataframe
-        raw_data_dir (str): Directory containing GFF3 file
-        genome_type (str): Genome type ("microbe", "algal", etc.)
-        identifier_attribute (str): GFF3 attribute selected by the counts header
-        
-    Returns:
-        pd.DataFrame: Annotation dataframe with protein ID and display_name columns added
-    """
-    
-    # Look for GFF3 file in the raw data directory
     gff_files = glob.glob(os.path.join(raw_data_dir, "*.gff3"))
     if not gff_files:
-        gff_files = glob.glob(os.path.join(raw_data_dir, "genes.gff3"))
-    
-    if not gff_files:
         raise FileNotFoundError(
-            f"No GFF3 file found in {raw_data_dir} for identifier "
-            f"'{identifier_attribute}'."
+            f"gff_quant_id='{gff_quant_id}' differs from gff_annot_id='{gff_annot_id}' "
+            f"but no *.gff3 file was found in {raw_data_dir}. "
+            "A GFF3 file is required to build the ID bridge."
         )
-    
-    gff_file = gff_files[0]  # Use first GFF3 file found
-    log.info(f"Adding protein ID mapping and display names from {os.path.basename(gff_file)}")
-    
-    feature_types = {
-        "algal": ("gene", "product_name"),
-        "microbe": ("CDS", "product"),
-        "plant": ("mRNA", "Name"),
-    }
-    feature_type, display_attribute = feature_types.get(
-        genome_type, ("gene", "product")
-    )
-    identifier_attribute = identifier_attribute or "ID"
-    identifier_to_display = {}
-    
-    with open(gff_file, 'r') as f:
-        for line in f:
-            if line.startswith('#') or line.strip() == '':
+
+    gff_file = gff_files[0]
+    found_quant = False
+    found_annot = False
+    quant_tag = f"{gff_quant_id}="
+    annot_tag = f"{gff_annot_id}="
+
+    with open(gff_file, "r") as fh:
+        for line in fh:
+            if line.startswith("#") or line.strip() == "":
                 continue
-                
-            fields = line.strip().split('\t')
+            fields = line.split("\t")
             if len(fields) < 9:
                 continue
-            
-            if fields[2] == feature_type:
-                attributes = fields[8]
-                identifier_match = re.search(
-                    rf"(?:^|;){re.escape(identifier_attribute)}=([^;]+)",
-                    attributes,
-                )
-                if not identifier_match:
-                    continue
+            info = fields[8]
+            if not found_quant and quant_tag in info:
+                found_quant = True
+            if not found_annot and annot_tag in info:
+                found_annot = True
+            if found_quant and found_annot:
+                break
 
-                identifier = identifier_match.group(1)
-                display_match = re.search(
-                    rf"(?:^|;){re.escape(display_attribute)}=([^;]+)",
-                    attributes,
-                )
-                identifier_to_display[identifier] = (
-                    display_match.group(1).strip() if display_match else identifier
-                )
+    errors = []
+    if not found_quant:
+        errors.append(
+            f"gff_quant_id='{gff_quant_id}' was not found as a GFF3 attribute "
+            f"in {os.path.basename(gff_file)}. "
+            "Check that this attribute name matches the GFF3 info column exactly "
+            "(e.g. 'ID', 'locus_tag', 'Name')."
+        )
+    if not found_annot:
+        errors.append(
+            f"gff_annot_id='{gff_annot_id}' was not found as a GFF3 attribute "
+            f"in {os.path.basename(gff_file)}. "
+            "Check that this attribute name matches the GFF3 info column exactly."
+        )
+    if errors:
+        raise ValueError("\n".join(errors))
 
     log.info(
-        f"Found {len(identifier_to_display)} {feature_type} records with "
-        f"GFF3 identifier '{identifier_attribute}'"
+        f"GFF3 attribute validation passed: "
+        f"gff_quant_id='{gff_quant_id}', gff_annot_id='{gff_annot_id}' "
+        f"both found in {os.path.basename(gff_file)}"
     )
-    if not identifier_to_display:
-        raise ValueError(
-            f"No GFF3 {feature_type} records contain the requested identifier "
-            f"attribute '{identifier_attribute}'. Check the first-column "
-            "header in counts.csv."
-        )
 
-    if genome_type == "algal" and 'protein_id' in merged_df.columns:
-        merged_df['transcriptome_id'] = merged_df['protein_id'].astype(str)
-    if 'transcriptome_id' not in merged_df.columns:
-        raise ValueError(
-            f"Annotation table for {genome_type} is missing the selected "
-            "transcriptome identifier."
-        )
 
-    merged_df['transcriptome_id'] = merged_df['transcriptome_id'].astype(str)
-    merged_df['display_name'] = merged_df['transcriptome_id'].map(
-        identifier_to_display
-    ).fillna('')
-    if 'protein_id' not in merged_df.columns:
-        merged_df['protein_id'] = ''
-
-    return merged_df
-
-def _compress_annotation_table(
-    merged_df: pd.DataFrame
+def _process_generic_annotations(
+    raw_data_dir: str,
+    gff_annot_id: str,
+    gff_quant_id: str,
 ) -> pd.DataFrame:
     """
-    Compress annotation table to ensure one gene per row with semicolon-separated annotations.
-    
+    Read all ``*_annotation_table.tsv`` files from ``raw_data_dir``, merge
+    them on their first column (``gff_annot_id``), and optionally remap the
+    ID column to ``gff_quant_id`` values via a GFF3 bridge scan.
+
+    When ``gff_quant_id == gff_annot_id`` no GFF3 file is needed and the
+    merged ID column is simply renamed to ``transcriptome_id``.  When they
+    differ, the GFF3 is scanned once to build an ``annot_id -> quant_id``
+    bridge.  All columns from every annotation file are kept as-is; no
+    column selection or renaming is performed beyond the ID column.
+
     Args:
-        merged_df (pd.DataFrame): Merged annotation dataframe potentially with duplicate genes
-        
+        raw_data_dir (str): Directory containing ``*_annotation_table.tsv``
+            files and optionally a ``*.gff3`` file.
+        gff_annot_id (str): GFF9 attribute whose values appear as the first
+            column of the annotation files.  The first column of each file is
+            renamed to this value if it does not already match.
+        gff_quant_id (str): GFF9 attribute whose values appear as the first
+            column of ``counts.csv`` / ``peak-height.csv``.  When this differs
+            from ``gff_annot_id``, the GFF3 is scanned to build an
+            ``annot_id -> quant_id`` bridge and the ID column is remapped.
+
     Returns:
-        pd.DataFrame: Compressed dataframe with one row per gene
+        pd.DataFrame: Merged annotation table with ``transcriptome_id`` as the
+            first column (containing ``gff_quant_id`` values) and all
+            annotation columns from every input file.  Returns an empty
+            DataFrame with a ``transcriptome_id`` column when no annotation
+            files are found.
     """
-    
-    def join_unique_values(series):
-        """Join unique non-empty values with double semicolon"""
+
+    def _join_unique(series: pd.Series) -> str:
+        """Aggregate duplicate rows: join unique non-empty values with ';;'."""
         unique_vals = sorted({
-            str(x).strip() for x in series.dropna() 
-            if str(x).strip() and str(x).strip().lower() not in ['nan', 'none', '']
+            str(x).strip() for x in series.dropna()
+            if str(x).strip() and str(x).strip().lower() not in ("nan", "none", "")
         })
-        return ';;'.join(unique_vals) if unique_vals else ''
-    
-    # Group by transcriptome_id and aggregate all other columns
-    annotation_columns = [col for col in merged_df.columns if col != 'transcriptome_id']
-    
-    # Group by transcriptome_id and aggregate
-    compressed_df = merged_df.groupby('transcriptome_id')[annotation_columns].agg(join_unique_values).reset_index()
-    
-    log.info(f"Compressed annotations from {len(merged_df)} rows to {len(compressed_df)} unique genes")
-    
-    return compressed_df
+        return ";;".join(unique_vals) if unique_vals else ""
+
+    annotation_files = glob.glob(os.path.join(raw_data_dir, "*_annotation_table.tsv"))
+
+    if not annotation_files:
+        log.warning(f"No *_annotation_table.tsv files found in {raw_data_dir}")
+        return pd.DataFrame(columns=["transcriptome_id"])
+
+    log.info(f"Found {len(annotation_files)} annotation file(s):")
+    for f in annotation_files:
+        log.info(f"  {os.path.basename(f)}")
+
+    processed_dfs: List[pd.DataFrame] = []
+    for file_path in annotation_files:
+        try:
+            df = pd.read_csv(file_path, sep="\t", low_memory=False)
+        except Exception as exc:
+            log.warning(f"  Could not read {os.path.basename(file_path)}: {exc}")
+            continue
+
+        if df.empty:
+            log.warning(f"  Skipped {os.path.basename(file_path)}: file is empty")
+            continue
+
+        # Rename first column to gff_annot_id if it does not already match
+        if df.columns[0] != gff_annot_id:
+            log.info(
+                f"  {os.path.basename(file_path)}: renaming first column "
+                f"'{df.columns[0]}' -> '{gff_annot_id}'"
+            )
+            df = df.rename(columns={df.columns[0]: gff_annot_id})
+
+        # Aggregate duplicate rows
+        annot_cols = [c for c in df.columns if c != gff_annot_id]
+        if annot_cols:
+            df = (
+                df.groupby(gff_annot_id)[annot_cols]
+                .agg(_join_unique)
+                .reset_index()
+            )
+        else:
+            df = df[[gff_annot_id]].drop_duplicates()
+
+        processed_dfs.append(df)
+        log.info(f"  Processed {os.path.basename(file_path)}: {len(df)} rows")
+
+    if not processed_dfs:
+        log.warning("No valid annotation data found in any files")
+        return pd.DataFrame(columns=["transcriptome_id"])
+
+    # Outer-merge all annotation DataFrames on gff_annot_id
+    merged_df = reduce(
+        lambda left, right: pd.merge(left, right, on=gff_annot_id, how="outer"),
+        processed_dfs,
+    )
+    merged_df = merged_df.fillna("")
+
+    # Build gff_annot_id -> gff_quant_id bridge from GFF3 when IDs differ
+    ids_differ = gff_quant_id != gff_annot_id
+    if ids_differ:
+        gff_files = glob.glob(os.path.join(raw_data_dir, "*.gff3"))
+        if not gff_files:
+            raise FileNotFoundError(
+                f"gff_quant_id ('{gff_quant_id}') differs from gff_annot_id "
+                f"('{gff_annot_id}') but no *.gff3 file was found in "
+                f"{raw_data_dir} to build the ID bridge."
+            )
+        gff_file = gff_files[0]
+        log.info(
+            f"Building annot_id -> quant_id bridge from {os.path.basename(gff_file)} "
+            f"('{gff_annot_id}' -> '{gff_quant_id}')"
+        )
+        annot_to_quant: Dict[str, str] = {}
+        quant_tag = f"{gff_quant_id}="
+        annot_tag = f"{gff_annot_id}="
+        with open(gff_file, "r") as fh:
+            for line in fh:
+                if line.startswith("#") or not line.strip():
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 9:
+                    continue
+                info = fields[8]
+                if quant_tag not in info or annot_tag not in info:
+                    continue
+                quant_m = re.search(rf"(?:^|;){re.escape(gff_quant_id)}=([^;]+)", info)
+                annot_m = re.search(rf"(?:^|;){re.escape(gff_annot_id)}=([^;]+)", info)
+                if quant_m and annot_m:
+                    annot_to_quant[annot_m.group(1).strip()] = quant_m.group(1).strip()
+
+        log.info(f"  Bridge built: {len(annot_to_quant)} annot_id -> quant_id mappings")
+        merged_df[gff_annot_id] = merged_df[gff_annot_id].map(annot_to_quant)
+
+    # Rename the ID column to the canonical 'transcriptome_id'
+    merged_df = merged_df.rename(columns={gff_annot_id: "transcriptome_id"})
+    merged_df["transcriptome_id"] = merged_df["transcriptome_id"].astype(str)
+
+    log.info(
+        f"Generic annotation merge complete: {len(merged_df)} rows, "
+        f"{len(merged_df.columns)} columns"
+    )
+    return merged_df
 
 # =============================================================================
 # ModelSEED reactions: loading, placeholder pathways, EC/rxn lookup, pathway lookups
@@ -5140,8 +4699,8 @@ def _build_ec_to_rxn(cache_path: Path) -> dict[str, str]:
     for rxn_id, ec_field in zip(df["id"], df["ec_numbers"]):
         if not isinstance(ec_field, str) or not ec_field.strip():
             continue
-        for ec in ec_field.split(";"):
-            ec = ec.strip()
+        for ec in ec_field.split("|"):
+            ec = ec.replace("EC:", "").strip()
             if ec:
                 ec_map.setdefault(ec, set()).add(rxn_id)
 
@@ -5465,7 +5024,7 @@ def _merge_multivalue_lookup(
 
     Rows where every key misses the lookup are returned as NaN.
     """
-    exploded = series.str.split(key_sep).explode().str.strip()
+    exploded = series.str.split(key_sep).explode().str.replace("EC:", "").str.strip()
     mapped = exploded.map(lookup).str.split(val_sep).explode()
     result = mapped.dropna().groupby(level=0).agg(lambda s: val_sep.join(sorted(set(s))))
     return result.reindex(series.index)
@@ -5479,8 +5038,8 @@ def add_modelseed_pathway_column(
     df: pd.DataFrame,
     cache_path: Path,
     pathway_sources: tuple[str, ...] = ("KEGG", "MetaCyc", "PlantCyc", "NOPATHWAY"),
-    rxn_col: str = "tx_modelseed_rxn",
-    cpd_col: str = "mx_modelseed_id",
+    ec_cols: Optional[List[str]] = None,
+    inchikey_col: Optional[str] = None,
     out_col: str = "modelseed_pathway",
     sep: str = ";",
     missing_token: str = "Unassigned",
@@ -5488,11 +5047,12 @@ def add_modelseed_pathway_column(
     """Add a `modelseed_pathway` column that unifies transcripts and metabolites
     onto the shared ModelSEED pathway namespace.
 
-    Transcript rows are resolved via `tx_modelseed_rxn` (rxn IDs -> pathways),
-    metabolite rows via `mx_modelseed_id` (cpd IDs -> pathways). Both lookups
-    draw from the same `pathway_sources`, so a transcript and a metabolite
-    that land in the same pathway get an identical value in `out_col` --
-    that shared string is your cross-data-type join key.
+    Transcript rows are resolved via their modelseed_rxn column (derived from EC
+    numbers during annotation table generation), metabolite rows via their
+    modelseed_id column (derived from InChIKey). Both lookups draw from the same
+    `pathway_sources`, so a transcript and a metabolite that land in the same
+    pathway get an identical value in `out_col` -- that shared string is your
+    cross-data-type join key.
 
     Reactions with compounds but no real pathway get a unique placeholder
     pathway under source "NOPATHWAY" (see `_assign_placeholder_pathways`).
@@ -5506,13 +5066,16 @@ def add_modelseed_pathway_column(
         Pathway annotation source(s) from the ModelSEED reactions `pathways`
         field to pull from, e.g. "KEGG", "MetaCyc", "PlantCyc", "NOPATHWAY".
         Multiple sources are unioned per row.
-    rxn_col, cpd_col:
-        Column names to look for. If not present in `df` as given, this function
-        also tries to auto-detect columns ending in "_modelseed_rxn" / "_modelseed_id"
-        (useful since `annotate_integrated_features` prefixes columns by dataset name,
-        e.g. "transcriptome_1_modelseed_rxn" rather than the assumed "tx_modelseed_rxn").
+    ec_cols:
+        Explicit list of prefixed column names containing modelseed_rxn IDs
+        (e.g. ["tx_modelseed_rxn", "px_modelseed_rxn"]). These are the columns
+        written by generate_tx_annotation_table. If None or empty, the rxn
+        lookup is skipped.
+    inchikey_col:
+        Explicit prefixed column name containing the MX modelseed_id
+        (e.g. "mx_modelseed_id"). If None, the cpd lookup is skipped.
     sep:
-        Delimiter for multi-valued IDs in `rxn_col`/`cpd_col`, and also used
+        Delimiter for multi-valued IDs in rxn/cpd columns, and also used
         to join multiple resolved pathway IDs in `out_col`.
     missing_token:
         Sentinel string used in this table for "no annotation" (both empty
@@ -5521,24 +5084,41 @@ def add_modelseed_pathway_column(
     rxn_to_pathways = _build_rxn_to_pathways(cache_path)
     cpd_to_pathways = _build_cpd_to_pathways(cache_path)
 
-    if rxn_col in df.columns:
-        rxn_cols = [rxn_col]
+    # Resolve rxn columns: the annotation table writes 'modelseed_rxn' per dataset,
+    # which after joining becomes e.g. 'tx_modelseed_rxn'. Accept any column whose
+    # name ends with '_modelseed_rxn' that is also present in df.
+    if ec_cols:
+        # ec_cols are the EC/KO source columns; the rxn column is derived from them
+        # and stored as <dataset>_modelseed_rxn during generate_tx_annotation_table
+        rxn_cols = [
+            c for c in df.columns
+            if c.endswith("_modelseed_rxn") or c == "modelseed_rxn"
+        ]
+        if rxn_cols:
+            log.info(f"Using reaction column(s) for modelseed pathway assignment: {rxn_cols}")
+        else:
+            log.info("No modelseed_rxn columns found in annotation table; skipping rxn pathway lookup.")
     else:
         rxn_cols = []
-    # Use every reaction column (tx_ and px_ share the TX annotation format)
-    rxn_cols = list(dict.fromkeys(
-        rxn_cols + [c for c in df.columns if c.endswith("_modelseed_rxn") or c == "modelseed_rxn"]
-    ))
-    if rxn_cols:
-        log.info(f"Using reaction column(s) for pathway assignment: {rxn_cols}")
+        log.info("No EC columns configured; skipping modelseed rxn pathway lookup.")
 
-    if cpd_col not in df.columns:
-        candidates = [c for c in df.columns if c.endswith("_modelseed_id") or c == "modelseed_id"]
-        if candidates:
-            log.info(f"'{cpd_col}' not found; auto-detected metabolite cpd column(s): {candidates}")
-            cpd_col = candidates[0]
+    # Resolve cpd column: the annotation table writes 'modelseed_id' per MX dataset,
+    # which after joining becomes e.g. 'mx_modelseed_id'.
+    if inchikey_col:
+        # inchikey_col is the InChIKey source; the cpd column is 'mx_modelseed_id'
+        cpd_col_candidates = [
+            c for c in df.columns
+            if c.endswith("_modelseed_id") or c == "modelseed_id"
+        ]
+        if cpd_col_candidates:
+            cpd_col = cpd_col_candidates[0]
+            log.info(f"Using compound column '{cpd_col}' for modelseed pathway assignment.")
         else:
             cpd_col = None
+            log.info("No modelseed_id column found in annotation table; skipping cpd pathway lookup.")
+    else:
+        cpd_col = None
+        log.info("No InChIKey column configured; skipping modelseed cpd pathway lookup.")
 
     def _is_missing(val: object) -> bool:
         return (
@@ -5656,6 +5236,7 @@ def generate_mx_annotation_table(
     polarity: str,
     output_dir: str,
     output_filename: str,
+    inchikey_col: str = None,
     overwrite: bool = False
 ) -> pd.DataFrame:
     """
@@ -5667,11 +5248,18 @@ def generate_mx_annotation_table(
         polarity: Polarity setting ('positive', 'negative', 'multipolarity')
         output_dir: Output directory for saving annotation map
         output_filename: Filename for saving the annotation map
+        inchikey_col: Exact column header in the library-results file containing InChIKey values.
+            Required — raises ValueError if not provided.
         overwrite: Overwrite existing output if True
 
     Returns:
         pd.DataFrame: annotation_table DataFrame
     """
+    if not inchikey_col:
+        raise ValueError(
+            "inchikey_col must be specified in datasets.mx.annotation_columns.inchikey_col "
+            "in data_processing.yml."
+        )
 
     # Get metabolite IDs from raw data
     if not raw_data.empty:
@@ -5740,11 +5328,13 @@ def generate_mx_annotation_table(
                     })
                     return ';;'.join(unique_vals) if unique_vals else None
 
-                inchikey_cols = ['InChiKey', 'InChIKey', 'inchikey', 'INCHIKEY']
-                inchikey_values = []
-                for col in inchikey_cols:
-                    if col in matches.columns:
-                        inchikey_values.extend(matches[col].dropna().tolist())
+                if inchikey_col not in matches.columns:
+                    raise ValueError(
+                        f"InChIKey column '{inchikey_col}' not found in library-results file. "
+                        f"Available columns: {list(matches.columns)}. "
+                        "Update datasets.mx.annotation_columns.inchikey_col in data_processing.yml."
+                    )
+                inchikey_values = matches[inchikey_col].dropna().tolist()
 
                 mapping_data.append({
                     'metabolite_id': met_id,
@@ -5836,53 +5426,101 @@ def generate_mx_annotation_table(
 def generate_tx_annotation_table(
     raw_data: pd.DataFrame,
     raw_data_dir: str,
-    genome_type: str,
     output_dir: str,
     output_filename: str,
-    identifier_column: str = None,
+    gff_quant_id: str = None,
+    gff_annot_id: str = None,
+    ec_number_col: str = None,
+    kegg_id_col: str = None,
+    ec_delimiter: str = ",",
+    kegg_id_delimiter: str = ",",
     prefix: str = "tx",
 ) -> pd.DataFrame:
     """
-    Generate a merged gene annotation table from multiple annotation files.
+    Generate a merged gene annotation table from all ``*_annotation_table.tsv``
+    files found in ``raw_data_dir``.
 
-    The same annotation files/formats serve tx and px data; ``prefix`` selects the
-    feature-ID prefix ("tx" or "px") used to match annotations to the data.
+    The same annotation files/formats serve tx and px data; ``prefix`` selects
+    the feature-ID prefix ("tx" or "px") used to match annotations to the data.
+
+    Two GFF9 attribute names control how feature IDs are resolved:
+
+    * ``gff_quant_id`` -- the GFF9 attribute whose values appear as the first
+      column of ``counts.csv`` / ``peak-height.csv``.  These become the
+      ``transcriptome_id`` values in the annotation table and must match the
+      feature IDs in the integrated data matrix.  If the first column of
+      ``raw_data`` does not already carry this name it is renamed silently.
+    * ``gff_annot_id`` -- the GFF9 attribute whose values appear as the first
+      column of the annotation files.  If the first column of any annotation
+      file does not already carry this name it is renamed silently.  When this
+      differs from ``gff_quant_id``, the GFF3 is used to build a bridge that
+      re-keys annotation rows to the quant-data identifier.
+
+    When ``gff_quant_id == gff_annot_id`` (the common case) no GFF3 file is
+    required.  A GFF3 file is only needed -- and validated -- when the two IDs
+    differ.
+
+    Both default to the first column header of ``raw_data`` when not supplied.
 
     Args:
-        raw_data (pd.DataFrame): Raw transcriptomics data with gene IDs as index
-        raw_data_dir (str): Directory containing annotation table files
-        genome_type (str): Type of genome - "microbe", "algal", "metagenome", or "plant"
-        output_dir (str): Output directory for saving the merged annotation table
-        output_filename (str): Filename for the output annotation table
+        raw_data (pd.DataFrame): Raw transcriptomics / proteomics data.
+        raw_data_dir (str): Directory containing annotation table files and
+            optionally a GFF3 file.
+        output_dir (str): Output directory for saving the merged annotation table.
+        output_filename (str): Filename for the output annotation table.
+        gff_quant_id (str): GFF9 attribute matching the first column of counts.csv.
+        gff_annot_id (str): GFF9 attribute matching the first column of annotation files.
+        ec_number_col (str): Exact column header in the annotation file containing EC numbers.
+            Required — raises ValueError if not provided.
+        kegg_id_col (str): Exact column header in the annotation file containing KEGG IDs / KO accessions.
+            Required — raises ValueError if not provided.
+        ec_delimiter (str): Delimiter used to split multiple EC numbers within a cell (default ',').
+        kegg_id_delimiter (str): Delimiter used to split multiple KEGG IDs within a cell (default ',').
+        prefix (str): Feature-ID prefix ("tx" or "px").
 
     Returns:
-        pd.DataFrame: Merged annotation table with transcriptome_id and annotation columns
+        pd.DataFrame: Merged annotation table indexed by ``transcriptome_id``
+            with all annotation columns from every input file.
     """
 
-    identifier_column = identifier_column or raw_data.columns[0]
+    if not ec_number_col:
+        raise ValueError(
+            "ec_number_col must be specified in datasets.tx.annotation_columns.ec_number_col "
+            "in data_processing.yml."
+        )
+    if not kegg_id_col:
+        raise ValueError(
+            "kegg_id_col must be specified in datasets.tx.annotation_columns.kegg_id_col "
+            "in data_processing.yml."
+        )
 
-    if genome_type == "microbe":
-        annotation_df = _process_microbe_annotations(
-            raw_data_dir, output_dir, output_filename, identifier_column
+    # Fall back to the first column of raw_data when not configured
+    fallback = raw_data.columns[0] if not raw_data.empty else "ID"
+    gff_quant_id = gff_quant_id or fallback
+    gff_annot_id = gff_annot_id or gff_quant_id
+
+    log.info(f"Generating annotation table (prefix='{prefix}')")
+    log.info(f"  gff_quant_id: '{gff_quant_id}'")
+    log.info(f"  gff_annot_id: '{gff_annot_id}'")
+    log.info(f"  ec_number_col: '{ec_number_col}' (delimiter: '{ec_delimiter}')")
+    log.info(f"  kegg_id_col: '{kegg_id_col}' (delimiter: '{kegg_id_delimiter}')")
+
+    # Rename counts.csv first column to gff_quant_id if needed
+    if not raw_data.empty and raw_data.columns[0] != gff_quant_id:
+        log.info(
+            f"  Renaming raw_data first column '{raw_data.columns[0]}' -> '{gff_quant_id}'"
         )
-    elif genome_type == "algal":
-        annotation_df = _process_algal_annotations(
-            raw_data_dir,
-            output_dir,
-            output_filename,
-            identifier_column=identifier_column,
-        )
-    elif genome_type == "metagenome":
-        log.info(f"Annotation processing for '{genome_type}' genome type is not yet implemented.")
-        empty_df = pd.DataFrame(columns=['transcriptome_id'])
-        write_integration_file(empty_df, output_dir, output_filename, indexing=False)
-        return empty_df
-    elif genome_type == "plant":
-        annotation_df = _process_plant_annotations(
-            raw_data_dir, output_dir, output_filename, identifier_column
-        )
-    else:
-        raise ValueError(f"Invalid genome_type '{genome_type}'. Must be one of: 'microbe', 'algal', 'metagenome', 'plant'")
+        raw_data = raw_data.rename(columns={raw_data.columns[0]: gff_quant_id})
+
+    # Upfront GFF3 attribute validation (no-op when IDs are identical)
+    _validate_gff_attributes(raw_data_dir, gff_quant_id, gff_annot_id)
+
+    # Build the merged annotation table generically
+    annotation_df = _process_generic_annotations(
+        raw_data_dir=raw_data_dir,
+        gff_annot_id=gff_annot_id,
+        gff_quant_id=gff_quant_id,
+    )
 
     if not raw_data.empty and not annotation_df.empty:
         _validate_annotation_gene_ids(annotation_df, raw_data, prefix)
@@ -5893,15 +5531,22 @@ def generate_tx_annotation_table(
     annotation_df = annotation_df.map(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
 
     if not annotation_df.empty:
-        ec_to_rxn = _build_ec_to_rxn(cache_path=Path(output_dir) / "modelseed_reactions.tsv")
-        annotation_df['modelseed_rxn'] = _merge_multivalue_lookup(
-            annotation_df['kegg_ec'], ec_to_rxn, key_sep=";;", val_sep=";"
-        )
+        if ec_number_col not in annotation_df.columns:
+            log.warning(
+                "  EC number column '%s' not found in annotation table columns: %s. "
+                "Skipping modelseed_rxn lookup.",
+                ec_number_col, list(annotation_df.columns),
+            )
+        else:
+            log.info("  Using column '%s' for modelseed_rxn lookup.", ec_number_col)
+            ec_to_rxn = _build_ec_to_rxn(cache_path=Path(output_dir) / "modelseed_reactions.tsv")
+            annotation_df['modelseed_rxn'] = _merge_multivalue_lookup(
+                annotation_df[ec_number_col], ec_to_rxn, key_sep=ec_delimiter, val_sep=";"
+            )
 
     write_integration_file(annotation_df, output_dir, output_filename, indexing=True)
 
     return annotation_df
-
 
 def annotate_integrated_features(
     integrated_data: pd.DataFrame,
@@ -5939,18 +5584,18 @@ def annotate_integrated_features(
 
     dataset_stats = {}
 
+    # Collect explicit column names from each dataset's config for pathway lookups
+    # After joining, annotation columns are prefixed with dataset_name (e.g. tx_EC, mx_InChiKey)
+    ec_cols: List[str] = []
+    kegg_id_cols: List[str] = []
+    inchikey_col: Optional[str] = None
+
     if datasets is not None:
         for dataset in datasets:
             if hasattr(dataset, 'annotation_table') and dataset.annotation_table is not None:
                 log.info(f"Processing annotation table for {dataset.dataset_name}")
 
                 ann_table = dataset.annotation_table.copy()
-
-                potential_id_cols = []
-                for col in ann_table.columns:
-                    if 'id' in col.lower() or col == ann_table.index.name:
-                        potential_id_cols.append(col)
-
                 ann_table.columns = [f"{dataset.dataset_name}_{col}" for col in ann_table.columns]
 
                 matches = ann_table.index.intersection(all_features)
@@ -5971,18 +5616,35 @@ def annotate_integrated_features(
                 log.info(f"  Features with annotations: {len(matches)}")
                 log.info(f"  Annotation columns added: {len(ann_table.columns)}")
 
-    # Add ModelSEED pathway column (auto-detects dataset-prefixed rxn/cpd columns
-    # if the "tx_"/"mx_" naming convention isn't exactly followed)
+                # Collect prefixed column names for pathway lookups from dataset config
+                ds_name = dataset.dataset_name
+                if hasattr(dataset, 'ec_number_col') and dataset.ec_number_col:
+                    prefixed_ec = f"{ds_name}_{dataset.ec_number_col}"
+                    if prefixed_ec in final_annotation_df.columns:
+                        ec_cols.append(prefixed_ec)
+                if hasattr(dataset, 'kegg_id_col') and dataset.kegg_id_col:
+                    prefixed_ko = f"{ds_name}_{dataset.kegg_id_col}"
+                    if prefixed_ko in final_annotation_df.columns:
+                        kegg_id_cols.append(prefixed_ko)
+                if hasattr(dataset, 'inchikey_col') and dataset.inchikey_col:
+                    # MX annotation table stores InChIKey under the fixed output column 'InChiKey'
+                    prefixed_ik = f"{ds_name}_InChiKey"
+                    if prefixed_ik in final_annotation_df.columns:
+                        inchikey_col = prefixed_ik
+
     final_annotation_df = add_modelseed_pathway_column(
-        final_annotation_df, cache_path=Path(cache_dir) / "modelseed_reactions.tsv"
+        final_annotation_df,
+        cache_path=Path(cache_dir) / "modelseed_reactions.tsv",
+        ec_cols=ec_cols or None,
+        inchikey_col=inchikey_col,
     )
 
-    # Add KEGG pathway columns (mx_kegg_id, kegg_pathway, kegg_pathway_name),
-    # auto-detecting dataset-prefixed InChIKey/EC/KO columns, with API
-    # responses cached under output_dir so re-runs don't hit KEGG/MW again.
     final_annotation_df = add_kegg_pathway_annotations(
         final_annotation_df,
         cache_dir=Path(cache_dir) if cache_dir else None,
+        inchikey_col=inchikey_col,
+        ec_cols=ec_cols or None,
+        ko_cols=kegg_id_cols or None,
     )
 
     final_annotation_df = final_annotation_df.fillna('Unassigned')
@@ -6430,25 +6092,12 @@ def add_kegg_pathway_name_column(
     df[new_col] = df[pathway_col].apply(map_cell)
     return df
 
-def _find_columns(df: pd.DataFrame, suffixes: List[str]) -> List[str]:
-    """All columns whose name ends with any of the given suffixes (case-insensitive)."""
-    return [c for c in df.columns if any(c.lower().endswith(s.lower()) for s in suffixes)]
-
-def _find_column(df: pd.DataFrame, suffixes: List[str]) -> Optional[str]:
-    """Find the first column whose name ends with any of the given suffixes (case-insensitive)."""
-    for col in df.columns:
-        col_lower = col.lower()
-        for suffix in suffixes:
-            if col_lower.endswith(suffix.lower()):
-                return col
-    return None
-
 def add_kegg_pathway_annotations(
     df: pd.DataFrame,
     cache_dir: Optional[Union[str, Path]] = None,
-    inchikey_suffixes: List[str] = ("mx_InChiKey", "InChiKey"),
-    ec_suffixes: List[str] = ("tx_kegg_ec", "kegg_ec"),
-    ko_suffixes: List[str] = ("tx_ko_acc", "ko_acc"),
+    inchikey_col: Optional[str] = None,
+    ec_cols: Optional[List[str]] = None,
+    ko_cols: Optional[List[str]] = None,
     kegg_id_col: str = "mx_kegg_id",
     pathway_col: str = "kegg_pathway",
     pathway_name_col: str = "kegg_pathway_name",
@@ -6462,16 +6111,30 @@ def add_kegg_pathway_annotations(
       3. EC/KO (fallback)   -> kegg_pathway      (KEGG link API, ec:/ko:, cached, merged)
       4. kegg_pathway       -> kegg_pathway_name (KEGG list API, cached)
 
-    Auto-detects source columns by suffix match, since upstream joins may
-    prefix columns with dataset names (e.g. 'metabolomics_mx_InChiKey').
-    Silently skips steps whose required source column isn't found.
+    Uses explicit column names passed from annotate_integrated_features rather than
+    suffix-based auto-detection. Steps whose required source column is None are skipped.
+
+    Parameters
+    ----------
+    inchikey_col : str, optional
+        Prefixed column name containing InChIKey values (e.g. 'mx_InChiKey').
+        When provided, drives the InChIKey -> KEGG compound ID -> pathway route.
+    ec_cols : list of str, optional
+        Prefixed column name(s) containing EC numbers (e.g. ['tx_EC']).
+        Used as fallback when inchikey_col is not provided.
+    ko_cols : list of str, optional
+        Prefixed column name(s) containing KEGG KO accessions (e.g. ['tx_KEGG_ko']).
+        Used as fallback when inchikey_col is not provided.
     """
     df = df.copy()
     cache_dir = Path(cache_dir) if cache_dir else None
 
-    inchikey_col = _find_column(df, list(inchikey_suffixes))
-    ec_col = _find_columns(df, list(ec_suffixes))
-    ko_col = _find_columns(df, list(ko_suffixes))
+    # Validate that provided columns actually exist in df
+    if inchikey_col and inchikey_col not in df.columns:
+        log.warning(f"KEGG annotation: InChIKey column '{inchikey_col}' not found in annotation table; skipping InChIKey route.")
+        inchikey_col = None
+    ec_cols = [c for c in (ec_cols or []) if c in df.columns]
+    ko_cols = [c for c in (ko_cols or []) if c in df.columns]
 
     if inchikey_col:
         log.info(f"KEGG annotation: using InChIKey column '{inchikey_col}'")
@@ -6483,18 +6146,16 @@ def add_kegg_pathway_annotations(
             df, kegg_id_col=kegg_id_col, pathway_col=pathway_col, delay=delay, batch_size=batch_size,
             cache_path=cache_dir / "kegg_cpd_to_pathway.json" if cache_dir else None,
         )
-    else:
-        log.warning("KEGG annotation: no InChIKey column found, skipping compound->pathway mapping")
-
-    if ec_col or ko_col:
-        log.info(f"KEGG annotation: using EC column '{ec_col}', KO column '{ko_col}'")
+    elif ec_cols or ko_cols:
+        log.info(f"KEGG annotation: using EC column(s) '{ec_cols}', KO column(s) '{ko_cols}'")
         df = add_ec_ko_pathway_column(
-            df, ec_col=ec_col, ko_col=ko_col, pathway_col=pathway_col, delay=delay, batch_size=batch_size,
+            df, ec_col=ec_cols, ko_col=ko_cols, pathway_col=pathway_col, delay=delay, batch_size=batch_size,
             ec_cache_path=cache_dir / "kegg_ec_to_pathway.json" if cache_dir else None,
             ko_cache_path=cache_dir / "kegg_ko_to_pathway.json" if cache_dir else None,
         )
     else:
-        log.warning("KEGG annotation: no EC or KO column found, skipping EC/KO->pathway mapping")
+        log.warning("KEGG annotation: no InChIKey, EC, or KO columns provided; skipping KEGG pathway annotation.")
+
 
     if pathway_col in df.columns:
         df = add_kegg_pathway_name_column(
@@ -6621,6 +6282,14 @@ def load_link_table_metadata(
     name. Blank cells mean that a shared sample is absent from that datatype.
     One shared-name column is required (``unique_group``, ``shared_sample``,
     ``shared_name``, or ``sample``); all remaining columns are categories.
+
+    For datasets with multiple polarities (e.g. MX), the link table may use
+    polarity-suffixed columns (``mx_pos`` / ``mx_neg``) instead of a single
+    ``mx`` column.  The correct column is selected via the dataset's
+    ``polarity`` attribute: ``"positive"`` → ``{name}_pos``,
+    ``"negative"`` → ``{name}_neg``.  Both polarity columns are used to
+    update the data-table column names so that each polarity's raw sample
+    names are mapped to the shared ``unique_group`` identifiers.
     """
     path = Path(link_table_path)
     if not path.is_file():
@@ -6628,17 +6297,46 @@ def load_link_table_metadata(
 
     link_table = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig", dtype=str)
     link_table.columns = link_table.columns.astype(str).str.strip()
-    dataset_names = [ds.dataset_name for ds in datasets]
-    missing_columns = [name for name in dataset_names if name not in link_table.columns]
+
+    # Build a mapping from each dataset to the link-table column(s) that hold
+    # its raw sample names.  For polarised datasets (e.g. MX) the link table
+    # uses per-polarity columns (<name>_pos / <name>_neg) rather than a single
+    # <name> column.
+    _POLARITY_SUFFIX = {"positive": "_pos", "negative": "_neg"}
+
+    dataset_sample_columns: dict[str, list[str]] = {}
+    missing_columns: list[str] = []
+    for ds in datasets:
+        name = ds.dataset_name
+        if name in link_table.columns:
+            # Plain column present – use it directly.
+            dataset_sample_columns[name] = [name]
+        else:
+            # Look for polarity-suffixed columns (<name>_pos, <name>_neg).
+            polarity_cols = [
+                col for col in link_table.columns
+                if col.startswith(f"{name}_") and col[len(name) + 1:] in ("pos", "neg")
+            ]
+            if polarity_cols:
+                dataset_sample_columns[name] = polarity_cols
+                log.info(
+                    "Dataset '%s': using polarity-suffixed columns %s from link table.",
+                    name, polarity_cols,
+                )
+            else:
+                missing_columns.append(name)
+
     if missing_columns:
         raise ValueError(
             f"Metadata link table is missing dataset columns: {missing_columns}. "
-            f"Expected columns for {dataset_names}."
+            f"Expected columns (or polarity-suffixed variants) for "
+            f"{[ds.dataset_name for ds in datasets]}."
         )
 
     shared_candidates = [
         column for column in ("unique_group", "shared_sample", "shared_name", "sample")
-        if column in link_table.columns and column not in dataset_names
+        if column in link_table.columns
+        and column not in {c for cols in dataset_sample_columns.values() for c in cols}
     ]
     if not shared_candidates:
         raise ValueError(
@@ -6654,23 +6352,58 @@ def load_link_table_metadata(
 
     linked_metadata = {}
     for ds in datasets:
-        sample_column = ds.dataset_name
+        name = ds.dataset_name
+        sample_cols = dataset_sample_columns[name]
+
+        # Determine which polarity column to use when there are multiple.
+        if len(sample_cols) == 1:
+            sample_column = sample_cols[0]
+        else:
+            # Select the column matching the dataset's polarity attribute.
+            polarity = getattr(ds, "polarity", None)
+            suffix = _POLARITY_SUFFIX.get(polarity) if polarity else None
+            if suffix:
+                matched = [c for c in sample_cols if c.endswith(suffix)]
+                if matched:
+                    sample_column = matched[0]
+                else:
+                    # Fall back to the first available polarity column.
+                    log.warning(
+                        "Dataset '%s': no column matching polarity '%s' found in %s; "
+                        "using '%s'.",
+                        name, polarity, sample_cols, sample_cols[0],
+                    )
+                    sample_column = sample_cols[0]
+            else:
+                log.warning(
+                    "Dataset '%s': multiple polarity columns %s but no polarity "
+                    "attribute set; using '%s'.",
+                    name, sample_cols, sample_cols[0],
+                )
+                sample_column = sample_cols[0]
+
         table = link_table.copy()
         table[sample_column] = table[sample_column].replace(r"^\s*$", pd.NA, regex=True)
         table = table.dropna(subset=[sample_column]).copy()
         table[sample_column] = table[sample_column].astype(str)
 
-        if table[sample_column].duplicated().any():
+        # Rename the (possibly polarity-suffixed) column to the plain dataset
+        # name so that downstream code can always use ds.dataset_name as the
+        # column key.
+        if sample_column != name:
+            table = table.rename(columns={sample_column: name})
+
+        if table[name].duplicated().any():
             duplicates = table.loc[
-                table[sample_column].duplicated(keep=False), sample_column
+                table[name].duplicated(keep=False), name
             ].unique().tolist()
             raise ValueError(
-                f"Metadata link table has duplicate {ds.dataset_name} sample names: "
+                f"Metadata link table has duplicate {name} sample names: "
                 f"{duplicates}"
             )
 
         table = table.set_index("unique_group", drop=False)
-        linked_metadata[ds.dataset_name] = table
+        linked_metadata[name] = table
         write_integration_file(
             data=table,
             output_dir=ds.output_dir,
@@ -6678,8 +6411,8 @@ def load_link_table_metadata(
             indexing=True,
         )
         log.info(
-            "Linked %d %s samples from %s",
-            len(table), ds.dataset_name, path,
+            "Linked %d %s samples from %s (link-table column: '%s')",
+            len(table), name, path, sample_column,
         )
 
     if return_link_table:
@@ -6736,12 +6469,19 @@ def link_data_across_datasets(
         mapping = dict(zip(ds.linked_metadata[sample_col], ds.linked_metadata[unifying_col]))
         data_subset.columns = [data_subset.columns[0]] + [mapping.get(col, col) for col in data_subset.columns[1:]]
         
-        # Handle duplicate columns (occurs in metabolomics datasets with multiple polarities)
+        # Handle duplicate sample columns (occurs in metabolomics datasets with multiple polarities).
+        # Separate the feature-ID column before groupby so it is never summed or
+        # reordered by the alphabetical groupby sort.
         if data_subset.columns.duplicated().any():
-            data_subset = data_subset.T.groupby(data_subset.columns).sum().T
-        
+            feature_id_col = "CompoundID" if "CompoundID" in data_subset.columns else data_subset.columns[0]
+            id_series = data_subset[feature_id_col]
+            sample_cols = data_subset.drop(columns=[feature_id_col])
+            sample_cols = sample_cols.T.groupby(sample_cols.columns).sum().T
+            data_subset = pd.concat([id_series, sample_cols], axis=1)
+
+        feature_id_col = "CompoundID" if "CompoundID" in data_subset.columns else data_subset.columns[0]
         unified_data[ds.dataset_name] = data_subset
-        sample_sets[ds.dataset_name] = set(data_subset.columns[1:])
+        sample_sets[ds.dataset_name] = set(data_subset.columns.difference([feature_id_col]))
 
     # Restrict to overlapping samples if requested
     if overlap_only and len(unified_data) > 1:
@@ -6752,7 +6492,9 @@ def link_data_across_datasets(
             raise ValueError("No overlapping samples found across datasets.")
         
         for name, data_subset in unified_data.items():
-            feature_id_column = data_subset.columns[0]
+            # Use the known feature-ID column name rather than positional [0],
+            # which may be wrong after the transpose-groupby-transpose merge.
+            feature_id_column = "CompoundID" if "CompoundID" in data_subset.columns else data_subset.columns[0]
             cols = [feature_id_column] + [
                 col for col in overlapping_columns if col in data_subset.columns
             ]
@@ -6762,7 +6504,11 @@ def link_data_across_datasets(
     for ds in datasets:
         log.info(f"Saving linked data for {ds.dataset_name}...")
         df = unified_data[ds.dataset_name]
-        df = df.set_index(df.columns[0])
+        # Use the known feature-ID column name ('CompoundID') rather than
+        # positional columns[0], which may be a sample column after the
+        # transpose-groupby-transpose duplicate-column merge reorders columns.
+        feature_id_col = "CompoundID" if "CompoundID" in df.columns else df.columns[0]
+        df = df.set_index(feature_id_col)
         write_integration_file(df, ds.output_dir, ds._linked_data_filename, indexing=True)
         unified_data[ds.dataset_name] = df
 
@@ -8984,6 +8730,11 @@ def compare_groups_to_pathways(
             rank_scores = (
                 exploded[exploded['pathway'] != missing_token]
                 .groupby('pathway').size().sort_values(ascending=False)
+            )
+        elif pe.get('rank_by') == 'mean_abs_value':
+            rank_scores = (
+                exploded[exploded['pathway'] != missing_token]
+                .groupby('pathway').mean(numeric_only=True).max(axis=1).sort_values(ascending=False)
             )
         else:
             raise ValueError(f"Unknown rank_by method: {pe.get('rank_by')}")
