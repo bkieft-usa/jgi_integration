@@ -62,8 +62,9 @@ analysis:
       feature_list_file:
 
   pathway_enrichment:
-    pathway_col: modelseed_pathway    # kegg_pathway | modelseed_pathway
-    exclude_nopathway: true          # exclude pathways with no canonical name
+    pathway_col: kegg_module          # kegg_module | kegg_pathway | kegg_reaction | modelseed_pathway
+    exclude_nopathway: true          # exclude pathways with no canonical name (modelseed_pathway only)
+    exclude_global_maps: true        # drop KEGG global/overview maps (map011xx/map012xx, e.g. map01100) from the test (kegg_pathway only)
     bipartite_only: true              # keep only pathways with features from every data type
     min_features_per_pathway: 2       # drop pathways with fewer than this many features before testing
     min_features_per_group: 2         # drop groups with fewer than this many features before testing

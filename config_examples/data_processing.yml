@@ -4,6 +4,7 @@ datasets:
     input_state: raw             # raw (integer-like counts) | prenormalized (already normalized and/or log-transformed; scale is auto-detected)
     gff_quant_id: locus_tag      # GFF9 attribute that matches the first column of counts.csv (e.g. locus_tag, ID, Name)
     gff_annot_id: locus_tag      # GFF9 attribute that matches the first column of the annotation files (can be the same as gff_quant_id)
+    gff_feature_type: CDS        # Optional: only keep GFF3 rows whose 3rd column matches this string (e.g. CDS, gene, mRNA). Leave blank to keep all rows.
     annotation_columns:          # Required: exact column headers in the TX annotation table files
       ec_number_col: EC          # Column header containing EC numbers (e.g. EC, ECnum, ec_number)
       kegg_id_col: KEGG_ko       # Column header containing KEGG IDs / KO accessions (e.g. KEGG_ko, KO, ko_acc)
@@ -35,8 +36,8 @@ datasets:
 
   mx:
     dataset_dir: metabolomics # Do not change
-    chromatography: HILIC
-    polarity: multipolarity
+    chromatography: [HILIC, C18] # One folder name or a list of folder names
+    polarity: [POS, NEG]          # POS, NEG, or a list of both
     input_state: raw             # raw (peak heights) | prenormalized
     annotation_columns:          # Required: exact column header in the MX annotation/library-results file
       inchikey_col: InChIKey     # Column header containing InChIKey values (e.g. InChIKey, InChiKey, inchikey)
@@ -44,7 +45,7 @@ datasets:
       filtering:
         presence_min_percent: 20
         magnitude_min_mean: 1000
-      normalization_method: auto # auto (mx: pqn, per polarity) | pqn | median | tic | median_of_ratios | none
+      normalization_method: auto # auto (mx: pqn, per chromatography/polarity) | pqn | median | tic | median_of_ratios | none
       transformation_method: auto # auto (mx: log2) | log2; vst is not applicable to peak heights
       recenter_samples: false
       devariancing:
@@ -64,6 +65,7 @@ datasets:
     input_state: raw             # raw (peak heights) | prenormalized
     gff_quant_id: locus_tag      # GFF9 attribute that matches the first column of peak-height.csv (e.g. locus_tag, ID, Name)
     gff_annot_id: locus_tag      # GFF9 attribute that matches the first column of the annotation files (can be the same as gff_quant_id)
+    gff_feature_type: CDS        # Optional: only keep GFF3 rows whose 3rd column matches this string (e.g. CDS, gene, mRNA). Leave blank to keep all rows.
     annotation_columns:          # Required: exact column headers in the PX annotation table files (same format as tx)
       ec_number_col: EC          # Column header containing EC numbers (e.g. EC, ECnum, ec_number)
       kegg_id_col: KEGG_ko       # Column header containing KEGG IDs / KO accessions (e.g. KEGG_ko, KO, ko_acc)
