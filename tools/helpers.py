@@ -11,6 +11,7 @@ import os
 import re
 import random
 import time
+import textwrap
 import shutil
 import subprocess
 import sys
@@ -3430,407 +3431,58 @@ def _annotate_and_save_submodules(
             )
             plt.close()
 
-# ====================================
-# Dataset acquisition functions
-# ====================================     
-
-# def find_mx_parent_folder(
-#     pid: str,
-#     pi_name: str,
-#     mx_dir: str,
-#     polarity: str,
-#     datatype: str,
-#     chromatography: str,
-#     filtered_mx: bool = True,
-#     overwrite: bool = False,
-# ) -> str:
-#     """
-#     Find the parent folder for metabolomics (MX) data on Google Drive using rclone.
-
-#     Args:
-#         pid (str): Proposal ID.
-#         pi_name (str): PI name.
-#         mx_dir (str): Local MX data directory.
-#         polarity (str): Polarity ('positive', 'negative', 'multipolarity').
-#         datatype (str): Data type ('peak-height', 'peak-area', etc.).
-#         chromatography (str): Chromatography type.
-#         filtered_mx (bool): Whether to use filtered data.
-#         overwrite (bool): Overwrite existing results.
-
-#     Returns:
-#         str: Path to the final results folder, or None if not found.
-#     """
-    
-#     if datatype == "peak-area":
-#         datatype = "quant"
-#     if filtered_mx and datatype == "quant":
-#         log.info("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
-#         return None
-#     if polarity == "multipolarity":
-#         mx_data_pattern = f"{mx_dir}/*{chromatography}*/*_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*_{datatype}.csv"
-#     elif polarity in ["positive", "negative"]:
-#         mx_data_pattern = f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}.csv"
-#     else:
-#         log.info(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
-#         return None
-#     if glob.glob(os.path.expanduser(mx_data_pattern)) and not overwrite:
-#         log.info("MX folder already downloaded and linked.")
-#         return None
-#     elif glob.glob(os.path.expanduser(mx_data_pattern)) and overwrite:
-#         log.info("MX folder already downloaded and linked. Overwriting as per user request...")
-#     elif not glob.glob(os.path.expanduser(mx_data_pattern)):
-#         log.info("MX folder not found locally. Proceeding to find and link MX data from Google Drive...")
-
-#     # Find project folder
-#     cmd = f"rclone lsd JGI_Metabolomics_Projects: | grep -E '{pid}|{pi_name}'"
-#     log.info("Finding MX parent folders...")
-#     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    
-#     if result.stdout:
-#         data = [line.split()[:5] for line in result.stdout.strip().split('\n')]
-#         mx_parent = pd.DataFrame(data, columns=["dir", "date", "time", "size", "folder"])
-#         mx_parent = mx_parent[["date", "time", "folder"]]
-#         mx_parent["ix"] = range(1, len(mx_parent) + 1)
-#         mx_parent = mx_parent[["ix", "date", "time", "folder"]]
-#         mx_final_folders = []
-#         # For each possible project folder (some will not be the right "final" folder)
-#         log.info("Finding MX final folders...")
-#         for project_folder in mx_parent["folder"].values:
-#             cmd = f"rclone lsd --max-depth 2 JGI_Metabolomics_Projects:{project_folder}"
-#             try:
-#                 result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-#             except:
-#                 continue
-#             if result.stdout or result.stderr:
-#                 output = result.stdout if result.stdout else result.stderr
-#                 data = [line.split()[:5] for line in output.strip().split('\n')]
-#                 mx_final = pd.DataFrame(data, columns=["dir", "date", "time", "size", "folder"])
-#                 mx_final = mx_final[["date", "time", "folder"]]
-#                 mx_final["ix"] = range(1, len(mx_final) + 1)
-#                 mx_final = mx_final[["ix", "date", "time", "folder"]]
-#                 mx_final['parent_folder'] = project_folder
-#                 mx_final_folders.append(mx_final)
-#             else:
-#                 return None
-
-#         mx_final_combined = pd.concat(mx_final_folders, ignore_index=True)
-#         untargeted_mx_final = mx_final_combined[
-#             mx_final_combined["folder"].str.contains("Untargeted", case=False) & 
-#             mx_final_combined["folder"].str.contains("final", case=False) & 
-#             ~mx_final_combined["folder"].str.contains("pilot", case=False)
-#         ]
-#         if untargeted_mx_final.shape[0] > 1:
-#             log.info("Warning! Multiple untargeted MX final folders found:")
-#             log.info(untargeted_mx_final)
-#             return None
-#         elif untargeted_mx_final.shape[0] == 0:
-#             log.info("Warning! No untargeted MX final folders found.")
-#             return None
-#         else:
-#             final_results_folder = f"{untargeted_mx_final['parent_folder'].values[0]}/{untargeted_mx_final['folder'].values[0]}"
-
-#         script_dir = f"{mx_dir}/scripts"
-#         os.makedirs(script_dir, exist_ok=True)
-#         script_name = f"{script_dir}/find_mx_files.sh"
-#         with open(script_name, "w") as script_file:
-#             script_file.write(f"cd {script_dir}/\n")
-#             script_file.write(f"rclone lsd --max-depth 2 JGI_Metabolomics_Projects:{untargeted_mx_final['parent_folder'].values[0]}")
-        
-#         log.info("Using the following metabolomics final results folder for further analysis:")
-#         log.info(untargeted_mx_final)
-#         return final_results_folder
-#     else:
-#         log.info(f"Warning! No folders could be found with rclone lsd command: {cmd}")
-#         return None
-
-# def gather_mx_files(
-#     mx_untargeted_remote: str,
-#     mx_dir: str,
-#     polarity: str,
-#     datatype: str,
-#     chromatography: str,
-#     filtered_mx: bool = True,
-#     extract: bool = False,
-#     overwrite: bool = False
-# ) -> tuple:
-#     """
-#     Link MX files from Google Drive to the local directory using rclone, and optionally extract them.
-
-#     Args:
-#         mx_untargeted_remote (str): Remote MX folder path.
-#         mx_dir (str): Local MX data directory.
-#         polarity (str): Polarity.
-#         datatype (str): Data type.
-#         chromatography (str): Chromatography type.
-#         filtered_mx (bool): Use filtered data.
-#         extract (bool): Extract archives after linking.
-#         overwrite (bool): Overwrite existing results.
-
-#     Returns:
-#         tuple: DataFrames of archives and extractions, or None.
-#     """
-    
-#     if datatype == "peak-area":
-#         datatype = "quant"
-#     if filtered_mx and datatype == "quant":
-#         log.info("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
-#         return None
-#     if polarity == "multipolarity":
-#         mx_data_pattern = f"{mx_dir}/*{chromatography}*/*_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*_{datatype}.csv"
-#     elif polarity in ["positive", "negative"]:
-#         mx_data_pattern = f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{mx_dir}/*{chromatography}*/*{polarity}_{datatype}.csv"
-#     else:
-#         log.info(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
-#         return None
-#     if glob.glob(os.path.expanduser(mx_data_pattern)) and not overwrite:
-#         log.info("MX data already linked.")
-#         return "Archive already linked", "Archive already extracted"
-#     else:
-#         raise ValueError("You are not currently authorized to download metabolomics data from source. Please contact your JGI project manager for access.")
-    
-#     script_dir = f"{mx_dir}/scripts"
-#     os.makedirs(script_dir, exist_ok=True)
-#     script_name = f"{script_dir}/gather_mx_files.sh"
-#     if chromatography == "C18":
-#         chromatography = "C18_" # This (hopefully) removes C18-Lipid
-
-#     # Create the script to link MX files
-#     with open(script_name, "w") as script_file:
-#         script_file.write(f"cd {script_dir}/\n")
-#         script_file.write(f"rclone copy --include '*{chromatography}*.zip' --stats-one-line -v --max-depth 1 JGI_Metabolomics_Projects:{mx_untargeted_remote} {mx_dir};")
-    
-#     log.info("Linking MX files...")
-#     result = subprocess.run(f"chmod +x {script_name} && {script_name}", shell=True, check=True, capture_output=True, text=True)
-
-#     if result.stdout or result.stderr:
-#         output = result.stdout if result.stdout else result.stderr
-#         data = [line.split() for line in output.strip().split('\n')]
-#         archives = pd.DataFrame(data)
-#         if extract is True:
-#             extractions = extract_mx_archives(mx_dir, chromatography)
-#             display(extractions)
-#             return archives, extractions
-#         else:
-#             return archives
-#     else:
-#         log.info(f"Warning! No files could be found with rclone copy command in {script_name}")
-#         return None
-
-# def extract_mx_archives(mx_dir: str, chromatography: str) -> pd.DataFrame:
-#     """
-#     Extract MX zip archives in the specified directory.
-
-#     Args:
-#         mx_dir (str): Directory containing MX archives.
-#         chromatography (str): Chromatography type.
-
-#     Returns:
-#         pd.DataFrame: DataFrame of extracted files.
-#     """
-    
-#     cmd = f"for archive in {mx_dir}/*{chromatography}*zip; do newdir={mx_dir}/$(basename $archive .zip); rm -rf $newdir; mkdir -p $newdir; unzip -j $archive -d $newdir; done"
-#     log.info("Extracting the following archive to be used for MX data input:")
-#     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    
-#     if result.stdout:
-#         data = [line.split() for line in result.stdout.strip().split('\n')]
-#         df = pd.DataFrame(data)
-#         df = df[df.iloc[:, 0].str.contains('Archive', na=False)]
-#         df.iloc[:, 1] = df.iloc[:, 1].str.replace(f"{mx_dir}/", "", regex=False)
-#         return df
-#     else:
-#         log.info(f"No archives could be decompressed with unzip command: {cmd}")
-#         return None
+def normalize_mx_config_values(value, field_name: str) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        raise ValueError(f"datasets.mx.{field_name} must be a string or a non-empty list.")
+    if not values or any(not isinstance(item, str) or not item.strip() for item in values):
+        raise ValueError(f"datasets.mx.{field_name} must contain non-empty strings.")
+    values = [item.strip() for item in values]
+    if field_name == "chromatography" and any(
+        item.casefold() == "multichromatography" for item in values
+    ):
+        raise ValueError(
+            "Use one chromatography folder name or a list of folder names in "
+            "datasets.mx.chromatography; 'multichromatography' is not a folder."
+        )
+    if len({item.casefold() for item in values}) != len(values):
+        raise ValueError(f"datasets.mx.{field_name} must not contain duplicates.")
+    return values
 
 
-# def find_tx_files(
-#     pid: str,
-#     tx_dir: str,
-#     tx_index: int,
-#     overwrite: bool = False,
-# ) -> pd.DataFrame:
-#     """
-#     Find TX files for a project using JAMO report select.
+def normalize_mx_polarities(value) -> list[str]:
+    values = normalize_mx_config_values(value, "polarity")
+    polarity_aliases = {
+        "pos": "POS",
+        "positive": "POS",
+        "neg": "NEG",
+        "negative": "NEG",
+    }
+    normalized = []
+    for polarity in values:
+        key = polarity.casefold()
+        if key == "multipolarity":
+            normalized.extend(["POS", "NEG"])
+        elif key in polarity_aliases:
+            normalized.append(polarity_aliases[key])
+        else:
+            raise ValueError(
+                f"Unrecognized MX polarity '{polarity}'. Use POS, NEG, or a list of them."
+            )
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("datasets.mx.polarity must not contain duplicate polarities.")
+    return normalized
 
-#     Args:
-#         pid (str): Proposal ID.
-#         tx_dir (str): TX data directory.
-#         tx_index (int): Index of analysis project to use.
-#         overwrite (bool): Overwrite existing results.
-
-#     Returns:
-#         pd.DataFrame: DataFrame of TX file information.
-#     """
-    
-#     if os.path.exists(f"{tx_dir}/all_tx_portal_files.txt") and overwrite is False:
-#         log.info("TX files already found.")
-#         return pd.DataFrame()
-#     else:
-#         raise ValueError("You are not currently authorized to download transcriptomics data from source. Please contact your JGI project manager for access.")
-    
-#     file_list = f"{tx_dir}/all_tx_portal_files.txt"
-#     script_dir = f"{tx_dir}/scripts"
-#     os.makedirs(script_dir, exist_ok=True)
-#     script_name = f"{script_dir}/find_tx_files.sh"
-
-#     if not os.path.exists(os.path.dirname(file_list)):
-#         os.makedirs(os.path.dirname(file_list))
-#     if not os.path.exists(os.path.dirname(script_name)):
-#         os.makedirs(os.path.dirname(script_name))
-    
-#     log.info("Creating script to find TX files...")
-#     script_content = (
-#         f"jamo report select _id,metadata.analysis_project.analysis_project_id,metadata.library_name,metadata.analysis_project.status_name where "
-#         f"metadata.proposal_id={pid} file_name=counts.txt "
-#         f"| sed 's/\\[//g' | sed 's/\\]//g' | sed 's/u'\\''//g' | sed 's/'\\''//g' | sed 's/ //g' > {file_list}"
-#     )
-
-#     log.info("Finding TX files...")
-#     subprocess.run(
-#         f"echo \"{script_content}\" > {script_name} && chmod +x {script_name} && module load jamo && source {script_name}",
-#         shell=True, check=True
-#     )
-    
-#     files = pd.read_csv(file_list, header=None, sep="\t")
-#     files.columns = ["fileID.counts", "APID", "libIDs", "status"]
-#     files["nLibs"] = files["libIDs"].apply(lambda ll: len(ll.split(",")))
-    
-#     def get_tpm_file_id(apid):
-#         result = subprocess.run(
-#             f"module load jamo; jamo report select _id where file_name=tpm_counts.txt,metadata.analysis_project.analysis_project_id={apid}",
-#             shell=True, capture_output=True, text=True
-#         )
-#         return result.stdout.strip()
-    
-#     files["fileID.tpm"] = files["APID"].apply(get_tpm_file_id)
-    
-#     def fetch_refs(apid):
-#         try:
-#             cmd = (
-#                 f"x=$(curl https://rqc.jgi.lbl.gov/api/seq_jat_import/apid_to_ref/{apid}); "
-#                 f"echo $(echo $x | jq .name)','$(echo $x | jq .Genome[].file_path)','$(echo $x | jq .Transcriptome[].file_path)','$(echo $x | jq .Annotation[].file_path)','$(echo $x | jq .KEGG[].file_path)"
-#             )
-#             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-#             ref_data = pd.read_csv(io.StringIO(result.stdout), header=None, sep=",")
-#             ref_data.columns = ["ref_name", "ref_genome", "ref_transcriptome", "ref_gff", "ref_protein_kegg"]
-#             ref_data["APID"] = apid
-#             return ref_data
-#         except Exception as e:
-#             log.info(f"Error fetching refs for {apid}: {e}")
-#             return pd.DataFrame({"ref_name": [np.nan], "ref_genome": [np.nan], "ref_transcriptome": [np.nan], "ref_gff": [np.nan], "ref_protein_kegg": [np.nan], "APID": [apid]})
-    
-#     refs = pd.concat([fetch_refs(apid) for apid in files["APID"].unique()], ignore_index=True)
-#     files = files.merge(refs, on="APID", how="left").sort_values(by=["ref_name", "APID"]).reset_index(drop=True)
-#     files["ix"] = files.index + 1
-#     # Move "ix" column to the beginning
-#     cols = ["ix"] + [col for col in files.columns if col != "ix"]
-#     files = files[cols]
-#     files.reset_index(drop=True)
-    
-#     if files.shape[0] > 0:
-#         log.info(f"Using the value of 'tx_index' ({tx_index}) from the config file to choose the correct 'ix' column (change if incorrect): ")
-#         files.to_csv(f"{tx_dir}/all_tx_portal_files.txt", sep="\t", index=False)
-#         display(files)
-#         return files
-#     else:
-#         log.info("No files found.")
-#         return None
-
-# def gather_tx_files(
-#     file_list: pd.DataFrame,
-#     tx_index: int = None,
-#     tx_dir: str = None,
-#     overwrite: bool = False
-# ) -> str:
-#     """
-#     Link TX files to the working directory using JAMO.
-
-#     Args:
-#         file_list (pd.DataFrame): DataFrame of TX file information.
-#         tx_index (int): Index of analysis project to use.
-#         tx_dir (str): TX data directory.
-#         overwrite (bool): Overwrite existing results.
-
-#     Returns:
-#         str: Analysis project ID (APID).
-#     """
-
-#     if glob.glob(f"{tx_dir}/*counts.txt") and os.path.exists(f"{tx_dir}/all_tx_portal_files.txt") and overwrite is False:
-#         log.info("TX files already linked.")
-#         tx_files = pd.read_csv(f"{tx_dir}/all_tx_portal_files.txt", sep="\t")
-#         apid = int(tx_files.iloc[tx_index-1:,2].values)
-#         return apid
-#     else:
-#         raise ValueError("You are not currently authorized to download transcriptomics data from source. Please contact your JGI project manager for access.")
-
-
-#     if tx_index is None:
-#         log.info("There may be multiple APIDS or analyses for a given PI/Proposal ID and you have not specified which one to use!")
-#         log.info("Please set 'tx_index' in the project config file by choosing the correct row from the table above.")
-#         sys.exit(1)
-
-#     script_dir = f"{tx_dir}/scripts"
-#     os.makedirs(script_dir, exist_ok=True)
-#     script_name = f"{script_dir}/gather_tx_files.sh"
-#     log.info("Linking TX files...")
-
-#     with open(script_name, "w") as script_file:
-#         script_file.write(f"cd {script_dir}/\n")
-        
-#         file_list = file_list[file_list["ix"] == tx_index]
-#         apid = file_list["APID"].values[0]
-#         for _, row in file_list.iterrows():
-#             for file_type in ["counts","tpm"]: # "tpm_counts" may be needed for older projects
-#                 file_id = row[f"fileID.{file_type}"]
-#                 apid = row['APID']
-#                 filename = f"{tx_dir}/{row['ix']}_{apid}.{file_type}.txt"
-#                 if file_type == "tpm":
-#                     file_type = "tpm_counts"
-#                 script_file.write(f"""
-#                     module load jamo;
-#                     if [ $(jamo info id {file_id} | cut -f3 -d' ') == 'PURGED' ]; then 
-#                         echo file purged! fetching {file_id} - rerun later to link; jamo fetch id {file_id} 2>&1 > /dev/null
-#                     else 
-#                         if [ $(jamo info id {file_id} | cut -f3 -d' ') == 'RESTORE_IN_PROGRESS' ]; then 
-#                             echo restore in progress for file id {file_id} - rerun later to link
-#                         else
-#                             echo "\t{file_type} file for APID {apid} with ID {file_id} linked to {filename}";
-#                             jamo link id {file_id} 2>&1 > /dev/null;
-#                             mv {file_id}.{file_type}.txt {filename}
-#                         fi
-#                     fi
-#                     """)
-#             for file_type in ["genome","transcriptome","gff","protein_kegg"]:
-#                 file_path = row[f"ref_{file_type}"]
-#                 try:
-#                     apid = row['APID']
-#                     filename = f"{tx_dir}/{os.path.basename(file_path)}"
-#                     if file_path:
-#                         script_file.write(f"""
-#                             echo "\t{file_type} file for APID {apid} to {file_path}";
-#                             ln -sf {file_path} {tx_dir}/
-#                         """)
-#                 except:
-#                     log.info(f"\tError linking {file_type} file for APID {apid}. File does not exist or you may need to wait for files to be restored.")
-#                     continue
-
-#     subprocess.run(f"chmod +x {script_name} && {script_name}", shell=True, check=True)
-    
-#     if apid:
-#         with open(f"{tx_dir}/apid.txt", "w") as f:
-#             f.write(str(apid))
-#         log.info(f"Working with APID: {apid} from tx_index {tx_index}.")
-#         return apid
-#     else:
-#         log.info("Warning: Did not find APID. Check the index you selected from the tx_files object.")
-#         return None
 
 def get_mx_data(
     input_dir: str,
     output_dir: str,
     output_filename: str,
-    chromatography: str,
-    polarity: str,
+    chromatography,
+    polarity,
     datatype: str = "peak-height",
     filtered_mx: bool = True,
 ) -> pd.DataFrame:
@@ -3841,8 +3493,8 @@ def get_mx_data(
         input_dir (str): Input directory containing MX data.
         output_dir (str): MX data directory.
         output_filename (str): Output filename for MX data.
-        chromatography (str): Chromatography type.
-        polarity (str): Polarity.
+        chromatography (str or list[str]): Configured chromatography folder(s).
+        polarity (str or list[str]): Configured polarity or polarities (POS/NEG).
         datatype (str): Data type.
         filtered_mx (bool): Use filtered data.
         overwrite (bool): Overwrite existing results.
@@ -3851,76 +3503,74 @@ def get_mx_data(
         pd.DataFrame: MX data matrix.
     """
 
+    chromatographies = normalize_mx_config_values(chromatography, "chromatography")
+    polarities = normalize_mx_polarities(polarity)
     if datatype == "peak-area":
         datatype = "quant"
     if filtered_mx and datatype == "quant":
         log.info("Quant (peak area) data is not filtered. Please use peak-height as 'datatype'.")
         return None
-    if polarity == "multipolarity":
-        mx_data_pattern = f"{input_dir}/*{chromatography}*/*_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{input_dir}/*{chromatography}*/*_{datatype}.csv"
-    elif polarity in ["positive", "negative"]:
-        mx_data_pattern = f"{input_dir}/*{chromatography}*/*{polarity}_{datatype}-filtered-3x-exctrl.csv" if filtered_mx else f"{input_dir}/*{chromatography}*/*{polarity}_{datatype}.csv"
-    else:
-        log.info(f"Polarity '{polarity}' is not recognized. Please use 'positive', 'negative', or 'multipolarity'.")
-        return None
-
-    mx_data_files = glob.glob(os.path.expanduser(mx_data_pattern))
-    if mx_data_files:
-        if len(mx_data_files) > 1:
-            multipolarity_datasets = []
-            for mx_data_file in mx_data_files:
-                file_polarity = (
-                    "positive" if "positive" in mx_data_file 
-                    else "negative" if "negative" in mx_data_file 
-                    else "NO_POLARITY"
+    multigroup = len(chromatographies) > 1 or len(polarities) > 1
+    datasets = []
+    for chrom in chromatographies:
+        for polarity_code in polarities:
+            file_polarity = "positive" if polarity_code == "POS" else "negative"
+            suffix = (
+                f"_{file_polarity}_{datatype}-filtered-3x-exctrl.csv"
+                if filtered_mx else f"_{file_polarity}_{datatype}.csv"
+            )
+            pattern = str(Path(input_dir) / chrom / "**" / f"*{suffix}")
+            files = sorted(glob.glob(os.path.expanduser(pattern), recursive=True))
+            if not files:
+                log.warning(
+                    "No MX data files found for chromatography=%s, polarity=%s "
+                    "matching %s.",
+                    chrom, polarity_code, pattern,
                 )
-                mx_dataset = pd.read_csv(mx_data_file)
-                mx_data = mx_dataset.copy()
-                if datatype == "peak-height":
-                    mx_data.columns = mx_data.columns.str.replace(' Peak height', '')
-                if datatype == "peak-area":
-                    mx_data.columns = mx_data.columns.str.replace(' Peak area', '')
-                mx_data.columns = mx_data.columns.str.replace('.mzML', '')
-                mx_data = mx_data.rename(columns={mx_data.columns[0]: 'CompoundID'})
-                mx_data = mx_data.drop(columns=['row m/z', 'row retention time'])
-                mx_data = mx_data.drop(columns=[col for col in mx_data.columns if "Unnamed" in col])
-                if pd.api.types.is_numeric_dtype(mx_data['CompoundID']):
-                    mx_data['CompoundID'] = 'mx_' + mx_data['CompoundID'].astype(str) + "_" + str(file_polarity)
-                multipolarity_datasets.append(mx_data)
-            multipolarity_data = pd.concat(multipolarity_datasets, axis=0)
-            log.info(f"MX data loaded from {mx_data_files}:")
-            #display(multipolarity_data.head())
-            write_integration_file(data=multipolarity_data, output_dir=output_dir, filename=output_filename, indexing=False)
-            return multipolarity_data
-        elif len(mx_data_files) == 1:
-            mx_data_filename = mx_data_files[0]  # Assuming you want the first match
-            mx_dataset = pd.read_csv(mx_data_filename)
-            mx_data = mx_dataset.copy()
-            if datatype == "peak-height":
-                mx_data.columns = mx_data.columns.str.replace(' Peak height', '')
-            if datatype == "peak-area":
-                mx_data.columns = mx_data.columns.str.replace(' Peak area', '')
-            mx_data.columns = mx_data.columns.str.replace('.mzML', '')
-            mx_data = mx_data.rename(columns={mx_data.columns[0]: 'CompoundID'})
-            mx_data = mx_data.drop(columns=['row m/z', 'row retention time'])
-            mx_data = mx_data.drop(columns=[col for col in mx_data.columns if "Unnamed" in col])
-            if pd.api.types.is_numeric_dtype(mx_data['CompoundID']):
-                mx_data['CompoundID'] = 'mx_' + mx_data['CompoundID'].astype(str)
-            log.info(f"MX data loaded from {mx_data_filename}:")
-            write_integration_file(data=mx_data, output_dir=output_dir, filename=output_filename, indexing=False)
-            #display(mx_data.head())
-            return mx_data
-        else:
-            log.info("No MX data files found.")
-            return None
+                continue
 
-    else:
-        log.warning(f"MX data file matching pattern {mx_data_pattern} not found.")
-        log.warning(
-            "Place the MX results file(s) under the chromatography directory "
-            f"({input_dir}/{chromatography}/) before running the workflow."
+            for mx_data_file in files:
+                mx_data = pd.read_csv(mx_data_file)
+                if datatype == "peak-height":
+                    mx_data.columns = mx_data.columns.str.replace(" Peak height", "")
+                elif datatype == "peak-area":
+                    mx_data.columns = mx_data.columns.str.replace(" Peak area", "")
+                mx_data.columns = mx_data.columns.str.replace(".mzML", "")
+                mx_data = mx_data.rename(columns={mx_data.columns[0]: "CompoundID"})
+                mx_data = mx_data.drop(columns=["row m/z", "row retention time"])
+                mx_data = mx_data.drop(
+                    columns=[col for col in mx_data.columns if "Unnamed" in col]
+                )
+                feature_ids = mx_data["CompoundID"]
+                if pd.api.types.is_numeric_dtype(feature_ids):
+                    feature_ids = "mx_" + feature_ids.astype(str)
+                if multigroup:
+                    mx_data["CompoundID"] = (
+                        feature_ids.astype(str)
+                        + f"_{chrom.lower()}_{polarity_code.lower()}"
+                    )
+                else:
+                    mx_data["CompoundID"] = feature_ids.astype(str)
+                datasets.append(mx_data)
+
+    if not datasets:
+        raise FileNotFoundError(
+            f"No MX result files found under {input_dir} for "
+            f"chromatography={chromatographies} and polarity={polarities}."
         )
-        return pd.DataFrame()
+
+    mx_data = pd.concat(datasets, axis=0, ignore_index=True)
+    write_integration_file(
+        data=mx_data,
+        output_dir=output_dir,
+        filename=output_filename,
+        indexing=False,
+    )
+    log.info(
+        "MX data loaded for chromatographies=%s and polarities=%s.",
+        chromatographies, polarities,
+    )
+    return mx_data
 
 
 def load_raw_metadata(
@@ -3955,7 +3605,7 @@ def load_raw_metadata(
 
 def load_mx_metadata(
     input_dir: str,
-    chromatography: str,
+    chromatography,
     output_dir: str,
     output_filename: str = "raw_metadata.csv",
 ) -> pd.DataFrame:
@@ -3963,12 +3613,18 @@ def load_mx_metadata(
 
     The data-gathering workflow may stage one polarity-specific metadata file
     such as ``*_positive_metadata.tab`` and ``*_negative_metadata.tab`` below
-    the chromatography directory. A single ``raw_metadata.csv`` is also
-    accepted for compatibility. Metadata is normalized using the original MX
-    transformations, concatenated, and de-duplicated before being cached.
+    each configured chromatography directory. A single ``raw_metadata.csv``
+    is also accepted for compatibility. Metadata is normalized using the
+    original MX transformations, concatenated, and de-duplicated before being
+    cached.
     """
-    chromatography_dir = Path(input_dir) / chromatography
-    metadata_files = sorted(chromatography_dir.glob("**/*_metadata.tab"))
+    chromatography_names = normalize_mx_config_values(chromatography, "chromatography")
+    chromatography_dirs = [Path(input_dir) / chrom for chrom in chromatography_names]
+    metadata_files = sorted(
+        metadata_path
+        for chromatography_dir in chromatography_dirs
+        for metadata_path in chromatography_dir.glob("**/*_metadata.tab")
+    )
     metadata_sep = "\t"
     if not metadata_files:
         metadata_files = sorted((Path(input_dir)).glob("raw_metadata.csv"))
@@ -3977,10 +3633,10 @@ def load_mx_metadata(
         log.warning(
             "No MX metadata files found under %s. Expected polarity-specific "
             "*_metadata.tab files or raw_metadata.csv.",
-            chromatography_dir,
+            chromatography_dirs,
         )
         raise FileNotFoundError(
-            f"No MX raw_metadata.csv files found under {chromatography_dir}"
+            f"No MX metadata files found under {chromatography_dirs}"
         )
 
     metadata_tables = []
@@ -4020,8 +3676,8 @@ def get_mx_metadata(
     output_filename: str,
     output_dir: str,
     input_dir: str,
-    chromatography: str,
-    polarity: str
+    chromatography,
+    polarity,
 ) -> pd.DataFrame:
     """
     Load MX metadata from extracted files, optionally filtered.
@@ -4037,12 +3693,22 @@ def get_mx_metadata(
         pd.DataFrame: MX metadata DataFrame.
     """
 
-    if polarity == "multipolarity":
-        mx_metadata_pattern = f"{input_dir}/*{chromatography}*/*_metadata.tab"
-        mx_metadata_files = glob.glob(os.path.expanduser(mx_metadata_pattern))
-    elif polarity in ["positive", "negative"]:
-        mx_metadata_pattern = f"{input_dir}/*{chromatography}*/*{polarity}_metadata.tab"
-        mx_metadata_files = glob.glob(os.path.expanduser(mx_metadata_pattern))
+    chromatographies = normalize_mx_config_values(chromatography, "chromatography")
+    polarities = normalize_mx_polarities(polarity)
+    mx_metadata_files = []
+    for chrom in chromatographies:
+        chrom_metadata_files = glob.glob(
+            os.path.expanduser(f"{input_dir}/{chrom}/**/*_metadata.tab"),
+            recursive=True,
+        )
+        for metadata_file in chrom_metadata_files:
+            file_path = metadata_file.lower()
+            if any(
+                ("positive" if code == "POS" else "negative") in file_path
+                for code in polarities
+            ):
+                mx_metadata_files.append(metadata_file)
+    mx_metadata_files = sorted(set(mx_metadata_files))
 
     if mx_metadata_files:
         if len(mx_metadata_files) > 1:
@@ -4246,26 +3912,26 @@ def get_tx_metadata(
 # Feature annotation functions
 # ====================================
 
-def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.DataFrame, prefix: str = "tx") -> None:
+def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, gff_quant_id: str, raw_data: pd.DataFrame, prefix: str = "tx") -> None:
     """
     Validate that gene IDs in annotation table match those in raw data.
     
     Args:
-        annotation_df (pd.DataFrame): Annotation table with transcriptome_id column
+        annotation_df (pd.DataFrame): Annotation table with gff_annot_id column
+        gff_quant_id (str): The GFF attribute used for quantification IDs
         raw_data (pd.DataFrame): Raw data with feature IDs in its first column
         prefix (str): Dataset prefix ("tx" or "px") applied to feature IDs
     """
-    identifier_column = raw_data.columns[0]
     tag = f"{prefix}_"
 
     # If the prefix is used in raw data, ensure annotation gene IDs also have it
-    if all(str(gid).startswith(tag) for gid in raw_data[identifier_column]):
-        if not all(str(gid).startswith(tag) for gid in annotation_df['transcriptome_id']):
-            annotation_df['transcriptome_id'] = annotation_df['transcriptome_id'].apply(lambda x: f'{tag}{x}')
+    if all(str(gid).startswith(tag) for gid in raw_data[gff_quant_id]):
+        if not all(str(gid).startswith(tag) for gid in annotation_df[gff_quant_id]):
+            annotation_df[gff_quant_id] = annotation_df[gff_quant_id].apply(lambda x: f'{tag}{x}')
 
     # Get gene IDs from both datasets
-    raw_data_genes = set(raw_data[identifier_column].tolist())
-    annotation_genes = set(annotation_df['transcriptome_id'].tolist())
+    raw_data_genes = set(raw_data[gff_quant_id].tolist())
+    annotation_genes = set(annotation_df[gff_quant_id].tolist())
     
     # Calculate overlap statistics
     common_genes = raw_data_genes.intersection(annotation_genes)
@@ -4284,15 +3950,16 @@ def _validate_annotation_gene_ids(annotation_df: pd.DataFrame, raw_data: pd.Data
         log.warning(f"Low gene ID overlap ({overlap_pct:.1f}%) between raw data and annotations")
     if overlap_pct == 0:
         log.info("Raw data GeneIDs:")
-        log.info(raw_data[identifier_column].tolist()[:10])
-        log.info("Annotation transcriptome_ids:")
-        log.info(annotation_df['transcriptome_id'].tolist()[:10])
+        log.info(raw_data[gff_quant_id].tolist()[:10])
+        log.info("Annotation IDs:")
+        log.info(annotation_df[gff_quant_id].tolist()[:10])
         raise ValueError("No matching gene IDs found between raw data and annotations, something is wrong.")
 
 def _validate_gff_attributes(
     raw_data_dir: str,
     gff_quant_id: str,
     gff_annot_id: str,
+    gff_table: Optional[pd.DataFrame] = None,
 ) -> None:
     """
     Validate that ``gff_quant_id`` and ``gff_annot_id`` appear as GFF3
@@ -4304,10 +3971,15 @@ def _validate_gff_attributes(
     differ, because that is the only case where the GFF3 is actually used to
     build the ``annot_id -> quant_id`` mapping.
 
+    If ``gff_table`` is supplied (a pre-parsed flat DataFrame produced by
+    ``TX.load_gff()``) it is used directly instead of re-reading the file.
+
     Args:
         raw_data_dir (str): Directory that may contain a ``*.gff3`` file.
         gff_quant_id (str): GFF9 attribute expected in counts.csv first column.
         gff_annot_id (str): GFF9 attribute expected in annotation file first column.
+        gff_table (pd.DataFrame, optional): Pre-parsed GFF3 flat table from
+            ``TX.load_gff()``.  When provided the file is not re-read.
 
     Raises:
         FileNotFoundError: If ``gff_quant_id != gff_annot_id`` and no GFF3
@@ -4322,47 +3994,54 @@ def _validate_gff_attributes(
         )
         return
 
-    gff_files = glob.glob(os.path.join(raw_data_dir, "*.gff3"))
-    if not gff_files:
-        raise FileNotFoundError(
-            f"gff_quant_id='{gff_quant_id}' differs from gff_annot_id='{gff_annot_id}' "
-            f"but no *.gff3 file was found in {raw_data_dir}. "
-            "A GFF3 file is required to build the ID bridge."
-        )
-
-    gff_file = gff_files[0]
-    found_quant = False
-    found_annot = False
     quant_tag = f"{gff_quant_id}="
     annot_tag = f"{gff_annot_id}="
 
-    with open(gff_file, "r") as fh:
-        for line in fh:
-            if line.startswith("#") or line.strip() == "":
-                continue
-            fields = line.split("\t")
-            if len(fields) < 9:
-                continue
-            info = fields[8]
-            if not found_quant and quant_tag in info:
-                found_quant = True
-            if not found_annot and annot_tag in info:
-                found_annot = True
-            if found_quant and found_annot:
-                break
+    # Use pre-parsed table when available
+    if gff_table is not None and not gff_table.empty:
+        info_series = gff_table["attributes"].dropna()
+        found_quant = info_series.str.contains(quant_tag, regex=False).any()
+        found_annot = info_series.str.contains(annot_tag, regex=False).any()
+        source_name = "pre-parsed gff_table"
+    else:
+        gff_files = glob.glob(os.path.join(raw_data_dir, "*.gff3"))
+        if not gff_files:
+            raise FileNotFoundError(
+                f"gff_quant_id='{gff_quant_id}' differs from gff_annot_id='{gff_annot_id}' "
+                f"but no *.gff3 file was found in {raw_data_dir}. "
+                "A GFF3 file is required to build the ID bridge."
+            )
+        gff_file = gff_files[0]
+        source_name = os.path.basename(gff_file)
+        found_quant = False
+        found_annot = False
+        with open(gff_file, "r") as fh:
+            for line in fh:
+                if line.startswith("#") or line.strip() == "":
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 9:
+                    continue
+                info = fields[8]
+                if not found_quant and quant_tag in info:
+                    found_quant = True
+                if not found_annot and annot_tag in info:
+                    found_annot = True
+                if found_quant and found_annot:
+                    break
 
     errors = []
     if not found_quant:
         errors.append(
             f"gff_quant_id='{gff_quant_id}' was not found as a GFF3 attribute "
-            f"in {os.path.basename(gff_file)}. "
+            f"in {source_name}. "
             "Check that this attribute name matches the GFF3 info column exactly "
             "(e.g. 'ID', 'locus_tag', 'Name')."
         )
     if not found_annot:
         errors.append(
             f"gff_annot_id='{gff_annot_id}' was not found as a GFF3 attribute "
-            f"in {os.path.basename(gff_file)}. "
+            f"in {source_name}. "
             "Check that this attribute name matches the GFF3 info column exactly."
         )
     if errors:
@@ -4371,7 +4050,7 @@ def _validate_gff_attributes(
     log.info(
         f"GFF3 attribute validation passed: "
         f"gff_quant_id='{gff_quant_id}', gff_annot_id='{gff_annot_id}' "
-        f"both found in {os.path.basename(gff_file)}"
+        f"both found in {source_name}"
     )
 
 
@@ -4379,17 +4058,21 @@ def _process_generic_annotations(
     raw_data_dir: str,
     gff_annot_id: str,
     gff_quant_id: str,
+    gff_table: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Read all ``*_annotation_table.tsv`` files from ``raw_data_dir``, merge
     them on their first column (``gff_annot_id``), and optionally remap the
     ID column to ``gff_quant_id`` values via a GFF3 bridge scan.
 
-    When ``gff_quant_id == gff_annot_id`` no GFF3 file is needed and the
-    merged ID column is simply renamed to ``transcriptome_id``.  When they
+    When ``gff_quant_id == gff_annot_id`` no GFF3 file is needed.  When they
     differ, the GFF3 is scanned once to build an ``annot_id -> quant_id``
     bridge.  All columns from every annotation file are kept as-is; no
     column selection or renaming is performed beyond the ID column.
+
+    If ``gff_table`` is supplied (a pre-parsed flat DataFrame produced by
+    ``TX.load_gff()``) it is used for the ID bridge instead of re-reading
+    the GFF3 file from disk.
 
     Args:
         raw_data_dir (str): Directory containing ``*_annotation_table.tsv``
@@ -4401,12 +4084,15 @@ def _process_generic_annotations(
             column of ``counts.csv`` / ``peak-height.csv``.  When this differs
             from ``gff_annot_id``, the GFF3 is scanned to build an
             ``annot_id -> quant_id`` bridge and the ID column is remapped.
+        gff_table (pd.DataFrame, optional): Pre-parsed GFF3 flat table from
+            ``TX.load_gff()``.  When provided the file is not re-read for the
+            ID bridge step.
 
     Returns:
-        pd.DataFrame: Merged annotation table with ``transcriptome_id`` as the
+        pd.DataFrame: Merged annotation table with ``gff_quant_id`` as the
             first column (containing ``gff_quant_id`` values) and all
             annotation columns from every input file.  Returns an empty
-            DataFrame with a ``transcriptome_id`` column when no annotation
+            DataFrame with a ``gff_quant_id`` column when no annotation
             files are found.
     """
 
@@ -4422,7 +4108,7 @@ def _process_generic_annotations(
 
     if not annotation_files:
         log.warning(f"No *_annotation_table.tsv files found in {raw_data_dir}")
-        return pd.DataFrame(columns=["transcriptome_id"])
+        return pd.DataFrame(columns=[gff_annot_id])
 
     log.info(f"Found {len(annotation_files)} annotation file(s):")
     for f in annotation_files:
@@ -4464,54 +4150,101 @@ def _process_generic_annotations(
 
     if not processed_dfs:
         log.warning("No valid annotation data found in any files")
-        return pd.DataFrame(columns=["transcriptome_id"])
+        return pd.DataFrame(columns=[gff_annot_id])
 
     # Outer-merge all annotation DataFrames on gff_annot_id
+    log.info(f"Merging {len(processed_dfs)} annotation DataFrames on '{gff_annot_id}'")
     merged_df = reduce(
         lambda left, right: pd.merge(left, right, on=gff_annot_id, how="outer"),
         processed_dfs,
     )
-    merged_df = merged_df.fillna("")
+    # Fill NaN only in annotation columns — preserve the key column's original dtype
+    # so that the annot_id -> quant_id map() lookup works correctly regardless of
+    # whether the key column is int64 or object.
+    annot_cols_only = [c for c in merged_df.columns if c != gff_annot_id]
+    merged_df[annot_cols_only] = merged_df[annot_cols_only].fillna("")
+    log.info(f"Merged annotation DataFrame contains unique feature rows: {len(merged_df[gff_annot_id].unique())}")
 
-    # Build gff_annot_id -> gff_quant_id bridge from GFF3 when IDs differ
+    # Build gff_annot_id -> gff_quant_id bridge from GFF3 when IDs differ.
+    # Goal: add a gff_quant_id column to merged_df so that downstream joins
+    # against the quant table (which uses gff_quant_id as its feature ID) work.
     ids_differ = gff_quant_id != gff_annot_id
     if ids_differ:
-        gff_files = glob.glob(os.path.join(raw_data_dir, "*.gff3"))
-        if not gff_files:
-            raise FileNotFoundError(
-                f"gff_quant_id ('{gff_quant_id}') differs from gff_annot_id "
-                f"('{gff_annot_id}') but no *.gff3 file was found in "
-                f"{raw_data_dir} to build the ID bridge."
-            )
-        gff_file = gff_files[0]
         log.info(
-            f"Building annot_id -> quant_id bridge from {os.path.basename(gff_file)} "
-            f"('{gff_annot_id}' -> '{gff_quant_id}')"
+            f"gff_quant_id ('{gff_quant_id}') differs from gff_annot_id ('{gff_annot_id}'); "
+            "building annot_id -> quant_id bridge from GFF3"
         )
-        annot_to_quant: Dict[str, str] = {}
         quant_tag = f"{gff_quant_id}="
         annot_tag = f"{gff_annot_id}="
-        with open(gff_file, "r") as fh:
-            for line in fh:
-                if line.startswith("#") or not line.strip():
-                    continue
-                fields = line.split("\t")
-                if len(fields) < 9:
-                    continue
-                info = fields[8]
+        # Keys = gff_annot_id values (str), Values = gff_quant_id values (str)
+        annot_to_quant: Dict[str, str] = {}
+
+        if gff_table is not None and not gff_table.empty:
+            # Use the pre-parsed table — no file I/O needed
+            log.info("  Using pre-parsed gff_table for ID bridge")
+            for _, row in gff_table.iterrows():
+                info = str(row.get("attributes", ""))
                 if quant_tag not in info or annot_tag not in info:
                     continue
                 quant_m = re.search(rf"(?:^|;){re.escape(gff_quant_id)}=([^;]+)", info)
                 annot_m = re.search(rf"(?:^|;){re.escape(gff_annot_id)}=([^;]+)", info)
                 if quant_m and annot_m:
                     annot_to_quant[annot_m.group(1).strip()] = quant_m.group(1).strip()
+        else:
+            gff_files = glob.glob(os.path.join(raw_data_dir, "*.gff3"))
+            if not gff_files:
+                raise FileNotFoundError(
+                    f"gff_quant_id ('{gff_quant_id}') differs from gff_annot_id "
+                    f"('{gff_annot_id}') but no *.gff3 file was found in "
+                    f"{raw_data_dir} to build the ID bridge."
+                )
+            gff_file = gff_files[0]
+            log.info(
+                f"Building annot_id -> quant_id bridge from {os.path.basename(gff_file)} "
+                f"('{gff_annot_id}' -> '{gff_quant_id}')"
+            )
+            with open(gff_file, "r") as fh:
+                for line in fh:
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    fields = line.split("\t")
+                    if len(fields) < 9:
+                        continue
+                    info = fields[8]
+                    if quant_tag not in info or annot_tag not in info:
+                        continue
+                    quant_m = re.search(rf"(?:^|;){re.escape(gff_quant_id)}=([^;]+)", info)
+                    annot_m = re.search(rf"(?:^|;){re.escape(gff_annot_id)}=([^;]+)", info)
+                    if quant_m and annot_m:
+                        annot_to_quant[annot_m.group(1).strip()] = quant_m.group(1).strip()
 
         log.info(f"  Bridge built: {len(annot_to_quant)} annot_id -> quant_id mappings")
-        merged_df[gff_annot_id] = merged_df[gff_annot_id].map(annot_to_quant)
+        if not annot_to_quant:
+            log.warning(
+                f"  No mappings found — check that both '{gff_quant_id}' and "
+                f"'{gff_annot_id}' appear together on the same GFF3 feature rows."
+            )
 
-    # Rename the ID column to the canonical 'transcriptome_id'
-    merged_df = merged_df.rename(columns={gff_annot_id: "transcriptome_id"})
-    merged_df["transcriptome_id"] = merged_df["transcriptome_id"].astype(str)
+        # Cast both sides to str so int64 vs str mismatches don't silently produce NaN.
+        annot_to_quant_str = {str(k): str(v) for k, v in annot_to_quant.items()}
+        # Insert gff_quant_id as the second column so the table has both IDs:
+        #   col 0: gff_annot_id  (e.g. proteinId=16019)  — matches annotation files
+        #   col 1: gff_quant_id  (e.g. ID=gene_1)        — matches quant table feature IDs
+        merged_df.insert(
+            1,
+            gff_quant_id,
+            merged_df[gff_annot_id].astype(str).map(annot_to_quant_str),
+        )
+        n_mapped = merged_df[gff_quant_id].notna().sum()
+        log.info(
+            f"  {n_mapped}/{len(merged_df)} annotation rows successfully mapped "
+            f"to a {gff_quant_id} value"
+        )
+    else:
+        log.info(
+            f"gff_quant_id ('{gff_quant_id}') matches gff_annot_id ('{gff_annot_id}'); "
+            "no ID bridge needed — downstream joins can use the existing key column directly"
+        )
 
     log.info(
         f"Generic annotation merge complete: {len(merged_df)} rows, "
@@ -5233,11 +4966,12 @@ def _validate_annotation_metabolite_ids(annotation_df: pd.DataFrame, raw_data: p
 def generate_mx_annotation_table(
     raw_data: pd.DataFrame,
     dataset_raw_dir: str,
-    polarity: str,
+    polarity,
     output_dir: str,
     output_filename: str,
     inchikey_col: str = None,
-    overwrite: bool = False
+    overwrite: bool = False,
+    chromatography=None,
 ) -> pd.DataFrame:
     """
     Generate metabolite ID to annotation mapping table for metabolomics data.
@@ -5245,7 +4979,7 @@ def generate_mx_annotation_table(
     Args:
         raw_data: Raw metabolomics data DataFrame
         dataset_raw_dir: Directory containing raw dataset files
-        polarity: Polarity setting ('positive', 'negative', 'multipolarity')
+        polarity: Configured polarity or polarities (POS/NEG).
         output_dir: Output directory for saving annotation map
         output_filename: Filename for saving the annotation map
         inchikey_col: Exact column header in the library-results file containing InChIKey values.
@@ -5275,39 +5009,44 @@ def generate_mx_annotation_table(
     # Find and process FBMN library-results files
     log.info(f"Looking for FBMN library-results files in {dataset_raw_dir}")
 
+    chromatographies = normalize_mx_config_values(chromatography, "chromatography")
+    polarities = normalize_mx_polarities(polarity)
+    multigroup = len(chromatographies) > 1 or len(polarities) > 1
     fbmn_data = pd.DataFrame()
     try:
-        if polarity == "multipolarity":
-            compound_files = glob.glob(os.path.expanduser(f"{dataset_raw_dir}/*/*library-results.tsv"))
-            if len(compound_files) > 1:
-                all_fbmn_data = []
-                for file_path in compound_files:
-                    file_polarity = ("positive" if "positive" in file_path
-                                else "negative" if "negative" in file_path
-                                else "unknown")
-                    df = pd.read_csv(file_path, sep='\t')
-                    df['metabolite_id'] = 'mx_' + df['#Scan#'].astype(str) + '_' + file_polarity
-                    all_fbmn_data.append(df)
-                fbmn_data = pd.concat(all_fbmn_data, axis=0, ignore_index=True)
-            elif len(compound_files) == 1:
-                log.warning("Only single compound file found with multipolarity setting.")
-                fbmn_data = pd.read_csv(compound_files[0], sep='\t')
-                fbmn_data['metabolite_id'] = 'mx_' + fbmn_data['#Scan#'].astype(str) + '_unknown'
-
-        elif polarity in ["positive", "negative"]:
-            compound_files = glob.glob(os.path.expanduser(f"{dataset_raw_dir}/*/*{polarity}*library-results.tsv"))
-            if len(compound_files) == 1:
-                fbmn_data = pd.read_csv(compound_files[0], sep='\t')
-                fbmn_data['metabolite_id'] = 'mx_' + fbmn_data['#Scan#'].astype(str) + '_' + polarity
-                log.info(f"Using compound file: {compound_files[0]}")
-            elif len(compound_files) > 1:
-                log.warning(f"Multiple compound files found: {compound_files}. Using first one.")
-                fbmn_data = pd.read_csv(compound_files[0], sep='\t')
-                fbmn_data['metabolite_id'] = 'mx_' + fbmn_data['#Scan#'].astype(str) + '_' + polarity
-            else:
-                log.warning(f"No compound files found for {polarity} polarity.")
-        else:
-            log.warning(f"Unknown polarity: {polarity}")
+        all_fbmn_data = []
+        file_polarities = {"POS": "positive", "NEG": "negative"}
+        for chrom in chromatographies:
+            compound_files = glob.glob(
+                os.path.expanduser(
+                    f"{dataset_raw_dir}/{chrom}/**/*library-results.tsv"
+                ),
+                recursive=True,
+            )
+            for file_path in compound_files:
+                file_path_lower = file_path.lower()
+                file_polarity = next(
+                    (
+                        code for code, name in file_polarities.items()
+                        if name in file_path_lower
+                    ),
+                    None,
+                )
+                if file_polarity is None:
+                    log.warning(
+                        "Skipping library-results file without recognized polarity: %s",
+                        file_path,
+                    )
+                    continue
+                if file_polarity not in polarities:
+                    continue
+                df = pd.read_csv(file_path, sep="\t")
+                df["metabolite_id"] = "mx_" + df["#Scan#"].astype(str)
+                if multigroup:
+                    df["metabolite_id"] += f"_{chrom.lower()}_{file_polarity.lower()}"
+                all_fbmn_data.append(df)
+        if all_fbmn_data:
+            fbmn_data = pd.concat(all_fbmn_data, axis=0, ignore_index=True)
 
     except Exception as e:
         log.warning(f"Error reading compound files: {e}")
@@ -5435,6 +5174,7 @@ def generate_tx_annotation_table(
     ec_delimiter: str = ",",
     kegg_id_delimiter: str = ",",
     prefix: str = "tx",
+    gff_table: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Generate a merged gene annotation table from all ``*_annotation_table.tsv``
@@ -5443,14 +5183,14 @@ def generate_tx_annotation_table(
     The same annotation files/formats serve tx and px data; ``prefix`` selects
     the feature-ID prefix ("tx" or "px") used to match annotations to the data.
 
-    Two GFF9 attribute names control how feature IDs are resolved:
+    Two gff attribute names control how feature IDs are resolved:
 
-    * ``gff_quant_id`` -- the GFF9 attribute whose values appear as the first
+    * ``gff_quant_id`` -- the gff attribute whose values appear as the first
       column of ``counts.csv`` / ``peak-height.csv``.  These become the
-      ``transcriptome_id`` values in the annotation table and must match the
+      ``gff_annot_id`` values in the annotation table and must match the
       feature IDs in the integrated data matrix.  If the first column of
       ``raw_data`` does not already carry this name it is renamed silently.
-    * ``gff_annot_id`` -- the GFF9 attribute whose values appear as the first
+    * ``gff_annot_id`` -- the gff attribute whose values appear as the first
       column of the annotation files.  If the first column of any annotation
       file does not already carry this name it is renamed silently.  When this
       differs from ``gff_quant_id``, the GFF3 is used to build a bridge that
@@ -5462,14 +5202,18 @@ def generate_tx_annotation_table(
 
     Both default to the first column header of ``raw_data`` when not supplied.
 
+    If ``gff_table`` is supplied (a pre-parsed flat DataFrame produced by
+    ``TX.load_gff()``) it is forwarded to the internal helpers so the GFF3
+    file is not re-read from disk.
+
     Args:
         raw_data (pd.DataFrame): Raw transcriptomics / proteomics data.
         raw_data_dir (str): Directory containing annotation table files and
             optionally a GFF3 file.
         output_dir (str): Output directory for saving the merged annotation table.
         output_filename (str): Filename for the output annotation table.
-        gff_quant_id (str): GFF9 attribute matching the first column of counts.csv.
-        gff_annot_id (str): GFF9 attribute matching the first column of annotation files.
+        gff_quant_id (str): GFF attribute matching the first column of counts.csv.
+        gff_annot_id (str): GFF attribute matching the first column of annotation files.
         ec_number_col (str): Exact column header in the annotation file containing EC numbers.
             Required — raises ValueError if not provided.
         kegg_id_col (str): Exact column header in the annotation file containing KEGG IDs / KO accessions.
@@ -5477,9 +5221,11 @@ def generate_tx_annotation_table(
         ec_delimiter (str): Delimiter used to split multiple EC numbers within a cell (default ',').
         kegg_id_delimiter (str): Delimiter used to split multiple KEGG IDs within a cell (default ',').
         prefix (str): Feature-ID prefix ("tx" or "px").
+        gff_table (pd.DataFrame, optional): Pre-parsed GFF3 flat table from
+            ``TX.load_gff()``.  When provided the GFF3 file is not re-read.
 
     Returns:
-        pd.DataFrame: Merged annotation table indexed by ``transcriptome_id``
+        pd.DataFrame: Merged annotation table indexed by ``gff_annot_id``
             with all annotation columns from every input file.
     """
 
@@ -5513,21 +5259,22 @@ def generate_tx_annotation_table(
         raw_data = raw_data.rename(columns={raw_data.columns[0]: gff_quant_id})
 
     # Upfront GFF3 attribute validation (no-op when IDs are identical)
-    _validate_gff_attributes(raw_data_dir, gff_quant_id, gff_annot_id)
+    _validate_gff_attributes(raw_data_dir, gff_quant_id, gff_annot_id, gff_table=gff_table)
 
     # Build the merged annotation table generically
     annotation_df = _process_generic_annotations(
         raw_data_dir=raw_data_dir,
         gff_annot_id=gff_annot_id,
         gff_quant_id=gff_quant_id,
+        gff_table=gff_table,
     )
 
     if not raw_data.empty and not annotation_df.empty:
-        _validate_annotation_gene_ids(annotation_df, raw_data, prefix)
+        _validate_annotation_gene_ids(annotation_df, gff_quant_id, raw_data, prefix)
     else:
         raise ValueError("Either input raw_data or computed annotation_df is empty. Cannot validate gene IDs.")
 
-    annotation_df = annotation_df.set_index('transcriptome_id')
+    annotation_df = annotation_df.set_index(gff_annot_id)
     annotation_df = annotation_df.map(lambda x: str(x).replace('|', ';;') if isinstance(x, str) else x)
 
     if not annotation_df.empty:
@@ -5588,6 +5335,8 @@ def annotate_integrated_features(
     # After joining, annotation columns are prefixed with dataset_name (e.g. tx_EC, mx_InChiKey)
     ec_cols: List[str] = []
     kegg_id_cols: List[str] = []
+    ec_delimiters: Dict[str, str] = {}
+    kegg_id_delimiters: Dict[str, str] = {}
     inchikey_col: Optional[str] = None
 
     if datasets is not None:
@@ -5622,10 +5371,12 @@ def annotate_integrated_features(
                     prefixed_ec = f"{ds_name}_{dataset.ec_number_col}"
                     if prefixed_ec in final_annotation_df.columns:
                         ec_cols.append(prefixed_ec)
+                        ec_delimiters[prefixed_ec] = getattr(dataset, "ec_delimiter", ",") or ","
                 if hasattr(dataset, 'kegg_id_col') and dataset.kegg_id_col:
                     prefixed_ko = f"{ds_name}_{dataset.kegg_id_col}"
                     if prefixed_ko in final_annotation_df.columns:
                         kegg_id_cols.append(prefixed_ko)
+                        kegg_id_delimiters[prefixed_ko] = getattr(dataset, "kegg_id_delimiter", ",") or ","
                 if hasattr(dataset, 'inchikey_col') and dataset.inchikey_col:
                     # MX annotation table stores InChIKey under the fixed output column 'InChiKey'
                     prefixed_ik = f"{ds_name}_InChiKey"
@@ -5643,8 +5394,8 @@ def annotate_integrated_features(
         final_annotation_df,
         cache_dir=Path(cache_dir) if cache_dir else None,
         inchikey_col=inchikey_col,
-        ec_cols=ec_cols or None,
-        ko_cols=kegg_id_cols or None,
+        ec_cols=ec_delimiters or None,
+        ko_cols=kegg_id_delimiters or None,
     )
 
     final_annotation_df = final_annotation_df.fillna('Unassigned')
@@ -5760,7 +5511,7 @@ def fetch_kegg_id(
             return kegg_id if kegg_id else None
         except (requests.RequestException, ValueError) as exc:
             if attempt == retries:
-                print(f"Warning: failed to fetch '{inchikey}' after {retries} attempts: {exc}")
+                log.warning(f"Warning: failed to fetch '{inchikey}' after {retries} attempts: {exc}")
                 return None
             time.sleep(backoff * attempt)
     return None
@@ -5821,10 +5572,16 @@ def fetch_kegg_links_batch(
     Query KEGG REST 'link' API for a batch (<=10) of KEGG IDs sharing the
     same db prefix (e.g. 'cpd:', 'ec:', 'ko:') and return
     {id_without_prefix: [target_id, ...]}.
+
+    IDs with no links map to []. If KEGG rejects the batch as malformed
+    (HTTP 400) the IDs are retried one at a time so a single bad ID does not
+    blank out the rest of the batch; an ID rejected on its own maps to [].
+    On a network/server failure the batch's IDs are *omitted* from the
+    result so they are not cached as empty and get retried on the next run.
     """
     result: Dict[str, List[str]] = {i: [] for i in ids}
     query = "+".join(f"{prefix}{i}" for i in ids)
-    
+
     KEGG_LINK_URL = "https://rest.kegg.jp/link/{target}/{query}"
     url = KEGG_LINK_URL.format(target=target, query=query)
 
@@ -5833,6 +5590,17 @@ def fetch_kegg_links_batch(
             resp = session.get(url, timeout=timeout)
             if resp.status_code == 404:
                 # No links found for any ID in this batch
+                return result
+            if resp.status_code == 400:
+                if len(ids) > 1:
+                    split: Dict[str, List[str]] = {}
+                    for single in ids:
+                        split.update(fetch_kegg_links_batch(
+                            [single], prefix, session, target=target,
+                            timeout=timeout, retries=retries, backoff=backoff,
+                        ))
+                    return split
+                log.warning(f"KEGG rejected ID '{prefix}{ids[0]}' (HTTP 400); treating as unmapped.")
                 return result
             resp.raise_for_status()
             for line in resp.text.strip().splitlines():
@@ -5844,8 +5612,11 @@ def fetch_kegg_links_batch(
             return result
         except (requests.RequestException, ValueError) as exc:
             if attempt == retries:
-                print(f"Warning: failed to fetch '{target}' links for batch {ids} after {retries} attempts: {exc}")
-                return result
+                log.warning(
+                    f"Warning: failed to fetch '{target}' links for batch {ids} after {retries} attempts "
+                    f"(not cached; will retry next run): {exc}"
+                )
+                return {}
             time.sleep(backoff * attempt)
     return result
 
@@ -5873,258 +5644,358 @@ def build_kegg_link_lookup(
 
     return get_cached_lookup(ids, cache_path, fetch_missing)
 
-def fetch_kegg_pathway_names_cached(
+def fetch_kegg_list_cached(
+    db: str,
     cache_path: Optional[Union[str, Path]] = None,
-    timeout: int = 10,
+    timeout: int = 30,
     retries: int = 3,
     backoff: float = 1.0,
+    refresh: bool = False,
 ) -> Dict[str, str]:
     """
-    Fetch the full KEGG reference pathway ID -> name list, using a cached
-    copy if available (this is a single bulk API call, so caching is
-    all-or-nothing rather than per-key).
+    Fetch a full KEGG ``list/<db>`` table (e.g. 'pathway', 'module',
+    'reaction') as {bare_id: name}, using a cached copy if available.
+    This is a single bulk API call, so caching is all-or-nothing.
+
+    IDs are stored without a db prefix ('map00010', 'M00001', 'R00001').
+    For reactions KEGG returns 'name1; name2; equation'; only the first
+    name is kept.  Any ';' left in a name is replaced with ',' because ';'
+    is the multi-value separator in the annotation table.
+
+    ``refresh=True`` ignores the cached copy and re-downloads the list
+    (used when an ID is missing from a stale cache).
     """
-    cache = load_json_cache(cache_path)
+    cache = {} if refresh else load_json_cache(cache_path)
     if cache:
         return cache
 
-    KEGG_LIST_URL = "https://rest.kegg.jp/list/{db}"
-    url = KEGG_LIST_URL.format(db="pathway")
+    url = f"https://rest.kegg.jp/list/{db}"
     with requests.Session() as session:
-        session.headers.update({"User-Agent": "kegg-pathway-name-lookup/1.0"})
+        session.headers.update({"User-Agent": f"kegg-{db}-name-lookup/1.0"})
         for attempt in range(1, retries + 1):
             try:
                 resp = session.get(url, timeout=timeout)
                 resp.raise_for_status()
                 names: Dict[str, str] = {}
                 for line in resp.text.strip().splitlines():
-                    if not line:
+                    if "\t" not in line:
                         continue
-                    pathway_id, name = line.split("\t")
-                    names[pathway_id.replace("path:", "")] = name
+                    entry_id, name = line.split("\t", 1)
+                    if db == "reaction":
+                        name = name.split("; ")[0]
+                    names[_strip_kegg_prefix(entry_id)] = name.replace(";", ",").strip()
                 save_json_cache(cache_path, names)
                 return names
             except (requests.RequestException, ValueError) as exc:
                 if attempt == retries:
-                    log.warning(f"Failed to fetch KEGG pathway names after {retries} attempts: {exc}")
+                    log.warning(f"Failed to fetch KEGG {db} names after {retries} attempts: {exc}")
                     return {}
                 time.sleep(backoff * attempt)
     return {}
 
-def add_compound_pathway_column(
-    df: pd.DataFrame,
-    kegg_id_col: str = "mx_kegg_id",
-    pathway_col: str = "kegg_pathway",
-    pathway_sep: str = ";",
-    delay: float = 0.2,
-    batch_size: int = 10,
+
+def fetch_kegg_pathway_names_cached(
     cache_path: Optional[Union[str, Path]] = None,
-) -> pd.DataFrame:
-    df = df.copy()
-    if pathway_col not in df.columns:
-        df[pathway_col] = None
-
-    id_lists = df[kegg_id_col].apply(
-        lambda cell: split_list_cell(cell, delimiter=";", keep_empty=True)
-    )
-    all_ids = sorted({k for ids in id_lists for k in ids if k})
-    lookup = build_kegg_link_lookup(
-        all_ids, prefix="cpd:", target="pathway", delay=delay, batch_size=batch_size, cache_path=cache_path
-    )
-
-    def map_row(ids: List[str]) -> Optional[str]:
-        if not ids or all(not i for i in ids):
-            return None
-        return ";".join(pathway_sep.join(lookup.get(cid, []) or []) if cid else "" for cid in ids)
-
-    df[pathway_col] = id_lists.apply(map_row)
-    return df
-
-
-def get_ec_or_ko_ids(
-    row: pd.Series,
-    ec_col: Union[str, List[str]] = "tx_kegg_ec",
-    ko_col: Union[str, List[str]] = "tx_ko_acc",
-) -> Tuple[List[str], Optional[str]]:
-    """
-    Return (ids, source) for a row, using the EC column(s) if present, falling back
-    to the KO column(s). source is 'ec', 'ko', or None if neither has values.
-    Each argument may be one column name or a list (e.g. tx_ and px_ columns).
-    """
-    def _collect(cols) -> List[str]:
-        cols = [cols] if isinstance(cols, str) else list(cols or [])
-        ids: List[str] = []
-        for c in cols:
-            ids += split_list_cell(row.get(c), delimiter=",", drop_sentinel="Unassigned", keep_empty=False)
-        return list(dict.fromkeys(ids))
-
-    ec_ids = _collect(ec_col)
-    if ec_ids:
-        return ec_ids, "ec"
-    ko_ids = _collect(ko_col)
-    if ko_ids:
-        return ko_ids, "ko"
-    return [], None
-
-
-def add_ec_ko_pathway_column(
-    df: pd.DataFrame,
-    ec_col: Union[str, List[str]] = "tx_kegg_ec",
-    ko_col: Union[str, List[str]] = "tx_ko_acc",
-    pathway_col: str = "kegg_pathway",
-    pathway_sep: str = ";",
-    delay: float = 0.2,
-    batch_size: int = 10,
-    ec_cache_path: Optional[Union[str, Path]] = None,
-    ko_cache_path: Optional[Union[str, Path]] = None,
-) -> pd.DataFrame:
-    df = df.copy()
-    if pathway_col not in df.columns:
-        df[pathway_col] = None
-
-    id_source_pairs = df.apply(lambda row: get_ec_or_ko_ids(row, ec_col, ko_col), axis=1)
-    id_lists = id_source_pairs.apply(lambda pair: pair[0])
-    source_types = id_source_pairs.apply(lambda pair: pair[1])
-
-    ec_ids_all = sorted({i for ids, src in zip(id_lists, source_types) if src == "ec" for i in ids})
-    ko_ids_all = sorted({i for ids, src in zip(id_lists, source_types) if src == "ko" for i in ids})
-
-    ec_lookup = (
-        build_kegg_link_lookup(ec_ids_all, prefix="ec:", target="pathway",
-                                 delay=delay, batch_size=batch_size, cache_path=ec_cache_path)
-        if ec_ids_all else {}
-    )
-    ko_lookup = (
-        build_kegg_link_lookup(ko_ids_all, prefix="ko:", target="pathway",
-                                 delay=delay, batch_size=batch_size, cache_path=ko_cache_path)
-        if ko_ids_all else {}
-    )
-
-    def merge_row(existing, ids: List[str], source: Optional[str]) -> Optional[str]:
-        if not ids or source is None:
-            return existing
-        lookup = ec_lookup if source == "ec" else ko_lookup
-        new_pathways = list(dict.fromkeys(p for i in ids for p in (lookup.get(i) or [])))
-        if not new_pathways:
-            return existing
-        existing_pathways = []
-        if pd.notna(existing) and existing:
-            existing_pathways = [t.strip() for t in str(existing).replace(";", pathway_sep).split(pathway_sep) if t.strip()]
-        combined = list(dict.fromkeys(existing_pathways + new_pathways))
-        return pathway_sep.join(combined) if combined else None
-
-    df[pathway_col] = [
-        merge_row(existing, ids, src)
-        for existing, ids, src in zip(df[pathway_col], id_lists, source_types)
-    ]
-    return df
-
-def fetch_kegg_pathway_names(
-    session: requests.Session,
     timeout: int = 10,
     retries: int = 3,
     backoff: float = 1.0,
 ) -> Dict[str, str]:
+    """KEGG reference pathway ID -> name ({'map00010': 'Glycolysis / Gluconeogenesis', ...})."""
+    return fetch_kegg_list_cached("pathway", cache_path=cache_path, timeout=timeout,
+                                  retries=retries, backoff=backoff)
+
+
+# KEGG link/pathway returns organism-agnostic reference maps ("path:map00860")
+# alongside KO-/EC-specific copies of the same map ("path:ko00860",
+# "path:ec00860"). Collapse everything to "path:map#####" so transcripts,
+# proteins and metabolites land on identical pathway IDs.
+_KEGG_PATHWAY_ID_RE = re.compile(r"^(?:path:)?[a-z]{2,4}(\d{5})$")
+_KO_ID_RE = re.compile(r"^K\d{5}$")
+_EC_ID_RE = re.compile(r"^\d+\.\d+\.\d+\.n?\d+$")  # complete ECs only; partial (x.x.x.-) never link to pathways
+
+# KEGG "Global and overview maps" (map011xx / map012xx, e.g. map01100
+# Metabolic pathways). They contain most of metabolism, so they are kept in
+# the annotation table but can be dropped in enrichment (exclude_global_maps).
+KEGG_GLOBAL_MAP_RE = re.compile(r"^(?:path:)?map01[12]\d\d$")
+
+# Cofactor / currency compounds that participate in hundreds to thousands of
+# KEGG reactions (water alone is in >4,000). Linking a detected metabolite to
+# every such reaction or module would connect it to nearly every gene, so
+# these compounds are skipped for the module and reaction levels. Pathway
+# assignments are unaffected.
+KEGG_CURRENCY_COMPOUNDS = frozenset({
+    "C00001",  # H2O
+    "C00002",  # ATP
+    "C00003",  # NAD+
+    "C00004",  # NADH
+    "C00005",  # NADPH
+    "C00006",  # NADP+
+    "C00007",  # O2
+    "C00008",  # ADP
+    "C00009",  # Orthophosphate
+    "C00010",  # CoA
+    "C00011",  # CO2
+    "C00013",  # Diphosphate
+    "C00014",  # NH3
+    "C00015",  # UDP
+    "C00016",  # FAD
+    "C00020",  # AMP
+    "C00027",  # H2O2
+    "C00028",  # Acceptor
+    "C00030",  # Reduced acceptor
+    "C00035",  # GDP
+    "C00044",  # GTP
+    "C00080",  # H+
+    "C00138",  # Reduced ferredoxin
+    "C00139",  # Oxidized ferredoxin
+    "C01352",  # FADH2
+})
+
+# Annotation levels written by add_kegg_pathway_annotations:
+#   target  -> KEGG link/list database name
+#   col     -> output ID column
+#   name_col-> output name column
+KEGG_LEVELS = (
+    {"target": "pathway",  "col": "kegg_pathway",  "name_col": "kegg_pathway_name"},
+    {"target": "module",   "col": "kegg_module",   "name_col": "kegg_module_name"},
+    {"target": "reaction", "col": "kegg_reaction", "name_col": "kegg_reaction_name"},
+)
+
+
+def _strip_kegg_prefix(kegg_id: str) -> str:
+    """'md:M00001' -> 'M00001', 'rn:R00351' -> 'R00351', 'path:map00010' -> 'map00010'."""
+    return str(kegg_id).strip().split(":", 1)[-1]
+
+
+def _to_kegg_map_pathway(pathway_id: str) -> Optional[str]:
+    """Normalize a KEGG pathway ID (path:ko00860, ec00860, map00860, ...) to 'path:map00860'."""
+    m = _KEGG_PATHWAY_ID_RE.match(str(pathway_id).strip())
+    return f"path:map{m.group(1)}" if m else None
+
+
+def _dedupe_map_pathways(pathway_ids) -> List[str]:
+    """Normalize pathway IDs to path:map##### and deduplicate, preserving order."""
+    return list(dict.fromkeys(p for p in (_to_kegg_map_pathway(x) for x in pathway_ids) if p))
+
+
+def _normalize_kegg_target_ids(target: str, ids) -> List[str]:
+    """Normalize linked IDs for a level: map##### for pathways, bare M#####/R##### otherwise."""
+    if target == "pathway":
+        return _dedupe_map_pathways(ids)
+    return list(dict.fromkeys(_strip_kegg_prefix(i) for i in ids if i))
+
+
+def _parse_kegg_gene_ids(cell, delimiter: str, kind: str) -> List[str]:
     """
-    Fetch the full KEGG reference pathway list and return
-    {pathway_id: pathway_name}, e.g. {'map00010': 'Glycolysis / Gluconeogenesis'}.
+    Parse an EC or KO annotation cell into bare KEGG IDs.
 
-    This is a single bulk request — KEGG only has ~550 reference pathways,
-    so there's no need to look up names one at a time.
+    Splits on the configured ``delimiter`` *and* on ';;' (the separator used
+    when duplicate annotation rows are collapsed and when '|' is replaced in
+    generate_tx_annotation_table), strips 'EC:'/'ko:'-style prefixes, and
+    drops tokens that are not valid complete EC numbers / KO accessions
+    (e.g. 'EC:1.1.1.-', 'Unassigned'), which KEGG either rejects or never links.
     """
-    KEGG_LIST_URL = "https://rest.kegg.jp/list/{db}"
-    url = KEGG_LIST_URL.format(db="pathway")
-
-    for attempt in range(1, retries + 1):
-        try:
-            resp = session.get(url, timeout=timeout)
-            resp.raise_for_status()
-            names: Dict[str, str] = {}
-            for line in resp.text.strip().splitlines():
-                if not line:
-                    continue
-                pathway_id, name = line.split("\t")
-                pathway_id = pathway_id.replace("path:", "")
-                names[pathway_id] = name
-            return names
-        except (requests.RequestException, ValueError) as exc:
-            if attempt == retries:
-                print(f"Warning: failed to fetch KEGG pathway names after {retries} attempts: {exc}")
-                return {}
-            time.sleep(backoff * attempt)
-    return {}
+    if cell is None or (not isinstance(cell, (list, tuple)) and pd.isna(cell)):
+        return []
+    seps = {";;"}
+    if delimiter:
+        seps.add(delimiter)
+    pattern = "|".join(re.escape(s) for s in sorted(seps, key=len, reverse=True))
+    valid = _EC_ID_RE if kind == "ec" else _KO_ID_RE
+    out: List[str] = []
+    for tok in re.split(pattern, str(cell)):
+        tok = tok.strip()
+        if ":" in tok:
+            tok = tok.split(":", 1)[1].strip()
+        if kind == "ko":
+            tok = tok.upper()
+        if valid.match(tok):
+            out.append(tok)
+    return list(dict.fromkeys(out))
 
 
-def add_kegg_pathway_name_column(
+def _as_col_delimiters(cols, default_delimiter: str = ",") -> Dict[str, str]:
+    """Accept a column name, a list of names, or a {column: delimiter} dict."""
+    if not cols:
+        return {}
+    if isinstance(cols, str):
+        return {cols: default_delimiter}
+    if isinstance(cols, dict):
+        return {c: (d or default_delimiter) for c, d in cols.items()}
+    return {c: default_delimiter for c in cols}
+
+
+def get_ec_and_ko_ids(
+    row: pd.Series,
+    ec_cols: Union[str, List[str], Dict[str, str], None] = None,
+    ko_cols: Union[str, List[str], Dict[str, str], None] = None,
+) -> Tuple[List[str], List[str]]:
+    """
+    Return (ec_ids, ko_ids) for a row, collected from *all* given EC and KO
+    columns (e.g. tx_ and px_ columns). Each argument may be a column name, a
+    list of names, or a {column: delimiter} dict built from the dataset config.
+    IDs are returned bare (no 'EC:'/'ko:' prefix) and deduplicated.
+    """
+    def _collect(cols, kind: str) -> List[str]:
+        ids: List[str] = []
+        for c, delim in _as_col_delimiters(cols).items():
+            ids += _parse_kegg_gene_ids(row.get(c), delim, kind)
+        return list(dict.fromkeys(ids))
+
+    return _collect(ec_cols, "ec"), _collect(ko_cols, "ko")
+
+
+def add_kegg_link_column(
     df: pd.DataFrame,
-    pathway_col: str = "kegg_pathway",
-    new_col: str = "kegg_pathway_name",
-    pathway_sep: str = ";",
+    target: str,
+    out_col: str,
+    kegg_id_col: Optional[str] = None,
+    ec_cols: Union[str, List[str], Dict[str, str], None] = None,
+    ko_cols: Union[str, List[str], Dict[str, str], None] = None,
+    exclude_compounds: Optional[set] = None,
+    sep: str = ";",
+    delay: float = 0.2,
+    batch_size: int = 10,
+    cache_dir: Optional[Union[str, Path]] = None,
+) -> pd.DataFrame:
+    """
+    Assign one KEGG annotation level (``target`` = 'pathway', 'module' or
+    'reaction') to every feature and write it to ``out_col``.
+
+    Each row's IDs are the union of what KEGG links to:
+      * its KEGG compound IDs in ``kegg_id_col`` (metabolites; ';'-separated),
+        minus any in ``exclude_compounds``,
+      * its EC numbers in ``ec_cols`` and KO accessions in ``ko_cols``
+        (genes/proteins).
+    Pathways are normalized to ``path:map#####``; modules and reactions to
+    bare ``M#####`` / ``R#####``. Rows with nothing linked are left as None.
+
+    Lookups use the KEGG REST link API in batches and are cached per source
+    and level in ``cache_dir`` (``kegg_<cpd|ec|ko>_to_<target>.json``).
+    """
+    df = df.copy()
+    cache_dir = Path(cache_dir) if cache_dir else None
+    exclude_compounds = set(exclude_compounds or ())
+
+    def _cache(src: str) -> Optional[Path]:
+        return cache_dir / f"kegg_{src}_to_{target}.json" if cache_dir else None
+
+    def _lookup(ids_per_row: List[List[str]], prefix: str, src: str) -> Dict[str, List[str]]:
+        all_ids = sorted({i for ids in ids_per_row for i in ids})
+        if not all_ids:
+            return {}
+        return build_kegg_link_lookup(all_ids, prefix=prefix, target=target,
+                                      delay=delay, batch_size=batch_size, cache_path=_cache(src))
+
+    if kegg_id_col and kegg_id_col in df.columns:
+        cpd_lists = [
+            [c for c in split_list_cell(cell, delimiter=";", keep_empty=False) if c not in exclude_compounds]
+            for cell in df[kegg_id_col]
+        ]
+    else:
+        cpd_lists = [[] for _ in range(len(df))]
+
+    if ec_cols or ko_cols:
+        pairs = [get_ec_and_ko_ids(row, ec_cols, ko_cols) for _, row in df.iterrows()]
+        ec_lists = [p[0] for p in pairs]
+        ko_lists = [p[1] for p in pairs]
+    else:
+        ec_lists = ko_lists = [[] for _ in range(len(df))]
+
+    cpd_lookup = _lookup(cpd_lists, "cpd:", "cpd")
+    ec_lookup = _lookup(ec_lists, "ec:", "ec")
+    ko_lookup = _lookup(ko_lists, "ko:", "ko")
+
+    def _row(cpds, ecs, kos) -> Optional[str]:
+        raw = [t for i in cpds for t in (cpd_lookup.get(i) or [])]
+        raw += [t for i in ecs for t in (ec_lookup.get(i) or [])]
+        raw += [t for i in kos for t in (ko_lookup.get(i) or [])]
+        ids = _normalize_kegg_target_ids(target, raw)
+        return sep.join(ids) if ids else None
+
+    df[out_col] = [_row(c, e, k) for c, e, k in zip(cpd_lists, ec_lists, ko_lists)]
+    return df
+
+
+def add_kegg_name_column(
+    df: pd.DataFrame,
+    id_col: str,
+    new_col: str,
+    target: str,
+    sep: str = ";",
     cache_path: Optional[Union[str, Path]] = None,
 ) -> pd.DataFrame:
+    """
+    Add a name column parallel to ``id_col`` (same order and ``sep``) using
+    the KEGG ``list/<target>`` table. Unknown IDs get an empty name so the
+    positions in the ID and name columns still line up.
+    """
     df = df.copy()
-    name_lookup = fetch_kegg_pathway_names_cached(cache_path=cache_path)
+    names = fetch_kegg_list_cached(target, cache_path=cache_path)
 
-    def resolve_pathway_id(pid: str) -> str:
-        clean_id = pid.replace("path:", "").strip()
-        if not clean_id:
-            return ""
-        name = name_lookup.get(clean_id)
-        if name:
-            return name
-        m = re.match(r"^[a-z]+(\d+)$", clean_id)
-        if m:
-            return name_lookup.get(f"map{m.group(1)}", "")
-        return ""
+    # The name list is cached all-or-nothing; if KEGG has added entries since
+    # it was cached, refetch once so new IDs get names.
+    ids = {_strip_kegg_prefix(t) for cell in df[id_col].dropna() for t in str(cell).split(sep) if t}
+    if names and cache_path and any(i not in names for i in ids):
+        log.info(f"KEGG {target} name cache is missing {sum(i not in names for i in ids)} ID(s); refreshing.")
+        names = fetch_kegg_list_cached(target, cache_path=cache_path, refresh=True) or names
 
-    def map_cell(cell) -> Optional[str]:
-        if pd.isna(cell) or not cell:
+    def _name(kegg_id: str) -> str:
+        bare = _strip_kegg_prefix(kegg_id)
+        if bare in names:
+            return names[bare]
+        m = re.match(r"^[a-z]+(\d{5})$", bare)  # ko00010 / eco00010 -> map00010
+        return names.get(f"map{m.group(1)}", "") if (m and target == "pathway") else ""
+
+    def _cell(cell) -> Optional[str]:
+        if cell is None or pd.isna(cell) or not str(cell):
             return None
-        resolved_slots = []
-        for slot in str(cell).split(";"):
-            if not slot:
-                resolved_slots.append("")
-                continue
-            names = [resolve_pathway_id(pid) for pid in slot.split(pathway_sep)]
-            resolved_slots.append(pathway_sep.join(names))
-        return ";".join(resolved_slots)
+        return sep.join(_name(t) for t in str(cell).split(sep))
 
-    df[new_col] = df[pathway_col].apply(map_cell)
+    df[new_col] = df[id_col].apply(_cell)
     return df
+
 
 def add_kegg_pathway_annotations(
     df: pd.DataFrame,
     cache_dir: Optional[Union[str, Path]] = None,
     inchikey_col: Optional[str] = None,
-    ec_cols: Optional[List[str]] = None,
-    ko_cols: Optional[List[str]] = None,
+    ec_cols: Union[List[str], Dict[str, str], None] = None,
+    ko_cols: Union[List[str], Dict[str, str], None] = None,
     kegg_id_col: str = "mx_kegg_id",
-    pathway_col: str = "kegg_pathway",
-    pathway_name_col: str = "kegg_pathway_name",
+    levels: Tuple[dict, ...] = KEGG_LEVELS,
+    exclude_compounds: Optional[set] = KEGG_CURRENCY_COMPOUNDS,
     delay: float = 0.2,
     batch_size: int = 10,
 ) -> pd.DataFrame:
     """
-    Full KEGG pathway annotation pipeline, wired for cached API calls:
-      1. InChIKey          -> mx_kegg_id        (MW API, cached)
-      2. mx_kegg_id         -> kegg_pathway      (KEGG link API, cpd:, cached)
-      3. EC/KO (fallback)   -> kegg_pathway      (KEGG link API, ec:/ko:, cached, merged)
-      4. kegg_pathway       -> kegg_pathway_name (KEGG list API, cached)
+    Full KEGG annotation pipeline, wired for cached API calls. For every
+    feature it assigns three nested levels of KEGG annotation:
 
-    Uses explicit column names passed from annotate_integrated_features rather than
-    suffix-based auto-detection. Steps whose required source column is None are skipped.
+      * ``kegg_pathway``  / ``kegg_pathway_name``  - reference pathway maps (path:map#####),
+        including the global/overview maps such as map01100 "Metabolic pathways"
+      * ``kegg_module``   / ``kegg_module_name``   - KEGG modules (M#####), e.g. M00001 glycolysis
+      * ``kegg_reaction`` / ``kegg_reaction_name`` - KEGG reactions (R#####)
+
+    Metabolites reach each level via InChIKey -> KEGG compound (``kegg_id_col``,
+    Metabolomics Workbench API) -> KEGG link; genes/proteins via the union of
+    their EC numbers and KO accessions -> KEGG link. Both routes write into the
+    same columns, so every data type shares one ID space per level.
+
+    Cofactor/currency compounds (``exclude_compounds``, default
+    KEGG_CURRENCY_COMPOUNDS) are not linked at the module and reaction levels,
+    where they would otherwise connect a metabolite to nearly every gene.
 
     Parameters
     ----------
     inchikey_col : str, optional
         Prefixed column name containing InChIKey values (e.g. 'mx_InChiKey').
-        When provided, drives the InChIKey -> KEGG compound ID -> pathway route.
-    ec_cols : list of str, optional
-        Prefixed column name(s) containing EC numbers (e.g. ['tx_EC']).
-        Used as fallback when inchikey_col is not provided.
-    ko_cols : list of str, optional
-        Prefixed column name(s) containing KEGG KO accessions (e.g. ['tx_KEGG_ko']).
-        Used as fallback when inchikey_col is not provided.
+    ec_cols : list of str or {column: delimiter}, optional
+        Prefixed column name(s) containing EC numbers (e.g. {'tx_EC': ','}).
+    ko_cols : list of str or {column: delimiter}, optional
+        Prefixed column name(s) containing KEGG KO accessions (e.g. {'tx_KEGG_ko': ','}).
+    levels : tuple of dict
+        Which levels to compute (see KEGG_LEVELS).
     """
     df = df.copy()
     cache_dir = Path(cache_dir) if cache_dir else None
@@ -6133,8 +6004,12 @@ def add_kegg_pathway_annotations(
     if inchikey_col and inchikey_col not in df.columns:
         log.warning(f"KEGG annotation: InChIKey column '{inchikey_col}' not found in annotation table; skipping InChIKey route.")
         inchikey_col = None
-    ec_cols = [c for c in (ec_cols or []) if c in df.columns]
-    ko_cols = [c for c in (ko_cols or []) if c in df.columns]
+    ec_cols = {c: d for c, d in _as_col_delimiters(ec_cols).items() if c in df.columns}
+    ko_cols = {c: d for c, d in _as_col_delimiters(ko_cols).items() if c in df.columns}
+
+    if not (inchikey_col or ec_cols or ko_cols):
+        log.warning("KEGG annotation: no InChIKey, EC, or KO columns provided; skipping KEGG annotation.")
+        return df
 
     if inchikey_col:
         log.info(f"KEGG annotation: using InChIKey column '{inchikey_col}'")
@@ -6142,26 +6017,26 @@ def add_kegg_pathway_annotations(
             df, inchikey_col=inchikey_col, new_col=kegg_id_col, delay=delay,
             cache_path=cache_dir / "kegg_inchikey_to_id.json" if cache_dir else None,
         )
-        df = add_compound_pathway_column(
-            df, kegg_id_col=kegg_id_col, pathway_col=pathway_col, delay=delay, batch_size=batch_size,
-            cache_path=cache_dir / "kegg_cpd_to_pathway.json" if cache_dir else None,
-        )
-    elif ec_cols or ko_cols:
-        log.info(f"KEGG annotation: using EC column(s) '{ec_cols}', KO column(s) '{ko_cols}'")
-        df = add_ec_ko_pathway_column(
-            df, ec_col=ec_cols, ko_col=ko_cols, pathway_col=pathway_col, delay=delay, batch_size=batch_size,
-            ec_cache_path=cache_dir / "kegg_ec_to_pathway.json" if cache_dir else None,
-            ko_cache_path=cache_dir / "kegg_ko_to_pathway.json" if cache_dir else None,
-        )
-    else:
-        log.warning("KEGG annotation: no InChIKey, EC, or KO columns provided; skipping KEGG pathway annotation.")
+    if ec_cols or ko_cols:
+        log.info(f"KEGG annotation: using EC column(s) {list(ec_cols)}, KO column(s) {list(ko_cols)}")
 
-
-    if pathway_col in df.columns:
-        df = add_kegg_pathway_name_column(
-            df, pathway_col=pathway_col, new_col=pathway_name_col,
-            cache_path=cache_dir / "kegg_pathway_names.json" if cache_dir else None,
+    prefixes = df.index.to_series().astype(str).str.split("_", n=1).str[0]
+    for level in levels:
+        target, col, name_col = level["target"], level["col"], level["name_col"]
+        df = add_kegg_link_column(
+            df, target=target, out_col=col,
+            kegg_id_col=kegg_id_col if inchikey_col else None,
+            ec_cols=ec_cols, ko_cols=ko_cols,
+            exclude_compounds=None if target == "pathway" else exclude_compounds,
+            delay=delay, batch_size=batch_size, cache_dir=cache_dir,
         )
+        df = add_kegg_name_column(
+            df, id_col=col, new_col=name_col, target=target,
+            cache_path=cache_dir / f"kegg_{target}_names.json" if cache_dir else None,
+        )
+        counts = df[col].notna().groupby(prefixes).sum().to_dict()
+        n_terms = df[col].dropna().str.split(";").explode().nunique()
+        log.info(f"KEGG annotation: {col}: {n_terms} distinct terms; features annotated by dataset: {counts}")
 
     return df
 
@@ -6271,244 +6146,236 @@ def link_metadata_with_custom_script(
     return linked_metadata
 
 
-def load_link_table_metadata(
-    datasets: list,
-    link_table_path: Union[str, Path],
-    return_link_table: bool = False,
-) -> dict[str, pd.DataFrame] | tuple[dict[str, pd.DataFrame], pd.DataFrame]:
-    """Load per-dataset metadata and raw-sample mappings from a link table.
+def load_link_table(link_table_path: Union[str, Path]) -> pd.DataFrame:
+    """Read the link_table.csv file and return it as a DataFrame.
 
-    The link table must contain one raw sample-name column for every dataset
-    name. Blank cells mean that a shared sample is absent from that datatype.
-    One shared-name column is required (``unique_group``, ``shared_sample``,
-    ``shared_name``, or ``sample``); all remaining columns are categories.
+    The link table must contain a ``unique_group`` column (the shared sample
+    name used as column names in linked/processed data) plus one column per
+    dataset, polarity, and (when multiple MX combinations are configured)
+    chromatography.
+    All remaining columns are treated as sample-level metadata categories.
 
-    For datasets with multiple polarities (e.g. MX), the link table may use
-    polarity-suffixed columns (``mx_pos`` / ``mx_neg``) instead of a single
-    ``mx`` column.  The correct column is selected via the dataset's
-    ``polarity`` attribute: ``"positive"`` → ``{name}_pos``,
-    ``"negative"`` → ``{name}_neg``.  Both polarity columns are used to
-    update the data-table column names so that each polarity's raw sample
-    names are mapped to the shared ``unique_group`` identifiers.
+    Args:
+        link_table_path: Path to the link_table.csv file.
+
+    Returns:
+        pd.DataFrame: The link table with stripped column names.
     """
     path = Path(link_table_path)
     if not path.is_file():
-        raise FileNotFoundError(f"Metadata link table not found: {path}")
+        raise FileNotFoundError(f"Link table not found: {path}")
 
     link_table = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig", dtype=str)
     link_table.columns = link_table.columns.astype(str).str.strip()
 
-    # Build a mapping from each dataset to the link-table column(s) that hold
-    # its raw sample names.  For polarised datasets (e.g. MX) the link table
-    # uses per-polarity columns (<name>_pos / <name>_neg) rather than a single
-    # <name> column.
-    _POLARITY_SUFFIX = {"positive": "_pos", "negative": "_neg"}
-
-    dataset_sample_columns: dict[str, list[str]] = {}
-    missing_columns: list[str] = []
-    for ds in datasets:
-        name = ds.dataset_name
-        if name in link_table.columns:
-            # Plain column present – use it directly.
-            dataset_sample_columns[name] = [name]
-        else:
-            # Look for polarity-suffixed columns (<name>_pos, <name>_neg).
-            polarity_cols = [
-                col for col in link_table.columns
-                if col.startswith(f"{name}_") and col[len(name) + 1:] in ("pos", "neg")
-            ]
-            if polarity_cols:
-                dataset_sample_columns[name] = polarity_cols
-                log.info(
-                    "Dataset '%s': using polarity-suffixed columns %s from link table.",
-                    name, polarity_cols,
-                )
-            else:
-                missing_columns.append(name)
-
-    if missing_columns:
+    if "unique_group" not in link_table.columns:
         raise ValueError(
-            f"Metadata link table is missing dataset columns: {missing_columns}. "
-            f"Expected columns (or polarity-suffixed variants) for "
-            f"{[ds.dataset_name for ds in datasets]}."
+            "link_table.csv must contain a 'unique_group' column with shared sample names."
         )
 
-    shared_candidates = [
-        column for column in ("unique_group", "shared_sample", "shared_name", "sample")
-        if column in link_table.columns
-        and column not in {c for cols in dataset_sample_columns.values() for c in cols}
-    ]
-    if not shared_candidates:
-        raise ValueError(
-            "Metadata link table must contain a shared sample-name column: "
-            "unique_group, shared_sample, shared_name, or sample."
-        )
-    shared_column = shared_candidates[0]
-    if shared_column != "unique_group":
-        link_table = link_table.rename(columns={shared_column: "unique_group"})
     link_table["unique_group"] = link_table["unique_group"].astype(str).str.strip()
     if (link_table["unique_group"] == "").any() or link_table["unique_group"].eq("nan").any():
-        raise ValueError("Metadata link table contains a blank shared sample name.")
+        raise ValueError("link_table.csv contains a blank 'unique_group' value.")
 
-    linked_metadata = {}
-    for ds in datasets:
-        name = ds.dataset_name
-        sample_cols = dataset_sample_columns[name]
+    log.info(f"Loaded link table from {path} with {len(link_table)} rows and columns: {list(link_table.columns)}")
+    return link_table
 
-        # Determine which polarity column to use when there are multiple.
-        if len(sample_cols) == 1:
-            sample_column = sample_cols[0]
-        else:
-            # Select the column matching the dataset's polarity attribute.
-            polarity = getattr(ds, "polarity", None)
-            suffix = _POLARITY_SUFFIX.get(polarity) if polarity else None
-            if suffix:
-                matched = [c for c in sample_cols if c.endswith(suffix)]
-                if matched:
-                    sample_column = matched[0]
-                else:
-                    # Fall back to the first available polarity column.
-                    log.warning(
-                        "Dataset '%s': no column matching polarity '%s' found in %s; "
-                        "using '%s'.",
-                        name, polarity, sample_cols, sample_cols[0],
-                    )
-                    sample_column = sample_cols[0]
-            else:
-                log.warning(
-                    "Dataset '%s': multiple polarity columns %s but no polarity "
-                    "attribute set; using '%s'.",
-                    name, sample_cols, sample_cols[0],
-                )
-                sample_column = sample_cols[0]
-
-        table = link_table.copy()
-        table[sample_column] = table[sample_column].replace(r"^\s*$", pd.NA, regex=True)
-        table = table.dropna(subset=[sample_column]).copy()
-        table[sample_column] = table[sample_column].astype(str)
-
-        # Rename the (possibly polarity-suffixed) column to the plain dataset
-        # name so that downstream code can always use ds.dataset_name as the
-        # column key.
-        if sample_column != name:
-            table = table.rename(columns={sample_column: name})
-
-        if table[name].duplicated().any():
-            duplicates = table.loc[
-                table[name].duplicated(keep=False), name
-            ].unique().tolist()
-            raise ValueError(
-                f"Metadata link table has duplicate {name} sample names: "
-                f"{duplicates}"
-            )
-
-        table = table.set_index("unique_group", drop=False)
-        linked_metadata[name] = table
-        write_integration_file(
-            data=table,
-            output_dir=ds.output_dir,
-            filename=ds._linked_metadata_filename,
-            indexing=True,
-        )
-        log.info(
-            "Linked %d %s samples from %s (link-table column: '%s')",
-            len(table), name, path, sample_column,
-        )
-
-    if return_link_table:
-        return linked_metadata, link_table
-    return linked_metadata
-
-def _data_colnames_to_replace(metadata, data):
-    """Find the metadata column that matches data column names."""
-    data_columns = data.columns.tolist()
-    for column in metadata.columns:
-        metadata_columns = set(metadata[column])
-        if set(data_columns).issubset(metadata_columns) or metadata_columns.issubset(set(data_columns)):
-            return column
-    return None
 
 def link_data_across_datasets(
     datasets: list,
+    integrated_metadata: "pd.DataFrame",
     overlap_only: bool = True,
 ) -> dict:
-    """
-    Integrate multiple omics datasets by matching sample names using metadata mapping.
+    """Rename raw_data columns for each dataset using the link table, then
+    optionally restrict to samples present in all datasets.
+
+    For each dataset the appropriate link-table column is selected:
+    * ``{dataset_name}`` — plain column (e.g. ``tx``, ``px``)
+    * ``{dataset_name}_neg`` / ``{dataset_name}_pos`` — polarity columns
+    * ``{dataset_name}_{chromatography}_neg`` /
+      ``{dataset_name}_{chromatography}_pos`` — multi-combination MX columns
+
+    The column values are the *original* column names in ``ds.raw_data``; they
+    are renamed to the corresponding ``unique_group`` values.
 
     Args:
-        datasets (list): List of dataset objects with linked_metadata and raw_data attributes.
-        overlap_only (bool): If True, restrict to overlapping samples.
+        datasets: List of Dataset objects with a ``raw_data`` attribute and a
+            ``dataset_name`` / optional ``polarity`` attribute.
+        integrated_metadata: The full link table DataFrame (as returned by
+            ``load_link_table``).
+        overlap_only: If True, restrict each dataset's linked data to samples
+            present in all datasets.
 
     Returns:
-        dict: Dictionary mapping dataset names to integrated data DataFrames.
+        dict mapping dataset_name → linked pd.DataFrame (features × samples,
+        columns are ``unique_group`` values).
     """
+    unified_data: dict = {}
+    sample_sets: dict = {}
 
-    unified_data = {}
-    sample_sets = {}
-    # Process each dataset
     for ds in datasets:
-        log.info(f"Processing {ds.dataset_name} metadata and data...")
+        name = ds.dataset_name
+        log.info(f"Linking {name} data using link table...")
 
-        # Link-table columns are named after dataset names and contain the raw
-        # quantitative-table sample names.
-        unifying_col = "unique_group"
-        sample_col = ds.dataset_name
-        if sample_col not in ds.linked_metadata.columns:
-            raise ValueError(
-                f"Link table metadata is missing raw sample column '{sample_col}'."
-            )
-        
-        # Get library names and create data subset
-        library_names = ds.linked_metadata[sample_col].dropna().tolist()
-        data_subset = ds.raw_data[
-            [ds.raw_data.columns[0]]
-            + [col for col in ds.raw_data.columns if col in library_names]
-        ].copy()
-        
-        # Create mapping from library names to unified group names
-        mapping = dict(zip(ds.linked_metadata[sample_col], ds.linked_metadata[unifying_col]))
-        data_subset.columns = [data_subset.columns[0]] + [mapping.get(col, col) for col in data_subset.columns[1:]]
-        
-        # Handle duplicate sample columns (occurs in metabolomics datasets with multiple polarities).
-        # Separate the feature-ID column before groupby so it is never summed or
-        # reordered by the alphabetical groupby sort.
-        if data_subset.columns.duplicated().any():
-            feature_id_col = "CompoundID" if "CompoundID" in data_subset.columns else data_subset.columns[0]
-            id_series = data_subset[feature_id_col]
-            sample_cols = data_subset.drop(columns=[feature_id_col])
-            sample_cols = sample_cols.T.groupby(sample_cols.columns).sum().T
-            data_subset = pd.concat([id_series, sample_cols], axis=1)
+        raw = ds.raw_data
+        feature_id_col = raw.columns[0]
 
-        feature_id_col = "CompoundID" if "CompoundID" in data_subset.columns else data_subset.columns[0]
-        unified_data[ds.dataset_name] = data_subset
-        sample_sets[ds.dataset_name] = set(data_subset.columns.difference([feature_id_col]))
-
-    # Restrict to overlapping samples if requested
-    if overlap_only and len(unified_data) > 1:
-        log.info("\tRestricting matching samples to only those present in all datasets...")
-        overlapping_columns = set.intersection(*sample_sets.values())
-        
-        if not overlapping_columns:
-            raise ValueError("No overlapping samples found across datasets.")
-        
-        for name, data_subset in unified_data.items():
-            # Use the known feature-ID column name rather than positional [0],
-            # which may be wrong after the transpose-groupby-transpose merge.
-            feature_id_column = "CompoundID" if "CompoundID" in data_subset.columns else data_subset.columns[0]
-            cols = [feature_id_column] + [
-                col for col in overlapping_columns if col in data_subset.columns
+        chromatographies = getattr(ds, "chromatography", [])
+        configured_polarities = getattr(ds, "polarity", [])
+        if (
+            isinstance(chromatographies, list)
+            and isinstance(configured_polarities, list)
+            and (len(chromatographies) > 1 or len(configured_polarities) > 1)
+        ):
+            polarities = [
+                (polarity, polarity.lower())
+                for polarity in configured_polarities
             ]
-            unified_data[name] = data_subset[cols]
 
-    # Save results if output directory provided
+            feature_ids = raw[feature_id_col].astype(str)
+            linked_parts = []
+            used_link_columns = []
+            for chrom in chromatographies:
+                for _, polarity_suffix in polarities:
+                    suffix = f"_{chrom.lower()}_{polarity_suffix}"
+                    feature_mask = feature_ids.str.endswith(suffix)
+                    if not feature_mask.any():
+                        continue
+
+                    sample_col = f"{name}_{chrom.lower()}_{polarity_suffix}"
+                    if sample_col not in integrated_metadata.columns:
+                        log.warning(
+                            "Skipping MX chromatography/polarity %s because "
+                            "link_table.csv has no '%s' column.",
+                            suffix[1:], sample_col,
+                        )
+                        continue
+
+                    lt = integrated_metadata[[sample_col, "unique_group"]].copy()
+                    lt[sample_col] = lt[sample_col].replace(r"^\s*$", pd.NA, regex=True)
+                    lt = lt.dropna(subset=[sample_col])
+                    lt[sample_col] = (
+                        lt[sample_col].astype(str)
+                        .str.replace(r"\.mzML$", "", regex=True)
+                        .str.strip()
+                    )
+                    if lt[sample_col].duplicated().any():
+                        dups = lt.loc[
+                            lt[sample_col].duplicated(keep=False), sample_col
+                        ].unique().tolist()
+                        raise ValueError(
+                            f"link_table.csv has duplicate raw sample names in "
+                            f"column '{sample_col}': {dups}"
+                        )
+                    mapping = dict(zip(lt[sample_col], lt["unique_group"]))
+                    sample_cols_to_keep = [
+                        col for col in raw.columns[1:] if col in mapping
+                    ]
+                    if not sample_cols_to_keep:
+                        log.warning(
+                            "Skipping MX chromatography/polarity %s because no "
+                            "raw sample columns match link_table column '%s'.",
+                            suffix[1:], sample_col,
+                        )
+                        continue
+
+                    data_subset = raw.loc[
+                        feature_mask, [feature_id_col] + sample_cols_to_keep
+                    ].copy()
+                    data_subset = data_subset.set_index(feature_id_col)
+                    data_subset = data_subset.rename(columns=mapping)
+                    if data_subset.columns.duplicated().any():
+                        data_subset = data_subset.T.groupby(data_subset.columns).sum().T
+                    linked_parts.append(data_subset)
+                    used_link_columns.append(sample_col)
+
+            if not linked_parts:
+                raise ValueError(
+                    "No MX chromatography/polarity features could be linked. Check "
+                    "that configured peak files and corresponding "
+                    "mx_<chromatography>_<polarity> link-table columns exist."
+                )
+            data_subset = pd.concat(linked_parts, axis=0, sort=False)
+            log.info(
+                "Dataset '%s': linked using chromatography/polarity columns %s.",
+                name, used_link_columns,
+            )
+        else:
+            # Use a plain dataset column when present; otherwise combine its polarity columns.
+            if name in integrated_metadata.columns:
+                sample_cols = [name]
+            else:
+                polarity_cols = [
+                    col for col in integrated_metadata.columns
+                    if col.startswith(f"{name}_")
+                    and col[len(name) + 1:] in ("pos", "neg")
+                ]
+                if polarity_cols:
+                    sample_cols = polarity_cols
+                    log.info(
+                        "Dataset '%s': using polarity columns %s from link table.",
+                        name, sample_cols,
+                    )
+                else:
+                    raise ValueError(
+                        f"link_table.csv has no column for dataset '{name}' "
+                        f"(expected '{name}', '{name}_pos', or '{name}_neg'). "
+                        f"Available columns: {list(integrated_metadata.columns)}"
+                    )
+
+            mapping: dict = {}
+            for sample_col in sample_cols:
+                lt = integrated_metadata[[sample_col, "unique_group"]].copy()
+                lt[sample_col] = lt[sample_col].replace(r"^\s*$", pd.NA, regex=True)
+                lt = lt.dropna(subset=[sample_col])
+                lt[sample_col] = (
+                    lt[sample_col].astype(str)
+                    .str.replace(r"\.mzML$", "", regex=True)
+                    .str.strip()
+                )
+                if lt[sample_col].duplicated().any():
+                    dups = lt.loc[
+                        lt[sample_col].duplicated(keep=False), sample_col
+                    ].unique().tolist()
+                    raise ValueError(
+                        f"link_table.csv has duplicate raw sample names in "
+                        f"column '{sample_col}': {dups}"
+                    )
+                mapping.update(dict(zip(lt[sample_col], lt["unique_group"])))
+
+            sample_cols_to_keep = [
+                col for col in raw.columns[1:] if col in mapping
+            ]
+            if not sample_cols_to_keep:
+                raise ValueError(
+                    f"No raw_data columns for '{name}' matched any link-table entry. "
+                    f"raw_data sample columns: {raw.columns[1:].tolist()[:10]}..."
+                )
+
+            data_subset = raw[[feature_id_col] + sample_cols_to_keep].copy()
+            data_subset = data_subset.set_index(feature_id_col)
+            data_subset = data_subset.rename(columns=mapping)
+            if data_subset.columns.duplicated().any():
+                data_subset = data_subset.T.groupby(data_subset.columns).sum().T
+
+        unified_data[name] = data_subset
+        sample_sets[name] = set(data_subset.columns)
+        log.info("Dataset '%s': linked %d samples.", name, len(data_subset.columns))
+
+    # Restrict to overlapping samples if requested.
+    if overlap_only and len(unified_data) > 1:
+        log.info("Restricting to samples present in all datasets...")
+        overlapping = set.intersection(*sample_sets.values())
+        if not overlapping:
+            raise ValueError("No overlapping samples found across datasets.")
+        for name in unified_data:
+            unified_data[name] = unified_data[name][
+                [col for col in unified_data[name].columns if col in overlapping]
+            ]
+
+    # Save and return (DataFrames are already indexed by feature ID).
     for ds in datasets:
-        log.info(f"Saving linked data for {ds.dataset_name}...")
         df = unified_data[ds.dataset_name]
-        # Use the known feature-ID column name ('CompoundID') rather than
-        # positional columns[0], which may be a sample column after the
-        # transpose-groupby-transpose duplicate-column merge reorders columns.
-        feature_id_col = "CompoundID" if "CompoundID" in df.columns else df.columns[0]
-        df = df.set_index(feature_id_col)
         write_integration_file(df, ds.output_dir, ds._linked_data_filename, indexing=True)
         unified_data[ds.dataset_name] = df
 
@@ -8233,6 +8100,12 @@ def prepare_universe(node_table, pathway_col, group_col, pe_cfg, missing_token='
     if pe_cfg.get('exclude_nopathway'):
         exploded = exploded[~exploded['pathway'].str.startswith("NOPATHWAY_")]
 
+    if pe_cfg.get('exclude_global_maps'):
+        # KEGG global/overview maps (map011xx/map012xx, e.g. map01100 "Metabolic
+        # pathways") contain most of metabolism and swamp the test. Only affects
+        # kegg_pathway values; module/reaction/ModelSEED IDs never match.
+        exploded = exploded[~exploded['pathway'].str.match(KEGG_GLOBAL_MAP_RE)]
+
     is_missing = (exploded['pathway'] == missing_token).to_numpy()
 
     if pe_cfg.get('bipartite_only'):
@@ -8272,15 +8145,34 @@ def compute_enrichment_matrix(exploded, alpha=0.05, fdr_method='fdr_bh', missing
     n = testable.index.to_series().groupby(testable['pathway']).nunique().reindex(overlap_mat.index)
     N_aligned = N.reindex(overlap_mat.columns)
 
-    pval_mat = np.array([[hypergeom.sf(k - 1, M, n[p], N_aligned[g]) for g, k in row.items()]
-                        for p, row in overlap_mat.iterrows()])
-    pval_df = pd.DataFrame(pval_mat, index=overlap_mat.index, columns=overlap_mat.columns)
+    overlap_vals = overlap_mat.values.ravel()          # shape: (P*G,)
+    testable_mask = overlap_vals > 0
 
-    flat_reject, flat_padj, _, _ = multipletests(
-        pval_df.values.ravel(), alpha=alpha, method=fdr_method
+    pvals_flat = np.ones(len(overlap_vals), dtype=float)
+    if testable_mask.any():
+        pathway_idx = np.repeat(np.arange(len(overlap_mat.index)), len(overlap_mat.columns))
+        group_idx   = np.tile(np.arange(len(overlap_mat.columns)), len(overlap_mat.index))
+        pathways_arr = overlap_mat.index.to_numpy()
+        groups_arr   = overlap_mat.columns.to_numpy()
+        for flat_i in np.where(testable_mask)[0]:
+            p = pathways_arr[pathway_idx[flat_i]]
+            g = groups_arr[group_idx[flat_i]]
+            k = overlap_vals[flat_i]
+            pvals_flat[flat_i] = hypergeom.sf(k - 1, M, n[p], N_aligned[g])
+    pval_df = pd.DataFrame(
+        pvals_flat.reshape(overlap_mat.shape),
+        index=overlap_mat.index, columns=overlap_mat.columns,
     )
+    # FDR correction over overlapping pairs only; non-overlapping pairs keep padj=1.0.
+    padj_flat = np.ones(len(overlap_vals), dtype=float)
+    if testable_mask.any():
+        _, padj_tested, _, _ = multipletests(
+            pvals_flat[testable_mask], alpha=alpha, method=fdr_method
+        )
+        padj_flat[testable_mask] = padj_tested
     padj_df = pd.DataFrame(
-        flat_padj.reshape(pval_df.shape), index=pval_df.index, columns=pval_df.columns
+        padj_flat.reshape(overlap_mat.shape),
+        index=overlap_mat.index, columns=overlap_mat.columns,
     )
 
     expected = np.outer(n.values, N_aligned.values) / M
@@ -8501,14 +8393,13 @@ def _add_trend_track(g, rgba, value_mat, category_labels, tick_labels,
         ax.set_yticklabels(tick_labels, fontsize=7, ha='left')
         ax.set_ylim(n_rows - 0.5, -0.5)   # top-to-bottom, matching imshow
 
-        # 3 sig-fig cell annotations
         for r in range(value_mat.shape[0]):
             for c in range(value_mat.shape[1]):
                 v = value_mat[r, c]
                 if not np.isnan(v):
                     lum = 0.299*rgba[r,c,0] + 0.587*rgba[r,c,1] + 0.114*rgba[r,c,2]
                     txt_col = 'black' if lum > 0.5 else 'white'
-                    ax.text(c, r, f"{v:.3g}", ha='center', va='center',
+                    ax.text(c, r, f"{v:.2g}", ha='center', va='center',
                             fontsize=4, color=txt_col)
 
     else:
@@ -8530,20 +8421,80 @@ def _add_trend_track(g, rgba, value_mat, category_labels, tick_labels,
         ax.xaxis.set_label_position('bottom')
         ax.xaxis.tick_bottom()
         ax.set_xticklabels(tick_labels, rotation=90, fontsize=7,
-                           ha='right', rotation_mode='anchor')
+                           ha='center', rotation_mode='default')
         ax.set_xlim(-0.5, n_cols - 0.5)
 
-        # 3 sig-fig cell annotations
         for r in range(value_mat.shape[0]):
             for c in range(value_mat.shape[1]):
                 v = value_mat[r, c]
                 if not np.isnan(v):
                     lum = 0.299*rgba[r,c,0] + 0.587*rgba[r,c,1] + 0.114*rgba[r,c,2]
                     txt_col = 'black' if lum > 0.5 else 'white'
-                    ax.text(c, r, f"{v:.3g}", ha='center', va='center',
+                    ax.text(c, r, f"{v:.2g}", ha='center', va='center',
                             fontsize=4, color=txt_col)
 
     for spine in ax.spines.values(): spine.set_visible(False)
+
+_PANEL_SCALE_TEXT = {
+    "counts": ("Cell colour (viridis) = number of features in the group that belong to the pathway; "
+               "scale runs from 0 (dark) to the maximum count (bright).",
+               "a bright cell means many of the group's features fall in that pathway."),
+    "normalized": ("Cell colour (magma) = fraction of all the pathway's features found in the group "
+                   "(each pathway column sums to 1); scale runs from 0 to 1.",
+                   "a bright cell means that group holds most of the pathway's features."),
+    "enrichment": ("Cell colour (RdBu_r) = fold enrichment, observed / expected feature overlap; "
+                   "1 means no enrichment, higher means over-represented. Stars give BH-FDR adjusted "
+                   "hypergeometric p-values (* padj<0.05, ** padj<0.01, *** padj<0.001).",
+                   "a dark red starred cell means the group is significantly over-represented in the pathway."),
+}
+
+def _build_panel_description(name, summary, has_row_trend, has_col_trend, row_trends, col_trends):
+    scale, example = _PANEL_SCALE_TEXT[name]
+    parts = [f"{summary}.", "Rows = feature groups; columns = pathways. " + scale,
+             "Grey squares next to the dendrograms (with numbers) = count of features of each data type "
+             "(label = data-type prefix) in that row/column; darker = more features."]
+    if has_row_trend or has_col_trend:
+        where = " and ".join(
+            w for w, h in (("right of the heatmap (per group)", has_row_trend),
+                           ("below the heatmap (per pathway)", has_col_trend)) if h)
+        cats = row_trends.columns if has_row_trend else col_trends.columns
+        parts.append(f"Trend heatmaps ({where}) = aggregated abundance of the member features across "
+                     f"metadata categories ({', '.join(map(str, cats))}); red = above average, "
+                     "blue = below, each track scaled independently; numbers are the plotted values.")
+    parts.append("Example: " + example)
+    return " ".join(parts)
+
+def _add_figure_description(fig, title, body, fontsize=8, title_fontsize=11):
+    """Place a bold title and a wrapped description box above the figure content.
+
+    Text is wrapped to the figure width using the measured width of the rendered text.
+    """
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    fig_w_px = fig.get_figwidth() * fig.dpi
+    max_w_px = fig_w_px * 0.96
+
+    probe = fig.text(0, 0, "".join(["M", "n"] * 20), fontsize=fontsize)
+    char_px = probe.get_window_extent(renderer=renderer).width / 40
+    probe.remove()
+
+    width = max(20, int(max_w_px / char_px))
+    wrapped = textwrap.fill(body, width=width)
+    while width > 20:
+        t = fig.text(0.5, 1.0, wrapped, fontsize=fontsize)
+        w_px = t.get_window_extent(renderer=renderer).width
+        t.remove()
+        if w_px <= max_w_px:
+            break
+        width -= 2
+        wrapped = textwrap.fill(body, width=width)
+
+    box = fig.text(0.5, 1.01, wrapped, ha="center", va="bottom", fontsize=fontsize,
+                   bbox=dict(boxstyle="round,pad=0.5", facecolor="#f5f5f5", edgecolor="#999999"))
+    pad_px = 0.5 * fontsize * fig.dpi / 72 + 6
+    box_top = box.get_window_extent(renderer=renderer).y1 + pad_px
+    y_title = fig.transFigure.inverted().transform((0, box_top))[1]
+    fig.text(0.5, y_title, title, ha="center", va="bottom", fontsize=title_fontsize, fontweight="bold")
 
 def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_df, pval_df,
                                 row_trends, col_trends, row_dtype_cols, row_dtype_cnt, row_dtype_norm,
@@ -8563,23 +8514,28 @@ def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_
     n_row_trend_cats = row_trends.shape[1] if has_row_trend else 0
     n_col_trend_cats = col_trends.shape[1] if has_col_trend else 0
 
-    trend_gap = kwargs.get('trend_gap', 0.025)   # configurable gap (figure-fraction)
+    trend_gap = kwargs.get('trend_gap', 0.008)   # configurable gap (figure-fraction)
 
     common = dict(
         row_linkage=row_link, col_linkage=col_link, row_cluster=True, col_cluster=True,
         figsize=layout["figsize"],
         dendrogram_ratio=layout["dendrogram_ratio"],
         colors_ratio=layout["colors_ratio"],
-        # Colorbar: top-left, aligned with the figure title
-        cbar_pos=(0.02, 0.88, 0.015, 0.08),
+        # Colorbar: top-left corner, above the row dendrogram (clear of the y-axis)
+        cbar_pos=(0.00, 0.93, 0.015, 0.05),
     )
 
-    panels = [("counts", counts_df, "viridis", "Feature Count"),
-              ("normalized", row_normalized_df, "magma", "Fraction of Pathway"),
-              ("enrichment", enrichment_matrix_df, "RdBu_r", "Fold Enrichment")]
+    panels = [
+        ("counts",      counts_df,            "viridis", "Feature Count",
+         "Number of features from each data type that belong to each pathway"),
+        ("normalized",  row_normalized_df,    "magma",   "Fraction of Pathway",
+         "Fraction of pathway features represented in each group (row-normalised)"),
+        ("enrichment",  enrichment_matrix_df, "RdBu_r",  "Fold Enrichment",
+         "Observed / expected feature overlap (hypergeometric enrichment)"),
+    ]
 
     figs = {}
-    for name, df, cmap, title in panels:
+    for name, df, cmap, title, description in panels:
         g = sns.clustermap(df, cmap=cmap, row_colors=row_dtype_cols, col_colors=col_dtype_cols, **common)
 
         curr_row_order = df.index[g.dendrogram_row.reordered_ind].tolist()
@@ -8601,23 +8557,18 @@ def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_
             ax_hm.set_xticks(ax_hm.get_xticks())
             ax_hm.set_xticklabels([])
         else:
-            ax_hm.tick_params(axis='x', labelsize=7)
+            ax_hm.tick_params(axis='x', labelsize=7, rotation=90, ha='right', rotation_mode='anchor')
 
         if name == "enrichment":
             _overlay_significance(g, pval_df, curr_row_order, curr_col_order)
-            g.figure.suptitle(
-                title + "\n* padj<0.05  ** padj<0.01  *** padj<0.001 (hypergeometric, BH-FDR)",
-                y=1.02)
-        else:
-            g.figure.suptitle(title, y=1.02)
+        _add_figure_description(
+            g.figure, title,
+            _build_panel_description(name, description, has_row_trend, has_col_trend,
+                                     row_trends, col_trends))
 
         _annotate_dtype_counts(g, row_dtype_cnt, row_dtype_norm, curr_row_order, axis='row')
         _annotate_dtype_counts(g, col_dtype_cnt, col_dtype_norm, curr_col_order, axis='col')
 
-        # ── Trend track sizing ────────────────────────────────────────────────
-        # Row trend track: each column is just wide enough to fit the widest
-        #   3-sig-fig annotation text (measured via a temporary Text artist).
-        # Col trend track: each row is cell_h_px tall (matches heatmap row height).
         if has_row_trend or has_col_trend:
             fig = g.figure
             fig.canvas.draw()
@@ -8630,11 +8581,10 @@ def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_
             cell_h_px = heat_h_px / n_rows   # height of one heatmap row
 
             if has_row_trend:
-                # Find the widest 3-sig-fig label across all row-trend values
                 row_vals = row_trends.values.ravel()
                 row_vals = row_vals[~np.isnan(row_vals)]
                 widest_str = max(
-                    (f"{v:.3g}" for v in row_vals),
+                    (f"{v:.2g}" for v in row_vals),
                     key=len,
                     default="0.0"
                 )
@@ -8710,7 +8660,7 @@ def compare_groups_to_pathways(
         requested = list(dict.fromkeys(selected_pathways))  # de-dup, preserve order
         missing = [p for p in requested if p not in available]
         if missing:
-            print(f"[compare_groups_to_pathways] Warning: {len(missing)} requested "
+            log.warning(f"[compare_groups_to_pathways] Warning: {len(missing)} requested "
                   f"pathway(s) not found after universe filtering (dropped by "
                   f"min_features_per_pathway/bipartite_only, or misspelled): {missing}")
         chosen_pathways = [p for p in requested if p in available]

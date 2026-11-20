@@ -22,7 +22,8 @@ normalization_methodS = ("auto", "median_of_ratios", "pqn", "median", "tic", "no
 LOG_TRANSFORMS = ("auto", "vst", "log2")
 _DEFAULT_NORMALIZATION = {"tx": "median_of_ratios", "mx": "pqn", "px": "pqn"}
 _DEFAULT_LOG_TRANSFORM = {"tx": "vst", "mx": "log2", "px": "log2"}
-_POLARITY_RE = re.compile(r"_(positive|negative)$")
+_CHROMATOGRAPHY_POLARITY_RE = re.compile(r"_([^_]+)_(pos|neg)$")
+_POLARITY_RE = re.compile(r"_(positive|negative|pos|neg)$")
 
 
 def _check_choice(value: Any, choices: Tuple[str, ...], name: str) -> None:
@@ -184,13 +185,20 @@ _SIZE_FACTOR_FUNCS = {
 
 
 def _feature_groups(index: pd.Index, data_type: str) -> Dict[str, np.ndarray]:
-    """Boolean masks per normalization group; mx features are grouped by polarity suffix."""
+    """Boolean masks per normalization group; MX uses chromatography/polarity suffixes."""
     labels = np.array(["all"] * len(index), dtype=object)
     if data_type == "mx":
         for i, name in enumerate(index.astype(str)):
+            chrom_match = _CHROMATOGRAPHY_POLARITY_RE.search(name)
+            if chrom_match:
+                chrom, polarity = chrom_match.groups()
+                labels[i] = f"{chrom}_{'positive' if polarity == 'pos' else 'negative'}"
+                continue
             m = _POLARITY_RE.search(name)
             if m:
-                labels[i] = m.group(1)
+                labels[i] = {"pos": "positive", "neg": "negative"}.get(
+                    m.group(1), m.group(1)
+                )
     return {g: labels == g for g in pd.unique(labels)}
 
 

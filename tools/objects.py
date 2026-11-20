@@ -549,9 +549,7 @@ class Dataset(BaseDataHandler):
         """Setup all dataset filename attributes."""
         manual_file_storage = {
             'raw_data': 'raw_data.csv',
-            'raw_metadata': 'raw_metadata.csv',
             'linked_data': 'linked_data.csv',
-            'linked_metadata': 'linked_metadata.csv',
             'filtered_data': 'filtered_data.csv',
             'normalized_data': 'normalized_data.csv',
             'detected_mask': 'detected_mask.csv',
@@ -610,9 +608,26 @@ class Dataset(BaseDataHandler):
 
     @property
     def sample_to_group(self) -> dict:
-        """Mapping of linked sample name (unique_group) to its condition label."""
-        meta = self.linked_metadata
-        return dict(zip(meta['unique_group'], meta['group']))
+        """Mapping of linked sample name (unique_group) to its condition label.
+
+        Built from the Analysis-level integrated_metadata (link table) filtered
+        to the samples actually present in this dataset's linked_data columns.
+        """
+        if not hasattr(self, '_integrated_metadata') or self._integrated_metadata is None:
+            raise RuntimeError(
+                f"Dataset '{self.dataset_name}' has no integrated_metadata reference. "
+                "Ensure Analysis.link_data() has been called."
+            )
+        meta = self._integrated_metadata
+        if 'group' not in meta.columns:
+            raise ValueError(
+                "integrated_metadata (link table) must contain a 'group' column "
+                "for sample_to_group mapping."
+            )
+        # Only include samples present in this dataset's linked_data
+        linked_cols = set(self.linked_data.columns) if not self.linked_data.empty else set()
+        subset = meta[meta['unique_group'].isin(linked_cols)] if linked_cols else meta
+        return dict(zip(subset['unique_group'], subset['group']))
 
     def _require(self, attr: str, step: str) -> pd.DataFrame:
         df = getattr(self, attr)
@@ -714,7 +729,7 @@ class Dataset(BaseDataHandler):
 
         call_params = {
             'data': {"linked": self.linked_data, "replicate_filtered": self.replicate_filtered_data},
-            'metadata': self.linked_metadata,
+            'metadata': self._integrated_metadata,
             'metadata_variables': self.project.study_variables,
             'alpha': 0.75,
             'output_dir': plot_dir,
@@ -728,9 +743,7 @@ class Dataset(BaseDataHandler):
 # Set up properties for Dataset class
 manual_file_storage = {
     'raw_data': 'raw_data.csv',
-    'raw_metadata': 'raw_metadata.csv',
     'linked_data': 'linked_data.csv',
-    'linked_metadata': 'linked_metadata.csv',
     'filtered_data': 'filtered_data.csv',
     'normalized_data': 'normalized_data.csv',
     'detected_mask': 'detected_mask.csv',
@@ -741,7 +754,6 @@ manual_file_storage = {
     'pca_grid': 'pca_grid.pdf',
     'annotation_table': 'annotation_table.csv'
 }
-#for attr in config['datasets']['file_storage']:
 for attr, filename in manual_file_storage.items():
     setattr(Dataset, attr, Dataset._create_property(None, attr, f'_{attr}_filename'))
 
@@ -749,8 +761,12 @@ class MX(Dataset):
     """Metabolomics dataset with specific configuration."""
     def __init__(self, project: Project, overwrite: bool = False):
         super().__init__("mx", project, overwrite)
-        self.chromatography = self.dataset_config['chromatography']
-        self.polarity = self.dataset_config['polarity']
+        self.chromatography = hlp.normalize_mx_config_values(
+            self.dataset_config.get("chromatography"), "chromatography"
+        )
+        self.polarity = hlp.normalize_mx_polarities(
+            self.dataset_config.get("polarity")
+        )
         self.mode = "untargeted" # Currently only untargeted supported, not configurable
         self.datatype = "peak-height" # Currently only peak-height supported, not configurable
         if 'metabolite_fraction' in self.dataset_config:
@@ -825,6 +841,7 @@ class MX(Dataset):
             'output_dir': self.output_dir,
             'output_filename': self._annotation_table_filename,
             'inchikey_col': self.inchikey_col,
+            'chromatography': self.chromatography,
         }
 
         result = hlp.generate_mx_annotation_table(**call_params)
@@ -844,6 +861,7 @@ class TX(Dataset):
         self.datatype = "counts" # Currently only counts supported, not configurable
         self.gff_quant_id = self.dataset_config.get('gff_quant_id', None)
         self.gff_annot_id = self.dataset_config.get('gff_annot_id', None)
+        self.gff_feature_type = self.dataset_config.get('gff_feature_type', None) or None
         ann_cols = self.dataset_config.get('annotation_columns', {})
         if not ann_cols or 'ec_number_col' not in ann_cols or 'kegg_id_col' not in ann_cols:
             raise ValueError(
@@ -855,8 +873,76 @@ class TX(Dataset):
         self.kegg_id_col = ann_cols['kegg_id_col']
         self.ec_delimiter = ann_cols.get('ec_delimiter', ',')
         self.kegg_id_delimiter = ann_cols.get('kegg_id_delimiter', ',')
+        self.gff_table: Optional[pd.DataFrame] = None
         self._get_raw_data(overwrite=self.overwrite)
+        self.load_gff()
         self._generate_annotation_table(overwrite=self.overwrite)
+
+    def load_gff(self) -> pd.DataFrame:
+        """
+        Parse the GFF3 file found in ``dataset_raw_dir`` into a flat
+        ``pd.DataFrame`` and store it as ``self.gff_table``.
+
+        Each non-comment, non-empty line is parsed into the nine standard GFF3
+        columns::
+
+            seqname, source, feature, start, end, score, strand, frame, attributes
+
+        If ``gff_feature_type`` is set in the dataset config (e.g. ``"CDS"``)
+        only rows whose ``feature`` column (column 3) matches that string are
+        kept.  Pass ``None`` / leave the config key blank to retain all rows.
+
+        The resulting DataFrame is stored as ``self.gff_table`` and also
+        returned so callers can inspect it directly.  If no GFF3 file is found
+        the attribute is set to an empty DataFrame and a warning is logged.
+
+        Returns:
+            pd.DataFrame: Flat GFF3 table (filtered by feature type when
+                ``gff_feature_type`` is configured).
+        """
+        import glob as _glob
+
+        gff_files = _glob.glob(os.path.join(self.dataset_raw_dir, "*.gff3"))
+        if not gff_files:
+            log.warning(
+                f"TX.load_gff: no *.gff3 file found in {self.dataset_raw_dir}. "
+                "gff_table will be empty."
+            )
+            self.gff_table = pd.DataFrame(
+                columns=["seqname", "source", "feature", "start", "end",
+                         "score", "strand", "frame", "attributes"]
+            )
+            return self.gff_table
+
+        gff_file = gff_files[0]
+        log.info(f"TX.load_gff: parsing {os.path.basename(gff_file)}")
+
+        _GFF_COLS = ["seqname", "source", "feature", "start", "end",
+                     "score", "strand", "frame", "attributes"]
+        rows = []
+        with open(gff_file, "r") as fh:
+            for line in fh:
+                if line.startswith("#") or not line.strip():
+                    continue
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) < 9:
+                    continue
+                rows.append(fields[:9])
+
+        gff_df = pd.DataFrame(rows, columns=_GFF_COLS)
+
+        if self.gff_feature_type:
+            before = len(gff_df)
+            gff_df = gff_df[gff_df["feature"] == self.gff_feature_type].reset_index(drop=True)
+            log.info(
+                f"TX.load_gff: filtered to feature_type='{self.gff_feature_type}': "
+                f"{len(gff_df)} / {before} rows retained."
+            )
+        else:
+            log.info(f"TX.load_gff: no feature_type filter — {len(gff_df)} rows loaded.")
+
+        self.gff_table = gff_df
+        return self.gff_table
 
     def _get_raw_data(self, overwrite: bool = False) -> None:
         log.info("Getting Raw Data (TX)")
@@ -930,6 +1016,7 @@ class TX(Dataset):
             'kegg_id_col': self.kegg_id_col,
             'ec_delimiter': self.ec_delimiter,
             'kegg_id_delimiter': self.kegg_id_delimiter,
+            'gff_table': self.gff_table,
         }
 
         result = hlp.generate_tx_annotation_table(**call_params)
@@ -948,6 +1035,7 @@ class PX(Dataset):
         self.datatype = "peak-height"
         self.gff_quant_id = self.dataset_config.get('gff_quant_id', None)
         self.gff_annot_id = self.dataset_config.get('gff_annot_id', None)
+        self.gff_feature_type = self.dataset_config.get('gff_feature_type', None) or None
         ann_cols = self.dataset_config.get('annotation_columns', {})
         if not ann_cols or 'ec_number_col' not in ann_cols or 'kegg_id_col' not in ann_cols:
             raise ValueError(
@@ -959,8 +1047,76 @@ class PX(Dataset):
         self.kegg_id_col = ann_cols['kegg_id_col']
         self.ec_delimiter = ann_cols.get('ec_delimiter', ',')
         self.kegg_id_delimiter = ann_cols.get('kegg_id_delimiter', ',')
+        self.gff_table: Optional[pd.DataFrame] = None
         self._get_raw_data(overwrite=self.overwrite)
+        self.load_gff()
         self._generate_annotation_table(overwrite=self.overwrite)
+
+    def load_gff(self) -> pd.DataFrame:
+        """
+        Parse the GFF3 file found in ``dataset_raw_dir`` into a flat
+        ``pd.DataFrame`` and store it as ``self.gff_table``.
+
+        Each non-comment, non-empty line is parsed into the nine standard GFF3
+        columns::
+
+            seqname, source, feature, start, end, score, strand, frame, attributes
+
+        If ``gff_feature_type`` is set in the dataset config (e.g. ``"CDS"``)
+        only rows whose ``feature`` column (column 3) matches that string are
+        kept.  Pass ``None`` / leave the config key blank to retain all rows.
+
+        The resulting DataFrame is stored as ``self.gff_table`` and also
+        returned so callers can inspect it directly.  If no GFF3 file is found
+        the attribute is set to an empty DataFrame and a warning is logged.
+
+        Returns:
+            pd.DataFrame: Flat GFF3 table (filtered by feature type when
+                ``gff_feature_type`` is configured).
+        """
+        import glob as _glob
+
+        gff_files = _glob.glob(os.path.join(self.dataset_raw_dir, "*.gff3"))
+        if not gff_files:
+            log.warning(
+                f"PX.load_gff: no *.gff3 file found in {self.dataset_raw_dir}. "
+                "gff_table will be empty."
+            )
+            self.gff_table = pd.DataFrame(
+                columns=["seqname", "source", "feature", "start", "end",
+                         "score", "strand", "frame", "attributes"]
+            )
+            return self.gff_table
+
+        gff_file = gff_files[0]
+        log.info(f"PX.load_gff: parsing {os.path.basename(gff_file)}")
+
+        _GFF_COLS = ["seqname", "source", "feature", "start", "end",
+                     "score", "strand", "frame", "attributes"]
+        rows = []
+        with open(gff_file, "r") as fh:
+            for line in fh:
+                if line.startswith("#") or not line.strip():
+                    continue
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) < 9:
+                    continue
+                rows.append(fields[:9])
+
+        gff_df = pd.DataFrame(rows, columns=_GFF_COLS)
+
+        if self.gff_feature_type:
+            before = len(gff_df)
+            gff_df = gff_df[gff_df["feature"] == self.gff_feature_type].reset_index(drop=True)
+            log.info(
+                f"PX.load_gff: filtered to feature_type='{self.gff_feature_type}': "
+                f"{len(gff_df)} / {before} rows retained."
+            )
+        else:
+            log.info(f"PX.load_gff: no feature_type filter — {len(gff_df)} rows loaded.")
+
+        self.gff_table = gff_df
+        return self.gff_table
 
     def _get_raw_data(self, overwrite: bool = False) -> None:
         log.info("Getting Raw Data (PX)")
@@ -1024,6 +1180,7 @@ class PX(Dataset):
             ec_delimiter=self.ec_delimiter,
             kegg_id_delimiter=self.kegg_id_delimiter,
             prefix="px",
+            gff_table=self.gff_table,
         )
         if result.empty:
             log.error("No annotation table generated for PX dataset. Please check your annotation files.")
@@ -1040,13 +1197,13 @@ class Analysis(BaseDataHandler):
         log.info("Initializing Analysis")
         self.datasets_config = self.project.config['datasets']
         self.analysis_config = self.project.config['analysis']
-        self.link_table = self.project.project_config.get('link_table')
+        self.link_table_path = self.project.project_config.get('link_table')
         self.overwrite = self.project.overwrite
 
         # Use hash-based tags for output directory
         self.data_processing_tag = project.data_processing_hash
         self.analysis_tag = project.analysis_hash
-        analysis_outdir = self._set_up_analysis_outdir(self.project, self.data_processing_tag, 
+        analysis_outdir = self._set_up_analysis_outdir(self.project, self.data_processing_tag,
                                                       self.analysis_tag, overwrite=self.overwrite)
         self.output_dir = analysis_outdir
         os.makedirs(self.output_dir, exist_ok=True)
@@ -1059,19 +1216,15 @@ class Analysis(BaseDataHandler):
         super().__init__(self.output_dir)
         self._setup_analysis_filenames()
 
-        # analysis_config is the flat 'analysis:' block from analysis.yml.
         self.datasets = datasets or []
-        if not self.link_table:
-            raise ValueError("project.link_table must point to the master link table.")
-        linked_metadata, self.link_table_metadata = hlp.load_link_table_metadata(
-            datasets=self.datasets,
-            link_table_path=self.link_table,
-            return_link_table=True,
-        )
-        for ds in self.datasets:
-            ds.linked_metadata = linked_metadata[ds.dataset_name]
+        if not self.link_table_path:
+            raise ValueError("project.link_table must point to the link_table.csv file.")
+        self.integrated_metadata = hlp.load_link_table(self.link_table_path)
 
-        # The track is set by the global analysis.replicate_pairing flag.
+        # Propagate the link table to each dataset so sample_to_group works.
+        for ds in self.datasets:
+            ds._integrated_metadata = self.integrated_metadata
+
         self.replicate_pairing = self.analysis_config.get('replicate_pairing')
         if self.replicate_pairing not in prep.PAIRINGS:
             raise ValueError(
@@ -1081,7 +1234,6 @@ class Analysis(BaseDataHandler):
             "sample_resolution" if self.replicate_pairing == "paired" else "condition_resolution"
         )
         log.info(f"replicate_pairing='{self.replicate_pairing}' -> track '{self._integration_mode}'")
-        self.integrated_metadata = self.link_table_metadata.copy()
         for ds in self.datasets:
             ds._scaled_data_filename = f"scaled_data_{self.replicate_pairing}.csv"
             ds.clear_cache('scaled_data')
@@ -1273,7 +1425,7 @@ class Analysis(BaseDataHandler):
                         **kwargs)
 
     def link_data(self, overlap_only: bool = True, overwrite: bool = False) -> None:
-        """Rename raw quantitative sample columns using the master link table."""
+        """Rename raw_data columns using the link table and store as linked_data."""
         log.info("Linking analysis datasets along shared samples")
 
         # Check if all datasets already have linked data
@@ -1284,19 +1436,17 @@ class Analysis(BaseDataHandler):
         if not datasets_to_process:
             return
 
-        # The master link table is loaded during Analysis initialization.
-        for ds in self.datasets:
-            if not hasattr(ds, 'linked_metadata') or ds.linked_metadata.empty:
-                raise ValueError(f"Dataset {ds.dataset_name} lacks link-table metadata.")
-
-        # Call external function
-        linked_data = hlp.link_data_across_datasets(datasets=self.datasets,
-                                                       overlap_only=overlap_only)
+        # Use integrated_metadata (the full link table) loaded during Analysis.__init__
+        linked_data = hlp.link_data_across_datasets(
+            datasets=self.datasets,
+            integrated_metadata=self.integrated_metadata,
+            overlap_only=overlap_only,
+        )
 
         # Set results back to datasets
         for ds in self.datasets:
             if linked_data[ds.dataset_name].empty:
-                log.error(f"Linking data resulted in empty table for {ds.dataset_name}. Please check your datasets and linked metadata.")
+                log.error(f"Linking data resulted in empty table for {ds.dataset_name}. Please check your datasets and link table.")
                 sys.exit(1)
             ds.linked_data = linked_data[ds.dataset_name]
             log.info(f"Created linked_data for {ds.dataset_name} with {ds.linked_data.shape[1]} samples and {ds.linked_data.shape[0]} features.")
@@ -1662,7 +1812,9 @@ class Analysis(BaseDataHandler):
         trend tracks.
 
         Config keys (under ``analysis.pathway_enrichment``):
-            ``pathway_col``             - annotation column to use (default "modelseed_pathway")
+            ``pathway_col``             - annotation column to use: "kegg_module" (recommended),
+                                          "kegg_pathway", "kegg_reaction" or "modelseed_pathway"
+            ``exclude_global_maps``     - drop KEGG global/overview maps (map011xx/012xx) from the test
             ``bipartite_only``          - keep only pathways with features from every data type
             ``min_features_per_pathway``- drop pathways smaller than this before testing (default 3)
             ``min_features_per_group``  - drop groups smaller than this before testing (default 5)
