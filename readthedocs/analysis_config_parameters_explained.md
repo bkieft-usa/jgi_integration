@@ -68,8 +68,9 @@ Configuration path: `analysis.pathway_enrichment`. The notebook calls `analysis.
 
 | Key | Description |
 |-----|-------------|
-| `pathway_col` | Annotation-table column containing pathway labels, such as `modelseed_pathway` or `kegg_pathway`. |
-| `exclude_nopathway` | Excludes pathway labels beginning with `NOPATHWAY_` when true. |
+| `pathway_col` | Annotation-table column used for the test and heatmaps. `kegg_module` (default; KEGG modules such as `M00001`), `kegg_pathway` (KEGG pathway maps), `kegg_reaction` (KEGG reactions such as `R00351`), or `modelseed_pathway`. All three KEGG levels are always written to the annotation table, so switching only requires changing this value. |
+| `exclude_nopathway` | Excludes pathway labels beginning with `NOPATHWAY_` when true (only relevant to `modelseed_pathway`). |
+| `exclude_global_maps` | Excludes KEGG global/overview maps (`map011xx`/`map012xx`, e.g. `map01100` Metabolic pathways) from the test when true. These maps contain most metabolic features and would otherwise dominate the results. Only relevant to `kegg_pathway`. |
 | `bipartite_only` | When true, retains annotated pathways represented in every included data type. |
 | `min_features_per_pathway` | Minimum annotated feature count for a pathway to be tested. |
 | `min_features_per_group` | Minimum feature count for a group to be retained. |
@@ -105,8 +106,9 @@ analysis:
       max_features: 12000
       block_scale: true
   pathway_enrichment:
-    pathway_col: modelseed_pathway
+    pathway_col: kegg_module
     exclude_nopathway: true
+    exclude_global_maps: true
     bipartite_only: true
     min_features_per_pathway: 2
     min_features_per_group: 2

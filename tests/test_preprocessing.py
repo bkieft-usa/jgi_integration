@@ -119,6 +119,28 @@ def test_polarity_groups_and_per_polarity_normalization():
     assert pos.std() / pos.mean() < 0.15 and neg.std() / neg.mean() < 0.15
 
 
+def test_multichromatography_features_are_grouped_by_chromatography_and_polarity():
+    df = pd.DataFrame(
+        [[2, 4], [4, 8], [20, 10], [40, 20]],
+        index=[
+            "mx_1_hilic_pos",
+            "mx_2_c18_pos",
+            "mx_3_hilic_neg",
+            "mx_4_c18_neg",
+        ],
+        columns=["sample_a", "sample_b"],
+    )
+
+    _, factors = prep.normalize_samples(df, "median", "mx")
+
+    assert set(factors.columns) == {
+        "hilic_positive",
+        "c18_positive",
+        "hilic_negative",
+        "c18_negative",
+    }
+
+
 def test_raw_filters_semantics():
     df = pd.DataFrame([[0, 0, 0, 10], [5, 5, 0, 0], [100, 100, 100, 100], [1, 1, 1, 1]],
                       index=["a", "b", "c", "d"], columns=list("wxyz"))

@@ -38,7 +38,7 @@ project_data/
 └── output_data/                       # created/filled by workflow
 ```
 
-The names `transcriptomics` and `metabolomics` are the defaults in the example data-processing config, not fixed API names. If you change either `dataset_dir`, use that exact folder name beneath `raw_data`. The chromatography folder name must match `datasets.mx.chromatography`.
+The names `transcriptomics` and `metabolomics` are the defaults in the example data-processing config, not fixed API names. If you change either `dataset_dir`, use that exact folder name beneath `raw_data`. Each chromatography folder name must match an entry in `datasets.mx.chromatography`.
 
 ## **Transcriptomics Input**
 
@@ -62,7 +62,7 @@ Keep the remaining organism-specific source headers shown above. Do not retain a
 
 ## **Metabolomics Input**
 
-The current MX dataset uses untargeted peak-height data. It searches under `raw_data/<mx dataset_dir>/<chromatography>/` for CSV result files. For `polarity: positive` or `negative`, names must end in `_<polarity>_peak-height-filtered-3x-exctrl.csv`; for `polarity: multipolarity`, they must end in `_peak-height-filtered-3x-exctrl.csv`. For example:
+The current MX dataset uses untargeted peak-height data. It searches under `raw_data/<mx dataset_dir>/<chromatography>/` for CSV result files. Configure `chromatography` as one folder name or a list, and `polarity` as `POS`, `NEG`, or a list such as `[POS, NEG]`. Filenames must end in `_<positive|negative>_peak-height-filtered-3x-exctrl.csv`.
 
 ```text
 raw_data/metabolomics/HILIC/
@@ -75,7 +75,7 @@ raw_data/metabolomics/HILIC/
    └── negative_library-results.tsv
 ```
 
-The result CSV should be the vendor/JGI peak-height table: its first column is the compound/scan identifier, with one numeric column per sample. Keep the `row m/z` and `row retention time` columns if present; the loader removes them. Sample headers should identify the corresponding `.mzML` files; the loader removes the `.mzML` suffix and ` Peak height` text before matching them to the link table. Multipolarity mode can combine positive and negative result files; include polarity in each filename so generated metabolite IDs distinguish the two.
+The result CSV should be the vendor/JGI peak-height table: its first column is the compound/scan identifier, with one numeric column per sample. Keep the `row m/z` and `row retention time` columns if present; the loader removes them. Sample headers should identify the corresponding `.mzML` files; the loader removes the `.mzML` suffix and ` Peak height` text before matching them to the link table. When multiple chromatography/polarity combinations are configured, feature IDs are suffixed with chromatography and polarity (for example, `mx_123_hilic_neg`), and normalization is performed separately for each combination.
 
 Place polarity metadata as tab-separated `*_metadata.tab` files anywhere beneath the chromatography folder. A single `raw_data/<mx dataset_dir>/raw_metadata.csv` is accepted as a compatibility input if no metadata TSVs are present. Metadata filenames are normalized by removing `.mzML`; they must therefore resolve to the sample names represented in the peak-height table and link table.
 
@@ -98,7 +98,7 @@ sample_03,library_003,,control,day7
 
 Requirements:
 
-- Include one column for every configured dataset, such as `tx` and `mx`.
+- Include one column for every configured dataset, such as `tx` and `mx`. When multiple MX chromatography/polarity combinations are configured, use one MX column per combination in the form `mx_<chromatography>_<polarity>`, e.g. `mx_hilic_neg`, `mx_c18_pos`; chromatography and `pos`/`neg` are lowercase.
 - Include one shared-name column: `unique_group` (recommended), `shared_sample`, `shared_name`, or `sample`. Every row must have a nonblank shared name.
 - Put the raw quantitative-table sample identifier in the dataset column. It must exactly match a sample header after the loader's normalization described above. For MX, this normally means omitting `.mzML` and ` Peak height`; verify the final normalized peak-height column names.
 - Leave a dataset cell blank when that shared sample is absent from that datatype. A raw sample name may appear only once in each dataset column.

@@ -45,6 +45,21 @@ Example: Changing the filtering threshold (see below) will generate a new hash l
 
 ---
 
+## Metabolomics Chromatography <a id="metabolomics-chromatography"></a>
+
+For `datasets.mx`, `chromatography` accepts one folder name or a list of folder names. `polarity` accepts `POS`, `NEG`, or a list of both. For example:
+
+```yaml
+datasets:
+  mx:
+    chromatography: [HILIC, C18]
+    polarity: [POS, NEG]
+```
+
+The workflow combines available peak-height tables across the configured chromatography/polarity combinations. When more than one combination is configured, feature IDs are suffixed with `_<chromatography>_<polarity>` (for example, `mx_123_hilic_neg`), and normalization is performed separately for each combination. Add matching columns to `link_table.csv` using the pattern `mx_<chromatography>_<polarity>`, with lowercase chromatography and `pos`/`neg` polarity suffixes (for example, `mx_hilic_neg` and `mx_c18_pos`). Missing file/link-column combinations are skipped.
+
+---
+
 ## GFF Identifier Fields <a id="gff-identifier-fields"></a>
 
 `datasets.<dataset_name>.gff_quant_id` and `datasets.<dataset_name>.gff_annot_id` apply to `tx` and `px` datasets only.
@@ -88,7 +103,7 @@ Applied by `analysis.normalize_all_datasets()`.
 
 | Config key | Type | Default | Description |
 |------------|------|---------|-------------|
-| `sample_normalization` | string | `auto` | Raw input only. `auto` uses median-of-ratios size factors for `tx` and probabilistic quotient normalization (PQN) for `mx`/`px` (`mx` is normalized separately per polarity). Other options: `median_of_ratios`, `pqn`, `median`, `tic`, `none`. |
+| `sample_normalization` | string | `auto` | Raw input only. `auto` uses median-of-ratios size factors for `tx` and probabilistic quotient normalization (PQN) for `mx`/`px` (`mx` is normalized separately for each configured chromatography/polarity combination). Other options: `median_of_ratios`, `pqn`, `median`, `tic`, `none`. |
 | `pseudocount` | number | `1` | `tx` only. Counts are transformed as `log2(count / size_factor + pseudocount)`. |
 | `recenter_samples` | boolean | `false` | Prenormalized input only. Aligns per-sample medians on the log scale. A warning is logged when sample medians differ by more than one log2 unit. |
 
