@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from tools import helpers as hlp
 
@@ -143,3 +144,76 @@ def test_prepare_universe_can_exclude_global_maps():
     pe["exclude_global_maps"] = False
     kept = set(hlp.prepare_universe(node_table, "kegg_pathway", "group", pe)["pathway"])
     assert "path:map01100" in kept
+
+
+def test_prepare_universe_bipartite_only_filters_pathways_and_groups():
+    node_table = pd.DataFrame(
+        {
+            # g1 spans tx+mx; g2 is tx-only; g3 spans tx+mx but mx member is unannotated
+            "group": ["g1", "g1", "g2", "g2", "g3", "g3"],
+            "kegg_module": ["M1", "M1", "M2", "M1", "M2", None],
+        },
+        index=["tx_a", "mx_b", "tx_c", "tx_d", "tx_e", "mx_f"],
+    )
+    pe = {"min_features_per_pathway": 1, "min_features_per_group": 1, "bipartite_only": True}
+    out = hlp.prepare_universe(node_table, "kegg_module", "group", pe)
+    assert set(out["group"]) == {"g1", "g3"}
+    assert set(out.loc[out["pathway"] != "Unassigned", "pathway"]) == {"M1"}
+
+    pe["bipartite_only"] = False
+    out = hlp.prepare_universe(node_table, "kegg_module", "group", pe)
+    assert set(out["group"]) == {"g1", "g2", "g3"}
+    assert set(out.loc[out["pathway"] != "Unassigned", "pathway"]) == {"M1", "M2"}
+
+
+def test_get_trend_values_returns_category_share_of_summed_abundance():
+    abundance = pd.DataFrame(
+        {"s1": [1.0, 3.0, 100.0], "s2": [3.0, 1.0, 300.0], "s3": [0.0, 0.0, 600.0], "s4": [0.0, 0.0, 0.0]},
+        index=["tx_a", "tx_b", "mx_c"],
+    )
+    meta = pd.DataFrame(
+        {"cond": ["A", "A", "B", "B"], "order": [2, 2, 1, 1]}, index=["s1", "s2", "s3", "s4"]
+    )
+    mapping = pd.DataFrame({"pathway": ["P1", "P1", "P1"]}, index=["tx_a", "tx_b", "mx_c"])
+
+    out = hlp.get_trend_values(abundance, mapping, "pathway", meta, "order", "cond", agg="mean")
+    # tx: per-sample sums 4,4,0,0 -> means A=4, B=0 -> shares A=1, B=0
+    # mx: per-sample sums 100,300,600,0 -> means A=200, B=300 -> shares A=0.4, B=0.6
+    # averaged over data types: A=0.7, B=0.3; columns ordered by `order` (B first)
+    assert list(out.columns) == ["B", "A"]
+    assert out.loc["P1", "A"] == pytest.approx(0.7)
+    assert out.loc["P1", "B"] == pytest.approx(0.3)
+
+
+def test_log_annotation_coverage_reports_fraction_per_data_type():
+    df = pd.DataFrame(
+        {
+            "kegg_module": ["M00001", "Unassigned", None, "M00002;M00003"],
+            "modelseed_pathway": ["NOPATHWAY_rxn1", "rn00010 (Glycolysis)", None, None],
+        },
+        index=["tx_a", "tx_b", "mx_c", "mx_d"],
+    )
+    table = hlp.log_annotation_coverage(df, cols=["kegg_module", "modelseed_pathway"])
+    assert table.loc["kegg_module", "tx (n=2)"] == "1 (50.0%)"
+    assert table.loc["kegg_module", "mx (n=2)"] == "1 (50.0%)"
+    # NOPATHWAY_ placeholders do not count as annotated
+    assert table.loc["modelseed_pathway", "tx (n=2)"] == "1 (50.0%)"
+    assert table.loc["modelseed_pathway", "mx (n=2)"] == "0 (0.0%)"
+
+
+def test_term_labels_use_parallel_name_column():
+    node_table = pd.DataFrame(
+        {
+            "kegg_module": ["M00001;M00002", "M00002", "Unassigned"],
+            "kegg_module_name": ["Glycolysis (Embden-Meyerhof pathway);Glycolysis, core module",
+                                 "Glycolysis, core module", "Unassigned"],
+            "modelseed_pathway": ["rn00010 (Glycolysis)", None, None],
+        },
+        index=["tx_a", "mx_b", "tx_c"],
+    )
+    labels = hlp.get_term_labels(node_table, "kegg_module", ["M00001", "M00002", "M99999"], max_name_len=12)
+    assert labels == {"M00001": "M00001 (Glycolysis…)", "M00002": "M00002 (Glycolysis,…)", "M99999": "M99999"}
+    # ModelSEED IDs already carry names and are left unchanged
+    assert hlp.get_term_labels(node_table, "modelseed_pathway", ["rn00010 (Glycolysis)"]) == {
+        "rn00010 (Glycolysis)": "rn00010 (Glycolysis)"
+    }

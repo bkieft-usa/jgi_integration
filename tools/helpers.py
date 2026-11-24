@@ -5398,6 +5398,8 @@ def annotate_integrated_features(
         ko_cols=kegg_id_delimiters or None,
     )
 
+    log_annotation_coverage(final_annotation_df, title="Pathway/module/reaction annotation coverage by data type")
+
     final_annotation_df = final_annotation_df.fillna('Unassigned')
 
     final_annotation_df = final_annotation_df.reset_index()
@@ -8085,6 +8087,94 @@ import pathlib
 # 1. DATA PIPELINE
 # ==========================================
 
+ANNOTATION_COVERAGE_COLS = ("modelseed_pathway", "kegg_pathway", "kegg_module", "kegg_reaction")
+
+
+def log_annotation_coverage(
+    df: pd.DataFrame,
+    cols=ANNOTATION_COVERAGE_COLS,
+    missing_token: str = "Unassigned",
+    title: str = "Annotation coverage",
+) -> pd.DataFrame:
+    """
+    Log, for each data type (feature-ID prefix: tx, mx, px, ...), how many and
+    what fraction of features have at least one term in each annotation column.
+
+    ``NOPATHWAY_*`` ModelSEED placeholders are not counted as annotations.
+    ``df`` is indexed by feature ID or has a ``feature_id`` column. Returns
+    the coverage table (rows = columns checked, cells = "n (pct%)").
+    """
+    if "feature_id" in df.columns:
+        df = df.set_index("feature_id")
+    cols = [c for c in cols if c in df.columns]
+    if not cols or df.empty:
+        return pd.DataFrame()
+
+    prefixes = df.index.to_series().astype(str).str.split("_", n=1).str[0]
+    totals = prefixes.value_counts().sort_index()
+
+    def _has_term(cell) -> bool:
+        if cell is None or (not isinstance(cell, str) and pd.isna(cell)):
+            return False
+        return any(
+            t.strip() and t.strip() != missing_token and not t.strip().startswith("NOPATHWAY_")
+            for t in str(cell).split(";")
+        )
+
+    table = pd.DataFrame(index=cols, columns=[f"{p} (n={n})" for p, n in totals.items()], dtype=object)
+    for col in cols:
+        annotated = df[col].map(_has_term).groupby(prefixes).sum()
+        for p, n in totals.items():
+            k = int(annotated.get(p, 0))
+            table.loc[col, f"{p} (n={n})"] = f"{k} ({100 * k / n:.1f}%)" if n else "0 (0.0%)"
+
+    log.info(f"{title} (features with >=1 term; NOPATHWAY_ placeholders not counted):")
+    for line in table.to_string().splitlines():
+        log.info(f"  {line}")
+    return table
+
+
+def get_term_names(node_table, pathway_col, terms, sep=';'):
+    """
+    Return {term_id: descriptive name} for the given terms ('' when unknown).
+
+    Names come from the parallel ``<pathway_col>_name`` column (e.g.
+    kegg_module -> kegg_module_name), aligned by position. For KEGG levels
+    with no name column, names are fetched from the KEGG ``list`` API.
+    Columns without a name column (e.g. modelseed_pathway, whose IDs already
+    read "rn00230 (Purine metabolism)") get no extra names.
+    """
+    terms = list(dict.fromkeys(terms))
+    names = {}
+    name_col = f"{pathway_col}_name"
+    if name_col in node_table.columns:
+        pairs = node_table[[pathway_col, name_col]].dropna().astype(str)
+        for ids, nms in zip(pairs[pathway_col], pairs[name_col]):
+            id_list, name_list = ids.split(sep), nms.split(sep)
+            if len(id_list) != len(name_list):
+                continue
+            for i, n in zip(id_list, name_list):
+                i, n = i.strip(), n.strip()
+                if i and n and n != 'Unassigned':
+                    names.setdefault(i, n)
+    else:
+        level = next((lv for lv in KEGG_LEVELS if lv["col"] == pathway_col), None)
+        if level is not None:
+            kegg_names = fetch_kegg_list_cached(level["target"])
+            names = {t: kegg_names.get(_strip_kegg_prefix(t), "") for t in terms}
+    return {t: names.get(t, "") for t in terms}
+
+
+def get_term_labels(node_table, pathway_col, terms, sep=';', max_name_len=None):
+    """Return {term_id: "term_id (name)"}; terms with no known name are left as-is."""
+    labels = {}
+    for t, n in get_term_names(node_table, pathway_col, terms, sep=sep).items():
+        if n and max_name_len and len(n) > max_name_len:
+            n = n[: max_name_len - 1].rstrip() + "…"
+        labels[t] = f"{t} ({n})" if n else t
+    return labels
+
+
 def prepare_universe(node_table, pathway_col, group_col, pe_cfg, missing_token='Unassigned'):
     df = node_table[[group_col, pathway_col]].copy()
 
@@ -8127,6 +8217,17 @@ def prepare_universe(node_table, pathway_col, group_col, pe_cfg, missing_token='
     node_dedup = node_table[~node_table.index.duplicated(keep='first')]
     g_counts = node_dedup[group_col].value_counts()
     keep_groups = g_counts[g_counts >= pe_cfg['min_features_per_group']].index
+
+    if pe_cfg.get('bipartite_only'):
+        # Same rule for data-driven groups (rows): keep only groups whose members
+        # span every data type. Counted over all group members in the node table,
+        # annotated or not, matching the min_features_per_group basis.
+        node_dtypes = node_dedup.index.astype(str).str.split('_').str[0]
+        total_dtypes = node_dtypes.nunique()
+        g_dtypes = pd.Series(node_dtypes, index=node_dedup.index).groupby(node_dedup[group_col]).nunique()
+        multi_dtype_groups = g_dtypes[g_dtypes >= total_dtypes].index
+        keep_groups = keep_groups.intersection(multi_dtype_groups)
+
     exploded = exploded[exploded['group'].isin(keep_groups)]
 
     return exploded
@@ -8180,35 +8281,57 @@ def compute_enrichment_matrix(exploded, alpha=0.05, fdr_method='fdr_bh', missing
 
     return overlap_mat, fold_df, pval_df, padj_df
 
-def get_trend_values(quant_df, mapping_df, group_col, metadata_df, sort_by, collapse_by, agg='median'):
-    if collapse_by and metadata_df is not None:
-        meta = metadata_df.reindex(quant_df.columns)
-        if meta[collapse_by].isna().all():
+def get_trend_values(abundance_df, mapping_df, group_col, metadata_df, sort_by, collapse_by, agg='median'):
+    """
+    Share of each group's/pathway's summed abundance falling in each metadata category.
+
+    For each label in ``mapping_df[group_col]`` (index = feature ID) and each data
+    type (feature-ID prefix: tx, mx, ...):
+      1. sum the linear-scale abundance (``abundance_df``: features x samples) of
+         the label's member features in every sample;
+      2. pool samples by ``collapse_by`` with ``agg`` ("median" | "mean") over
+         replicates (no pooling when ``collapse_by`` is empty: one column per sample);
+      3. divide by the row total, giving each category's share (rows sum to 1).
+    Shares are then averaged across the data types the label contains, so each
+    data type counts equally regardless of its units. Columns are ordered by
+    ``sort_by``. Labels with no measured members get NaN.
+    """
+    meta = metadata_df.reindex(abundance_df.columns) if metadata_df is not None else None
+    if collapse_by:
+        if meta is None or collapse_by not in meta.columns or meta[collapse_by].isna().all():
             raise ValueError(
-                f"metadata_df.index has no overlap with quant_df.columns — "
-                f"e.g. quant_df cols: {list(quant_df.columns[:3])} vs "
-                f"metadata_df index: {list(metadata_df.index[:3])}"
+                f"Cannot pool samples by '{collapse_by}': metadata_df.index has no overlap with "
+                f"abundance_df.columns (e.g. {list(abundance_df.columns[:3])} vs "
+                f"{list(metadata_df.index[:3]) if metadata_df is not None else []})"
             )
 
-        collapsed_samples = quant_df.T.groupby(meta[collapse_by]).agg(agg).T
+    members = (
+        mapping_df[[group_col]].rename_axis('feature').reset_index()
+        .dropna().drop_duplicates()
+    )
+    members = members[members['feature'].isin(abundance_df.index)]
+    members['dtype'] = members['feature'].astype(str).str.split('_').str[0]
 
-        if sort_by and sort_by in metadata_df.columns:
-            sort_order = metadata_df.groupby(collapse_by)[sort_by].first().sort_values().index
-            sort_order = [c for c in sort_order if c in collapsed_samples.columns]
-            collapsed_samples = collapsed_samples.reindex(columns=sort_order)
+    shares = []
+    for _, m in members.groupby('dtype'):
+        summed = abundance_df.loc[m['feature']].set_axis(m[group_col].to_numpy()).groupby(level=0).sum()
+        if collapse_by:
+            summed = summed.T.groupby(meta[collapse_by]).agg(agg).T
+        shares.append(summed.div(summed.sum(axis=1).replace(0, np.nan), axis=0))
 
-    else:
-        collapsed_samples = quant_df
+    labels = mapping_df[group_col].dropna().unique()
+    if not shares:
+        return pd.DataFrame(index=labels, dtype=float)
+    out = pd.concat(shares).groupby(level=0).mean()
 
-    labels = mapping_df[group_col].unique()
-    final_values = []
-    for label in labels:
-        feats = mapping_df[mapping_df[group_col] == label].index.unique()
-        valid_feats = [f for f in feats if f in collapsed_samples.index]
-        val = collapsed_samples.loc[valid_feats].agg(agg, axis=0) if valid_feats else pd.Series(np.nan, index=collapsed_samples.columns)
-        final_values.append(val)
+    if sort_by and meta is not None and sort_by in meta.columns:
+        key = meta[sort_by]
+        if collapse_by:
+            key = meta.groupby(collapse_by)[sort_by].first()
+        order = key.reindex(out.columns).sort_values(kind='stable').index
+        out = out.reindex(columns=order)
 
-    return pd.DataFrame(final_values, index=labels)
+    return out.reindex(labels)
 
 # ==========================================
 # 2. VISUAL ENGINE
@@ -8323,17 +8446,16 @@ def _measure_ticklabel_bottom_edge(ax):
     if not extents: return ax.get_position().y0
     return fig.transFigure.inverted().transform((0, min(e.y0 for e in extents)))[1]
 
-def _values_to_rgba_zscored(value_mat, cmap='RdBu_r', vmax=None):
-    """Convert a value matrix to RGBA using a symmetric diverging norm centred at 0.
+def _values_to_rgba_share(value_mat, cmap='Purples'):
+    """Convert a matrix of shares (0-1) to RGBA on a sequential scale from 0 to the track maximum.
 
-    vmax : if provided, use this as the colour scale maximum (allows a shared
-           scale across multiple calls). If None, derived from the data.
+    NaN cells are fully transparent.
     """
     if value_mat.size == 0 or np.all(np.isnan(value_mat)):
-        return np.full((*value_mat.shape, 4), cm.get_cmap(cmap)(0.5))
-    if vmax is None:
-        vmax = max(np.nanmax(np.abs(value_mat)), 1e-9)
-    norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+        rgba = np.zeros((*value_mat.shape, 4))
+        return rgba
+    vmax = max(np.nanmax(value_mat), 1e-9)
+    norm = Normalize(vmin=0.0, vmax=vmax)
     rgba = cm.get_cmap(cmap)(norm(np.nan_to_num(value_mat, nan=0.0)))
     rgba[np.isnan(value_mat), 3] = 0.0
     return rgba
@@ -8458,9 +8580,11 @@ def _build_panel_description(name, summary, has_row_trend, has_col_trend, row_tr
             w for w, h in (("right of the heatmap (per group)", has_row_trend),
                            ("below the heatmap (per pathway)", has_col_trend)) if h)
         cats = row_trends.columns if has_row_trend else col_trends.columns
-        parts.append(f"Trend heatmaps ({where}) = aggregated abundance of the member features across "
-                     f"metadata categories ({', '.join(map(str, cats))}); red = above average, "
-                     "blue = below, each track scaled independently; numbers are the plotted values.")
+        parts.append(f"Trend heatmaps ({where}) = share of the member features' summed abundance "
+                     f"found in each metadata category ({', '.join(map(str, cats))}): abundances are "
+                     "summed per sample, pooled over replicates, and divided by the total, so each "
+                     "group/pathway sums to 1 across categories (data types weighted equally). "
+                     "Darker = larger share; each track scaled independently; numbers are the plotted values.")
     parts.append("Example: " + example)
     return " ".join(parts)
 
@@ -8499,7 +8623,7 @@ def _add_figure_description(fig, title, body, fontsize=8, title_fontsize=11):
 def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_df, pval_df,
                                 row_trends, col_trends, row_dtype_cols, row_dtype_cnt, row_dtype_norm,
                                 col_dtype_cols, col_dtype_cnt, col_dtype_norm,
-                                trend_cmap='RdBu_r', output_dir=None, **kwargs):
+                                trend_cmap='Purples', output_dir=None, **kwargs):
 
     n_rows, n_cols = len(row_normalized_df), len(row_normalized_df.columns)
     square_cells = kwargs.get('square_cells', False)
@@ -8608,7 +8732,7 @@ def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_
         # Each trend track is colour-scaled independently from its own data.
         if has_row_trend:
             row_trend_aligned = row_trends.reindex(curr_row_order)
-            rgba = _values_to_rgba_zscored(row_trend_aligned.values, cmap=trend_cmap)
+            rgba = _values_to_rgba_share(row_trend_aligned.values, cmap=trend_cmap)
             _add_trend_track(g, rgba, value_mat=row_trend_aligned.values,
                               category_labels=row_trend_aligned.columns,
                               tick_labels=curr_row_order,
@@ -8618,7 +8742,7 @@ def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_
         if has_col_trend:
             col_trend_aligned = col_trends.reindex(curr_col_order)
             # rgba shape: (n_cats, n_pathways, 4)  — transpose values for imshow
-            rgba = _values_to_rgba_zscored(col_trend_aligned.values.T, cmap=trend_cmap)
+            rgba = _values_to_rgba_share(col_trend_aligned.values.T, cmap=trend_cmap)
             _add_trend_track(g, rgba, value_mat=col_trend_aligned.values.T,
                               category_labels=col_trend_aligned.columns,
                               tick_labels=curr_col_order,
@@ -8640,12 +8764,16 @@ def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_
 
 def compare_groups_to_pathways(
     node_table: pd.DataFrame,
-    quant_df: pd.DataFrame,
+    abundance_df: pd.DataFrame,
     metadata_df: pd.DataFrame,
     output_dir: str = None,
     pe: dict = None,
 ) -> dict:
 
+    log_annotation_coverage(
+        node_table, cols=[pe['pathway_col']],
+        title=f"'{pe['pathway_col']}' coverage of features in the node table, by data type",
+    )
     exploded = prepare_universe(node_table, pe['pathway_col'], 'group', pe)
     overlap_mat, fold_mat, pval_mat, padj_mat = compute_enrichment_matrix(
         exploded, alpha=pe['alpha'], fdr_method=pe.get('fdr_method', 'fdr_bh')
@@ -8699,15 +8827,32 @@ def compare_groups_to_pathways(
     row_dtype_cols, row_dtype_cnt, row_dtype_norm = _get_dtype_composition(exploded, 'group', kept_groups)
     col_dtype_cols, col_dtype_cnt, col_dtype_norm = _get_dtype_composition(exploded, 'pathway', chosen_pathways)
 
-    row_trends = get_trend_values(quant_df, node_table, 'group', metadata_df, pe['trend_sort_by'], pe['trend_collapse_by'], pe['trend_agg'])
-    col_trends = get_trend_values(quant_df, exploded, 'pathway', metadata_df, pe['trend_sort_by'], pe['trend_collapse_by'], pe['trend_agg'])
+    row_trends = get_trend_values(abundance_df, node_table, 'group', metadata_df, pe['trend_sort_by'], pe['trend_collapse_by'], pe['trend_agg'])
+    col_trends = get_trend_values(abundance_df, exploded, 'pathway', metadata_df, pe['trend_sort_by'], pe['trend_collapse_by'], pe['trend_agg'])
+
+    # Descriptive labels: "M00001 (Glycolysis ...)" for KEGG modules/reactions/
+    # pathways. Full names go to the CSVs; heatmap labels are truncated.
+    all_terms = [t for t in padj_mat.index if t != missing_token]
+    term_names = get_term_names(node_table, pe['pathway_col'], all_terms)
+    plot_labels = get_term_labels(
+        node_table, pe['pathway_col'], chosen_pathways,
+        max_name_len=pe.get('label_max_chars', 60),
+    )
+
+    def _relabel_cols(df):
+        return df.rename(columns=plot_labels)
+
+    def _relabel_index(df):
+        return df.rename(index=plot_labels) if df is not None else df
 
     figs = plot_group_pathway_heatmaps(
-        counts_df=counts_df, row_normalized_df=norm_df, enrichment_matrix_df=enrich_df,
-        pval_df=padj_df, row_trends=row_trends, col_trends=col_trends,
+        counts_df=_relabel_cols(counts_df), row_normalized_df=_relabel_cols(norm_df),
+        enrichment_matrix_df=_relabel_cols(enrich_df), pval_df=_relabel_cols(padj_df),
+        row_trends=row_trends, col_trends=_relabel_index(col_trends),
         row_dtype_cols=row_dtype_cols, row_dtype_cnt=row_dtype_cnt, row_dtype_norm=row_dtype_norm,
-        col_dtype_cols=col_dtype_cols, col_dtype_cnt=col_dtype_cnt, col_dtype_norm=col_dtype_norm,
-        trend_cmap=pe.get('trend_cmap', 'RdBu_r'), output_dir=output_dir
+        col_dtype_cols=_relabel_index(col_dtype_cols), col_dtype_cnt=_relabel_index(col_dtype_cnt),
+        col_dtype_norm=_relabel_index(col_dtype_norm),
+        trend_cmap=pe.get('trend_cmap', 'Purples'), output_dir=output_dir
     )
 
     # ---- Export everything
@@ -8715,7 +8860,12 @@ def compare_groups_to_pathways(
         out = pathlib.Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 
-        exploded.to_csv(out / "exploded_universe.csv")
+        exploded.assign(pathway_name=exploded['pathway'].map(term_names).fillna("")).to_csv(
+            out / "exploded_universe.csv"
+        )
+        pd.DataFrame(
+            {"pathway": all_terms, "pathway_name": [term_names.get(t, "") for t in all_terms]}
+        ).to_csv(out / "pathway_names.csv", index=False)
 
         overlap_mat.to_csv(out / "full_overlap_matrix.csv")
         fold_mat.to_csv(out / "full_fold_enrichment_matrix.csv")
@@ -8733,4 +8883,5 @@ def compare_groups_to_pathways(
                 "kept_groups": kept_groups,
             }, f, indent=2, default=str)
 
-    return {"figs": figs, "padj_matrix": padj_df, "selected_pathways": chosen_pathways, "kept_groups": kept_groups}
+    return {"figs": figs, "padj_matrix": padj_df, "selected_pathways": chosen_pathways,
+            "kept_groups": kept_groups, "pathway_names": term_names}

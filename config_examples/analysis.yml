@@ -65,7 +65,7 @@ analysis:
     pathway_col: kegg_module          # kegg_module | kegg_pathway | kegg_reaction | modelseed_pathway
     exclude_nopathway: true          # exclude pathways with no canonical name (modelseed_pathway only)
     exclude_global_maps: true        # drop KEGG global/overview maps (map011xx/map012xx, e.g. map01100) from the test (kegg_pathway only)
-    bipartite_only: true              # keep only pathways with features from every data type
+    bipartite_only: true              # keep only pathways and groups with features from every data type
     min_features_per_pathway: 2       # drop pathways with fewer than this many features before testing
     min_features_per_group: 2         # drop groups with fewer than this many features before testing
     alpha: 0.05                       # FDR significance threshold for enrichment test
@@ -75,5 +75,5 @@ analysis:
     enrichment_value: fold_enrichment # fold_enrichment | neg_log10_padj (heat metric for the enrichment panel)
     trend_sort_by: timepoint          # metadata column to order the trend track's columns by
     trend_collapse_by: timepoint      # metadata column to POOL samples by in the trend track (null = one column per sample)
-    trend_agg: median                 # mean | median -- trend track color statistic
+    trend_agg: median                 # mean | median -- pools replicates' summed abundances per category (track = share of total per category)
     trend_dispersion: none             # sem | std | iqr | none -- trend track opacity statistic

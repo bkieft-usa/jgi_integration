@@ -71,7 +71,8 @@ Configuration path: `analysis.pathway_enrichment`. The notebook calls `analysis.
 | `pathway_col` | Annotation-table column used for the test and heatmaps. `kegg_module` (default; KEGG modules such as `M00001`), `kegg_pathway` (KEGG pathway maps), `kegg_reaction` (KEGG reactions such as `R00351`), or `modelseed_pathway`. All three KEGG levels are always written to the annotation table, so switching only requires changing this value. |
 | `exclude_nopathway` | Excludes pathway labels beginning with `NOPATHWAY_` when true (only relevant to `modelseed_pathway`). |
 | `exclude_global_maps` | Excludes KEGG global/overview maps (`map011xx`/`map012xx`, e.g. `map01100` Metabolic pathways) from the test when true. These maps contain most metabolic features and would otherwise dominate the results. Only relevant to `kegg_pathway`. |
-| `bipartite_only` | When true, retains annotated pathways represented in every included data type. |
+| `label_max_chars` | Optional (default 60). For KEGG columns, heatmap labels read `ID (name)`, e.g. `M00001 (Glycolysis (Embden-Meyerhof pathway)…)`, and names longer than this are shortened with `…`. Full names are always written to `pathway_names.csv`. The run also logs the share of each data type's features in the node table that have a term in `pathway_col`. |
+| `bipartite_only` | When true, retains only annotated pathways (heatmap columns) and feature groups (heatmap rows) that contain features from every included data type. Group membership counts all features in the group, annotated or not. |
 | `min_features_per_pathway` | Minimum annotated feature count for a pathway to be tested. |
 | `min_features_per_group` | Minimum feature count for a group to be retained. |
 | `alpha` | Significance level passed to the multiple-testing routine. Corrected p-value matrices are returned; entries are not filtered by this value. The implementation uses Benjamini-Hochberg when `fdr_method` is not supplied. |
@@ -80,9 +81,9 @@ Configuration path: `analysis.pathway_enrichment`. The notebook calls `analysis.
 | `selected_pathways` | Optional explicit pathway list; when present it takes precedence over ranking and `top_n`. |
 | `rank_by` | `summed_significance` ranks pathways by adjusted significance; other values currently rank by feature count. |
 | `trend_sort_by` | Metadata column used to order the trend-track categories. |
-| `trend_collapse_by` | Metadata column used to pool samples for the trend track; a false/null value leaves sample columns uncollapsed. |
-| `trend_agg` | Aggregation used for pooled trend values, such as `mean` or `median`. |
-| `trend_cmap` | Colormap used for pathway/group trend tracks. |
+| `trend_collapse_by` | Metadata column used to pool samples for the trend track; a false/null value leaves sample columns uncollapsed. The trend track shows, for each group or pathway, the share of its members' summed normalized abundance found in each category (rows sum to 1; data types weighted equally). |
+| `trend_agg` | How replicates' summed abundances are pooled within a category: `mean` or `median`. |
+| `trend_cmap` | Sequential colormap used for pathway/group trend tracks (default `Purples`). |
 
 The current example also contains `show_only_sig`, `enrichment_value`, and `trend_dispersion`. These keys are not currently read by the pathway-enrichment implementation and therefore do not change its results.
 

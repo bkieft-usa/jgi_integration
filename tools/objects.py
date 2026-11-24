@@ -1797,6 +1797,35 @@ class Analysis(BaseDataHandler):
 
         self.group_features_step(overwrite=overwrite, **kwargs)
 
+    def _normalized_abundance_for_trends(self) -> pd.DataFrame:
+        """Concatenate each dataset's linear-scale ``normalized_data`` (features x samples),
+        with feature IDs prefixed by dataset name to match the integrated feature IDs."""
+        frames = []
+        for ds in self.datasets:
+            ds.check_and_load_attribute('normalized_data', ds._normalized_data_filename, False)
+            df = getattr(ds, 'normalized_data', None)
+            if df is None or df.empty:
+                raise RuntimeError(
+                    f"Dataset '{ds.dataset_name}' has no normalized_data. Run normalize_data() first."
+                )
+            df = df.copy()
+            if not df.index.astype(str).str.startswith(f"{ds.dataset_name}_").all():
+                df.index = [f"{ds.dataset_name}_{idx}" for idx in df.index]
+            df.columns = df.columns.astype(str)
+            frames.append(df)
+        return pd.concat(frames, axis=0, join='outer')
+
+    def _sample_metadata_for_trends(self) -> pd.DataFrame:
+        """Link-table metadata with one row per sample, indexed by ``unique_group``
+        (the sample column names of ``normalized_data``)."""
+        metadata = self.integrated_metadata.reset_index(drop=True)
+        if "unique_group" not in metadata.columns:
+            raise ValueError("Integrated metadata is missing required column 'unique_group'.")
+        metadata["unique_group"] = metadata["unique_group"].astype(str)
+        metadata = metadata.drop_duplicates("unique_group").set_index("unique_group", drop=False)
+        metadata.index.name = None
+        return metadata
+
     def compare_groups_to_pathways(self, **override_kwargs) -> dict:
         """
         Compare data-driven feature groups against knowledge-driven pathway annotations.
@@ -1807,23 +1836,23 @@ class Analysis(BaseDataHandler):
 
         Pipeline: (1) explode and filter the feature/pathway universe, (2) 
         compute hypergeometric enrichment matrices, (3) select top pathways 
-        for display, (4) calculate aggregated abundance trends for rows and 
-        columns, (5) plot results as a series of heatmaps with attached 
-        trend tracks.
+        for display, (4) for every group and pathway, compute the share of its
+        members' summed normalized abundance in each metadata category,
+        (5) plot results as a series of heatmaps with attached trend tracks.
 
         Config keys (under ``analysis.pathway_enrichment``):
             ``pathway_col``             - annotation column to use: "kegg_module" (recommended),
                                           "kegg_pathway", "kegg_reaction" or "modelseed_pathway"
             ``exclude_global_maps``     - drop KEGG global/overview maps (map011xx/012xx) from the test
-            ``bipartite_only``          - keep only pathways with features from every data type
+            ``bipartite_only``          - keep only pathways and groups with features from every data type
             ``min_features_per_pathway``- drop pathways smaller than this before testing (default 3)
             ``min_features_per_group``  - drop groups smaller than this before testing (default 5)
             ``alpha``                   - significance threshold for enrichment (default 0.05)
             ``top_n``                   - number of pathways to display in the heatmap (default 50)
             ``trend_sort_by``           - metadata column to order trend track columns by
             ``trend_collapse_by``       - metadata column to pool samples by (e.g. "timepoint")
-            ``trend_agg``               - "mean" | "median" summary shown as trend track color
-            ``trend_cmap``              - colormap for trend tracks (default "RdBu_r")
+            ``trend_agg``               - "mean" | "median" of replicate summed abundances per category
+            ``trend_cmap``              - sequential colormap for trend tracks (default "Purples")
 
         Returns a dict with keys:
             ``figs`` (the heatmap figures), ``pval_matrix`` (full stats table)
@@ -1838,8 +1867,8 @@ class Analysis(BaseDataHandler):
 
         call_params = {
             'node_table':        self.feature_network_node_table,
-            'quant_df':          self.integrated_data_selected,
-            'metadata_df':       self._metadata_for_integrated_data(),
+            'abundance_df':      self._normalized_abundance_for_trends(),
+            'metadata_df':       self._sample_metadata_for_trends(),
             'output_dir':        self.output_dir,
             'pe':                pe,
         }

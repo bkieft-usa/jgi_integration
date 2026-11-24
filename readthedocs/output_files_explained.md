@@ -145,7 +145,7 @@ One row per feature in `integrated_data.csv` (all integrated features, not only 
 | `kegg_module`, `kegg_module_name` | **KEGG level 2: modules** (`M#####`, e.g. `M00001` glycolysis, `M00012` glyoxylate cycle). Smaller functional units than pathway maps, and the recommended level for group–pathway enrichment (`pathway_col: kegg_module`). Fewer features have a module than a pathway, because many KOs are not part of any module. |
 | `kegg_reaction`, `kegg_reaction_name` | **KEGG level 3: reactions** (`R#####`, e.g. `R00200` pyruvate kinase). The most specific level. It directly links an enzyme to the metabolites it acts on, but each reaction has only a few features. Cofactor/currency compounds (water, ATP, NAD(P)H, CoA, CO₂, H⁺, …) are **not** linked at the module or reaction level, because they take part in thousands of reactions. They still receive pathways. |
 
-`Unassigned` means no annotation was found.
+`Unassigned` means no annotation was found. The log prints how many features of each data type (and what percentage) received at least one `modelseed_pathway`, `kegg_pathway`, `kegg_module` and `kegg_reaction` term. `NOPATHWAY_*` placeholders are not counted.
 
 ### 5.3 Data-driven feature groups
 
@@ -211,6 +211,7 @@ This step asks: **does a data-driven group contain more members of a known pathw
    - `bipartite_only`: keep only pathways with members from **every** data type present.
    - `min_features_per_pathway`: drop small pathways.
    - `min_features_per_group`: drop small groups.
+   - `bipartite_only`: also keep only groups whose members (annotated or not) span **every** data type present.
    
    Unannotated features stay in the background count but are never tested.
 2. **Test.** For every pathway x group pair with at least one shared feature, a one-sided hypergeometric test gives the probability of seeing at least that many pathway members in the group by chance. Here *M* = number of features in the universe, *n* = features in the pathway, *N* = features in the group and *k* = the overlap.
@@ -222,13 +223,14 @@ This step asks: **does a data-driven group contain more members of a known pathw
 
 | File | Contents |
 |---|---|
-| `exploded_universe.csv` | The tested universe: one row per feature–pathway pair (index = feature ID; columns `group`, `pathway`, and `dtype` when `bipartite_only` is on). |
+| `exploded_universe.csv` | The tested universe: one row per feature–pathway pair (index = feature ID; columns `group`, `pathway`, `pathway_name`, and `dtype` when `bipartite_only` is on). |
+| `pathway_names.csv` | Every tested term (`pathway`) with its full descriptive name from KEGG (`pathway_name`), e.g. `M00001` → `Glycolysis (Embden-Meyerhof pathway), glucose => pyruvate`. The name is empty for `modelseed_pathway`, whose IDs already include it. |
 | `full_overlap_matrix.csv` | Pathway x group: number of shared features (*k*). |
 | `full_fold_enrichment_matrix.csv` | Pathway x group: fold enrichment. |
 | `full_pvalue_matrix.csv` | Pathway x group: raw hypergeometric p-values. |
 | `full_padj_matrix.csv` | Pathway x group: BH-adjusted p-values. **Use this table for significance calls** (compare it with `alpha` in the config). |
-| `group_trend_values.csv` | Group x metadata category: the `trend_agg` (mean or median) of the selected-data values of the group's members, after pooling samples by `trend_collapse_by` (for example, timepoint). |
-| `pathway_trend_values.csv` | The same summary for each pathway (all universe features in the pathway). |
+| `group_trend_values.csv` | Group x metadata category: the share of the group's summed abundance found in each category. For each data type, the normalized (linear-scale, not log or z-scored) abundances of the group's members are summed per sample, pooled over the replicates in each `trend_collapse_by` category with `trend_agg` (mean or median), and divided by the total across categories. Shares are then averaged over the group's data types, so each data type counts equally whatever its units. Each row sums to 1. |
+| `pathway_trend_values.csv` | The same shares for each pathway (all universe features in the pathway). |
 | `run_config.json` | The `pathway_enrichment` settings used, plus the pathways and groups that were actually drawn. |
 
 **Tip:** to list significant results, combine `full_padj_matrix.csv` (padj < `alpha`) with `full_fold_enrichment_matrix.csv` and `full_overlap_matrix.csv`. A significant result based on an overlap of 2 features is weak evidence even when its fold enrichment is high.
