@@ -267,23 +267,23 @@ The grouping method's own structure, saved so that the explorer can draw it fait
 
 ### 5.6 Explorer bundle: `explorer/`
 
-Precomputed tables for the interactive explorer (`jgi-integrate explore`), written by the last pipeline stage (`build_explorer`). The folder is self-contained: copy it anywhere and open it with `jgi-integrate explore --bundle <folder>`. All tables are parquet files; open them with `pandas.read_parquet`. See `explorer.md` for the statistics used.
+Precomputed tables for the interactive explorer (`jgi-integrate explore`), written by the last pipeline stage (`build_explorer`). The folder is self-contained: copy it anywhere and open it with `jgi-integrate explore --bundle <folder>`. All tables are parquet files; open them with `pandas.read_parquet`. See `explorer.md` and the explorer's Methods tab for the statistics used.
 
 | File | Contents |
 |---|---|
-| `manifest.json` | Run identity, grouping method, metadata variables and their types, detected nesting, annotation types, settings, build timings. |
+| `manifest.json` | Run identity, grouping method, metadata variables (with types, detected nesting and identical-variable aliases), annotation types, feature-network summary, number of tests, settings, build timings. |
 | `samples.parquet`, `sample_metadata.parquet`, `sample_similarity.parquet` | Aligned metadata with sample PCA/UMAP coordinates; per-sample metadata; sample correlation matrix (clustered order). |
-| `features.parquet` | One row per integrated feature: data type, display name, group, noise flag, annotation count, UMAP position, kME (correlation with its group eigengene). |
+| `features.parquet` | One row per integrated feature: data type, display name, group, noise flag, annotation count, network position (`x`, `y`) and degree, kME (correlation with its group eigengene). |
 | `abundance_z.parquet`, `abundance_log.parquet` | Integrated z-scores; per-dataset log-scale abundance. |
-| `annotations_long.parquet`, `terms.parquet` | Feature–term pairs (full annotation scope); one row per term with sizes and group concentration statistics. |
-| `groups.parquet`, `group_eigengenes.parquet`, `group_network.parquet` | Group summaries (size, data types, coherence, top term, strongest association); eigengene per sample; eigengene-correlation edges between groups. |
-| `term_scores.parquet` | Mean z-score profile per term. |
-| `enrichment.parquet` | Every tested term–group pair (all annotation types). |
-| `associations.parquet` | Feature, group and term tests against every metadata variable (moderated F/t, CAMERA). |
-| `agreement_types/terms/groups/null.parquet` | Knowledge vs data-driven agreement: per annotation type (AMI, ARI, co-membership vs permutation null), per term, per group. |
-| `feature_edges.parquet` | Real network edges (network_modules only). |
-| `native_structure.json` | Dendrogram or HDBSCAN cluster tree for the Groups page. |
-| `candidates.parquet` | Unannotated features in groups with significant enrichment (discovery list). |
+| `annotations_long.parquet`, `terms.parquet` | Feature–term pairs (full annotation scope); one row per term with sizes, its largest share in one group and the number of groups it spans. |
+| `groups.parquet`, `group_eigengenes.parquet` | Group summaries (size, data types, coherence, top term, strongest association); eigengene per sample. |
+| `term_eigengenes.parquet` | Eigengene per sample for every term with at least 3 features. |
+| `enrichment.parquet` | Every tested term–group pair (all annotation types): hypergeometric p and BH-adjusted padj. |
+| `associations.parquet` | Feature, group and term tests against every metadata variable: moderated F (all levels) and moderated t for every pair of levels, or the slope for continuous variables. |
+| `agreement.parquet` | Per annotation type: observed same-group share of co-annotated feature pairs, the share expected with random groups, their ratio and the permutation p. |
+| `feature_edges.parquet` | The feature network: the run's own edges (network methods) or the k-nearest-neighbour correlation edges derived for display (other methods). |
+| `discovery_votes.parquet` | Neighbour-voting results for features lacking an annotation type: term, neighbours carrying it (k of n), hypergeometric p and padj. |
+| `native_structure.json` | Dendrogram or HDBSCAN cluster tree (hierarchical clustering / HDBSCAN only). |
 
 ### 5.7 Other figures in the Analysis folder
 
