@@ -26,7 +26,7 @@ def _null_design(rng, n_feat=2000, groups=4, reps=5):
 
 def test_moderated_tests_are_calibrated_under_null():
     df, meta = _null_design(np.random.default_rng(1))
-    tab, _ = st.associate_matrix(df, meta, ["trt"], {"trt": "categorical"}, {}, "feature")
+    tab = st.associate_matrix(df, meta, ["trt"], {"trt": "categorical"}, {}, "feature")
     for test in ("moderated_F", "moderated_t"):
         p = tab.loc[tab["test"] == test, "p"].to_numpy()
         assert sps.kstest(p, "uniform").pvalue > 0.001, test
@@ -38,12 +38,14 @@ def test_planted_effect_detected_and_bh_controls_fdr():
     df, meta = _null_design(rng)
     sd = df.iloc[:100].std(axis=1).to_numpy()[:, None]
     df.iloc[:100, meta["trt"].to_numpy() == "t0"] += 3 * sd   # a 3-SD shift for each planted feature
-    tab, _ = st.associate_matrix(df, meta, ["trt"], {"trt": "categorical"}, {}, "feature")
-    t0 = tab[(tab["contrast"] == "t0 vs rest")].set_index("entity_id")
-    hits = t0["padj"] < 0.05
-    assert hits.loc[[f"f{i}" for i in range(100)]].mean() > 0.9
-    false = hits.drop([f"f{i}" for i in range(100)]).sum()
-    assert false / max(hits.sum(), 1) < 0.1
+    tab = st.associate_matrix(df, meta, ["trt"], {"trt": "categorical"}, {}, "feature")
+    planted = [f"f{i}" for i in range(100)]
+    for contrast, power in (("omnibus", 0.8), ("t0 vs t1", 0.7)):  # a pair has 5 vs 5 samples: less power
+        t0 = tab[(tab["contrast"] == contrast)].set_index("entity_id")
+        hits = t0["padj"] < 0.05
+        assert hits.loc[planted].mean() > power, contrast
+        false = hits.drop(planted).sum()
+        assert false / max(hits.sum(), 1) < 0.1, contrast
 
 
 def test_nesting_aggregation_prevents_pseudoreplication():
@@ -58,8 +60,8 @@ def test_nesting_aggregation_prevents_pseudoreplication():
     nesting = md.detect_nesting(meta, ["organism", "lineage"])
     assert nesting == {"organism": None, "lineage": "organism"}
     types = {"organism": "categorical", "lineage": "categorical"}
-    nested, _ = st.associate_matrix(df, meta, ["lineage"], types, nesting, "feature")
-    naive, _ = st.associate_matrix(df, meta, ["lineage"], types, {}, "feature")
+    nested = st.associate_matrix(df, meta, ["lineage"], types, nesting, "feature")
+    naive = st.associate_matrix(df, meta, ["lineage"], types, {}, "feature")
     assert (nested["p"] < 0.05).mean() < 0.08          # calibrated at the organism level
     assert (naive["p"] < 0.05).mean() > 0.2            # pseudo-replication inflates
     assert (nested["n"] == 6).all() and (nested["unit"] == "organism").all()
@@ -71,28 +73,58 @@ def test_continuous_variable_slope():
     meta = pd.DataFrame({"dose": x}, index=[f"s{i}" for i in range(len(x))])
     Y = rng.normal(size=(500, len(x)))
     Y[:50] += 0.5 * x
-    tab, _ = st.associate_matrix(pd.DataFrame(Y, columns=meta.index), meta, ["dose"], {"dose": "continuous"}, {},
+    tab = st.associate_matrix(pd.DataFrame(Y, columns=meta.index), meta, ["dose"], {"dose": "continuous"}, {},
                                  "feature")
     assert set(tab["test"]) == {"moderated_t"}
     assert (tab.iloc[:50]["padj"] < 0.05).all()
     assert np.allclose(tab.iloc[:50]["effect"].mean(), 0.5, atol=0.1)
 
 
-def test_camera_corrects_for_intra_set_correlation():
-    rng = np.random.default_rng(5)
-    samples = [f"s{i}" for i in range(24)]
-    meta = pd.DataFrame({"trt": ["a"] * 12 + ["b"] * 12}, index=samples)
-    Y = rng.normal(size=(3000, 24))
-    Y[:100] += 1.5 * rng.normal(size=24)       # correlated but unrelated to treatment
-    Y[100:200, 12:] += 1.0                      # truly shifted
-    _, fits = st.associate_matrix(pd.DataFrame(Y, columns=samples), meta, ["trt"], {"trt": "categorical"}, {},
-                                  "feature", keep_fits=True)
-    fit, _ = fits["trt"]
-    z = st.t_to_z(st.moderated_t(fit, fit.contrasts["a"])[1], fit.df_total)
-    res = st.camera(z, fit.residuals, {"corr_null": np.arange(100), "shifted": np.arange(100, 200)}).set_index("set")
-    assert res.loc["corr_null", "p"] > 0.01
-    assert res.loc["shifted", "p"] < 1e-6
-    assert res.loc["corr_null", "correlation"] > 0.3
+def test_pairwise_contrasts_cover_every_pair_with_mean_difference_effects():
+    df, meta = _null_design(np.random.default_rng(5), n_feat=200, groups=4)
+    tab = st.associate_matrix(df, meta, ["trt"], {"trt": "categorical"}, {}, "feature")
+    pairs = sorted(set(tab.loc[tab["test"] == "moderated_t", "contrast"]))
+    assert pairs == ["t0 vs t1", "t0 vs t2", "t0 vs t3", "t1 vs t2", "t1 vs t3", "t2 vs t3"]
+    assert set(tab.loc[tab["test"] == "moderated_F", "contrast"]) == {"omnibus"}
+    t = tab[tab["contrast"] == "t1 vs t3"].set_index("entity_id")
+    means = df.T.groupby(meta["trt"]).mean().T
+    assert np.allclose(t["effect"], (means["t1"] - means["t3"]).loc[t.index], atol=1e-8)
+    # binary variable: one comparison, no F test (it would equal t squared)
+    two = meta.assign(trt=np.where(meta["trt"].isin(["t0", "t1"]), "a", "b"))
+    tab2 = st.associate_matrix(df, two, ["trt"], {"trt": "categorical"}, {}, "feature")
+    assert set(tab2["contrast"]) == {"a vs b"} and set(tab2["test"]) == {"moderated_t"}
+
+
+def test_identical_variables_are_tested_once():
+    meta = pd.DataFrame({"organism": list("aabbcc"), "lineage": list("XXXXYY"),
+                         "group": ["a-X", "a-X", "b-X", "b-X", "c-Y", "c-Y"], "rep": [1, 2] * 3})
+    assert md.identical_variables(meta, ["organism", "lineage", "group", "rep"]) == {"group": "organism"}
+
+
+def test_knn_network_layout_and_neighbor_votes():
+    from tools.explorer_bundle import network as net
+    rng = np.random.default_rng(7)
+    base = rng.normal(size=(2, 12))
+    z = pd.DataFrame(np.vstack([base[0] + rng.normal(0, 0.1, (10, 12)), base[1] + rng.normal(0, 0.1, (10, 12))]),
+                     index=[f"tx_a{i}" for i in range(10)] + [f"tx_b{i}" for i in range(10)])
+    e = net.knn_edges(z, k=3)
+    assert len(e) and not (e["source"] == e["target"]).any()
+    same = e["source"].str[3] == e["target"].str[3]
+    assert same.mean() > 0.95                                   # neighbours come from the same cluster
+    xy = net.layout(z.index, e)
+    assert np.isfinite(xy.to_numpy()).all() and len(xy) == 20
+    # cluster a carries term T1 (except tx_a0, unannotated); cluster b carries T2
+    ann = pd.DataFrame({"feature_id": [f"tx_a{i}" for i in range(1, 10)] + [f"tx_b{i}" for i in range(10)],
+                        "ann_type": "kegg_module", "term_name": ""})
+    ann["term_id"] = np.where(ann["feature_id"].str.startswith("tx_a"), "T1", "T2")
+    types = [annot.AnnType("kegg_module", "KEGG module", "kegg_module", None, ";", "id_name", None)]
+    votes = net.neighbor_votes(e, z.index, ann, types, pd.Series("tx", index=z.index))
+    v = votes.set_index(["feature_id", "term_id"])
+    assert set(votes["feature_id"]) == {"tx_a0"}               # only the unannotated feature is a candidate
+    assert v.loc[("tx_a0", "T1"), "share"] == 1.0
+    one = net.votes_from_neighbors(net.adjacency(e).query("feature_id == 'tx_a0'")["neighbor"], ann,
+                                   net.vote_background(ann, z.index))
+    assert one.iloc[0]["term_id"] == "T1" and np.isclose(one.iloc[0]["p"], v.loc[("tx_a0", "T1"), "p"])
 
 
 def test_bh_matches_statsmodels():
@@ -176,27 +208,32 @@ def _pq(out, name):
 def test_bundle_files_and_no_unnamed_columns(built):
     method, a, out = built
     m = json.load(open(os.path.join(out, "manifest.json")))
-    assert m["grouping_method"] == method and m["schema_version"] == 1
+    assert m["grouping_method"] == method and m["schema_version"] == 2
     for name in ("samples", "features", "abundance_z", "abundance_log", "annotations_long", "groups", "terms",
-                 "enrichment", "associations", "group_eigengenes", "term_scores", "candidates", "group_network"):
+                 "enrichment", "associations", "group_eigengenes", "term_eigengenes", "agreement", "feature_edges",
+                 "discovery_votes"):
         df = _pq(out, name)
         assert not any(str(c).startswith("Unnamed") for c in df.columns), name
     assert bundle_is_current(a)
     assert m["nesting"] == {"lineage": "organism"}
     assert set(m["variables"]) == {"organism", "lineage", "group", "replicate"}
+    assert m["variable_aliases"] == {"group": "organism"}         # same partition: tested once
+    assert "group" not in set(_pq(out, "associations")["variable"])
 
 
 def test_bundle_recovers_planted_signals(built):
     method, a, out = built
     assoc = _pq(out, "associations")
-    feat = assoc[(assoc["entity_type"] == "feature") & (assoc["variable"] == "organism") &
-                 (assoc["contrast"] == "o0 vs rest")].set_index("entity_id")
+    org = assoc[assoc["variable"] == "organism"]
+    assert len(set(org.loc[(org["entity_type"] == "feature") & (org["test"] == "moderated_t"), "contrast"])) == 15
+    feat = org[(org["entity_type"] == "feature") & (org["contrast"] == "omnibus")].set_index("entity_id")
     planted = [f for f in feat.index if f.startswith("tx_g0") or f.startswith("mx_0")]
     assert (feat.loc[planted, "padj"] < 0.05).mean() > 0.9
-    assert (feat.loc[planted, "effect"] > 2).all()
-    grp = assoc[(assoc["entity_type"] == "group") & (assoc["contrast"] == "o0 vs rest") &
-                (assoc["variable"] == "organism")].set_index("entity_id")
+    grp = org[(org["entity_type"] == "group") & (org["contrast"] == "omnibus")].set_index("entity_id")
     assert grp.loc["group_1", "padj"] < 0.05
+    term = org[(org["entity_type"] == "term") & (org["entity_id"] == "kegg_module::M00001") &
+               (org["contrast"] == "omnibus")]
+    assert term["padj"].iloc[0] < 0.05                          # term eigengene follows group_1
     enr = _pq(out, "enrichment")
     m1 = enr[(enr["ann_type"] == "kegg_module") & (enr["term_id"] == "M00001")].set_index("group")
     assert m1.loc["group_1", "padj"] < 0.05
@@ -206,24 +243,30 @@ def test_bundle_recovers_planted_signals(built):
     assert assoc["p"].dtype == np.float64
 
 
-def test_bundle_method_specific_structure(built):
+def test_bundle_network_and_method_specific_structure(built):
     method, a, out = built
+    m = json.load(open(os.path.join(out, "manifest.json")))
     native = json.load(open(os.path.join(out, "native_structure.json")))
     groups = _pq(out, "groups").set_index("group")
+    feats = _pq(out, "features").set_index("feature_id")
     enr = _pq(out, "enrichment")
+    grouped = feats.dropna(subset=["group"])
+    assert grouped[["x", "y"]].notna().all().all()               # every grouped feature is placed
+    assert feats.loc[feats["group"].isna(), "x"].isna().all()
+    e = _pq(out, "feature_edges")
+    pairs = {tuple(sorted(p)) for p in zip(e["source"], e["target"])}
+    assert len(pairs) == len(e)                                  # undirected, no duplicates
+    if method == "network_modules":
+        assert m["network"]["kind"] == "real" and native is None
+    else:
+        assert m["network"]["kind"] == "knn" and len(e) >= len(grouped)
     if method == "hierarchical_clustering":
         assert native["kind"] == "dendrogram" and native["approximate"] is False
         assert sorted(native["leaf_groups"]) == sorted(groups.index)
-    elif method == "network_modules":
-        e = _pq(out, "feature_edges")
-        pairs = {tuple(sorted(p)) for p in zip(e["source"], e["target"])}
-        assert len(pairs) == len(e)                     # both-direction duplicates removed
-        assert native["kind"] == "network"
-    else:
+    if method == "hdbscan":
         assert groups.loc["noise", "is_noise"]
-        assert "noise" not in set(enr["group"])           # noise is never tested as a group
-        assert "noise" not in set(_pq(out, "candidates")["group"])
-        assert int(json.load(open(os.path.join(out, "manifest.json")))["n_noise"]) == 25
+        assert "noise" not in set(enr["group"])                  # noise is never tested as a group
+        assert int(m["n_noise"]) == 25
 
 
 def test_bundle_rebuild_skipped_when_current(built, caplog):
