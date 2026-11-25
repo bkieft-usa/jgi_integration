@@ -1,4 +1,4 @@
-# Build and publish the multi-arch release image bkieft/jgi-integration.
+# Build and publish the multi-arch release image ghcr.io/bkieft-usa/jgi-integration.
 #
 #   push to main      -> :latest and :sha-<short commit>
 #   push a tag vX.Y.Z -> :X.Y.Z and :X.Y (pin a release with tag=X.Y.Z ./start.command)
@@ -7,9 +7,9 @@
 # Each architecture builds natively on its own runner (no emulation); the merge job then combines the two
 # into one tag, so Docker pulls the right one on every machine.
 #
-# Repository secrets (Settings > Secrets and variables > Actions):
-#   DOCKERHUB_USERNAME  Docker Hub account that owns bkieft/jgi-integration
-#   DOCKERHUB_TOKEN     Docker Hub personal access token with Read & Write scope
+# No secrets needed: the run's built-in GITHUB_TOKEN pushes to GitHub Container Registry (packages: write).
+# After the first publish, make the package public once (repo page > Packages > jgi-integration >
+# Package settings > Change visibility), so users can pull without logging in.
 #
 # Later: add a tests job and list it in build's `needs:` so images are published only when tests pass.
 name: Docker image
@@ -26,9 +26,10 @@ concurrency:
 
 permissions:
   contents: read
+  packages: write
 
 env:
-  IMAGE: bkieft/jgi-integration
+  IMAGE: ghcr.io/bkieft-usa/jgi-integration
 
 jobs:
   build:
@@ -60,8 +61,9 @@ jobs:
 
       - uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push by digest
         id: build
@@ -76,7 +78,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ env.PLATFORM_PAIR }}
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ env.PLATFORM_PAIR }},mode=max
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ env.PLATFORM_PAIR }},mode=max,image-manifest=true,oci-mediatypes=true
 
       - name: Export digest
         run: |
@@ -105,8 +107,9 @@ jobs:
 
       - uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta
         uses: docker/metadata-action@v5

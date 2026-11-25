@@ -4,7 +4,7 @@
 # Ports are bound to 127.0.0.1 so neither JupyterLab nor the explorer is reachable from other machines.
 services:
   jgi-integration:
-    image: bkieft/jgi-integration:${tag:-latest}
+    image: ghcr.io/bkieft-usa/jgi-integration:${tag:-latest}
     container_name: jgi-integration
     volumes:
       - ${PWD}:/home/jovyan/work/input_data

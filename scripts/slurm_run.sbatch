@@ -17,7 +17,7 @@
 set -euo pipefail
 INPUT=${1:?usage: sbatch slurm_run.sbatch <input_data dir> <output_data dir>}
 OUTPUT=${2:?usage: sbatch slurm_run.sbatch <input_data dir> <output_data dir>}
-IMAGE=${IMAGE:-docker://bkieft/jgi-integration:latest}
+IMAGE=${IMAGE:-docker://ghcr.io/bkieft-usa/jgi-integration:latest}
 RUNTIME=${RUNTIME:-apptainer}
 EXTRA_ARGS=${EXTRA_ARGS:-}          # e.g. "--stop-after group_features" or "--start-at enrich"
 

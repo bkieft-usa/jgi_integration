@@ -151,23 +151,23 @@ cd /path/to/project_data/input_data
 ./start.command
 ```
 
-`start.command` starts Docker Desktop if it is not running, downloads the newest image (`bkieft/jgi-integration:latest`; Docker picks the build for your computer's CPU), starts the container and opens JupyterLab in your browser. If no tab opens, copy the link it prints into your browser.
+`start.command` starts Docker Desktop if it is not running, downloads the newest image (`ghcr.io/bkieft-usa/jgi-integration:latest`; Docker picks the build for your computer's CPU), starts the container and opens JupyterLab in your browser. If no tab opens, copy the link it prints into your browser.
 
 Leave the `start.command` window open while you work. To finish, press **Ctrl+C** in that window, or close it; either stops the container. Your files in `input_data` and `output_data` are kept.
 
 It stops with a message if Docker is not installed, or if another program is already using port 8888 or 8050 (for example another JupyterLab). Stop that program and run it again.
 
-To use a specific published image instead of the newest, set its tag, e.g. `tag=1.2.0 ./start.command` for a release or `tag=sha-1a2b3c4` for a single commit (tags are listed on [Docker Hub](https://hub.docker.com/r/bkieft/jgi-integration/tags)).
+To use a specific published image instead of the newest, set its tag, e.g. `tag=1.2.0 ./start.command` for a release or `tag=sha-1a2b3c4` for a single commit (tags are listed on the [package page](https://github.com/bkieft-usa/jgi_integration/pkgs/container/jgi-integration)).
 
 ### For developers
 
-**Working on the code.** `./start.command --dev` starts your local `bkieft/jgi-integration:dev` image with `dev/docker-compose-dev.yml` (copy it from `docker/docker-compose-dev.example.yml`). The dev image, built from `docker/Dockerfile-dev`, contains only the Python environment; the compose file mounts your `jgi_integration` checkout into the container, so code edits take effect without rebuilding. Build it once, and again only when `venv/pyproject.toml` or `venv/uv.lock` change:
+**Working on the code.** `./start.command --dev` starts your local `ghcr.io/bkieft-usa/jgi-integration:dev` image with `dev/docker-compose-dev.yml` (copy it from `docker/docker-compose-dev.example.yml`). The dev image, built from `docker/Dockerfile-dev`, contains only the Python environment; the compose file mounts your `jgi_integration` checkout into the container, so code edits take effect without rebuilding. Build it once, and again only when `venv/pyproject.toml` or `venv/uv.lock` change:
 
 ```sh
-docker build -t bkieft/jgi-integration:dev -f docker/Dockerfile-dev .
+docker build -t ghcr.io/bkieft-usa/jgi-integration:dev -f docker/Dockerfile-dev .
 ```
 
-**Releasing.** `.github/workflows/docker-image.yml` builds `docker/Dockerfile` for linux/amd64 and linux/arm64 on every push to `main` and publishes it as `:latest` and `:sha-<commit>`. Pushing a git tag `vX.Y.Z` also publishes `:X.Y.Z` and `:X.Y`. The image contains the code of the commit that was pushed, and each run's `run_manifest.json` records that commit. The workflow needs two repository secrets: `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token with Read & Write scope).
+**Releasing.** `.github/workflows/docker-image.yml` builds `docker/Dockerfile` for linux/amd64 and linux/arm64 on every push to `main` and publishes it as `:latest` and `:sha-<commit>`. Pushing a git tag `vX.Y.Z` also publishes `:X.Y.Z` and `:X.Y`. The image contains the code of the commit that was pushed, and each run's `run_manifest.json` records that commit. Images are published to GitHub Container Registry (`ghcr.io/bkieft-usa/jgi-integration`) with the workflow's built-in token, so no secrets are needed. The package must be public so users can pull it without logging in; set this once on the package page under **Package settings → Change visibility**.
 
 **Packaging a project for users.** Users need only the `project_data` folder; the code comes with the image. In `input_data/`, put a real copy (not a symlink) of `docker/start.command`, executable, and `docker/docker-compose.example.yml` renamed `docker-compose.yml`. Archive it as `.tar.gz`, which keeps `start.command` executable (`-h` stores the files that symlinks point to):
 

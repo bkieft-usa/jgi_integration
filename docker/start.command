@@ -6,7 +6,7 @@
 #           System Settings > Privacy & Security > Open Anyway, or run: bash start.command)
 #   Linux:  ./start.command
 #
-#   ./start.command             newest published image (bkieft/jgi-integration:latest, for any CPU)
+#   ./start.command             newest published image (ghcr.io/bkieft-usa/jgi-integration:latest, for any CPU)
 #   ./start.command --dev       your local build of docker/Dockerfile-dev (:dev), with dev/docker-compose-dev.yml
 #   tag=<tag> ./start.command   a specific published image, e.g. tag=1.2.0 or tag=sha-1a2b3c4
 #
@@ -57,9 +57,9 @@ if ! docker info >/dev/null 2>&1; then
     fi
     docker info >/dev/null 2>&1 || die "Docker is not running. Start Docker, then run this again."
 fi
-if [ "$dev" -eq 1 ] && ! docker image inspect "bkieft/jgi-integration:${tag}" >/dev/null 2>&1; then
-    die "no local image bkieft/jgi-integration:${tag}. Build it from your jgi_integration checkout:
-  docker build -t bkieft/jgi-integration:${tag} -f docker/Dockerfile-dev ."
+if [ "$dev" -eq 1 ] && ! docker image inspect "ghcr.io/bkieft-usa/jgi-integration:${tag}" >/dev/null 2>&1; then
+    die "no local image ghcr.io/bkieft-usa/jgi-integration:${tag}. Build it from your jgi_integration checkout:
+  docker build -t ghcr.io/bkieft-usa/jgi-integration:${tag} -f docker/Dockerfile-dev ."
 fi
 docker compose version >/dev/null 2>&1 || die "'docker compose' is missing. Update Docker Desktop, or install the docker-compose-plugin on Linux."
 
@@ -73,7 +73,7 @@ done
 # ---- start -------------------------------------------------------------------------------------------
 compose() { docker compose -p "$PROJECT" -f "$compose_file" "$@"; }
 
-echo "Starting ${CONTAINER} with image bkieft/jgi-integration:${tag}"
+echo "Starting ${CONTAINER} with image ghcr.io/bkieft-usa/jgi-integration:${tag}"
 compose up -d --force-recreate --pull "$pull" || die "the container did not start (see the messages above)."
 
 stop_container() {

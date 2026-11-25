@@ -1,5 +1,5 @@
 # Release image: environment + workflow code. Built for linux/amd64 and linux/arm64 by
-# .github/workflows/docker-image.yml on every push to main, and published as bkieft/jgi-integration:latest.
+# .github/workflows/docker-image.yml on every push to main, and published as ghcr.io/bkieft-usa/jgi-integration:latest.
 FROM quay.io/jupyter/base-notebook:latest
 
 ######## Install base software

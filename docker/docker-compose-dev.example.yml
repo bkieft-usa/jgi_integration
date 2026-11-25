@@ -4,7 +4,7 @@
 # Adjust the first volume if your checkout is not at ../../jgi_integration relative to input_data/.
 services:
   jgi-integration:
-    image: bkieft/jgi-integration:${tag:-dev}   # local build of docker/Dockerfile-dev
+    image: ghcr.io/bkieft-usa/jgi-integration:${tag:-dev}   # local build of docker/Dockerfile-dev
     container_name: jgi-integration
     volumes:
       - ${PWD}/../../jgi_integration:/home/jovyan/work/jgi_integration
