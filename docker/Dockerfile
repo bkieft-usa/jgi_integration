@@ -1,4 +1,6 @@
-FROM jupyter/base-notebook:latest
+# Release image: environment + workflow code. Built for linux/amd64 and linux/arm64 by
+# .github/workflows/docker-image.yml on every push to main, and published as bkieft/jgi-integration:latest.
+FROM quay.io/jupyter/base-notebook:latest
 
 ######## Install base software
 USER root
@@ -13,9 +15,10 @@ RUN apt-get update && \
 ######## Set up user environment
 ENV HOME=/home/jovyan
 ENV WORK=${HOME}/work
+ENV REPO=${WORK}/jgi_integration
 ENV MPLCONFIGDIR="${HOME}/.cache/matplotlib"
-ENV PYTHONPATH="${WORK}/jgi_integration"
-RUN mkdir -p ${WORK} ${HOME}/.cache/matplotlib ${HOME}/.cache/uv && \
+ENV PYTHONPATH="${REPO}"
+RUN mkdir -p ${REPO}/venv ${HOME}/.cache/matplotlib ${HOME}/.cache/uv && \
     chown -R jovyan:users ${WORK} ${HOME}/.cache
 
 ######## Start as jovyan
@@ -26,29 +29,30 @@ WORKDIR ${WORK}
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="${HOME}/.local/bin:${PATH}"
 
-######## Set up software environment with uv
+######## Python environment (before the code, so code-only changes reuse this layer)
 # dash ships a legacy JupyterLab source extension (only for inline Dash in notebooks, unused here);
 # removing it stops JupyterLab from prompting for a rebuild.
-RUN git clone https://github.com/bkieft-usa/jgi_integration.git && \
-    cd jgi_integration && \
-    cp notebooks/workflow.ipynb ../ && \
-    cp docker/jupyter_server_config.py ${HOME}/.jupyter/jupyter_server_config.py && \
-    cd venv && \
-    uv sync --locked && \
+COPY --chown=jovyan:users venv/pyproject.toml venv/uv.lock ${REPO}/venv/
+RUN cd ${REPO}/venv && \
+    uv sync --locked --python 3.11 && \
+    uv cache clean && \
     rm -f .venv/share/jupyter/lab/extensions/dash-jupyterlab.tgz
-ENV VIRTUAL_ENV=${WORK}/jgi_integration/venv/.venv
-ENV PATH="${VIRTUAL_ENV}/bin:${WORK}/jgi_integration/bin:${PATH}"
+ENV VIRTUAL_ENV=${REPO}/venv/.venv
+ENV PATH="${VIRTUAL_ENV}/bin:${REPO}/bin:${PATH}"
 ENV MPLBACKEND=Agg
 
-######## Ports: 8888 = JupyterLab, 8050 = integration explorer (python -m tools.cli explore --host 0.0.0.0)
-EXPOSE 8888 8050
-
-######## Set up user workflow environment
 RUN python -m ipykernel install --user \
     --name=jgi-integration \
     --display-name="JGI Integration"
 
-######## Ensure proper permissions after setting up container
-USER root
-RUN chown -R jovyan:users ${HOME}
-USER jovyan
+######## Workflow code (the build context is the repository; see .dockerignore)
+COPY --chown=jovyan:users . ${REPO}
+RUN cp ${REPO}/notebooks/workflow.ipynb ${WORK}/ && \
+    cp ${REPO}/docker/jupyter_server_config.py ${HOME}/.jupyter/jupyter_server_config.py
+
+# Commit the image was built from; recorded in each run's run_manifest.json (the image has no .git).
+ARG GIT_SHA=""
+ENV JGI_GIT_SHA=${GIT_SHA}
+
+######## Ports: 8888 = JupyterLab, 8050 = integration explorer
+EXPOSE 8888 8050

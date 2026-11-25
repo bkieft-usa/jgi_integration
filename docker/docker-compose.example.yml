@@ -1,38 +1,15 @@
-# Example compose file. Copy next to your input_data/ folder and set tag=<image tag>.
-#   docker compose up jgi-integration            # JupyterLab on http://localhost:8888; start the explorer
-#                                                 # from its notebook or terminal -> http://localhost:8050
-#   docker compose run --rm pipeline              # headless run of the whole workflow (CLI)
-#   PROJECT=<name> DP=<hash> AN=<hash> docker compose up explorer
-#                                                 # explorer only, without JupyterLab, on http://localhost:8050
-#                                                 # (stop jgi-integration first: both use port 8050)
-x-common: &common
-  image: bkieft/jgi-integration:${tag:-latest}
-  volumes:
-    - ${PWD}:/home/jovyan/work/input_data
-    - ${PWD}/../output_data:/home/jovyan/work/output_data
-  working_dir: /home/jovyan/work/
-
+# Distributed as input_data/docker-compose.yml, next to start.command, which runs it:
+#   ./start.command      (or double-click it on macOS) -> starts the container and opens JupyterLab
+# Run the workflow and the explorer from JupyterLab (notebook or terminal); the explorer is on http://localhost:8050.
+# Ports are bound to 127.0.0.1 so neither JupyterLab nor the explorer is reachable from other machines.
 services:
   jgi-integration:
-    <<: *common
+    image: bkieft/jgi-integration:${tag:-latest}
     container_name: jgi-integration
+    volumes:
+      - ${PWD}:/home/jovyan/work/input_data
+      - ${PWD}/../output_data:/home/jovyan/work/output_data
+    working_dir: /home/jovyan/work/
     ports:
-      - "8888:8888"   # JupyterLab
-      - "8050:8050"   # integration explorer
-
-  pipeline:
-    <<: *common
-    profiles: ["cli"]
-    command: >
-      python -m tools.cli run --config-dir /home/jovyan/work/input_data/config
-      --log-file /home/jovyan/work/output_data/last_run.log
-
-  explorer:
-    <<: *common
-    profiles: ["explorer"]
-    ports:
-      - "8050:8050"
-    command: >
-      python -m tools.cli explore --host 0.0.0.0 --port 8050
-      --project-dir /home/jovyan/work/output_data/${PROJECT:?set PROJECT=<project_name>}
-      -d ${DP:?set DP=<data processing hash>} -a ${AN:?set AN=<analysis hash>}
+      - "127.0.0.1:8888:8888"   # JupyterLab
+      - "127.0.0.1:8050:8050"   # integration explorer

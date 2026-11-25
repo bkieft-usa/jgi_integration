@@ -1,0 +1,10 @@
+# Build context for docker/Dockerfile and docker/Dockerfile-dev is the repository root.
+.git
+.github
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.ipynb_checkpoints
+**/.DS_Store
+readthedocs/*.docx
+readthedocs/*.pdf

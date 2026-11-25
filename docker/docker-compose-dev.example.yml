@@ -1,0 +1,16 @@
+# Developer variant, used by `./start.command --dev`. Copy to input_data/dev/docker-compose-dev.yml.
+# The -dev image (docker/Dockerfile-dev) holds only the Python environment; this mounts your jgi_integration
+# checkout over /home/jovyan/work/jgi_integration so code edits take effect without rebuilding.
+# Adjust the first volume if your checkout is not at ../../jgi_integration relative to input_data/.
+services:
+  jgi-integration:
+    image: bkieft/jgi-integration:${tag:-dev}   # local build of docker/Dockerfile-dev
+    container_name: jgi-integration
+    volumes:
+      - ${PWD}/../../jgi_integration:/home/jovyan/work/jgi_integration
+      - ${PWD}:/home/jovyan/work/input_data
+      - ${PWD}/../output_data:/home/jovyan/work/output_data
+    working_dir: /home/jovyan/work/
+    ports:
+      - "127.0.0.1:8888:8888"   # JupyterLab
+      - "127.0.0.1:8050:8050"   # integration explorer
