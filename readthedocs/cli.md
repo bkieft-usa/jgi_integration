@@ -60,15 +60,7 @@ stop_explorer()
 
 ## Where to run it
 
-**JupyterLab container.** Open a terminal in JupyterLab (File → New → Terminal) and run `jgi-integrate run --config-dir /home/jovyan/work/input_data/config` from any folder. See [setup.md](setup.md), steps 3–4.
-
-**Laptop (Docker, no JupyterLab):**
-```bash
-docker run --rm -v $PWD:/home/jovyan/work/input_data -v $PWD/../output_data:/home/jovyan/work/output_data \
-  -w /home/jovyan/work bkieft/jgi-integration:<tag> \
-  python -m tools.cli run --config-dir /home/jovyan/work/input_data/config
-```
-`docker/docker-compose.example.yml` provides the same as `docker compose run --rm pipeline`, plus an `explorer` service.
+**Laptop (JupyterLab container).** Start the container with `./start.command`, open a terminal in JupyterLab (File → New → Terminal) and run `jgi-integrate run --config-dir /home/jovyan/work/input_data/config` from any folder. See [setup.md](setup.md), steps 2–4.
 
 **HPC login node.** Use a login node only for `list` and for small runs; most centers limit CPU and memory there. Hierarchical clustering of 25,000 features needs about 5–10 GB of memory.
 

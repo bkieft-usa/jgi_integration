@@ -124,7 +124,7 @@ Re-runs are useful for reproducing results, continuing interrupted analyses, or 
 
 1.  When you are finished running the workflow and producing outputs, it is best to close it down gracefully rather than simply close your browser window. There are several methods to properly close down the docker container, any of which will work equally well:
 
-    - Recommended: To close with the running terminal/console, open the window that is running the container (where you ran the `… docker compose …` command during instructions in _setup.md_) and press ctrl/cmd-C on your keyboard.
+    - Recommended: go to the `start.command` window (see _setup.md_, step 2) and press Ctrl+C, or close that window.
 
     - To close with the Docker Desktop app, open the app and click on the Containers tab in the top left menu bar. Find the container named “jgi-integration” in the main panel and click the Stop button (black square) in the Actions column.
 

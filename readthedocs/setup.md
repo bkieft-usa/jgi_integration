@@ -8,7 +8,15 @@ The examples use Unix-style paths. Substitute your own host path where needed.
 
 ## **Prerequisites**
 
-Install and start [Docker Desktop](https://www.docker.com/products/docker-desktop). [Cytoscape Desktop](https://cytoscape.org/download.html) is optional for opening generated `.graphml` network files.
+The workflow runs on macOS and Linux.
+
+- **macOS:** install [Docker Desktop](https://www.docker.com/products/docker-desktop).
+- **Linux:** install [Docker Engine](https://docs.docker.com/engine/install/) with the Compose plugin (`docker compose`), or Docker Desktop.
+- **Windows:** use WSL. Install WSL with an Ubuntu distribution (`wsl --install` in PowerShell), then Docker Desktop with WSL integration turned on for that distribution. Keep the project folder inside the Linux file system (e.g. `~/project_data`, not `/mnt/c/...`) and follow the Linux instructions from an Ubuntu terminal. There is no native Windows image.
+
+In Docker Desktop, give Docker enough memory: **Settings → Resources → Memory**, at least 12 GB if your computer has 16 GB. With less, large runs can be stopped partway through for lack of memory.
+
+[Cytoscape Desktop](https://cytoscape.org/download.html) is optional for opening generated `.graphml` network files.
 
 ## **Input Directory Layout**
 
@@ -22,6 +30,7 @@ project_data/
 │   │   ├── data_processing.yml
 │   │   └── analysis.yml
 │   ├── docker-compose.yml
+│   ├── start.command                 # starts the container and opens JupyterLab
 │   ├── link_table.csv
 │   └── raw_data/
 │       ├── transcriptomics/          # dataset_dir for datasets.tx
@@ -121,34 +130,52 @@ In `config/data_processing.yml`, each configured dataset has a `dataset_dir` tha
 
 ## **Step 1: Prepare the Project Folder**
 
-Create a project directory and place the supplied `project_data` archive contents there, or create the layout described above. Do not move `docker-compose.yml` or the `config` directory from `input_data`. Ensure `output_data` exists alongside `input_data` and is writable.
+Create a project directory and place the supplied `project_data` archive contents there, or create the layout described above. Do not move `docker-compose.yml`, `start.command` or the `config` directory out of `input_data`. `output_data` is created next to `input_data` on first start if it does not exist.
 
-The supplied `docker-compose.yml` publishes two ports: `8888` for JupyterLab and `8050` for the results explorer. If you use your own compose file, include both:
+If you use your own compose file, publish both ports, `8888` for JupyterLab and `8050` for the results explorer:
 
 ```yaml
     ports:
-      - "8888:8888"   # JupyterLab
-      - "8050:8050"   # integration explorer
+      - "127.0.0.1:8888:8888"   # JupyterLab
+      - "127.0.0.1:8050:8050"   # integration explorer
 ```
 
-## **Step 2: Launch the Docker Container**
+## **Step 2: Start the Container**
 
-1. Confirm Docker is running with `docker info`.
-2. Change to the directory containing `docker-compose.yml`:
+**macOS:** double-click `start.command` in `input_data` in Finder. If macOS refuses to open it because it was downloaded from the internet, either go to **System Settings → Privacy & Security** and click **Open Anyway**, or run it from Terminal as `bash start.command` (see below).
 
-   ```sh
-   cd /path/to/project_data/input_data
-   ```
+**Linux (and Windows through WSL), or a macOS terminal:**
 
-3. Pull and start the container. Set the architecture for your system: `windows-amd64`, `mac-arm64`, `mac-amd64`, or `linux-amd64`. The Windows image is currently unstable and not recommended.
+```sh
+cd /path/to/project_data/input_data
+./start.command
+```
 
-   ```sh
-   tag=<arch> docker-compose -p jgi-integration up -d --force-recreate --pull
-   ```
+`start.command` starts Docker Desktop if it is not running, downloads the newest image (`bkieft/jgi-integration:latest`; Docker picks the build for your computer's CPU), starts the container and opens JupyterLab in your browser. If no tab opens, copy the link it prints into your browser.
 
-4. In the command output, find the Jupyter Server URL beginning with `http://127.0.0.1:8888/lab` and open it in a browser.
+Leave the `start.command` window open while you work. To finish, press **Ctrl+C** in that window, or close it; either stops the container. Your files in `input_data` and `output_data` are kept.
 
-If another JupyterLab server or another program is already using port 8888 or 8050, stop it before starting this container to avoid a port collision.
+It stops with a message if Docker is not installed, or if another program is already using port 8888 or 8050 (for example another JupyterLab). Stop that program and run it again.
+
+To use a specific published image instead of the newest, set its tag, e.g. `tag=1.2.0 ./start.command` for a release or `tag=sha-1a2b3c4` for a single commit (tags are listed on [Docker Hub](https://hub.docker.com/r/bkieft/jgi-integration/tags)).
+
+### For developers
+
+**Working on the code.** `./start.command --dev` starts your local `bkieft/jgi-integration:dev` image with `dev/docker-compose-dev.yml` (copy it from `docker/docker-compose-dev.example.yml`). The dev image, built from `docker/Dockerfile-dev`, contains only the Python environment; the compose file mounts your `jgi_integration` checkout into the container, so code edits take effect without rebuilding. Build it once, and again only when `venv/pyproject.toml` or `venv/uv.lock` change:
+
+```sh
+docker build -t bkieft/jgi-integration:dev -f docker/Dockerfile-dev .
+```
+
+**Releasing.** `.github/workflows/docker-image.yml` builds `docker/Dockerfile` for linux/amd64 and linux/arm64 on every push to `main` and publishes it as `:latest` and `:sha-<commit>`. Pushing a git tag `vX.Y.Z` also publishes `:X.Y.Z` and `:X.Y`. The image contains the code of the commit that was pushed, and each run's `run_manifest.json` records that commit. The workflow needs two repository secrets: `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token with Read & Write scope).
+
+**Packaging a project for users.** Users need only the `project_data` folder; the code comes with the image. In `input_data/`, put a real copy (not a symlink) of `docker/start.command`, executable, and `docker/docker-compose.example.yml` renamed `docker-compose.yml`. Archive it as `.tar.gz`, which keeps `start.command` executable (`-h` stores the files that symlinks point to):
+
+```sh
+tar -czhf <project>_project_data.tar.gz project_data
+```
+
+Everything in the folder is included, so package a clean copy: without `input_data/dev/` and with an empty `output_data/`.
 
 ## **Step 3: Generate the Results**
 

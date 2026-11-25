@@ -294,13 +294,15 @@ class Project:
             else:
                 log.warning(f"Notebook not found at {notebook_path}; only configs were saved.")
 
-        git_sha = None
-        try:
-            repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            git_sha = subprocess.run(["git", "-C", repo_dir, "rev-parse", "HEAD"], capture_output=True,
-                                     text=True, timeout=10).stdout.strip() or None
-        except Exception:
-            pass
+        # Release images carry their build commit in JGI_GIT_SHA (they have no .git); a checkout asks git.
+        git_sha = os.environ.get("JGI_GIT_SHA") or None
+        if git_sha is None:
+            try:
+                repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                git_sha = subprocess.run(["git", "-C", repo_dir, "rev-parse", "HEAD"], capture_output=True,
+                                         text=True, timeout=10).stdout.strip() or None
+            except Exception:
+                pass
         manifest = {
             "project_name": self.project_name,
             "data_processing_hash": self.data_processing_hash,
