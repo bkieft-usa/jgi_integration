@@ -1,0 +1,14 @@
+# Optional settings for the explorer bundle (python -m tools.cli build-explorer / explore / run).
+# NOT part of the run hash: changing these never creates a new Analysis--<hash> folder.
+explorer:
+  n_permutations: 1000        # label permutations for agreement null distributions
+  min_term_size: 2            # annotation terms with fewer grouped features are not tested
+  min_group_size: 2           # groups with fewer features are not tested for enrichment
+  min_set_size_tests: 3       # minimum features for term-score and CAMERA tests
+  fdr: 0.05                   # default false discovery rate shown in the explorer
+  exclude_global_maps: true   # drop KEGG overview maps (map011xx/012xx) from enrichment
+  variable_types: {}          # override auto-detection, e.g. {timepoint: continuous, dose: categorical}
+  eigengene_network:
+    min_abs_r: 0.7            # minimum |correlation| between group eigengenes to draw an edge
+    top_k: 5                  # strongest partners kept per group
+  seed: 0                     # embeddings and permutations are reproducible

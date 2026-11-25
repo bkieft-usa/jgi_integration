@@ -32,12 +32,16 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="${HOME}/.local/bin:${PATH}"
 
 ######## Set up software environment with uv
-RUN uv sync --locked
+# dash ships a legacy JupyterLab source extension (only for inline Dash in notebooks, unused here);
+# removing it stops JupyterLab from prompting for a rebuild.
+RUN uv sync --locked && \
+    rm -f .venv/share/jupyter/lab/extensions/dash-jupyterlab.tgz
 ENV VIRTUAL_ENV=${WORK}/.venv
-ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+ENV PATH="${VIRTUAL_ENV}/bin:${WORK}/jgi_integration/bin:${PATH}"
 
-######## Test tooling (kept outside the locked environment)
-RUN uv pip install pytest
+######## Ports: 8888 = JupyterLab, 8050 = integration explorer
+EXPOSE 8888 8050
+
 
 ######## Set up user workflow environment
 RUN python -m ipykernel install --user \

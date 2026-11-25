@@ -123,6 +123,14 @@ In `config/data_processing.yml`, each configured dataset has a `dataset_dir` tha
 
 Create a project directory and place the supplied `project_data` archive contents there, or create the layout described above. Do not move `docker-compose.yml` or the `config` directory from `input_data`. Ensure `output_data` exists alongside `input_data` and is writable.
 
+The supplied `docker-compose.yml` publishes two ports: `8888` for JupyterLab and `8050` for the results explorer. If you use your own compose file, include both:
+
+```yaml
+    ports:
+      - "8888:8888"   # JupyterLab
+      - "8050:8050"   # integration explorer
+```
+
 ## **Step 2: Launch the Docker Container**
 
 1. Confirm Docker is running with `docker info`.
@@ -140,6 +148,43 @@ Create a project directory and place the supplied `project_data` archive content
 
 4. In the command output, find the Jupyter Server URL beginning with `http://127.0.0.1:8888/lab` and open it in a browser.
 
-## **Step 3: Run the Workflow in JupyterLab**
+If another JupyterLab server or another program is already using port 8888 or 8050, stop it before starting this container to avoid a port collision.
 
-Open the workflow notebook and follow [run.md](run.md). If another JupyterLab server is already running, stop it before starting this container to avoid a port collision.
+## **Step 3: Generate the Results**
+
+Everything below happens inside JupyterLab. Choose **one** of the two ways; both run the same code and give identical results.
+
+**Option A: the notebook.** Open `workflow.ipynb` and run all cells, following [run.md](run.md). Figures are shown inline as each stage finishes.
+
+**Option B: the terminal.** Open a terminal in JupyterLab (**File → New → Terminal**) and run:
+
+```bash
+jgi-integrate run --config-dir /home/jovyan/work/input_data/config
+```
+
+This runs every stage without showing figures (they are saved to `output_data`). You can run it from any folder. When it finishes, it prints the command to explore the run. See [cli.md](cli.md) for partial runs, resuming a run, and running on an HPC cluster or under slurm.
+
+Either way, the last stage precomputes everything the explorer needs into the run's `explorer/` folder.
+
+## **Step 4: Explore the Results**
+
+Start the explorer in one of these ways, then open **http://localhost:8050** in your browser.
+
+**From the notebook.** The last cell of `workflow.ipynb` starts the explorer for the run you just made:
+
+```python
+from tools.explorer_launch import start_explorer, stop_explorer
+start_explorer(project.analysis_dir)
+```
+
+It runs in the background, so you can keep using the notebook, and it keeps running if you restart or close the notebook. Run `stop_explorer()` to stop it.
+
+**From a terminal.** Paste the command printed at the end of `jgi-integrate run`. It has this form:
+
+```bash
+jgi-integrate explore --project-dir /home/jovyan/work/output_data/<project_name> -d <data hash> -a <analysis hash>
+```
+
+The terminal stays busy while the explorer runs; press **Ctrl+C** to stop it. To find the hashes of earlier runs, run `jgi-integrate list --results-dir /home/jovyan/work/output_data`.
+
+Only one explorer can use port 8050 at a time. To switch runs, stop the current one first (re-running `start_explorer` in the notebook does this for you). See [explorer.md](explorer.md) for what each page shows.

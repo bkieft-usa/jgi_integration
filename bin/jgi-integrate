@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Thin wrapper: jgi-integrate <list|run|build-explorer|explore> [options]
+# Equivalent to `python -m tools.cli ...` from the repository root, using the project's virtual
+# environment even when another Python (e.g. an activated conda base) comes first on the PATH.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="${REPO}${PYTHONPATH:+:${PYTHONPATH}}"
+export MPLBACKEND="${MPLBACKEND:-Agg}"
+
+if [ -n "${PYTHON:-}" ]; then
+    py="${PYTHON}"
+elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "${VIRTUAL_ENV}/bin/python" ]; then
+    py="${VIRTUAL_ENV}/bin/python"                 # container images set VIRTUAL_ENV
+elif [ -x "${REPO}/venv/.venv/bin/python" ]; then
+    py="${REPO}/venv/.venv/bin/python"             # local checkout synced with `uv sync`
+else
+    py="python"
+fi
+exec "${py}" -m tools.cli "$@"

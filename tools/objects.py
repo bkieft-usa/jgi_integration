@@ -6,9 +6,13 @@ import pandas as pd
 import numpy as np
 import shutil
 from typing import Dict, Any, List, Optional, Tuple
-from IPython import get_ipython
+import platform
+import subprocess
+from datetime import datetime
 import tools.helpers as hlp
 import tools.preprocessing as prep
+import tools.metadata as md
+import tools.annotation_types as annot
 import logging
 import time
 import hashlib
@@ -34,12 +38,17 @@ class ConfigManager:
         # Set up config file paths
         self.project_config_file = self.config_dir / "project.yml"
         self.data_processing_config_file = self.config_dir / "data_processing.yml"
-        self.analysis_config_file = self._detect_analysis_config_file()
 
         if self.target_data_hash and self.target_analysis_hash:
+            # Persistent configs are restored onto the standard names in config_dir
+            self.analysis_config_file = self.config_dir / "analysis.yml"
             self._load_from_persistent_configs()
-        elif not self._standard_configs_exist():
-            log.warning("Standard config files not found and no hashes specified.")
+        else:
+            self.analysis_config_file = self._detect_analysis_config_file()
+            if not self._standard_configs_exist():
+                raise FileNotFoundError(
+                    f"Expected project.yml, data_processing.yml and analysis.yml in {self.config_dir}"
+                )
 
     def _detect_analysis_config_file(self) -> Path:
         """
@@ -119,18 +128,20 @@ class ConfigManager:
         is extracted so that ``combined_config['analysis']`` contains the flat
         config that ``Analysis.__init__`` reads via ``self.project.config['analysis']``.
         """
-        # Load project config
-        with open(self.project_config_file, 'r') as f:
-            project_config = yaml.safe_load(f)
+        # Snapshot the exact config text that is hashed. The run record writes these
+        # snapshots (not the files on disk, which may be edited while a run is going),
+        # so a persistent config always hashes to the name it is saved under.
+        self.config_texts = {}
+        for kind, path in (('project', self.project_config_file),
+                           ('data_processing', self.data_processing_config_file),
+                           ('analysis', self.analysis_config_file)):
+            with open(path, 'r') as f:
+                self.config_texts[kind] = f.read()
 
-        # Load data processing config and generate hash
-        with open(self.data_processing_config_file, 'r') as f:
-            data_processing_config = yaml.safe_load(f)
+        project_config = yaml.safe_load(self.config_texts['project'])
+        data_processing_config = yaml.safe_load(self.config_texts['data_processing'])
         data_processing_hash = self._generate_config_hash(data_processing_config)
-
-        # Load analysis config and generate hash
-        with open(self.analysis_config_file, 'r') as f:
-            raw_analysis_config = yaml.safe_load(f)
+        raw_analysis_config = yaml.safe_load(self.config_texts['analysis'])
         analysis_hash = self._generate_config_hash(raw_analysis_config)
 
         # Extract the flat 'analysis' sub-dict
@@ -192,36 +203,27 @@ class ConfigManager:
         }
     
 class Project:
-    """Project configuration and directory management with hash-based tagging."""
+    """Project configuration and directory management with hash-based tagging.
 
-    def __init__(self, data_processing_hash: str = None, analysis_hash: str = None, overwrite: bool = False):
+    Parameters
+    ----------
+    config_dir
+        Directory holding ``project.yml``, ``data_processing.yml`` and ``analysis.yml``
+        for a fresh run, or the project's persistent ``configs/`` directory
+        (``<results_path>/<project_name>/configs``) when resuming a run by hash.
+    data_processing_hash, analysis_hash
+        Both or neither. When given, the hash-tagged persistent configs in
+        ``config_dir`` are restored and used.
+    """
+
+    def __init__(self, config_dir: str, data_processing_hash: str = None, analysis_hash: str = None,
+                 overwrite: bool = False):
         log.info("Initializing Project")
-        
-        # Handle default config directory
-        config_dir = None
-        self.default_config_dir = "/home/jovyan/work/input_data/config"
-        self.custom_config_dir = "/home/jovyan/work/output_data/*/configs"
-        
-        if data_processing_hash is None and analysis_hash is None:
-            if os.path.isdir(self.default_config_dir):
-                config_dir = self.default_config_dir
-            else:
-                log.error("No configuration directory specified or default path is invalid.")
-                raise FileNotFoundError("Configuration directory not found.")
-        elif data_processing_hash is not None and analysis_hash is not None:
-            matching_dirs = glob.glob(self.custom_config_dir)
-            if matching_dirs and os.path.isdir(matching_dirs[0]):
-                config_dir = matching_dirs[0]
-            else:
-                log.error("No configuration directory found for the specified hashes.")
-                raise FileNotFoundError("Configuration directory not found for specified hashes.")
-        elif data_processing_hash is None and analysis_hash is not None:
-            log.error("Both data processing hash and analysis hash must be provided together.")
-            raise ValueError("Both data processing hash and analysis hash are required.")
-        elif data_processing_hash is not None and analysis_hash is None:
-            log.error("Both data processing hash and analysis hash must be provided together.")
-            raise ValueError("Both data processing hash and analysis hash are required.")
-        
+        if (data_processing_hash is None) != (analysis_hash is None):
+            raise ValueError("Both data processing hash and analysis hash must be provided together.")
+        if not config_dir or not os.path.isdir(config_dir):
+            raise FileNotFoundError(f"Configuration directory not found: {config_dir}")
+
         # Initialize config manager
         self.config_manager = ConfigManager(config_dir, data_processing_hash, analysis_hash)
         self.config, self.data_processing_hash, self.analysis_hash = self.config_manager.load_configs()
@@ -244,7 +246,8 @@ class Project:
         self.PI_name = self.project_config['PI_name']
         self.proposal_ID = self.project_config['proposal_ID']
         self.data_types = self.project_config['dataset_list']
-        self.study_variables = self.user_settings['variable_list']
+        # Optional; when empty, every non-ID metadata column is used (see Analysis.metadata_variables)
+        self.study_variables = self.user_settings.get('variable_list') or []
         self.project_name = self.user_settings['project_name']
         self.output_dir = self.project_config['results_path']
         self.cache_dir = self.project_config['results_path'] + "/cache"
@@ -254,82 +257,66 @@ class Project:
         log.info(f"Project directory: {self.project_dir}")
         self._validate_directory_structure()
 
-    def save_persistent_config_and_notebook(self):
-        """Save the current configuration and notebook with timestamp and tags for this run."""
-        
-        try:
-            # Use hash-based tags for naming
-            base_filename = f"Dataset_Processing--{self.data_processing_hash}_Analysis--{self.analysis_hash}"
-            
-            # Setup directories
-            config_dir = os.path.join(self.project_dir, "configs")
+    @property
+    def run_basename(self) -> str:
+        return f"Dataset_Processing--{self.data_processing_hash}_Analysis--{self.analysis_hash}"
+
+    @property
+    def analysis_dir(self) -> str:
+        return os.path.join(self.project_dir, f"Dataset_Processing--{self.data_processing_hash}",
+                            f"Analysis--{self.analysis_hash}")
+
+    def save_run_record(self, notebook_path: Optional[str] = None, stage_timings: Optional[Dict[str, float]] = None,
+                        argv: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Persist the hash-tagged configs, a ``run_manifest.json`` and (optionally) a notebook copy.
+
+        Configs go to ``<project_dir>/configs/<run_basename>_{project,data_processing,analysis}_config.yml``
+        so the run can be resumed or explored by hash. The manifest is written into the
+        analysis directory and records how/where/when the run was produced.
+        """
+        config_dir = os.path.join(self.project_dir, "configs")
+        os.makedirs(config_dir, exist_ok=True)
+        saved = {}
+        for config_type, text in self.config_manager.config_texts.items():
+            dest_path = os.path.join(config_dir, f"{self.run_basename}_{config_type}_config.yml")
+            with open(dest_path, 'w') as fh:
+                fh.write(text)
+            saved[config_type] = dest_path
+            log.info(f"Configuration saved to: {dest_path}")
+
+        if notebook_path:
             notebooks_dir = os.path.join(self.project_dir, "notebooks")
-            os.makedirs(config_dir, exist_ok=True)
             os.makedirs(notebooks_dir, exist_ok=True)
-            
-            # Save all three config files with hash-based naming
-            config_files = {
-                'project': self.config_manager.project_config_file,
-                'data_processing': self.config_manager.data_processing_config_file,
-                'analysis': self.config_manager.analysis_config_file
-            }
-            
-            for config_type, source_path in config_files.items():
-                dest_filename = f"{base_filename}_{config_type}_config.yml"
-                dest_path = os.path.join(config_dir, dest_filename)
-                
-                if os.path.exists(dest_path):
-                    log.warning(f"Configuration file already exists at {dest_path}. It will be updated.")
-                
-                # Copy config file to timestamped location
-                shutil.copy2(source_path, dest_path)
-                log.info(f"Configuration saved to: {dest_path}")
-
-            # Handle notebook saving (existing logic)
-            this_notebook_path = None
-            ipython = get_ipython()
-            if ipython and hasattr(ipython, 'kernel'):
-                connection_file = ipython.kernel.config['IPKernelApp']['connection_file']
-                kernel_id = connection_file.split('-', 1)[1].split('.')[0]
-                possible_paths = [
-                    f"/notebooks/*.ipynb",
-                    f"/work/*.ipynb", 
-                    f"*.ipynb",
-                    f"/home/jovyan/*.ipynb"
-                ]
-                for pattern in possible_paths:
-                    notebooks = glob.glob(pattern)
-                    if notebooks:
-                        this_notebook_path = max(notebooks, key=os.path.getmtime)
-                        log.info(f"Notebook path identified: {this_notebook_path}")
-                        break
-
-            if this_notebook_path and os.path.exists(this_notebook_path):
-                notebook_filename = f"{base_filename}_notebook.ipynb"
-                new_notebook_path = os.path.join(notebooks_dir, notebook_filename)
-                if os.path.exists(new_notebook_path):
-                    log.warning(f"Notebook file already exists at {new_notebook_path}. It will be updated.")
-                
-                # Wait for notebook to save and copy
-                start_md5 = hashlib.md5(open(this_notebook_path,'rb').read()).hexdigest()
-                current_md5 = start_md5
-                max_wait_time = 10
-                wait_time = 0
-                while start_md5 == current_md5 and wait_time < max_wait_time:
-                    time.sleep(2)
-                    wait_time += 2
-                    if os.path.exists(this_notebook_path):
-                        current_md5 = hashlib.md5(open(this_notebook_path,'rb').read()).hexdigest()
-
-                shutil.copy2(this_notebook_path, new_notebook_path)
-                log.info(f"Notebook saved to: {new_notebook_path}")
+            if os.path.exists(notebook_path):
+                dest = os.path.join(notebooks_dir, f"{self.run_basename}_notebook.ipynb")
+                shutil.copy2(notebook_path, dest)
+                log.info(f"Notebook saved to: {dest}")
             else:
-                log.warning("Could not locate notebook file. Only configuration was saved.")
-                log.info("To manually save the notebook, copy your .ipynb file to a persistent location such as:")
-                log.info(f"  {os.path.join(notebooks_dir, f'{base_filename}_notebook.ipynb')}")
-        
-        except Exception as e:
-            log.error(f"Failed to save configuration and notebook: {e}")
+                log.warning(f"Notebook not found at {notebook_path}; only configs were saved.")
+
+        git_sha = None
+        try:
+            repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            git_sha = subprocess.run(["git", "-C", repo_dir, "rev-parse", "HEAD"], capture_output=True,
+                                     text=True, timeout=10).stdout.strip() or None
+        except Exception:
+            pass
+        manifest = {
+            "project_name": self.project_name,
+            "data_processing_hash": self.data_processing_hash,
+            "analysis_hash": self.analysis_hash,
+            "written_at": datetime.now().isoformat(timespec="seconds"),
+            "argv": argv,
+            "git_sha": git_sha,
+            "host": platform.node(),
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+            "stage_timings_sec": stage_timings or {},
+            "configs": saved,
+        }
+        os.makedirs(self.analysis_dir, exist_ok=True)
+        with open(os.path.join(self.analysis_dir, "run_manifest.json"), "w") as fh:
+            json.dump(manifest, fh, indent=2)
+        return manifest
 
     def _validate_directory_structure(self) -> Dict[str, Any]:
         """Validate the overall directory structure for consistency."""
@@ -442,11 +429,23 @@ class BaseDataHandler:
         else:
             raise ValueError(f"Unsupported file format: {ext}")
     
+    @staticmethod
+    def _has_meaningless_index(data: pd.DataFrame) -> bool:
+        """An unnamed integer index (RangeIndex or a filtered copy of one) carries no information."""
+        idx = data.index
+        return idx.name is None and not isinstance(idx, pd.MultiIndex) and pd.api.types.is_integer_dtype(idx)
+
+    @staticmethod
+    def drop_unnamed_index_columns(data: pd.DataFrame) -> pd.DataFrame:
+        """Remove leading ``Unnamed: N`` columns produced by writing a meaningless index."""
+        drop = [c for c in data.columns if str(c).startswith("Unnamed:")]
+        return data.drop(columns=drop) if drop else data
+
     def save_data(self, data: pd.DataFrame, output_dir: str, filename: str, indexing: bool = True) -> str:
-        """Save DataFrame to disk."""
+        """Save DataFrame to disk. Unnamed integer indexes are never written."""
         os.makedirs(output_dir, exist_ok=True)
         file_path = os.path.join(output_dir, filename)
-        data.to_csv(file_path, index=indexing)
+        data.to_csv(file_path, index=indexing and not self._has_meaningless_index(data))
         return file_path
     
     def check_and_load_attribute(self, attribute_name: str, filename: str, overwrite: bool = False) -> bool:
@@ -1251,6 +1250,17 @@ class Analysis(BaseDataHandler):
         return self.analysis_config
 
     @property
+    def dataset_names(self) -> List[str]:
+        return [ds.dataset_name for ds in self.datasets] or list(self.project.data_types)
+
+    @property
+    def metadata_variables(self) -> List[str]:
+        """Study variables: ``user_settings.variable_list`` if given, else every non-ID
+        metadata column (including ``group``)."""
+        return md.infer_metadata_variables(self.integrated_metadata, self.dataset_names,
+                                           requested=self.project.study_variables)
+
+    @property
     def integration_mode(self) -> str:
         """
         Track derived from ``analysis.replicate_pairing``.
@@ -1274,36 +1284,10 @@ class Analysis(BaseDataHandler):
 
     def _metadata_for_integrated_data(self) -> pd.DataFrame:
         """Align the sample-level link table to sample or condition columns."""
-        metadata = self.integrated_metadata.reset_index(drop=True)
-        key_column = "unique_group" if self.integration_mode == "sample_resolution" else "group"
-        if key_column not in metadata.columns:
-            raise ValueError(f"Integrated metadata is missing required column '{key_column}'.")
-
         data = self.integrated_data
-        keys = (
-            set(data.columns.astype(str))
-            if isinstance(data, pd.DataFrame) and not data.empty
-            else set(metadata[key_column].dropna().astype(str))
-        )
-        metadata[key_column] = metadata[key_column].astype(str)
-        rows = []
-        for key, subset in metadata[metadata[key_column].isin(keys)].groupby(key_column, sort=True):
-            row = {}
-            for column in metadata.columns:
-                values = subset[column].dropna().unique()
-                row[column] = values[0] if len(values) == 1 else np.nan
-            row[key_column] = key
-            rows.append(row)
-
-        aligned = pd.DataFrame(rows)
-        if rows:
-            aligned = aligned.set_index(key_column, drop=False)
-        else:
-            aligned.index = pd.Index([])
-        if key_column == "group":
-            aligned["unique_group"] = aligned["group"]
-        aligned.index.name = None
-        return aligned
+        columns = data.columns if isinstance(data, pd.DataFrame) and not data.empty else None
+        pairing = "paired" if self.integration_mode == "sample_resolution" else "unpaired"
+        return md.align_metadata(self.integrated_metadata, columns, pairing)
 
     @staticmethod
     def _set_up_analysis_outdir(project: Project, data_processing_tag: str, analysis_tag: str, overwrite: bool = False) -> str:
@@ -1345,18 +1329,28 @@ class Analysis(BaseDataHandler):
         
         return property(getter, setter)
 
+    # Tables whose rows are records (ID stored in a column), not matrices indexed by feature
+    RECORD_TABLES = {'integrated_metadata', 'feature_annotation_table', 'feature_correlation_table',
+                     'feature_network_edge_table'}
+
     def _get_df(self, key, filename):
         """Get DataFrame from cache or disk."""
         if key not in self._cache:
             file_path = os.path.join(self.output_dir, filename) if filename else None
             if file_path and os.path.exists(file_path):
-                self._cache[key] = self.load_data(file_path)
+                if key in self.RECORD_TABLES:
+                    df = pd.read_csv(file_path, low_memory=False)
+                    self._cache[key] = self.drop_unnamed_index_columns(df)
+                else:
+                    self._cache[key] = self.load_data(file_path)
             else:
                 self._cache[key] = pd.DataFrame()
         return self._cache[key]
     
     def _set_df(self, key, filename, df):
         """Set DataFrame to cache and disk."""
+        if key in self.RECORD_TABLES and isinstance(df, pd.DataFrame):
+            df = self.drop_unnamed_index_columns(df)
         if filename:
             self.save_data(df, self.output_dir, filename, indexing=True)
         self._cache[key] = df
@@ -1422,6 +1416,7 @@ class Analysis(BaseDataHandler):
             ds.plot_pca(overwrite=self.overwrite,
                         analysis_outdir=self.output_dir,
                         show_plot=show_plot,
+                        metadata_variables=self.metadata_variables,
                         **kwargs)
 
     def link_data(self, overlap_only: bool = True, overwrite: bool = False) -> None:
@@ -1480,7 +1475,7 @@ class Analysis(BaseDataHandler):
         hlp.plot_simple_pca(
             df=self.integrated_data_selected,
             metadata=self._metadata_for_integrated_data(),
-            metadata_variables=self.project.study_variables,
+            metadata_variables=self.metadata_variables,
             title="Integrated Data PCA",
             output_dir=self.output_dir,
         )
@@ -1826,57 +1821,93 @@ class Analysis(BaseDataHandler):
         metadata.index.name = None
         return metadata
 
-    def compare_groups_to_pathways(self, **override_kwargs) -> dict:
+    def annotation_types(self) -> List["annot.AnnType"]:
+        """Every knowledge-driven annotation type present in ``feature_annotation_table``."""
+        return annot.detect_annotation_types(self.feature_annotation_table, self.dataset_names,
+                                             self.datasets_config)
+
+    def enrich_all(self, overwrite: bool = False, **override_kwargs) -> Dict[str, pd.DataFrame]:
         """
-        Compare data-driven feature groups against knowledge-driven pathway annotations.
+        Compare data-driven feature groups against **every** knowledge-driven annotation type.
 
-        All parameters are read from the ``pathway_enrichment`` block in
-        ``analysis.yml``.  Any keyword arguments passed directly to this method
-        override the config values.
+        For each annotation type (KEGG pathway/module/reaction, ModelSEED pathway, KO, COG,
+        EC, BRITE, ClassyFire/NPClassifier classes, ...), runs the one-sided hypergeometric
+        test (BH-corrected) of every term in every group, then writes heatmaps with trend
+        tracks. Settings come from ``analysis.pathway_enrichment``; ``bipartite_only`` is
+        only applied to cross-omic types (it would empty single-data-type annotations).
 
-        Pipeline: (1) explode and filter the feature/pathway universe, (2) 
-        compute hypergeometric enrichment matrices, (3) select top pathways 
-        for display, (4) for every group and pathway, compute the share of its
-        members' summed normalized abundance in each metadata category,
-        (5) plot results as a series of heatmaps with attached trend tracks.
-
-        Config keys (under ``analysis.pathway_enrichment``):
-            ``pathway_col``             - annotation column to use: "kegg_module" (recommended),
-                                          "kegg_pathway", "kegg_reaction" or "modelseed_pathway"
-            ``exclude_global_maps``     - drop KEGG global/overview maps (map011xx/012xx) from the test
-            ``bipartite_only``          - keep only pathways and groups with features from every data type
-            ``min_features_per_pathway``- drop pathways smaller than this before testing (default 3)
-            ``min_features_per_group``  - drop groups smaller than this before testing (default 5)
-            ``alpha``                   - significance threshold for enrichment (default 0.05)
-            ``top_n``                   - number of pathways to display in the heatmap (default 50)
-            ``trend_sort_by``           - metadata column to order trend track columns by
-            ``trend_collapse_by``       - metadata column to pool samples by (e.g. "timepoint")
-            ``trend_agg``               - "mean" | "median" of replicate summed abundances per category
-            ``trend_cmap``              - sequential colormap for trend tracks (default "Purples")
-
-        Returns a dict with keys:
-            ``figs`` (the heatmap figures), ``pval_matrix`` (full stats table)
+        Outputs (``<analysis_dir>/enrichment/``):
+            ``annotation_types.json``     - detected annotation types and how they are parsed
+            ``annotations_long.csv``      - feature_id, ann_type, term_id, term_name
+            ``enrichment_long.csv``       - every tested (ann_type, term, group) pair
+            ``<ann_type>/``               - full_*_matrix.csv, trend values, heatmaps
         """
-        if not hasattr(self, 'feature_network_node_table') or self.feature_network_node_table.empty:
-            raise RuntimeError(
-                "feature_network_node_table is empty. Run analysis.group_features() first."
-            )
+        if self.feature_network_node_table is None or self.feature_network_node_table.empty:
+            raise RuntimeError("feature_network_node_table is empty. Run analysis.group_features() first.")
+        enrich_dir = os.path.join(self.output_dir, "enrichment")
+        long_path = os.path.join(enrich_dir, "enrichment_long.csv")
+        if os.path.exists(long_path) and not (overwrite or self.overwrite):
+            log.info(f"Enrichment results already exist at {enrich_dir}. Loaded from disk.")
+            return {"enrichment_long": pd.read_csv(long_path)}
+        os.makedirs(enrich_dir, exist_ok=True)
 
-        # Retrieve config block
-        pe = self.analysis_parameters.get('pathway_enrichment', {})
+        pe = dict(self.analysis_parameters.get('pathway_enrichment', {}) or {})
+        pe.update(override_kwargs)
+        ann_types = self.annotation_types()
+        log.info(f"Enriching groups against {len(ann_types)} annotation types: {[a.key for a in ann_types]}")
+        long_df = annot.explode_all(self.feature_annotation_table, ann_types)
+        long_df.to_csv(os.path.join(enrich_dir, "annotations_long.csv"), index=False)
+        with open(os.path.join(enrich_dir, "annotation_types.json"), "w") as fh:
+            json.dump(annot.ann_types_summary(ann_types), fh, indent=2)
 
-        call_params = {
-            'node_table':        self.feature_network_node_table,
-            'abundance_df':      self._normalized_abundance_for_trends(),
-            'metadata_df':       self._sample_metadata_for_trends(),
-            'output_dir':        self.output_dir,
-            'pe':                pe,
-        }
-        
-        # Allow user to override complex plot settings
-        call_params.update(override_kwargs)
+        nodes = self.feature_network_node_table[['group']].copy()
+        nodes.index = nodes.index.astype(str)
+        abundance = self._normalized_abundance_for_trends()
+        sample_meta = self._sample_metadata_for_trends()
 
-        return hlp.compare_groups_to_pathways(**call_params)
+        frames = []
+        for a in ann_types:
+            node_df = nodes.join(annot.to_wide_term_columns(long_df, a, nodes.index))
+            pe_a = {**pe, 'pathway_col': a.key,
+                    'bipartite_only': bool(pe.get('bipartite_only')) and a.dtype_scope is None,
+                    'exclude_nopathway': False}
+            out_dir = os.path.join(enrich_dir, a.key)
+            try:
+                # Results are written to out_dir; the returned figures/matrices are not kept, since
+                # holding every type's figures in memory grows by ~0.5 GB per annotation type.
+                hlp.compare_groups_to_pathways(node_table=node_df, abundance_df=abundance,
+                                               metadata_df=sample_meta, output_dir=out_dir, pe=pe_a)
+            except Exception as exc:  # one sparse annotation type must not abort the run
+                log.warning(f"Enrichment skipped for '{a.key}': {exc}")
+                continue
+            finally:
+                hlp.plt.close('all')
+                del node_df
+            frames.append(pd.read_csv(os.path.join(out_dir, "enrichment_long.csv")))
+
+        enrichment_long = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        enrichment_long.to_csv(long_path, index=False)
+        log.info(f"Created table: {long_path} ({len(enrichment_long)} tested term/group pairs)")
+        return {"enrichment_long": enrichment_long}
+
+    def build_explorer(self, explorer_config: Optional[dict] = None, force: bool = False) -> str:
+        """Precompute the explorer bundle (``<analysis_dir>/explorer/``) for the Dash app."""
+        from tools.explorer_bundle.build import build_explorer_bundle
+        return build_explorer_bundle(self.output_dir, explorer_config=explorer_config,
+                                     dataset_names=self.dataset_names,
+                                     requested_variables=self.project.study_variables,
+                                     datasets_config=self.datasets_config,
+                                     run_info={
+                                         "project_name": self.project.project_name,
+                                         "data_processing_hash": self.data_processing_tag,
+                                         "analysis_hash": self.analysis_tag,
+                                         "replicate_pairing": self.replicate_pairing,
+                                         "grouping_method": self.analysis_parameters.get(
+                                             'feature_grouping', {}).get('method'),
+                                         "grouping_params": self.analysis_parameters.get(
+                                             'feature_grouping', {}).get('params', {}),
+                                     },
+                                     force=force)
 
 # Create properties for Analysis class
 manual_file_storage = {

@@ -57,16 +57,17 @@ my_jgi_project/
 For a new analysis, you can update the configuration files in the JupyterLab interface or your local directory at `input_data/config/*yml`, which will create a new set of results in unique output folders.
 
 **Re-run Existing Analysis (exact reproduction):**
-```python
-# Optionally, see what existing analyses are available in the previously saved configuration files
-hlp.list_persistent_configs()
+```bash
+# See which runs exist (and whether their saved configs are consistent)
+python -m tools.cli list --results-dir /home/jovyan/work/output_data
 
-# Use hashes to load specific saved configuration (replace the default None)
-project = objs.Project(data_processing_hash="a1b2c3d4", analysis_hash="e5f6g7h8")
+# Re-run / resume a saved configuration by its hashes
+python -m tools.cli run --config-dir /home/jovyan/work/output_data/<project_name>/configs -d a1b2c3d4 -a e5f6g7h8
 
-# If, for some reason, you want to overwrite existing workflow results
-project = objs.Project(data_processing_hash="a1b2c3d4", analysis_hash="e5f6g7h8", overwrite=True)
+# Recompute everything for that configuration
+python -m tools.cli run --config-dir /home/jovyan/work/output_data/<project_name>/configs -d a1b2c3d4 -a e5f6g7h8 --overwrite
 ```
+In the notebook, the same is `objs.Project(config_dir="/home/jovyan/work/output_data/<project_name>/configs", data_processing_hash="a1b2c3d4", analysis_hash="e5f6g7h8")`. See `cli.md` for running on a laptop or HPC, and `explorer.md` for the interactive explorer.
 
 When re-running existing analysis, the workflow automatically:
 - Loads exact parameters from your previous run

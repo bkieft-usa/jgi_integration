@@ -64,28 +64,29 @@ For `network_modules`, feature correlations are calculated before Louvain/Leiden
 
 ## Pathway Enrichment
 
-Configuration path: `analysis.pathway_enrichment`. The notebook calls `analysis.compare_groups_to_pathways()` after feature grouping. This compares feature groups with pathway annotations in the annotation table using hypergeometric enrichment and multiple-testing correction.
+Configuration path: `analysis.pathway_enrichment`. The `enrich` stage (`analysis.enrich_all()`) runs after feature grouping. It tests every data-driven group against **every annotation type** in the feature annotation table: KEGG pathway, module and reaction; ModelSEED pathway; and each dataset's term columns (KO, COG category/pathway/function, KEGG BRITE, EC, ClassyFire and NPClassifier classes, ModelSEED reactions). The test is a one-sided hypergeometric test with Benjamini–Hochberg correction within each annotation type. Results for each type go to `enrichment/<annotation_type>/`.
 
 | Key | Description |
 |-----|-------------|
-| `pathway_col` | Annotation-table column used for the test and heatmaps. `kegg_module` (default; KEGG modules such as `M00001`), `kegg_pathway` (KEGG pathway maps), `kegg_reaction` (KEGG reactions such as `R00351`), or `modelseed_pathway`. All three KEGG levels are always written to the annotation table, so switching only requires changing this value. |
-| `exclude_nopathway` | Excludes pathway labels beginning with `NOPATHWAY_` when true (only relevant to `modelseed_pathway`). |
-| `exclude_global_maps` | Excludes KEGG global/overview maps (`map011xx`/`map012xx`, e.g. `map01100` Metabolic pathways) from the test when true. These maps contain most metabolic features and would otherwise dominate the results. Only relevant to `kegg_pathway`. |
-| `label_max_chars` | Optional (default 60). For KEGG columns, heatmap labels read `ID (name)`, e.g. `M00001 (Glycolysis (Embden-Meyerhof pathway)…)`, and names longer than this are shortened with `…`. Full names are always written to `pathway_names.csv`. The run also logs the share of each data type's features in the node table that have a term in `pathway_col`. |
-| `bipartite_only` | When true, retains only annotated pathways (heatmap columns) and feature groups (heatmap rows) that contain features from every included data type. Group membership counts all features in the group, annotated or not. |
-| `min_features_per_pathway` | Minimum annotated feature count for a pathway to be tested. |
-| `min_features_per_group` | Minimum feature count for a group to be retained. |
-| `alpha` | Significance level passed to the multiple-testing routine. Corrected p-value matrices are returned; entries are not filtered by this value. The implementation uses Benjamini-Hochberg when `fdr_method` is not supplied. |
-| `fdr_method` | Optional multiple-testing correction method passed to `statsmodels.stats.multitest.multipletests`; omitted in the example, so the code uses `fdr_bh`. |
-| `top_n` | Number of pathways shown when `selected_pathways` is not specified. |
-| `selected_pathways` | Optional explicit pathway list; when present it takes precedence over ranking and `top_n`. |
-| `rank_by` | `summed_significance` ranks pathways by adjusted significance; other values currently rank by feature count. |
+| `background` | `annotated` (default, recommended): the universe for each annotation type is the grouped features with at least one annotation of that type, and group sizes count annotated members only. Unannotated features carry no information about a term; including them makes enrichment depend on how well each group happens to be annotated. `all`: every grouped feature. |
+| `exclude_global_maps` | Excludes KEGG global/overview maps (`map011xx`/`map012xx`, e.g. `map01100` Metabolic pathways) when true. They contain most metabolic features and would otherwise dominate. Only affects `kegg_pathway`. |
+| `bipartite_only` | When true, cross-omic annotation types (KEGG, ModelSEED) keep only pathways and groups with features from every data type. Single-data-type annotation types (e.g. COG for transcripts, compound classes for metabolites) ignore this setting, because it would remove all of their terms. |
+| `min_features_per_pathway` | Minimum annotated feature count for a term to be tested. |
+| `min_features_per_group` | Minimum feature count for a group to be tested. |
+| `alpha` | FDR threshold. Heatmap rows show the groups with at least one significant term among the displayed terms. |
+| `fdr_method` | Optional correction method for `statsmodels.stats.multitest.multipletests` (default `fdr_bh`). |
+| `top_n` | Number of terms shown in each heatmap when `selected_pathways` is not given. Every term is tested and saved regardless. |
+| `selected_pathways` | Optional `{annotation_type: [term IDs]}` mapping that fixes the heatmap columns for that type. A plain list applies to every type. |
+| `rank_by` | How terms are chosen for display: `feature_count` (default), `summed_significance` or `mean_abs_value`. Any other value is an error. |
 | `trend_sort_by` | Metadata column used to order the trend-track categories. |
-| `trend_collapse_by` | Metadata column used to pool samples for the trend track; a false/null value leaves sample columns uncollapsed. The trend track shows, for each group or pathway, the share of its members' summed normalized abundance found in each category (rows sum to 1; data types weighted equally). |
+| `trend_collapse_by` | Metadata column used to pool samples for the trend track; null leaves one column per sample. The trend track shows, for each group or term, the share of its members' summed normalized abundance in each category (rows sum to 1; data types weighted equally). |
 | `trend_agg` | How replicates' summed abundances are pooled within a category: `mean` or `median`. |
-| `trend_cmap` | Sequential colormap used for pathway/group trend tracks (default `Purples`). |
+| `trend_cmap` | Sequential colormap for trend tracks (default `Purples`). |
+| `label_max_chars` | Maximum length of term names in heatmap labels (default 60). |
 
-The current example also contains `show_only_sig`, `enrichment_value`, and `trend_dispersion`. These keys are not currently read by the pathway-enrichment implementation and therefore do not change its results.
+HDBSCAN `noise` and WGCNA `grey` features stay in the background but are never tested as a group.
+
+The interactive explorer computes its own enrichment table with less strict display filters (every group and term above the explorer's minimum sizes; no `bipartite_only`). The test and background are identical, so p-values match whenever the filters match. Explorer settings live in an optional, unhashed `explorer.yml` (see `explorer.md`).
 
 ## Configuration Example
 
@@ -107,15 +108,14 @@ analysis:
       max_features: 12000
       block_scale: true
   pathway_enrichment:
-    pathway_col: kegg_module
-    exclude_nopathway: true
+    background: annotated
     exclude_global_maps: true
     bipartite_only: true
     min_features_per_pathway: 2
     min_features_per_group: 2
     alpha: 0.05
     top_n: 75
-    rank_by: n_features
+    rank_by: feature_count
     trend_sort_by: timepoint
     trend_collapse_by: timepoint
     trend_agg: median

@@ -27,14 +27,21 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="${HOME}/.local/bin:${PATH}"
 
 ######## Set up software environment with uv
+# dash ships a legacy JupyterLab source extension (only for inline Dash in notebooks, unused here);
+# removing it stops JupyterLab from prompting for a rebuild.
 RUN git clone https://github.com/bkieft-usa/jgi_integration.git && \
     cd jgi_integration && \
-    cp notebooks/integration_workflow.ipynb ../ && \
+    cp notebooks/workflow.ipynb ../ && \
     cp docker/jupyter_server_config.py ${HOME}/.jupyter/jupyter_server_config.py && \
     cd venv && \
-    uv sync --locked
+    uv sync --locked && \
+    rm -f .venv/share/jupyter/lab/extensions/dash-jupyterlab.tgz
 ENV VIRTUAL_ENV=${WORK}/jgi_integration/venv/.venv
-ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+ENV PATH="${VIRTUAL_ENV}/bin:${WORK}/jgi_integration/bin:${PATH}"
+ENV MPLBACKEND=Agg
+
+######## Ports: 8888 = JupyterLab, 8050 = integration explorer (python -m tools.cli explore --host 0.0.0.0)
+EXPOSE 8888 8050
 
 ######## Set up user workflow environment
 RUN python -m ipykernel install --user \

@@ -47,9 +47,10 @@ The hashes identify the **parameters**, not the code version. Two runs with the 
 | Example Question | File(s) |
 |---|---|
 | What settings were used? | `configs/*.yml` |
-| What exactly was run, and what did the run log say? | `notebooks/*_notebook.ipynb` (code cells with their saved outputs, including feature counts kept at each filter) |
+| What exactly was run, and what did the run log say? | `Analysis--<A>/run_manifest.json` (command, code version, stage timings), the CLI `--log-file`, or `notebooks/*_notebook.ipynb` for notebook runs |
+| I want to browse the results interactively | `python -m tools.cli explore --bundle Analysis--<A>/explorer` (see `explorer.md`) |
 | Which features grouped together? | `Analysis--<A>/feature_network_node_table.csv` (`group` column) |
-| Which groups are enriched for which pathways? | `Analysis--<A>/heatmap_enrichment.png`, `full_padj_matrix.csv`, `full_fold_enrichment_matrix.csv` |
+| Which groups are enriched for which pathways? | `Analysis--<A>/enrichment/enrichment_long.csv` (all annotation types), `enrichment/<type>/heatmap_enrichment.png` |
 | What biological annotations are known about a feature? | `Analysis--<A>/feature_annotation_table.csv` |
 | Do samples separate by treatment? | `Analysis--<A>/Integrated_Data_PCA___<variable>.pdf` |
 | How many features survived each processing step? | Row counts of the CSVs in each dataset folder (Section 4), or the notebook log |
@@ -142,7 +143,7 @@ One row per feature in `integrated_data.csv` (all integrated features, not only 
 | `modelseed_pathway` | **The shared pathway key across data types.** Pathway IDs from the ModelSEED database (KEGG, MetaCyc and PlantCyc sources combined), reached through `*_modelseed_rxn` for genes/proteins and `mx_modelseed_id` for metabolites. A gene and a metabolite with the same pathway ID here are linked by known biochemistry. Values starting with `NOPATHWAY_rxn…` are placeholders: a reaction with known compounds but no named pathway. They keep gene–metabolite links that no named pathway covers, but they are not biological pathways. |
 | `mx_kegg_id` | KEGG compound ID looked up from the InChIKey. |
 | `kegg_pathway`, `kegg_pathway_name` | **KEGG level 1: pathway maps.** Reference pathway IDs (`path:map#####`) and names, including the broad global/overview maps (`map011xx`/`map012xx`, e.g. `map01100` Metabolic pathways). Organism-, KO- and EC-specific copies (`ko00860`, `ec00860`) are collapsed to `map00860`. All three KEGG levels are assigned the same way: metabolites through InChIKey → `mx_kegg_id` → KEGG, and transcripts/proteins through **both** their EC numbers and KO accessions. Every data type therefore shares one set of IDs at each level. Partial EC numbers (e.g. `EC:1.1.1.-`) are skipped. |
-| `kegg_module`, `kegg_module_name` | **KEGG level 2: modules** (`M#####`, e.g. `M00001` glycolysis, `M00012` glyoxylate cycle). Smaller functional units than pathway maps, and the recommended level for group–pathway enrichment (`pathway_col: kegg_module`). Fewer features have a module than a pathway, because many KOs are not part of any module. |
+| `kegg_module`, `kegg_module_name` | **KEGG level 2: modules** (`M#####`, e.g. `M00001` glycolysis, `M00012` glyoxylate cycle). Smaller functional units than pathway maps. Every KEGG level is tested in the enrichment stage. Fewer features have a module than a pathway, because many KOs are not part of any module. |
 | `kegg_reaction`, `kegg_reaction_name` | **KEGG level 3: reactions** (`R#####`, e.g. `R00200` pyruvate kinase). The most specific level. It directly links an enzyme to the metabolites it acts on, but each reaction has only a few features. Cofactor/currency compounds (water, ATP, NAD(P)H, CoA, CO₂, H⁺, …) are **not** linked at the module or reaction level, because they take part in thousands of reactions. They still receive pathways. |
 
 `Unassigned` means no annotation was found. The log prints how many features of each data type (and what percentage) received at least one `modelseed_pathway`, `kegg_pathway`, `kegg_module` and `kegg_reaction` term. `NOPATHWAY_*` placeholders are not counted.
@@ -199,30 +200,36 @@ One row per grouped feature (`node_id`). **Note that this file has "network_node
 | `module_trait_correlation.csv` / `.pdf` | Correlation of each module eigengene with the numeric metadata columns. |
 | `gs_vs_mm_plots/<module>_<trait>_gs_vs_mm.pdf` | For each module and trait: feature-trait correlation plotted against module membership. A strong positive trend means the module's core features are the ones linked to the trait. |
 
-### 5.4 Group–pathway comparison (step 11)
+### 5.4 Group–pathway comparison (`enrich` stage)
 
-This step asks: **does a data-driven group contain more members of a known pathway than chance would predict?**
+This step asks: **does a data-driven group contain more members of a known pathway (or KO, COG, EC, compound class…) than chance would predict?** It runs once for **every annotation type**, and each type's files are written to `enrichment/<annotation_type>/`. The `enrichment/` folder also holds:
+
+| File | Contents |
+|---|---|
+| `annotation_types.json` | Every annotation type found, with how it is parsed (ID column, name column, delimiter, data type). |
+| `annotations_long.csv` | One row per feature–term pair: `feature_id, ann_type, term_id, term_name`, with normalized IDs (e.g. `map00010`, not `path:map00010`). |
+| `enrichment_long.csv` | Every tested term–group pair across all types: `ann_type, term_id, term_name, group, k, K, n, N, fold, p, padj`. Filter on `padj` for significant results. |
 
 #### Method
 
-1. **Universe.** Starts from the node table. Each feature's pathway list (`pathway_enrichment.pathway_col`: `kegg_module` by default, or `kegg_pathway`, `kegg_reaction`, `modelseed_pathway`) is split into one row per feature–pathway pair. Filters, in order:
-   - `exclude_nopathway`: drop `NOPATHWAY_*` placeholders.
+1. **Universe.** Starts from the node table. For each annotation type, each feature's terms are split into one row per feature–term pair (`NOPATHWAY_*` ModelSEED placeholders are always dropped). Filters, in order:
    - `exclude_global_maps`: drop KEGG global/overview maps (`map011xx`/`map012xx`, e.g. `map01100` Metabolic pathways).
-   - `bipartite_only`: keep only pathways with members from **every** data type present.
+   - `bipartite_only` (cross-omic types only): keep only pathways with members from **every** data type present.
    - `min_features_per_pathway`: drop small pathways.
    - `min_features_per_group`: drop small groups.
    - `bipartite_only`: also keep only groups whose members (annotated or not) span **every** data type present.
    
-   Unannotated features stay in the background count but are never tested.
+   With `background: annotated` (default), the universe and group sizes count only features annotated with that type. With `background: all`, unannotated features stay in the background count but are never tested. HDBSCAN `noise` / WGCNA `grey` features stay in the background but are never tested as a group.
 2. **Test.** For every pathway x group pair with at least one shared feature, a one-sided hypergeometric test gives the probability of seeing at least that many pathway members in the group by chance. Here *M* = number of features in the universe, *n* = features in the pathway, *N* = features in the group and *k* = the overlap.
-3. **Correction.** P-values are adjusted with Benjamini–Hochberg FDR across all tested pairs. Pairs with no overlap get p = padj = 1.
+3. **Correction.** P-values are adjusted with Benjamini–Hochberg FDR across all tested pairs of that annotation type. Pairs with no overlap get p = padj = 1.
 4. **Fold enrichment** = *k* / (*n* · *N* / *M*). A value of 1 means what chance predicts, and values above 1 mean over-representation.
-5. **Display.** Only the top `top_n` pathways, ranked by `rank_by`, are drawn. **Ranking affects only the figures. Every pathway is tested and saved in the CSVs.**
+5. **Display.** Only the top `top_n` terms, ranked by `rank_by`, are drawn, with rows for the groups that have at least one significant displayed term. **Ranking affects only the figures. Every term is tested and saved in the CSVs.**
 
-#### Tables
+#### Tables (per annotation type, in `enrichment/<annotation_type>/`)
 
 | File | Contents |
 |---|---|
+| `enrichment_long.csv` | This type's rows of the combined long table. |
 | `exploded_universe.csv` | The tested universe: one row per feature–pathway pair (index = feature ID; columns `group`, `pathway`, `pathway_name`, and `dtype` when `bipartite_only` is on). |
 | `pathway_names.csv` | Every tested term (`pathway`) with its full descriptive name from KEGG (`pathway_name`), e.g. `M00001` → `Glycolysis (Embden-Meyerhof pathway), glucose => pyruvate`. The name is empty for `modelseed_pathway`, whose IDs already include it. |
 | `full_overlap_matrix.csv` | Pathway x group: number of shared features (*k*). |
@@ -249,7 +256,36 @@ All three share one layout, and each figure has a short legend printed above it:
 | `heatmap_normalized.png` | Fraction of the displayed pathway features that fall in each group (each column sums to 1; magma) | Bright cells: one group holds most of the pathway. |
 | `heatmap_enrichment.png` | Fold enrichment (RdBu_r). Stars mark BH-adjusted significance: `*` < 0.05, `**` < 0.01, `***` < 0.001 | Dark-red starred cells are the main result: a co-varying group that is significantly over-represented in a known pathway. |
 
-### 5.5 Other figures in the Analysis folder
+#### `grouping_structure/` (hierarchical clustering and HDBSCAN)
+
+The grouping method's own structure, saved so that the explorer can draw it faithfully.
+
+| File | Contents |
+|---|---|
+| `hierarchical_linkage.csv`, `_leaf_ids.csv`, `.json` | scipy linkage matrix (`left, right, distance, size`), the feature for each leaf, and the distance/linkage/cut settings. |
+| `hdbscan_condensed_tree.csv`, `_leaf_ids.csv`, `.json` | HDBSCAN condensed tree (`parent, child, lambda_val, child_size`) and the cluster IDs selected as groups (`group_<i+1>` is `selected_clusters[i]`). |
+
+### 5.6 Explorer bundle: `explorer/`
+
+Precomputed tables for the interactive explorer (`python -m tools.cli explore`), written by the last pipeline stage (`build_explorer`). The folder is self-contained: copy it anywhere and open it with `explore --bundle <folder>`. All tables are parquet files; open them with `pandas.read_parquet`. See `explorer.md` for the statistics used.
+
+| File | Contents |
+|---|---|
+| `manifest.json` | Run identity, grouping method, metadata variables and their types, detected nesting, annotation types, settings, build timings. |
+| `samples.parquet`, `sample_metadata.parquet`, `sample_similarity.parquet` | Aligned metadata with sample PCA/UMAP coordinates; per-sample metadata; sample correlation matrix (clustered order). |
+| `features.parquet` | One row per integrated feature: data type, display name, group, noise flag, annotation count, UMAP position, kME (correlation with its group eigengene). |
+| `abundance_z.parquet`, `abundance_log.parquet` | Integrated z-scores; per-dataset log-scale abundance. |
+| `annotations_long.parquet`, `terms.parquet` | Feature–term pairs (full annotation scope); one row per term with sizes and group concentration statistics. |
+| `groups.parquet`, `group_eigengenes.parquet`, `group_network.parquet` | Group summaries (size, data types, coherence, top term, strongest association); eigengene per sample; eigengene-correlation edges between groups. |
+| `term_scores.parquet` | Mean z-score profile per term. |
+| `enrichment.parquet` | Every tested term–group pair (all annotation types). |
+| `associations.parquet` | Feature, group and term tests against every metadata variable (moderated F/t, CAMERA). |
+| `agreement_types/terms/groups/null.parquet` | Knowledge vs data-driven agreement: per annotation type (AMI, ARI, co-membership vs permutation null), per term, per group. |
+| `feature_edges.parquet` | Real network edges (network_modules only). |
+| `native_structure.json` | Dendrogram or HDBSCAN cluster tree for the Groups page. |
+| `candidates.parquet` | Unannotated features in groups with significant enrichment (discovery list). |
+
+### 5.7 Other figures in the Analysis folder
 
 | File | Contents |
 |---|---|
@@ -270,6 +306,10 @@ The notebook also shows PCAs of the full integrated data and of each dataset's `
 | `..._analysis_config.yml` | `replicate_pairing`, `feature_selection`, `feature_grouping` and `pathway_enrichment`. |
 
 See `project_config_parameters_explained.md`, `data_processing_config_parameters_explained.md` and `analysis_config_parameters_explained.md` for details on each parameter.
+
+### Run record: `Analysis--<A>/run_manifest.json`
+
+Written at the end of every run (CLI or notebook): the command line, git commit of the workflow code, host, slurm job ID and the time each stage took. The configs saved in `configs/` are the exact text that was hashed when the run started, so edits made to the active config files during a run cannot be saved under the wrong hash.
 
 ### Notebook: `notebooks/`
 
@@ -297,12 +337,11 @@ See `project_config_parameters_explained.md`, `data_processing_config_parameters
 
 1. Note the two hashes from the folder names (for example `Dataset_Processing--5d861c04`, `Analysis--e340140e`).
 2. Put the original raw inputs and link table back at the paths listed in the project config.
-3. Place the `configs/` folder at `output_data/<project_name>/configs/` and start the notebook with:
-   ```python
-   project = objs.Project(data_processing_hash='5d861c04', analysis_hash='e340140e')
+3. Place the `configs/` folder at `output_data/<project_name>/configs/` and run:
+   ```bash
+   python -m tools.cli run --config-dir output_data/<project_name>/configs -d 5d861c04 -a e340140e
    ```
-   This copies the hash-tagged configs back to the active config names. The workflow warns if the recomputed hashes do not match.
-4. Run the notebook from top to bottom.
+   or, in the notebook, `objs.Project(config_dir="<...>/configs", data_processing_hash="5d861c04", analysis_hash="e340140e")`. This copies the hash-tagged configs back to the active config names. The workflow warns if the recomputed hashes do not match. `python -m tools.cli list --results-dir output_data` flags saved configs that do not hash to their run's name.
 
 What may still differ:
 

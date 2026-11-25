@@ -158,72 +158,6 @@ def write_integration_file(
     else:
         log.info("Not saving data to disk.")
 
-def list_persistent_configs():
-    """List available persistent configuration sets in a directory with last write dates."""
-    config_pattern = "/home/jovyan/work/output_data/*/configs/*.yml"
-    config_files = glob.glob(config_pattern, recursive=True)
-    
-    # Group by hash combination
-    config_sets = {}
-    for config_file in config_files:
-        config_file = Path(config_file)
-        name_parts = config_file.stem.split('_')
-        
-        if len(name_parts) >= 5:
-            data_hash = None
-            analysis_hash = None
-            
-            for part in name_parts:
-                if 'Processing--' in part:
-                    data_hash = part.split('--')[1]
-                elif 'Analysis--' in part:
-                    analysis_hash = part.split('--')[1]
-            
-            if data_hash and analysis_hash:
-                hash_combo = (data_hash, analysis_hash)
-                
-                if hash_combo not in config_sets:
-                    config_sets[hash_combo] = []
-                
-                # Get file modification time
-                mod_time = config_file.stat().st_mtime
-                config_sets[hash_combo].append({
-                    'file': config_file,
-                    'mod_time': mod_time,
-                    'timestamp': datetime.fromtimestamp(mod_time)
-                })
-    
-    # Find most recent file for each hash combination and prepare table data
-    table_data = []
-    for (data_hash, analysis_hash), files in config_sets.items():
-        # Sort by modification time and get the most recent
-        most_recent = max(files, key=lambda x: x['mod_time'])
-        
-        config_types = [f['file'].stem.split('_')[-2] for f in files]
-        complete = len(config_types) >= 3
-        status = "Complete" if complete else f"Missing ({3-len(config_types)} files)"
-        
-        table_data.append({
-            'Data Hash': data_hash,
-            'Analysis Hash': analysis_hash,
-            'Last Modified': most_recent['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
-            'Status': status,
-            'File Count': len(files)
-        })
-    
-    # Sort by last modified date (most recent first)
-    table_data.sort(key=lambda x: x['Last Modified'], reverse=True)
-    
-    # Create and display DataFrame
-    if table_data:
-        df = pd.DataFrame(table_data)
-        log.info("Available persistent configuration sets:")
-        display(df)
-    else:
-        log.info("No persistent configuration sets found yet.")
-    
-    return
-
 def list_project_configs() -> None:
     """
     List all saved configuration files for a project and print to standard output.
@@ -1745,6 +1679,21 @@ def plot_correlation_network(
     return node_table, edge_table
 
 
+def save_grouping_structure(output_dir: Optional[str], name: str, table: pd.DataFrame,
+                            leaf_ids=None, meta: Optional[dict] = None) -> None:
+    """Persist a grouping method's native structure (linkage, condensed tree...) to
+    ``<output_dir>/grouping_structure/`` so the explorer can show it faithfully."""
+    if not output_dir:
+        return
+    out = Path(output_dir) / "grouping_structure"
+    out.mkdir(parents=True, exist_ok=True)
+    table.to_csv(out / f"{name}.csv", index=False)
+    if leaf_ids is not None:
+        pd.Series(list(leaf_ids), name="feature_id").to_csv(out / f"{name}_leaf_ids.csv", index=False)
+    with open(out / f"{name}.json", "w") as fh:
+        json.dump(meta or {}, fh, indent=2, default=str)
+
+
 def group_features_hierarchical(
     data: pd.DataFrame,
     distance_metric: str = "correlation",
@@ -1805,6 +1754,10 @@ def group_features_hierarchical(
     dist = pdist(numeric_data.values, metric=distance_metric)
     Z = linkage(dist, method=linkage_method)
     labels = fcluster(Z, t=height_cutoff, criterion='distance')
+    save_grouping_structure(output_dir, "hierarchical_linkage", pd.DataFrame(
+        Z, columns=["left", "right", "distance", "size"]),
+        leaf_ids=numeric_data.index, meta={"distance_metric": distance_metric,
+                                           "linkage_method": linkage_method, "height_cutoff": height_cutoff})
 
     # Build group series
     group_series = pd.Series(
@@ -1929,11 +1882,22 @@ def group_features_hdbscan(
         hdbscan_metric = metric
 
     # Run HDBSCAN
-    raw_labels = hdbscan.HDBSCAN(
+    clusterer = hdbscan.HDBSCAN(
         metric=hdbscan_metric,
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
-    ).fit_predict(X)
+    )
+    raw_labels = clusterer.fit_predict(X)
+    try:
+        tree = clusterer.condensed_tree_.to_pandas()
+        selected = clusterer.condensed_tree_._select_clusters()
+        save_grouping_structure(output_dir, "hdbscan_condensed_tree", tree, leaf_ids=numeric_data.index,
+                                meta={"metric": metric, "min_cluster_size": min_cluster_size,
+                                      "min_samples": min_samples,
+                                      # label i (group_{i+1}) is condensed-tree node selected[i]
+                                      "selected_clusters": [int(c) for c in selected]})
+    except Exception as exc:
+        log.warning(f"Could not save HDBSCAN condensed tree: {exc}")
 
     # Map labels: -1 → "noise", others → "group_{label+1}"
     group_labels = [
@@ -8232,14 +8196,27 @@ def prepare_universe(node_table, pathway_col, group_col, pe_cfg, missing_token='
 
     return exploded
 
-def compute_enrichment_matrix(exploded, alpha=0.05, fdr_method='fdr_bh', missing_token='Unassigned'):
-    # Full-universe background -- includes unannotated ('Unassigned') features,
-    # so M/N reflect the true population, not just annotated features.
-    M = exploded.index.nunique()
-    N = exploded.index.to_series().groupby(exploded['group']).nunique()
+def compute_enrichment_matrix(exploded, alpha=0.05, fdr_method='fdr_bh', missing_token='Unassigned',
+                              background='annotated', exclude_groups=None):
+    """One-sided hypergeometric enrichment of every pathway in every group (BH-corrected).
 
-    # Drop 'Unassigned' from what's actually TESTED -- see prior message.
-    testable = exploded[exploded['pathway'] != missing_token]
+    ``background``:
+      * ``'annotated'`` (default, standard practice) -- the universe is the grouped features
+        with at least one annotation of this type; group sizes count annotated members only.
+        Unannotated features carry no information about a term and would otherwise dilute
+        or inflate enrichment depending on annotation coverage per group.
+      * ``'all'`` -- every grouped feature, annotated or not.
+    ``exclude_groups`` (e.g. HDBSCAN ``noise``) stay in the universe but are not tested.
+    """
+    is_annotated = exploded['pathway'] != missing_token
+    universe = exploded[is_annotated] if background == 'annotated' else exploded
+    M = universe.index.nunique()
+    N = universe.index.to_series().groupby(universe['group']).nunique()
+    if exclude_groups:
+        N = N.drop([g for g in exclude_groups if g in N.index])
+
+    # Unassigned is never a tested term
+    testable = exploded[is_annotated & exploded['group'].isin(N.index)]
     overlap_mat = pd.crosstab(testable['pathway'], testable['group'])
     overlap_mat = overlap_mat.reindex(columns=N.index, fill_value=0)
 
@@ -8762,6 +8739,37 @@ def plot_group_pathway_heatmaps(counts_df, row_normalized_df, enrichment_matrix_
 # 3. INTEGRATION
 # ==========================================
 
+def _is_noise_group(label) -> bool:
+    """Grouping labels meaning 'not in a real group' (HDBSCAN noise, WGCNA grey)."""
+    return str(label).lower() in {"noise", "grey", "gray", "-1", "unassigned"}
+
+
+def enrichment_long_table(overlap_mat, fold_mat, pval_mat, padj_mat, exploded,
+                          background='annotated', missing_token='Unassigned') -> pd.DataFrame:
+    """Long ``term_id, group, k, K, n, N, fold, p, padj`` table of every tested pair (k > 0)."""
+    is_annotated = exploded['pathway'] != missing_token
+    universe = exploded[is_annotated] if background == 'annotated' else exploded
+    N_total = universe.index.nunique()
+    group_n = universe.index.to_series().groupby(universe['group']).nunique()
+    testable = exploded[is_annotated]
+    term_K = testable.index.to_series().groupby(testable['pathway']).nunique()
+    k = overlap_mat.stack()
+    k = k[k > 0]
+    out = pd.DataFrame({
+        'term_id': k.index.get_level_values(0).astype(str),
+        'group': k.index.get_level_values(1).astype(str),
+        'k': k.to_numpy(),
+    })
+    out['K'] = out['term_id'].map(term_K).fillna(0).astype(int).to_numpy()
+    out['n'] = out['group'].map(group_n).fillna(0).astype(int).to_numpy()
+    out['N'] = N_total
+    keys = list(zip(k.index.get_level_values(0), k.index.get_level_values(1)))
+    out['fold'] = [fold_mat.at[t, g] for t, g in keys]
+    out['p'] = [pval_mat.at[t, g] for t, g in keys]
+    out['padj'] = [padj_mat.at[t, g] for t, g in keys]
+    return out
+
+
 def compare_groups_to_pathways(
     node_table: pd.DataFrame,
     abundance_df: pd.DataFrame,
@@ -8775,13 +8783,20 @@ def compare_groups_to_pathways(
         title=f"'{pe['pathway_col']}' coverage of features in the node table, by data type",
     )
     exploded = prepare_universe(node_table, pe['pathway_col'], 'group', pe)
-    overlap_mat, fold_mat, pval_mat, padj_mat = compute_enrichment_matrix(
-        exploded, alpha=pe['alpha'], fdr_method=pe.get('fdr_method', 'fdr_bh')
-    )
     missing_token = pe.get('missing_token', 'Unassigned')
+    exclude_groups = sorted({g for g in exploded['group'].unique() if _is_noise_group(g)})
+    overlap_mat, fold_mat, pval_mat, padj_mat = compute_enrichment_matrix(
+        exploded, alpha=pe['alpha'], fdr_method=pe.get('fdr_method', 'fdr_bh'),
+        missing_token=missing_token, background=pe.get('background', 'annotated'),
+        exclude_groups=exclude_groups,
+    )
+    if overlap_mat.empty:
+        raise ValueError(f"No testable pathway/group pairs for '{pe['pathway_col']}' after universe filtering.")
 
-    # get selected_pathways from pe (as a comma-separated list of strings in quotes)
+    # selected_pathways: {ann_type: [term IDs]} mapping; a plain list applies to every type
     selected_pathways = pe.get('selected_pathways', None)
+    if isinstance(selected_pathways, dict):
+        selected_pathways = selected_pathways.get(pe['pathway_col'])
     if selected_pathways:
         # User-specified subset takes priority over ranking entirely.
         available = set(padj_mat.index)
@@ -8799,7 +8814,8 @@ def compare_groups_to_pathways(
             )
         # Groups restricted to those with >=1 feature in the chosen pathways.
         kept_groups = sorted(
-            exploded.loc[exploded['pathway'].isin(chosen_pathways), 'group'].unique()
+            set(exploded.loc[exploded['pathway'].isin(chosen_pathways), 'group'].unique())
+            - set(exclude_groups)
         )
     else:
         if pe.get('rank_by') == 'summed_significance':
@@ -8816,8 +8832,16 @@ def compare_groups_to_pathways(
             )
         else:
             raise ValueError(f"Unknown rank_by method: {pe.get('rank_by')}")
+        # only tested pathways can be shown (e.g. a term found only in HDBSCAN noise is never tested)
+        rank_scores = rank_scores[rank_scores.index.isin(padj_mat.index)]
         chosen_pathways = rank_scores.head(pe['top_n']).index.tolist()
-        kept_groups = sorted(exploded['group'].unique())
+        # Heatmap rows: groups with at least one significant enrichment among the shown
+        # pathways (falls back to the most enriched groups when none pass alpha).
+        shown_padj = padj_mat.loc[chosen_pathways]
+        sig_groups = shown_padj.columns[(shown_padj < pe['alpha']).any(axis=0)]
+        if len(sig_groups) == 0:
+            sig_groups = shown_padj.min(axis=0).nsmallest(min(50, shown_padj.shape[1])).index
+        kept_groups = sorted(sig_groups)
 
     counts_df = overlap_mat.T.loc[kept_groups, chosen_pathways]
     enrich_df = fold_mat.T.loc[kept_groups, chosen_pathways]
@@ -8827,8 +8851,10 @@ def compare_groups_to_pathways(
     row_dtype_cols, row_dtype_cnt, row_dtype_norm = _get_dtype_composition(exploded, 'group', kept_groups)
     col_dtype_cols, col_dtype_cnt, col_dtype_norm = _get_dtype_composition(exploded, 'pathway', chosen_pathways)
 
-    row_trends = get_trend_values(abundance_df, node_table, 'group', metadata_df, pe['trend_sort_by'], pe['trend_collapse_by'], pe['trend_agg'])
-    col_trends = get_trend_values(abundance_df, exploded, 'pathway', metadata_df, pe['trend_sort_by'], pe['trend_collapse_by'], pe['trend_agg'])
+    row_trends = get_trend_values(abundance_df, node_table, 'group', metadata_df, pe.get('trend_sort_by'),
+                                  pe.get('trend_collapse_by'), pe.get('trend_agg', 'median'))
+    col_trends = get_trend_values(abundance_df, exploded, 'pathway', metadata_df, pe.get('trend_sort_by'),
+                                  pe.get('trend_collapse_by'), pe.get('trend_agg', 'median'))
 
     # Descriptive labels: "M00001 (Glycolysis ...)" for KEGG modules/reactions/
     # pathways. Full names go to the CSVs; heatmap labels are truncated.
@@ -8844,16 +8870,6 @@ def compare_groups_to_pathways(
 
     def _relabel_index(df):
         return df.rename(index=plot_labels) if df is not None else df
-
-    figs = plot_group_pathway_heatmaps(
-        counts_df=_relabel_cols(counts_df), row_normalized_df=_relabel_cols(norm_df),
-        enrichment_matrix_df=_relabel_cols(enrich_df), pval_df=_relabel_cols(padj_df),
-        row_trends=row_trends, col_trends=_relabel_index(col_trends),
-        row_dtype_cols=row_dtype_cols, row_dtype_cnt=row_dtype_cnt, row_dtype_norm=row_dtype_norm,
-        col_dtype_cols=_relabel_index(col_dtype_cols), col_dtype_cnt=_relabel_index(col_dtype_cnt),
-        col_dtype_norm=_relabel_index(col_dtype_norm),
-        trend_cmap=pe.get('trend_cmap', 'Purples'), output_dir=output_dir
-    )
 
     # ---- Export everything
     if output_dir:
@@ -8872,6 +8888,13 @@ def compare_groups_to_pathways(
         pval_mat.to_csv(out / "full_pvalue_matrix.csv")
         padj_mat.to_csv(out / "full_padj_matrix.csv")
 
+        enrichment_long_table(overlap_mat, fold_mat, pval_mat, padj_mat, exploded,
+                              background=pe.get('background', 'annotated'),
+                              missing_token=missing_token).assign(
+            ann_type=pe['pathway_col'],
+            term_name=lambda d: d['term_id'].map(term_names).fillna(""),
+        ).to_csv(out / "enrichment_long.csv", index=False)
+
         row_trends.to_csv(out / "group_trend_values.csv")
         col_trends.to_csv(out / "pathway_trend_values.csv")
 
@@ -8883,5 +8906,23 @@ def compare_groups_to_pathways(
                 "kept_groups": kept_groups,
             }, f, indent=2, default=str)
 
+    # Heatmap last, so the tables above are written even when there is too little to draw. Clustering
+    # the heatmap needs at least two groups and two terms.
+    figs = None
+    if len(kept_groups) >= 2 and len(chosen_pathways) >= 2:
+        figs = plot_group_pathway_heatmaps(
+            counts_df=_relabel_cols(counts_df), row_normalized_df=_relabel_cols(norm_df),
+            enrichment_matrix_df=_relabel_cols(enrich_df), pval_df=_relabel_cols(padj_df),
+            row_trends=row_trends, col_trends=_relabel_index(col_trends),
+            row_dtype_cols=row_dtype_cols, row_dtype_cnt=row_dtype_cnt, row_dtype_norm=row_dtype_norm,
+            col_dtype_cols=_relabel_index(col_dtype_cols), col_dtype_cnt=_relabel_index(col_dtype_cnt),
+            col_dtype_norm=_relabel_index(col_dtype_norm),
+            trend_cmap=pe.get('trend_cmap', 'Purples'), output_dir=output_dir
+        )
+    else:
+        log.info(f"Heatmap for '{pe['pathway_col']}' skipped: {len(kept_groups)} group(s) x "
+                 f"{len(chosen_pathways)} term(s) to show (needs at least 2 x 2). Enrichment tables were written.")
+
     return {"figs": figs, "padj_matrix": padj_df, "selected_pathways": chosen_pathways,
+            "full_padj_matrix": padj_mat, "full_overlap_matrix": overlap_mat,
             "kept_groups": kept_groups, "pathway_names": term_names}

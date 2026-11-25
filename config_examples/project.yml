@@ -1,6 +1,6 @@
 user_settings:
   project_name: Bartley_511319_Rice
-  variable_list:
+  variable_list:   # optional; omit to use every metadata column in the link table (incl. group)
     - timepoint
     - group
 

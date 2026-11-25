@@ -1,0 +1,133 @@
+/* Integration Explorer — light/dark tokens (validated reference palette) */
+:root, [data-bs-theme="light"] {
+  --surface-1: #fcfcfb;
+  --page: #f9f9f7;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --hairline: #e1e0d9;
+  --border: rgba(11, 11, 11, 0.10);
+  --accent: #2a78d6;
+  --bs-body-bg: var(--page);
+  --bs-body-color: var(--ink);
+  --bs-secondary-color: var(--ink-2);
+  --bs-border-color: var(--hairline);
+}
+[data-bs-theme="dark"] {
+  --surface-1: #1a1a19;
+  --page: #0d0d0d;
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --hairline: #2c2c2a;
+  --border: rgba(255, 255, 255, 0.10);
+  --accent: #3987e5;
+  --bs-body-bg: var(--page);
+  --bs-body-color: var(--ink);
+  --bs-secondary-color: var(--ink-2);
+  --bs-border-color: var(--hairline);
+}
+
+body {
+  background: var(--page);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+}
+.text-secondary { color: var(--ink-2) !important; }
+
+/* ---- shell ---- */
+.topbar {
+  position: sticky; top: 0; z-index: 1000;
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--hairline);
+  padding: 10px 20px 0;
+}
+.topbar-row { display: flex; align-items: center; gap: 20px; }
+.brand { font-weight: 650; font-size: 16px; }
+.run-id { font-size: 12px; font-variant-numeric: tabular-nums; }
+.global-search { flex: 1; max-width: 720px; margin-left: auto; }
+.theme-switch { white-space: nowrap; }
+.mainnav { margin-top: 8px; gap: 2px; }
+.mainnav .nav-link { color: var(--ink-2); padding: 6px 12px; border-radius: 6px 6px 0 0; font-size: 14px; }
+.mainnav .nav-link.active { background: transparent; color: var(--ink); box-shadow: inset 0 -2px 0 var(--accent);
+  border-radius: 0; font-weight: 600; }
+.shell { display: flex; min-height: calc(100vh - 100px); }
+.sidebar {
+  width: 230px; flex: 0 0 230px; padding: 18px 16px;
+  border-right: 1px solid var(--hairline); background: var(--surface-1);
+  position: sticky; top: 100px; align-self: flex-start; height: calc(100vh - 100px); overflow-y: auto;
+}
+.sidebar-title { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--muted); margin-bottom: 8px; }
+.sidebar .control { margin-bottom: 12px; }
+.sidebar-facts div { margin-bottom: 2px; }
+.page { flex: 1; min-width: 0; padding: 20px 24px 48px; }
+
+@media (max-width: 900px) {
+  .shell { flex-direction: column; }
+  .sidebar { width: auto; flex: none; position: static; height: auto; border-right: none;
+    border-bottom: 1px solid var(--hairline); }
+  .page { padding: 16px; }
+  .topbar-row { flex-wrap: wrap; }
+  .global-search { max-width: none; width: 100%; order: 3; }
+}
+
+/* ---- controls ---- */
+.controls { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: flex-end; margin-bottom: 12px; }
+.control { min-width: 0; }
+.form-label { margin-bottom: 2px; }
+
+/* ---- cards & stats ---- */
+.viz-card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; }
+.viz-card .card-header { background: transparent; border-bottom: 1px solid var(--hairline); padding: 10px 16px; }
+.card-title-text { font-weight: 600; font-size: 14px; }
+.stat-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+.stat-tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 14px; min-width: 140px; }
+.stat-label { font-size: 12px; color: var(--ink-2); }
+.stat-value { font-size: 22px; font-weight: 600; line-height: 1.25; }
+.stat-note { font-size: 11px; color: var(--muted); }
+.legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px;
+  vertical-align: -1px; }
+.alert-light { background: var(--surface-1); border-color: var(--hairline); color: var(--ink-2); }
+
+/* ---- tables ---- */
+.nav-cell { color: var(--accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.ag-theme-quartz, .ag-root-wrapper {
+  --ag-background-color: var(--surface-1);
+  --ag-foreground-color: var(--ink);
+  --ag-header-background-color: var(--page);
+  --ag-header-text-color: var(--ink-2);
+  --ag-border-color: var(--hairline);
+  --ag-row-border-color: var(--hairline);
+  --ag-odd-row-background-color: var(--surface-1);
+  --ag-row-hover-color: var(--hairline);
+  --ag-font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --ag-font-size: 13px;
+}
+
+/* ---- Dash 4 core components (dropdowns, inputs) follow the theme ---- */
+html[data-bs-theme="light"], html:not([data-bs-theme]) {
+  --Dash-Fill-Interactive-Strong: #2a78d6;
+  --Dash-Fill-Inverse-Strong: #fcfcfb;
+}
+html[data-bs-theme="dark"] {
+  --Dash-Fill-Interactive-Strong: #3987e5;
+  --Dash-Fill-Interactive-Weak: rgba(57, 135, 229, 0.12);
+  --Dash-Fill-Inverse-Strong: #1a1a19;
+  --Dash-Text-Primary: #f0efec;
+  --Dash-Text-Strong: #f0efec;
+  --Dash-Text-Weak: #c3c2b7;
+  --Dash-Text-Disabled: #898781;
+  --Dash-Stroke-Strong: rgba(255, 255, 255, 0.35);
+  --Dash-Stroke-Weak: rgba(255, 255, 255, 0.12);
+  --Dash-Fill-Primary-Hover: rgba(255, 255, 255, 0.06);
+  --Dash-Fill-Primary-Active: rgba(255, 255, 255, 0.10);
+  --Dash-Fill-Disabled: rgba(255, 255, 255, 0.08);
+  --Dash-Tooltip-Background-Color: #1a1a19;
+  --Dash-Tooltip-Border-Color: #383835;
+}
+html[data-bs-theme="dark"] .form-control { background: var(--surface-1); color: var(--ink); border-color: var(--hairline); }
+.nav-tabs .nav-link { color: var(--ink-2); }
+.nav-tabs .nav-link.active { color: var(--ink); background: var(--surface-1); }

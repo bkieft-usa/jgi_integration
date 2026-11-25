@@ -62,18 +62,18 @@ analysis:
       feature_list_file:
 
   pathway_enrichment:
-    pathway_col: kegg_module          # kegg_module | kegg_pathway | kegg_reaction | modelseed_pathway
-    exclude_nopathway: true          # exclude pathways with no canonical name (modelseed_pathway only)
+    # Runs for EVERY annotation type in the feature annotation table (KEGG pathway/module/reaction,
+    # ModelSEED pathway, KO, COG, EC, BRITE, compound classes...); results go to enrichment/<type>/.
+    background: annotated             # annotated (recommended: grouped features with >=1 annotation of the type) | all
     exclude_global_maps: true        # drop KEGG global/overview maps (map011xx/map012xx, e.g. map01100) from the test (kegg_pathway only)
-    bipartite_only: true              # keep only pathways and groups with features from every data type
+    bipartite_only: true              # cross-omic types only: keep pathways and groups with features from every data type
     min_features_per_pathway: 2       # drop pathways with fewer than this many features before testing
     min_features_per_group: 2         # drop groups with fewer than this many features before testing
     alpha: 0.05                       # FDR significance threshold for enrichment test
-    show_only_sig: false              # restrict heatmap to pathways/groups with >=1 significant pair
-    top_n: 75                         # number of pathways to DISPLAY in the heatmap (does not affect the stats test)
-    rank_by: n_features      # n_features | summed_significance | mean_abs_value
-    enrichment_value: fold_enrichment # fold_enrichment | neg_log10_padj (heat metric for the enrichment panel)
+    top_n: 75                         # number of pathways to DISPLAY in each heatmap (does not affect the stats test)
+    rank_by: feature_count            # feature_count | summed_significance | mean_abs_value
     trend_sort_by: timepoint          # metadata column to order the trend track's columns by
     trend_collapse_by: timepoint      # metadata column to POOL samples by in the trend track (null = one column per sample)
     trend_agg: median                 # mean | median -- pools replicates' summed abundances per category (track = share of total per category)
-    trend_dispersion: none             # sem | std | iqr | none -- trend track opacity statistic
+    # selected_pathways:              # optional {annotation_type: [term IDs]} to fix the heatmap columns
+    #   kegg_module: [M00001, M00002]
