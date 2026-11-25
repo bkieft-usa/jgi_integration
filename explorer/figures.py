@@ -55,26 +55,27 @@ def similarity_heatmap(sim: pd.DataFrame, theme, height: int = 480) -> go.Figure
 
 
 def agreement_dots(types: pd.DataFrame, labels: Dict[str, str], theme, height: Optional[int] = None) -> go.Figure:
+    """Observed same-group share of co-annotated feature pairs vs the share expected with
+    random groups (permutation mean ± 2 SD), one row per annotation type."""
     c = th.chrome(theme)
-    df = types.sort_values("z")
+    df = types.sort_values("ratio")
     names = [labels.get(a, a) for a in df["ann_type"]]
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=df["null_mean"], y=names, mode="markers", name="random groups (null mean ± 2 SD)",
+        x=df["expected"], y=names, mode="markers", name="random groups (mean ± 2 SD)",
         marker=dict(size=8, color=c["neutral_mark"], symbol="line-ns-open", line=dict(width=2, color=c["muted"])),
         error_x=dict(type="data", array=2 * df["null_sd"], color=c["muted"], thickness=1.5, width=0),
-        hovertemplate="%{y}<br>null mean %{x:.3f}<extra></extra>"))
+        hovertemplate="%{y}<br>expected with random groups %{x:.3f}<extra></extra>"))
     sig = df["p"] < 0.05
     fig.add_trace(go.Scatter(
-        x=df["comembership"], y=names, mode="markers", name="observed",
+        x=df["observed"], y=names, mode="markers", name="observed (blue: permutation p < 0.05)",
         marker=dict(size=10, color=np.where(sig, th.cat(theme, 0), c["muted"]),
                     line=dict(width=1.5, color=c["surface"])),
-        customdata=np.stack([df["z"], df["p"], df["ami"], df["n_features"], df["n_terms"]], axis=1),
-        hovertemplate="%{y}<br>observed %{x:.3f}<br>z = %{customdata[0]:.1f}, perm p = %{customdata[1]:.3f}"
-                      "<br>AMI = %{customdata[2]:.3f}<br>%{customdata[3]} features, %{customdata[4]} terms"
-                      "<extra></extra>"))
+        customdata=np.stack([df["ratio"], df["p"], df["n_features"], df["n_terms"]], axis=1),
+        hovertemplate="%{y}<br>observed %{x:.3f} (%{customdata[0]:.1f}× random)<br>permutation p = "
+                      "%{customdata[1]:.3f}<br>%{customdata[2]} features, %{customdata[3]} terms<extra></extra>"))
     return _base(fig, theme, height or max(260, 28 * len(df) + 80),
-                 xaxis_title="Same-group fraction of co-annotated feature pairs (mean over terms)",
+                 xaxis_title="Share of co-annotated feature pairs that fall in the same group (mean over terms)",
                  legend=dict(orientation="h", y=1.02, yanchor="bottom", x=0), margin=dict(l=200, r=16, t=40, b=48))
 
 
@@ -124,48 +125,73 @@ def ranked_bars(df: pd.DataFrame, theme, fdr: float, value_col: str, label_col: 
                  margin=dict(l=260, r=16, t=16, b=48), bargap=0.25)
 
 
-def feature_map(features: pd.DataFrame, theme, selected_group: Optional[str] = None,
-                highlight: Optional[Iterable[str]] = None, color_by: str = "group",
-                height: int = 560) -> go.Figure:
+def network_figure(nodes: pd.DataFrame, edges: pd.DataFrame, theme, color_by: str = "group",
+                   colored_groups: Optional[List[str]] = None, selected_group: Optional[str] = None,
+                   highlights: Optional[List[tuple]] = None, height: int = 640) -> go.Figure:
+    """The full feature network: one point per feature at its precomputed layout position.
+
+    ``highlights``: list of ``(label, feature_ids)``; when given, every other feature is drawn
+    in neutral gray and each highlighted set gets a categorical color (in the order given).
+    ``colored_groups``: the groups that get categorical colors when coloring by group (the rest
+    are gray), fixed per bundle so colors never move with filters.
+    """
     c = th.chrome(theme)
-    f = features.dropna(subset=["x"])
+    f = nodes.dropna(subset=["x"])
     fig = go.Figure()
-    hl = set(highlight or [])
+    if len(edges):
+        pos = f[["x", "y"]]
+        e = edges[edges["source"].isin(pos.index) & edges["target"].isin(pos.index)]
+        sx, sy = pos.loc[e["source"], "x"].to_numpy(), pos.loc[e["source"], "y"].to_numpy()
+        tx, ty = pos.loc[e["target"], "x"].to_numpy(), pos.loc[e["target"], "y"].to_numpy()
+        nan = np.full(len(e), np.nan)
+        fig.add_trace(go.Scattergl(x=np.column_stack([sx, tx, nan]).ravel(), y=np.column_stack([sy, ty, nan]).ravel(),
+                                   mode="lines", line=dict(color=c["axis"], width=0.6), opacity=0.5,
+                                   hoverinfo="skip", name=f"edges ({len(e):,})", showlegend=True))
+
     def custom(df):
-        return np.stack([df.index, df["group"].fillna(""), df["display_name"].fillna("")], axis=1)
-    tmpl = "<b>%{customdata[0]}</b><br>%{customdata[2]}<br>group: %{customdata[1]}<extra></extra>"
-    if color_by == "dtype":
-        for dt in sorted(f["dtype"].unique()):
-            sub = f[f["dtype"] == dt]
-            fig.add_trace(go.Scattergl(x=sub["x"], y=sub["y"], mode="markers", name=th.DTYPE_LABEL.get(dt, dt),
-                                       marker=dict(size=3, color=th.dtype_color(theme, dt), opacity=0.6),
-                                       customdata=custom(sub), hovertemplate=tmpl))
+        return np.stack([df.index, df["group"].fillna("–"), df["display_name"].fillna(""),
+                         np.where(df["is_annotated"], "annotated", "no annotation")], axis=1)
+    tmpl = "<b>%{customdata[0]}</b><br>%{customdata[2]}<br>group %{customdata[1]} · %{customdata[3]}<extra></extra>"
+
+    def add(df, name, color, size=5, symbol="circle", line_color=None, opacity=0.9, legend=True):
+        if df.empty:
+            return
+        fig.add_trace(go.Scattergl(
+            x=df["x"], y=df["y"], mode="markers", name=name, showlegend=legend,
+            marker=dict(size=size, color=color, symbol=symbol, opacity=opacity,
+                        line=dict(width=1 if line_color else 0, color=line_color or c["surface"])),
+            customdata=custom(df), hovertemplate=tmpl))
+
+    if highlights:
+        add(f, "other features", c["neutral_mark"], size=4, opacity=0.7)
+        for i, (label, ids) in enumerate(highlights[:8]):
+            sub = f[f.index.isin(ids)]
+            add(sub, f"{label} ({len(sub):,})", th.cat(theme, i), size=9, line_color=c["surface"])
+    elif color_by == "dtype":
+        for dt in sorted(f["dtype"].dropna().unique()):
+            add(f[f["dtype"] == dt], th.DTYPE_LABEL.get(dt, dt), th.dtype_color(theme, dt))
+    elif color_by == "annotation":
+        add(f[f["is_annotated"]], "annotated", th.cat(theme, 0))
+        add(f[~f["is_annotated"]], "no annotation of any type", th.cat(theme, 1))
     else:
-        rest = f[f["group"] != selected_group]
-        noise = rest["is_noise"].fillna(False).astype(bool)
-        fig.add_trace(go.Scattergl(x=rest.loc[~noise, "x"], y=rest.loc[~noise, "y"], mode="markers",
-                                   name="other groups", marker=dict(size=3, color=c["neutral_mark"], opacity=0.5),
-                                   customdata=custom(rest[~noise]), hovertemplate=tmpl))
-        if noise.any():
-            fig.add_trace(go.Scattergl(x=rest.loc[noise, "x"], y=rest.loc[noise, "y"], mode="markers",
-                                       name="noise / unassigned", visible="legendonly",
-                                       marker=dict(size=3, color=c["muted"], opacity=0.35),
-                                       customdata=custom(rest[noise]), hovertemplate=tmpl))
-        if selected_group is not None:
-            sel = f[f["group"] == selected_group]
-            fig.add_trace(go.Scattergl(x=sel["x"], y=sel["y"], mode="markers", name=f"{selected_group} ({len(sel)})",
-                                       marker=dict(size=6, color=th.cat(theme, 0),
-                                                   line=dict(width=0.5, color=c["surface"])),
-                                       customdata=custom(sel), hovertemplate=tmpl))
-    if hl:
-        sub = f[f.index.isin(hl)]
-        fig.add_trace(go.Scattergl(x=sub["x"], y=sub["y"], mode="markers", name=f"search matches ({len(sub)})",
-                                   marker=dict(size=10, color=th.cat(theme, 1), symbol="circle-open",
-                                               line=dict(width=2, color=th.cat(theme, 1))),
-                                   customdata=custom(sub), hovertemplate=tmpl))
+        colored = list(colored_groups or [])
+        noise = f["is_noise"].fillna(False).astype(bool)
+        rest = f[~f["group"].isin(colored) & ~noise]
+        add(rest, "other groups", c["neutral_mark"], size=4, opacity=0.8)
+        add(f[noise], "noise / unassigned", c["muted"], size=3, opacity=0.5)
+        styles = th.category_style(theme, colored)
+        for g in colored:
+            col, sym = styles[g]
+            add(f[f["group"] == g], g, col, symbol=sym, size=6)
+    if selected_group is not None:
+        sel = f[f["group"] == selected_group]
+        fig.add_trace(go.Scattergl(
+            x=sel["x"], y=sel["y"], mode="markers", name=f"selected: {selected_group} ({len(sel):,})",
+            marker=dict(size=9, color="rgba(0,0,0,0)", line=dict(width=1.2, color=c["ink"])),
+            customdata=custom(sel), hovertemplate=tmpl))
     return _base(fig, theme, height, xaxis=dict(visible=False), yaxis=dict(visible=False, scaleanchor="x"),
                  legend=dict(orientation="h", y=1.0, yanchor="bottom", x=0, itemsizing="constant"),
-                 margin=dict(l=8, r=8, t=32, b=8), dragmode="pan", clickmode="event")
+                 margin=dict(l=8, r=8, t=40, b=8), dragmode="pan", clickmode="event", hovermode="closest")
 
 
 def dendrogram(native: Dict, theme, selected_group: Optional[str] = None, height: int = 520) -> go.Figure:

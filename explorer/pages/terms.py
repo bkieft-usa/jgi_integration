@@ -21,7 +21,7 @@ def layout(b, params):
     term = params.get("term")
     opts = [{"label": b.term_label(term, 120), "value": term}] if term else []
     return html.Div([
-        ui.page_header("Knowledge-driven terms",
+        ui.page_header("Knowledge-Driven Groupings",
                        "Type a pathway, module, reaction, KO, EC number, COG, or compound class to see how its "
                        "features split across data-driven groups, whether it changes across your metadata, and which "
                        "features carry it."),
@@ -29,7 +29,8 @@ def layout(b, params):
             ui.labeled("Term", ui.dropdown("tm-pick", opts, term, placeholder="Search terms…", clearable=True,
                                            searchable=True, style={"minWidth": "520px"})),
             ui.labeled("Browse by annotation type", ui.dropdown(
-                "tm-browse", [{"label": a["label"], "value": a["key"]} for a in b.ann_types], None, clearable=True,
+                "tm-browse", [{"label": a["label"], "value": a["key"]} for a in b.ann_types], params.get("browse"),
+                clearable=True,
                 placeholder="(optional) list terms of one type", style={"minWidth": "280px"})),
         ], className="controls"),
         html.Div(id="tm-body"),
@@ -64,8 +65,8 @@ def register(app, b):
             return ui.card(f"{b.ann_label.get(browse, browse)} terms", ui.grid(
                 "tm-browse-grid", t, [("entity_id", None, None, 160), ("term_name", "name"),
                                       ("n_features", "features", "int", 100), ("n_grouped", "grouped", "int", 100),
-                                      ("concentration", "top-group share", "num", 130),
-                                      ("perm_padj", "concentration padj", "p", 150)], height=560,
+                                      ("concentration", "largest share in one group", "num", 180),
+                                      ("n_groups", "groups spanned", "int", 130)], height=560,
                 export_name=f"terms_{browse}"))
         if not term or term not in b.terms.index:
             return ui.note("Search for a term above, or pick an annotation type to browse its terms.")
@@ -77,7 +78,7 @@ def register(app, b):
             ui.stat("In data-driven groups", f"{int(r['n_grouped']):,}"),
             ui.stat("Groups spanned", int(r["n_groups"]) if pd.notna(r.get("n_groups")) else "–"),
             ui.stat("Largest share in one group", f"{r['concentration']:.0%}" if pd.notna(r.get("concentration")) else "–",
-                    f"permutation padj {ui.fmt_p(r.get('perm_padj'))}" if pd.notna(r.get("perm_padj")) else None),
+                    f"in {r['top_group']}" if isinstance(r.get("top_group"), str) else None),
         ])
         name = r["term_name"] if isinstance(r["term_name"], str) and r["term_name"] != r["term_id"] else ""
         header = html.Div([
@@ -91,7 +92,7 @@ def register(app, b):
                                 [ui.graph("tm-groups", 420), html.Div(id="tm-groups-note",
                                                                       className="small text-secondary")]), lg=6),
                 dbc.Col(ui.card("(b) Term abundance across metadata", [
-                    html.Div([ui.labeled("Metadata variable", ui.dropdown("tm-var", b.variables,
+                    html.Div([ui.labeled("Metadata variable", ui.dropdown("tm-var", b.variable_options(),
                                                                           b.variables[0] if b.variables else None))],
                              className="controls"),
                     ui.graph("tm-profile", 330), html.Div(id="tm-assoc")]), lg=6),
@@ -131,17 +132,17 @@ def register(app, b):
         term = _selected(search)
         if not term or not var:
             return th.empty_figure(theme, ""), None
-        if term not in b.term_scores.index:
-            return th.empty_figure(theme, "Too few features for a term score"), None
-        fig = fg.profile_strip(b.term_scores.loc[term], b.samples, var, b.levels(var), theme,
-                               "Term score (mean z of its features)")
+        if term not in b.term_eig.index:
+            return th.empty_figure(theme, "Fewer than 3 features: no term eigengene"), None
+        fig = fg.profile_strip(b.term_eig.loc[term], b.samples, var, b.levels(var), theme,
+                               "Term eigengene (SD)")
         a = b.associations_for("term", term)
-        a = a[a["variable"] == var].copy()
-        a["test"] = a["test"].map({"moderated_t": "self-contained", "moderated_F": "self-contained (F)",
-                                   "camera": "competitive (CAMERA)"})
+        a = a[a["variable"] == b.canonical(var)].copy()
+        a["test"] = a["test"].map({"moderated_t": "moderated t", "moderated_F": "moderated F"})
         return fig, ui.grid("tm-assoc-grid", a.sort_values("p"),
-                            [("contrast", None, None, 190), ("test", None, None, 170), ("effect", "effect", "num", 80),
-                             ("padj", "padj", "p", 80)], height=260, export_name="term_associations")
+                            [("contrast", "comparison", None, 220), ("test", None, None, 120),
+                             ("effect", "Δ eigengene", "num", 100), ("padj", "padj", "p", 80)], height=260,
+                            export_name="term_associations")
 
     @app.callback(Output("url", "href", allow_duplicate=True), Input("tm-groups", "clickData"),
                   prevent_initial_call=True)

@@ -1,8 +1,5 @@
-"""Structure views of data-driven groups.
+"""How the groups were formed, for methods that are not networks.
 
-* ``eigengene_network`` - groups linked by correlated eigengenes (the WGCNA
-  module-module view). Valid for every grouping method because it describes how groups
-  relate, not how they were formed.
 * ``hierarchical_dendrogram`` - the clustering's own linkage, truncated at the group
   level (faithful). Falls back to a dendrogram of group centroids (approximation,
   flagged) when the run predates saving the linkage.
@@ -23,26 +20,6 @@ from scipy.cluster.hierarchy import dendrogram, linkage, to_tree
 from tools.metadata import is_noise_label
 
 log = logging.getLogger(__name__)
-
-
-def eigengene_network(eigengenes: pd.DataFrame, min_abs_r: float = 0.7, top_k: int = 5) -> pd.DataFrame:
-    """Undirected edges ``source, target, r`` between groups (rows of ``eigengenes``).
-
-    Each group keeps its ``top_k`` strongest partners with ``|r| >= min_abs_r``.
-    """
-    if len(eigengenes) < 2:
-        return pd.DataFrame(columns=["source", "target", "r"])
-    R = np.corrcoef(np.nan_to_num(eigengenes.to_numpy(dtype=float)))
-    np.fill_diagonal(R, 0)
-    names = eigengenes.index.to_numpy()
-    keep = set()
-    for i in range(len(names)):
-        order = np.argsort(-np.abs(R[i]))[:top_k]
-        for j in order:
-            if abs(R[i, j]) >= min_abs_r:
-                keep.add((min(i, j), max(i, j)))
-    rows = [(names[i], names[j], float(R[i, j])) for i, j in sorted(keep)]
-    return pd.DataFrame(rows, columns=["source", "target", "r"])
 
 
 def hierarchical_dendrogram(structure_dir: Optional[str], groups: pd.Series,

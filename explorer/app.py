@@ -9,18 +9,19 @@ from dash import ALL, MATCH, Dash, Input, Output, State, ctx, dcc, html, no_upda
 
 from explorer import components as ui
 from explorer.data import Bundle
-from explorer.pages import associations, discovery, enrichment, feature, groups, overview, terms
+from explorer.pages import associations, discovery, enrichment, feature, groups, methods, overview, terms
 
 PAGES = {
     "/": ("Overview", overview),
-    "/associations": ("Associations", associations),
-    "/groups": ("Data-driven groups", groups),
-    "/terms": ("Knowledge terms", terms),
-    "/enrichment": ("Enrichment matrix", enrichment),
-    "/discovery": ("Discovery", discovery),
+    "/associations": ("Feature-Metadata Associations", associations),
+    "/groups": ("Data-Driven Groupings", groups),
+    "/terms": ("Knowledge-Driven Groupings", terms),
+    "/enrichment": ("Enrichment Matrix", enrichment),
+    "/discovery": ("Unannotated Feature Discovery", discovery),
+    "/methods": ("Methods", methods),
     "/feature": ("Feature", feature),
 }
-NAV_ORDER = ["/", "/associations", "/groups", "/terms", "/enrichment", "/discovery"]
+NAV_ORDER = ["/", "/associations", "/groups", "/terms", "/enrichment", "/discovery", "/methods"]
 
 
 def _navbar(b: Bundle) -> html.Div:
@@ -38,6 +39,11 @@ def _navbar(b: Bundle) -> html.Div:
     ], className="topbar")
 
 
+def _details(summary: str, items: list) -> html.Details:
+    """A collapsed list: the summary line is always shown, the items on click."""
+    return html.Details([html.Summary(summary), html.Div(items, className="details-list")], className="sidebar-details")
+
+
 def _sidebar(b: Bundle) -> html.Div:
     return html.Div([
         html.Div("Global filters", className="sidebar-title"),
@@ -51,11 +57,18 @@ def _sidebar(b: Bundle) -> html.Div:
         html.Div("This run", className="sidebar-title"),
         html.Div([
             html.Div(f"{b.manifest.get('grouping_method') or 'unknown'} grouping"),
-            html.Div(f"{b.manifest.get('n_samples')} {'samples' if not b.manifest.get('descriptive_only') else 'conditions'}"),
             html.Div(f"{b.manifest.get('n_features'):,} integrated features"),
-            html.Div(f"{b.manifest.get('n_groups'):,} groups"),
-            html.Div(f"{len(b.ann_types)} annotation types"),
-        ], className="small text-secondary sidebar-facts"),
+            _details(f"{b.manifest.get('n_samples')} {'samples' if not b.manifest.get('descriptive_only') else 'conditions'}",
+                     [html.Div(sid) for sid in b.manifest.get("sample_ids", b.samples.index.tolist())]),
+            _details(f"{b.manifest.get('n_groups'):,} groups",
+                     [html.Div([html.A(g, href=ui.href("/groups", group=g)),
+                                html.Span(f" {int(n):,}", className="text-secondary")])
+                      for g, n in b.groups["size"].items()]),
+            _details(f"{len(b.ann_types)} annotation types",
+                     [html.Div([html.A(a["label"], href=ui.href("/terms", browse=a["key"])),
+                                html.Span(f" {int((b.terms['ann_type'] == a['key']).sum()):,} terms",
+                                          className="text-secondary")]) for a in b.ann_types]),
+        ], className="small sidebar-facts"),
     ], className="sidebar")
 
 

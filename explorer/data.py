@@ -11,7 +11,10 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-SUPPORTED_SCHEMA = 1
+from tools.explorer_bundle import network as net
+from tools.explorer_bundle.stats import PAIR_SEP
+
+SUPPORTED_SCHEMA = 2
 
 
 def _read(bundle_dir: str, name: str, index: Optional[str] = None) -> pd.DataFrame:
@@ -22,6 +25,10 @@ def _read(bundle_dir: str, name: str, index: Optional[str] = None) -> pd.DataFra
     if index and index in df.columns:
         df = df.set_index(index)
     return df
+
+
+def contrast_label(contrast: str) -> str:
+    return "all levels (F test)" if contrast == "omnibus" else contrast
 
 
 class Bundle:
@@ -45,14 +52,11 @@ class Bundle:
         self.terms = _read(d, "terms", "entity_id")
         self.groups = _read(d, "groups", "group")
         self.eig = _read(d, "group_eigengenes", "group")
-        self.term_scores = _read(d, "term_scores", "entity_id")
+        self.term_eig = _read(d, "term_eigengenes", "entity_id")
         self.enrich = _read(d, "enrichment")
-        self.agree_types = _read(d, "agreement_types")
-        self.agree_null = _read(d, "agreement_null")
-        self.agree_groups = _read(d, "agreement_groups")
-        self.group_net = _read(d, "group_network")
+        self.agree = _read(d, "agreement")
         self.feature_edges = _read(d, "feature_edges")
-        self.candidates = _read(d, "candidates")
+        self.votes = _read(d, "discovery_votes")
         native_path = os.path.join(d, "native_structure.json")
         self.native = json.load(open(native_path)) if os.path.exists(native_path) else None
         self._assoc_path = os.path.join(d, "associations.parquet")
@@ -63,6 +67,7 @@ class Bundle:
         self.ann_types: List[Dict] = self.manifest.get("annotation_types", [])
         self.ann_label = {a["key"]: a["label"] for a in self.ann_types}
         self.variables: List[str] = self.manifest.get("variables", [])
+        self.aliases: Dict[str, str] = self.manifest.get("variable_aliases", {})
         self.var_types: Dict[str, str] = self.manifest.get("variable_types", {})
         self.nesting: Dict[str, str] = self.manifest.get("nesting", {})
         self.dtypes: List[str] = sorted(self.features["dtype"].dropna().unique().tolist())
@@ -70,6 +75,16 @@ class Bundle:
         self._ann_by_feature = self.ann.groupby("feature_id") if not self.ann.empty else None
         self._members = self.features.dropna(subset=["group"]).groupby("group").groups
         self._search = self._build_search_index()
+        net_info = self.manifest.get("network", {})
+        self.network_kind: str = net_info.get("kind", "knn")
+        self.network_nodes = self.features.index[self.features["x"].notna()]
+        self.adj = net.adjacency(self.feature_edges)
+        e = self.feature_edges
+        # every edge joins two different data types (e.g. correlation computed tx-vs-mx only)
+        self.bipartite = bool(len(e)) and bool((e["source"].str.split("_").str[0] !=
+                                                 e["target"].str.split("_").str[0]).all())
+        self._adj_by_feature = self.adj.groupby("feature_id") if len(self.adj) else None
+        self.vote_bg = net.vote_background(self.ann, self.network_nodes)
 
     # ---- identity ------------------------------------------------------------------------
     @property
@@ -165,21 +180,53 @@ class Bundle:
         with self._lock:
             return self._db.execute(sql, params).fetchdf()
 
+    def canonical(self, variable: str) -> str:
+        """Variables with the same partition as another are tested once, under the first name."""
+        return self.aliases.get(variable, variable)
+
+    def variable_options(self) -> List[Dict]:
+        return [{"label": f"{v} (same grouping as {self.aliases[v]})" if v in self.aliases else v, "value": v}
+                for v in self.variables]
+
     @lru_cache(maxsize=64)
     def contrasts(self, entity_type: str, variable: str) -> List[str]:
         df = self._query("SELECT DISTINCT contrast FROM assoc WHERE entity_type = ? AND variable = ? ORDER BY contrast",
-                         [entity_type, variable])
-        out = df["contrast"].tolist()
-        return (["omnibus"] if "omnibus" in out else []) + [c for c in out if c != "omnibus"]
+                         [entity_type, self.canonical(variable)])
+        return df["contrast"].tolist()
+
+    @lru_cache(maxsize=64)
+    def comparison_levels(self, entity_type: str, variable: str) -> List[str]:
+        """Levels that appear in pairwise comparisons, in the variable's natural order."""
+        levels = set()
+        for c in self.contrasts(entity_type, variable):
+            if PAIR_SEP in c:
+                levels.update(c.split(PAIR_SEP, 1))
+        try:
+            return sorted(levels, key=lambda v: float(v))
+        except ValueError:
+            return sorted(levels)
+
+    def resolve_pair(self, entity_type: str, variable: str, a: str, b: str):
+        """``(stored contrast, sign)``: comparisons are stored once per pair; ``sign = -1`` when
+        the request is the reverse of the stored direction."""
+        cs = set(self.contrasts(entity_type, variable))
+        if f"{a}{PAIR_SEP}{b}" in cs:
+            return f"{a}{PAIR_SEP}{b}", 1
+        if f"{b}{PAIR_SEP}{a}" in cs:
+            return f"{b}{PAIR_SEP}{a}", -1
+        return None, 1
 
     def associations_for(self, entity_type: str, entity_id: str) -> pd.DataFrame:
-        return self._query("SELECT * FROM assoc WHERE entity_type = ? AND entity_id = ? ORDER BY p",
-                           [entity_type, entity_id])
+        df = self._query("SELECT * FROM assoc WHERE entity_type = ? AND entity_id = ? ORDER BY p",
+                         [entity_type, entity_id])
+        df["contrast"] = df["contrast"].map(contrast_label)
+        return df
 
-    def association_table(self, entity_type: str, variable: str, contrast: str, test: Optional[str] = None,
-                          ann_type: Optional[str] = None, dtype: Optional[str] = None) -> pd.DataFrame:
+    def association_table(self, entity_type: str, variable: str, contrast: str, sign: int = 1,
+                          test: Optional[str] = None, ann_type: Optional[str] = None,
+                          dtype: Optional[str] = None) -> pd.DataFrame:
         sql = "SELECT * FROM assoc WHERE entity_type = ? AND variable = ? AND contrast = ?"
-        params: list = [entity_type, variable, contrast]
+        params: list = [entity_type, self.canonical(variable), contrast]
         if test:
             sql += " AND test = ?"
             params.append(test)
@@ -189,7 +236,25 @@ class Bundle:
         if dtype:
             sql += " AND dtype = ?"
             params.append(dtype)
-        return self._query(sql, params)
+        df = self._query(sql, params)
+        if sign == -1 and len(df):
+            df[["effect", "statistic"]] = -df[["effect", "statistic"]]
+            a, b = contrast.split(PAIR_SEP, 1)
+            df["contrast"] = f"{b}{PAIR_SEP}{a}"
+        return df
+
+    # ---- network ---------------------------------------------------------------------------
+    def neighbors(self, fid: str) -> pd.DataFrame:
+        """Direct network neighbours of a feature: ``neighbor, weight``."""
+        if self._adj_by_feature is None or fid not in self._adj_by_feature.groups:
+            return pd.DataFrame(columns=["neighbor", "weight"])
+        return self._adj_by_feature.get_group(fid)[["neighbor", "weight"]]
+
+    def neighbors_of_set(self, ids) -> pd.DataFrame:
+        """Edges from any feature in ``ids`` to features outside it: ``feature_id, neighbor, weight``."""
+        ids = set(ids)
+        a = self.adj
+        return a[a["feature_id"].isin(ids) & ~a["neighbor"].isin(ids)]
 
     # ---- metadata helpers ------------------------------------------------------------------
     def levels(self, variable: str, frame: Optional[pd.DataFrame] = None) -> List:

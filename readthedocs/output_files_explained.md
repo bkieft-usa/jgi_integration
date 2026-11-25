@@ -18,7 +18,7 @@ This guide on the outputs from the JGI multi-omics integration workflow explains
 │   ├── Dataset_Processing--<D>_Analysis--<A>_project_config.yml
 │   ├── Dataset_Processing--<D>_Analysis--<A>_data_processing_config.yml
 │   └── Dataset_Processing--<D>_Analysis--<A>_analysis_config.yml
-├── notebooks/
+├── notebooks/                    # only for runs started from the notebook
 │   └── Dataset_Processing--<D>_Analysis--<A>_notebook.ipynb
 └── Dataset_Processing--<D>/
     ├── transcriptomics/          # tx: one folder per dataset type that was run
@@ -47,13 +47,13 @@ The hashes identify the **parameters**, not the code version. Two runs with the 
 | Example Question | File(s) |
 |---|---|
 | What settings were used? | `configs/*.yml` |
-| What exactly was run, and what did the run log say? | `Analysis--<A>/run_manifest.json` (command, code version, stage timings), the CLI `--log-file`, or `notebooks/*_notebook.ipynb` for notebook runs |
-| I want to browse the results interactively | `python -m tools.cli explore --bundle Analysis--<A>/explorer` (see `explorer.md`) |
+| What exactly was run, and what did the run log say? | `Analysis--<A>/run_manifest.json` (command, code version, stage timings), and `notebooks/*_notebook.ipynb` for notebook runs |
+| I want to browse the results interactively | `jgi-integrate explore --bundle Analysis--<A>/explorer` (see `explorer.md`) |
 | Which features grouped together? | `Analysis--<A>/feature_network_node_table.csv` (`group` column) |
 | Which groups are enriched for which pathways? | `Analysis--<A>/enrichment/enrichment_long.csv` (all annotation types), `enrichment/<type>/heatmap_enrichment.png` |
 | What biological annotations are known about a feature? | `Analysis--<A>/feature_annotation_table.csv` |
 | Do samples separate by treatment? | `Analysis--<A>/Integrated_Data_PCA___<variable>.pdf` |
-| How many features survived each processing step? | Row counts of the CSVs in each dataset folder (Section 4), or the notebook log |
+| How many features survived each processing step? | Row counts of the CSVs in each dataset folder (Section 4), or the run log |
 
 ---
 
@@ -65,7 +65,7 @@ The workflow runs the steps below in order. Steps 1–6 run **separately for eac
 |---|---|---|---|---|
 | 1 | Load raw data | Reads the quantitative table for each dataset (`counts.csv` for tx, `peak-height.csv` for px, `*_peak-height-filtered-3x-exctrl.csv` files for mx from different polarities). Adds a dataset prefix to feature IDs (Section 7). For mx, combines all configured chromatography/polarity files with a suffix indicating which one the feature came from. | `datasets.<ds>.*` (data processing) | `raw_data.csv` |
 | 2 | Build per-dataset annotations | tx/px: merges every `*_annotation_table.tsv` file and maps EC numbers to ModelSEED reactions. mx: summarizes library matches (names, InChIKey, chemical classes) and maps them to ModelSEED compounds. | `datasets.<ds>.annotation_columns`, `gff_*` keys | `annotation_table.csv` |
-| 3 | Link samples | Renames each dataset's sample columns (data-type and method-specific names that aren't guarenteed to match between data types) to a shared sample name (`unique_group`) using the link table, then keeps only samples present in **every** dataset. | `project.link_table` (project) | `linked_data.csv`, `Analysis--<A>/integrated_metadata.csv` |
+| 3 | Link samples | Renames each dataset's sample columns (data-type and method-specific names that aren't guaranteed to match between data types) to a shared sample name (`unique_group`) using the link table, then keeps only samples present in **every** dataset. | `project.link_table` (project) | `linked_data.csv`, `Analysis--<A>/integrated_metadata.csv` |
 | 4 | Check input scale and filter | Records value statistics and detects whether the input is linear, log-scaled or already scaled. For `input_state: raw`, removes features that are rarely detected or very low in abundance. Skipped for `prenormalized` input. | `input_state`, `normalization_parameters.filtering` | `input_report.json`, `filtered_data.csv` |
 | 5 | Normalize and transform | Raw input only: corrects for sample-to-sample differences in depth or loading with size factors (defaults: median-of-ratios for tx; PQN for mx and px, computed separately for each mx chromatography/polarity). mx/px: zeros are treated as missing and filled with the feature's lowest observed value. Then transforms values to a log2-like scale (defaults: variance-stabilizing transform for tx, log2 for mx/px). | `normalization_method`, `transformation_method`, `pseudocount`, `recenter_samples` | `normalized_data.csv`, `detected_mask.csv`, `log_data.csv` |
 | 6a | Remove low-variance features | Removes the bottom N% of features by variance. With `mean_adjusted: true`, a feature is ranked against features of similar mean abundance, so low-abundance features are not favored. | `devariancing` | `devarianced_data.csv` |
@@ -76,7 +76,7 @@ The workflow runs the steps below in order. Steps 1–6 run **separately for eac
 | 9 | Group features by annotation (knowledge-driven) | Joins every dataset's `annotation_table.csv` onto the integrated features, then adds pathway assignments from ModelSEED and KEGG (Section 5.2). | (automatic) | `feature_annotation_table.csv` |
 | 10 | Group features by abundance (data-driven) | Clusters the selected features by their co-variation pattern across samples or groups. Six methods are available (Section 5.3). | `analysis.feature_grouping` | `feature_network_node_table.csv`, `feature_network_edge_table.csv`, plus method-specific files and folders |
 | 11 | Compare data-driven groups with knowledge-driven pathways | Tests whether each data-driven group contains more members of a knowledge-driven biological pathway than expected by chance, and plots the results as heatmaps. | `analysis.pathway_enrichment` | `heatmap_*.png`, `full_*_matrix.csv`, `*_trend_values.csv`, `exploded_universe.csv`, `run_config.json` |
-| 12 | Save provenance | Copies the three active configs and the notebook into `configs/` and `notebooks/` under hash-tagged names. | (automatic) | `configs/`, `notebooks/` |
+| 12 | Save provenance | Copies the three active configs into `configs/` under hash-tagged names and writes the run record. For notebook runs, also copies the notebook into `notebooks/`. | (automatic) | `configs/`, `run_manifest.json`, `notebooks/` (notebook runs only) |
 
 ### Two integration modes
 
@@ -98,7 +98,7 @@ The workflow runs the steps below in order. Steps 1–6 run **separately for eac
 | `input_report.json` | – | Input diagnostics: number of features and samples; fractions of missing, zero and negative values; min, median and max; skew; whether values are integers; and the `detected_scale` (`linear`, `log` or `scaled`) that drives later steps. |
 | `filtered_data.csv` | Raw | Features that passed the presence and magnitude filters. Identical to `linked_data.csv` for prenormalized input. |
 | `normalized_data.csv` | Linear, size-factor normalized | For mx/px, zeros are left **blank** (missing) here, not imputed. |
-| `detected_mask.csv` | True/False | `True` where the feature was actually observed (> 0, or non-missing for prenormalized input). Use it to tell real measurements apart from imputed values in `log_data.csv`. |
+| `detected_mask.csv` | True/False | `True` where the feature was actually observed (> 0, or non-missing when the input was already on a log or z scale). Use it to tell real measurements apart from imputed values in `log_data.csv`. |
 | `log_data.csv` | log2-like | Normalized, imputed (mx/px) and transformed values. This is the main "analysis-ready" abundance table for each dataset. |
 | `devarianced_data.csv` | log2-like | `log_data` with the lowest-variance features removed. |
 | `replicate_filtered_data.csv` | log2-like | Features that also passed the replicate-reliability filter. **This is the final per-dataset feature set** that goes into integration and feature selection. |
@@ -116,7 +116,7 @@ The workflow runs the steps below in order. Steps 1–6 run **separately for eac
 - **tx / px**: indexed by the gene/protein ID given by `gff_annot_id`. It contains **every column** of every `*_annotation_table.tsv` input file (for example, KEGG KO, EC, Pfam or GO, depending on what was supplied), plus:
   - `modelseed_rxn`: ModelSEED reaction IDs mapped from the EC column.
   - If `gff_quant_id` differs from `gff_annot_id`, a second ID column bridges the two through the GFF3 file.
-- **mx**: indexed by `metabolome_id` (the mx feature ID). This table was generated by the JGI untargeted anlaysis pipeline with the FBMN tool at GNPS2. Columns: `molecular_formula`, `Compound_Name`, `Smiles`, `INCHI`, `InChiKey`, `superclass`, `class`, `subclass`, `npclassifier_superclass`, `npclassifier_class`, `npclassifier_pathway`, `library_usi`, `display_name`, and `modelseed_id`. `modelseed_id` is matched by exact InChIKey first, then by the first 25 InChIKey characters (structure plus stereo layer), and only if neither matches, by fuzzy matching on the compound name. Treat name-only matches as tentative. Features with no spectral library hit have empty annotation fields.
+- **mx**: indexed by `metabolome_id` (the mx feature ID). This table was generated by the JGI untargeted analysis pipeline with the FBMN tool at GNPS2. Columns: `molecular_formula`, `Compound_Name`, `Smiles`, `INCHI`, `InChiKey`, `superclass`, `class`, `subclass`, `npclassifier_superclass`, `npclassifier_class`, `npclassifier_pathway`, `library_usi`, `display_name`, and `modelseed_id`. `modelseed_id` is matched by exact InChIKey first, then by the first 25 InChIKey characters (structure plus stereo layer), and only if neither matches, by fuzzy matching on the compound name. Treat name-only matches as tentative. Features with no spectral library hit have empty annotation fields.
 
 ---
 
@@ -130,7 +130,7 @@ The workflow runs the steps below in order. Steps 1–6 run **separately for eac
 | `integrated_data.csv` | features (all datasets) x samples or groups | All `scaled_data` matrices stacked together. Index column: `features`. Missing values are set to 0 (the feature mean, on the z-scale). |
 | `integrated_data_selected.csv` | selected features x samples or groups | The subset chosen in step 8. **This matrix is the input to grouping and to the trend values in the heatmaps.** If `block_scale` was on, each dataset's values are multiplied by a constant weight (logged in the notebook as `Block weights applied per dataset`), so they are no longer exact z-scores. Relative patterns within a feature are unchanged. |
 
-Note: in the current code, `feature_selection.params.max_features` sets how many features are kept.
+Note: `feature_selection.params.max_features` sets how many features are kept. The `top_n` key under `feature_selection` is not used.
 
 ### 5.2 Feature annotation: `feature_annotation_table.csv`
 
@@ -155,7 +155,7 @@ The grouping method is set by `analysis.feature_grouping.method`. Only the param
 | Method | How features are grouped | Group labels |
 |---|---|---|
 | `hierarchical_clustering` | Agglomerative clustering on pairwise distances (`distance_metric`; `correlation` = 1 − Pearson r), using `linkage_method`. The tree is cut at `height_cutoff`. With correlation distance, a cutoff of 0.5 means that features in the same cluster are, roughly, correlated at r ≳ 0.5 (the exact meaning depends on the linkage method). | `group_<n>` |
-| `network_modules` | Builds a network from pairwise correlations with \|r\| ≥ `corr_cutoff` (`corr_mode: bipartite` connects only features from **different** data types), drops components of fewer than 3 nodes, then finds communities with Louvain or Leiden. Communities larger than 400 nodes are split again. Features with no edge above the cutoff are **not** in any group. | `submodule_<n>` |
+| `network_modules` | Builds a network from pairwise Pearson or Spearman correlations (`corr_method`) with r ≥ `corr_cutoff` (\|r\| ≥ `corr_cutoff` when `keep_negative: true`). `corr_mode: bipartite` connects only features from **different** data types. It then drops components of fewer than 3 nodes and finds communities with Louvain or Leiden. Communities larger than 400 nodes are split again. Features with no edge above the cutoff are **not** in any group. | `submodule_<n>` |
 | `hdbscan` | Density-based clustering. Features that fit no dense cluster are labeled `noise`. | `group_<n>`, `noise` |
 | `nmf` | Non-negative matrix factorization, with the number of components chosen at the elbow of the reconstruction-error curve between `k_min` and `k_max`. Each feature is assigned to its highest-loading component. | `group_<n>` |
 | `leiden_knn` | k-nearest-neighbor graph (cosine similarity, `n_neighbors`), then Leiden community detection at the resolution that maximizes modularity. | `group_<n>` |
@@ -174,7 +174,7 @@ One row per grouped feature (`node_id`). **Note that this file has "network_node
 
 #### `feature_network_edge_table.csv`
 
-**Note that this file is only produced when the network mode of grouping has been selected**.
+This file is always written, but only `network_modules` fills it.
 
 - `network_modules`: one row per network edge with `source`, `target` and the correlation (`weight`). Use it with the node table in Cytoscape or a similar tool.
 - All other methods: **empty** (header only). These methods do not produce edges.
@@ -183,7 +183,7 @@ One row per grouped feature (`node_id`). **Note that this file has "network_node
 
 | File | Contents |
 |---|---|
-| `feature_correlation_table.csv` | All feature pairs that passed the correlation cutoff: `feature_1`, `feature_2`, `correlation`, `r_squared`, sorted by \|correlation\|. In `bipartite` mode, only pairs from different data types are included. |
+| `feature_correlation_table.csv` | All feature pairs that passed the correlation cutoff (positive correlations only, unless `keep_negative: true`): `feature_1`, `feature_2`, `correlation`, `r_squared`, sorted by \|correlation\|. In `bipartite` mode, only pairs from different data types are included. |
 | `feature_network_graph.graphml` | The whole network with node attributes. Opens in Cytoscape, Gephi, NetworkX or igraph. |
 | `submodules/feature_network_graph_submodule<N>.graphml`, `..._nodes.csv`, `..._edges.csv` | One sub-network per community. |
 | `submodules/feature_network_graph_submodule<N>_abundance.pdf` | Violin and strip plot of the mean scaled abundance of the community's members in each `group`. |
@@ -208,7 +208,7 @@ This step asks: **does a data-driven group contain more members of a known pathw
 |---|---|
 | `annotation_types.json` | Every annotation type found, with how it is parsed (ID column, name column, delimiter, data type). |
 | `annotations_long.csv` | One row per feature–term pair: `feature_id, ann_type, term_id, term_name`, with normalized IDs (e.g. `map00010`, not `path:map00010`). |
-| `enrichment_long.csv` | Every tested term–group pair across all types: `ann_type, term_id, term_name, group, k, K, n, N, fold, p, padj`. Filter on `padj` for significant results. |
+| `enrichment_long.csv` | Every term–group pair with at least one shared feature, across all types: `term_id, group, k, K, n, N, fold, p, padj, ann_type, term_name`. *k* = shared features, *K* = features in the term, *n* = features in the group, *N* = features in the universe (Method, below). Filter on `padj` for significant results. |
 
 #### Method
 
@@ -217,12 +217,12 @@ This step asks: **does a data-driven group contain more members of a known pathw
    - `bipartite_only` (cross-omic types only): keep only pathways with members from **every** data type present.
    - `min_features_per_pathway`: drop small pathways.
    - `min_features_per_group`: drop small groups.
-   - `bipartite_only`: also keep only groups whose members (annotated or not) span **every** data type present.
+   - `bipartite_only` (cross-omic types only): also keep only groups whose members (annotated or not) span **every** data type present.
    
-   With `background: annotated` (default), the universe and group sizes count only features annotated with that type. With `background: all`, unannotated features stay in the background count but are never tested. HDBSCAN `noise` / WGCNA `grey` features stay in the background but are never tested as a group.
-2. **Test.** For every pathway x group pair with at least one shared feature, a one-sided hypergeometric test gives the probability of seeing at least that many pathway members in the group by chance. Here *M* = number of features in the universe, *n* = features in the pathway, *N* = features in the group and *k* = the overlap.
+   With `background: annotated` (the default, used when the key is absent from the config), the universe and group sizes count only features annotated with that type. With `background: all`, unannotated features stay in the background count but are never tested. HDBSCAN `noise` / WGCNA `grey` features stay in the background but are never tested as a group.
+2. **Test.** For every pathway x group pair with at least one shared feature, a one-sided hypergeometric test gives the probability of seeing at least that many pathway members in the group by chance. Here *N* = number of features in the universe, *K* = features in the pathway, *n* = features in the group and *k* = the overlap (the same letters as the `enrichment_long.csv` columns).
 3. **Correction.** P-values are adjusted with Benjamini–Hochberg FDR across all tested pairs of that annotation type. Pairs with no overlap get p = padj = 1.
-4. **Fold enrichment** = *k* / (*n* · *N* / *M*). A value of 1 means what chance predicts, and values above 1 mean over-representation.
+4. **Fold enrichment** = *k* / (*K* · *n* / *N*). A value of 1 means what chance predicts, and values above 1 mean over-representation.
 5. **Display.** Only the top `top_n` terms, ranked by `rank_by`, are drawn, with rows for the groups that have at least one significant displayed term. **Ranking affects only the figures. Every term is tested and saved in the CSVs.**
 
 #### Tables (per annotation type, in `enrichment/<annotation_type>/`)
@@ -230,7 +230,7 @@ This step asks: **does a data-driven group contain more members of a known pathw
 | File | Contents |
 |---|---|
 | `enrichment_long.csv` | This type's rows of the combined long table. |
-| `exploded_universe.csv` | The tested universe: one row per feature–pathway pair (index = feature ID; columns `group`, `pathway`, `pathway_name`, and `dtype` when `bipartite_only` is on). |
+| `exploded_universe.csv` | The tested universe: one row per feature–pathway pair (columns `node_id` (feature ID), `group`, `pathway`, `pathway_name`, and `dtype` when `bipartite_only` applies to this type). Features without this annotation appear once with `pathway` = `Unassigned`; they count toward the background only with `background: all` and are never tested as a term. |
 | `pathway_names.csv` | Every tested term (`pathway`) with its full descriptive name from KEGG (`pathway_name`), e.g. `M00001` → `Glycolysis (Embden-Meyerhof pathway), glucose => pyruvate`. The name is empty for `modelseed_pathway`, whose IDs already include it. |
 | `full_overlap_matrix.csv` | Pathway x group: number of shared features (*k*). |
 | `full_fold_enrichment_matrix.csv` | Pathway x group: fold enrichment. |
@@ -256,7 +256,7 @@ All three share one layout, and each figure has a short legend printed above it:
 | `heatmap_normalized.png` | Fraction of the displayed pathway features that fall in each group (each column sums to 1; magma) | Bright cells: one group holds most of the pathway. |
 | `heatmap_enrichment.png` | Fold enrichment (RdBu_r). Stars mark BH-adjusted significance: `*` < 0.05, `**` < 0.01, `***` < 0.001 | Dark-red starred cells are the main result: a co-varying group that is significantly over-represented in a known pathway. |
 
-#### `grouping_structure/` (hierarchical clustering and HDBSCAN)
+### 5.5 Grouping structure: `grouping_structure/` (hierarchical clustering and HDBSCAN only)
 
 The grouping method's own structure, saved so that the explorer can draw it faithfully.
 
@@ -267,7 +267,7 @@ The grouping method's own structure, saved so that the explorer can draw it fait
 
 ### 5.6 Explorer bundle: `explorer/`
 
-Precomputed tables for the interactive explorer (`python -m tools.cli explore`), written by the last pipeline stage (`build_explorer`). The folder is self-contained: copy it anywhere and open it with `explore --bundle <folder>`. All tables are parquet files; open them with `pandas.read_parquet`. See `explorer.md` for the statistics used.
+Precomputed tables for the interactive explorer (`jgi-integrate explore`), written by the last pipeline stage (`build_explorer`). The folder is self-contained: copy it anywhere and open it with `jgi-integrate explore --bundle <folder>`. All tables are parquet files; open them with `pandas.read_parquet`. See `explorer.md` for the statistics used.
 
 | File | Contents |
 |---|---|
@@ -291,9 +291,9 @@ Precomputed tables for the interactive explorer (`python -m tools.cli explore`),
 |---|---|
 | `TX_data_(raw).pdf`, `MX_data_(raw).pdf` (and `PX_...`) | Histogram of every value in `linked_data` (raw scale, log-scaled y-axis). Use it to check the input for a sensible distribution and for an excess of zeros. |
 | `distribution_of_integrated_datasets.pdf` | Overlaid histograms of the scaled values of each dataset. After z-scoring, the datasets should overlap, centered at 0. A dataset that is visibly offset or much wider suggests a processing problem. |
+| `Integrated_Data_PCA_(all_features)___<variable>.pdf` | The same PCA for all features in `integrated_data.csv`, before feature selection. |
+| `TX_linked_data_PCA___<variable>.pdf`, `MX_...` (and `PX_...`) | PCA of each dataset's `linked_data` (raw values, before filtering and normalization), one file per variable. Use it to spot outlier samples or batch effects in the raw input. |
 | `Integrated_Data_PCA___<variable>.pdf` | PCA of `integrated_data_selected.csv` (PC1 against PC2), one file per variable in `user_settings.variable_list`. Points are samples or groups, colored by that variable, with density contours. Clear separation by a treatment variable means the selected features carry a treatment signal. Separation by a technical variable (batch, run order) is a warning sign. |
-
-The notebook also shows PCAs of the full integrated data and of each dataset's `linked_data`, but these appear only in the notebook, not as files.
 
 ---
 
@@ -309,11 +309,11 @@ See `project_config_parameters_explained.md`, `data_processing_config_parameters
 
 ### Run record: `Analysis--<A>/run_manifest.json`
 
-Written at the end of every run (CLI or notebook): the command line, git commit of the workflow code, host, slurm job ID and the time each stage took. The configs saved in `configs/` are the exact text that was hashed when the run started, so edits made to the active config files during a run cannot be saved under the wrong hash.
+Written at the end of every run (CLI or notebook): the command line, git commit of the workflow code (`git_sha`), host, slurm job ID and the time each stage took. The configs saved in `configs/` are the exact text that was hashed when the run started, so edits made to the active config files during a run cannot be saved under the wrong hash.
 
 ### Notebook: `notebooks/`
 
-`..._notebook.ipynb` is a copy of the notebook as it was saved at the end of the run, including the printed log of every step: features kept and removed at each filter, size-factor ranges, number of groups found, annotation coverage and any warnings. It opens in Jupyter, VS Code or GitHub without the data. If something in the outputs looks surprising, read this log first.
+Present only when the run was started from the notebook. `..._notebook.ipynb` is a copy of the notebook as it was saved at the end of the run, including the printed log of every step: features kept and removed at each filter, size-factor ranges, number of groups found, annotation coverage and any warnings. It opens in Jupyter, VS Code or GitHub without the data. If something in the outputs looks surprising, read this log first.
 
 ---
 
@@ -339,13 +339,13 @@ Written at the end of every run (CLI or notebook): the command line, git commit 
 2. Put the original raw inputs and link table back at the paths listed in the project config.
 3. Place the `configs/` folder at `output_data/<project_name>/configs/` and run:
    ```bash
-   python -m tools.cli run --config-dir output_data/<project_name>/configs -d 5d861c04 -a e340140e
+   jgi-integrate run --config-dir output_data/<project_name>/configs -d 5d861c04 -a e340140e
    ```
-   or, in the notebook, `objs.Project(config_dir="<...>/configs", data_processing_hash="5d861c04", analysis_hash="e340140e")`. This copies the hash-tagged configs back to the active config names. The workflow warns if the recomputed hashes do not match. `python -m tools.cli list --results-dir output_data` flags saved configs that do not hash to their run's name.
+   or, in the notebook, `objs.Project(config_dir="<...>/configs", data_processing_hash="5d861c04", analysis_hash="e340140e")`. This copies the hash-tagged configs back to the active config names. The workflow warns if the recomputed hashes do not match. `jgi-integrate list --results-dir output_data` flags saved configs that do not hash to their run's name.
 
 What may still differ:
 
-- **Code version.** The hashes do not include the workflow code. Record the git commit used for the run (`git log -1` in the workflow repository) alongside the outputs.
+- **Code version.** The hashes do not include the workflow code. The commit used is recorded as `git_sha` in `run_manifest.json`. Check out that commit (or use the container image built from it) to rerun the same code.
 - **External databases.** ModelSEED (downloaded from the `dev` branch of the ModelSEED database) and KEGG (REST API) are fetched live the first time and then cached. A fresh run without the cache can produce different pathway annotations if those databases have changed.
 - **Cached outputs.** With `overwrite=False`, existing files in the hashed folders are reused instead of recomputed. To regenerate a step, delete its output file or run with `overwrite=True`.
 - **Network colors** and the numbering of communities or clusters can change between runs. Group membership is what matters.
@@ -371,7 +371,7 @@ What may still differ:
 | `feature_network_edge_table.csv` is empty | The grouping method was not `network_modules`. These methods produce no edges. |
 | `submodules/` is empty | Same reason. It is filled only by `network_modules`. |
 | No `wgcna_results/` folder | The grouping method was not `wgcna`. |
-| No `heatmap_*.png` or `full_*_matrix.csv` files | The group–pathway step did not finish. Check the end of the notebook for errors. |
+| No `heatmap_*.png` or `full_*_matrix.csv` files | The group–pathway step did not finish. Check the end of the run log (or the notebook, for notebook runs) for errors. |
 | A pathway appears in the CSVs but not in the heatmap | It was outside the `top_n` displayed pathways. |
 | A feature is missing from the node table | It was removed by filtering, not selected in step 8, labeled as noise, or (for `network_modules`) had no edge above the correlation cutoff. Trace it through the per-dataset tables in Section 4. |
 | The number of samples is lower than expected | Only samples present in **all** datasets and listed in the link table are kept (step 3). |

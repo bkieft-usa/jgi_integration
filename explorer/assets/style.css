@@ -131,3 +131,24 @@ html[data-bs-theme="dark"] {
 html[data-bs-theme="dark"] .form-control { background: var(--surface-1); color: var(--ink); border-color: var(--hairline); }
 .nav-tabs .nav-link { color: var(--ink-2); }
 .nav-tabs .nav-link.active { color: var(--ink); background: var(--surface-1); }
+
+/* ---- sidebar collapsible lists ---- */
+.sidebar-details { margin: 4px 0; }
+.sidebar-details > summary { cursor: pointer; color: var(--ink-2); }
+.sidebar-details > summary:hover { color: var(--ink); }
+.sidebar-details[open] > summary { color: var(--ink); font-weight: 600; }
+.details-list { max-height: 260px; overflow-y: auto; padding: 4px 0 6px 12px; border-left: 1px solid var(--hairline);
+  margin: 4px 0 6px 4px; font-variant-numeric: tabular-nums; }
+.details-list div { margin-bottom: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.details-list a { color: var(--accent); text-decoration: none; }
+.details-list a:hover { text-decoration: underline; }
+
+/* ---- methods page ---- */
+.methods { max-width: 900px; }
+.methods h5 { margin-top: 22px; }
+.methods h6 { margin-top: 14px; font-weight: 600; }
+.methods table { font-size: 13px; margin: 8px 0 12px; border-collapse: collapse; }
+.methods th, .methods td { border-bottom: 1px solid var(--hairline); padding: 4px 10px 4px 0; vertical-align: top; }
+.methods code { color: var(--ink); background: var(--page); padding: 0 3px; border-radius: 3px; }
+.methods-paragraph { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; }
+.mainnav { flex-wrap: wrap; }

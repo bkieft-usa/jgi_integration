@@ -40,7 +40,7 @@ def layout(b, params):
         head,
         dbc.Row([
             dbc.Col(ui.card("Abundance across metadata", [
-                html.Div([ui.labeled("Metadata variable", ui.dropdown("ft-var", b.variables,
+                html.Div([ui.labeled("Metadata variable", ui.dropdown("ft-var", b.variable_options(),
                                                                       b.variables[0] if b.variables else None)),
                           ui.labeled("Scale", ui.dropdown("ft-scale", [{"label": "log-scale abundance", "value": "log"},
                                                                        {"label": "integrated z-score", "value": "z"}],
@@ -52,7 +52,9 @@ def layout(b, params):
                                                                ("term_name", "name")], height=300,
                                                export_name=f"{fid}_annotations") if len(ann) else
                         ui.note("No annotations of any type. See the group's enriched terms for hypotheses.")),
-                ui.card("Most correlated members of its group", html.Div(id="ft-neighbors")),
+                ui.card("Network neighbours", html.Div(id="ft-neighbors")),
+                html.A("Find annotation hypotheses for this feature →", href=ui.href("/discovery", feature=fid),
+                       className="small"),
             ], lg=5),
         ]),
     ])
@@ -73,8 +75,8 @@ def register(app, b):
             return th.empty_figure(theme, "No abundance values"), None
         fig = fg.profile_strip(vals, meta, var, b.levels(var, meta), theme, ylab)
         a = b.associations_for("feature", fid)
-        a = a[a["variable"] == var]
-        return fig, ui.grid("ft-assoc-grid", a, [("contrast", None, None, 220), ("effect", "log2FC", "num", 90),
+        a = a[a["variable"] == b.canonical(var)]
+        return fig, ui.grid("ft-assoc-grid", a, [("contrast", "comparison", None, 220), ("effect", "log2FC", "num", 90),
                                                  ("statistic", "t / F", "num", 80), ("padj", "padj", "p", 90)],
                             height=260, export_name=f"{fid}_associations")
 
@@ -83,13 +85,16 @@ def register(app, b):
         fid = _selected(search)
         if not fid or fid not in b.features.index:
             return None
-        g = b.features.at[fid, "group"]
-        if not isinstance(g, str):
-            return ui.note("Not in a data-driven group.")
-        cand = list(b.group_members(g).index)
-        r = b.correlated_features(fid, cand, top=20)
-        df = b.features.loc[r.index, ["dtype", "display_name", "is_annotated"]].assign(r=r.values) \
-            .rename_axis("feature_id").reset_index()
-        return ui.grid("ft-nb-grid", df, [("feature_id", None, None, 200), ("dtype", None, None, 60),
-                                          ("display_name", "name"), ("r", "r", "num", 70)], height=300,
-                       export_name=f"{fid}_neighbors")
+        nb = b.neighbors(fid)
+        if nb.empty:
+            return ui.note("Not in the feature network (not selected for grouping)." if pd.isna(b.features.at[fid, "x"])
+                           else "No network neighbours.")
+        df = b.features.loc[nb["neighbor"], ["dtype", "display_name", "group", "is_annotated"]] \
+            .assign(r=nb["weight"].to_numpy()).rename_axis("feature_id").reset_index().sort_values("r", ascending=False)
+        return html.Div([
+            html.Div("Directly connected features in the " +
+                     ("run's correlation network." if b.network_kind == "real" else "derived nearest-neighbour network."),
+                     className="small text-secondary mb-1"),
+            ui.grid("ft-nb-grid", df, [("feature_id", None, None, 200), ("dtype", None, None, 60),
+                                       ("display_name", "name"), ("r", "r", "num", 70)], height=300,
+                    export_name=f"{fid}_neighbors")])

@@ -1,12 +1,13 @@
 """Association statistics for the explorer bundle.
 
-* Linear models with empirical-Bayes variance moderation (Smyth 2004, the limma method),
-  vectorized over features. Categorical variables get a moderated F omnibus test plus a
-  moderated t for each level vs the mean of the other levels; continuous variables get a
-  moderated t on the slope.
-* CAMERA (Wu & Smyth 2012) competitive set test: is a set of features more associated
-  than the rest, with a variance-inflation factor for inter-feature correlation.
-* Benjamini-Hochberg FDR.
+One model for everything that is tested against metadata (features, group eigengenes,
+term eigengenes): a linear model with empirical-Bayes variance moderation (Smyth 2004, the
+limma method), vectorized over rows.
+
+* Categorical variable: moderated F test across all levels ("any difference"), plus a
+  moderated t test for every pair of levels.
+* Continuous variable: moderated t test of the slope.
+* Benjamini-Hochberg FDR within each comparison.
 
 Everything here is pure numpy/scipy so it is easy to unit test on synthetic data.
 """
@@ -100,7 +101,6 @@ class ModelFit:
     s2_post: np.ndarray         # rows
     df_total: float             # residual df + prior df
     xtx_inv: np.ndarray         # p x p
-    residuals: np.ndarray       # rows x n (for CAMERA correlation)
     n_obs: int
     df_resid: int
     unit: Optional[str] = None  # experimental unit when aggregated for nesting
@@ -137,16 +137,24 @@ def fit_variable(Y: np.ndarray, values: pd.Series, variable: str, var_type: str,
     s2 = (resid ** 2).sum(axis=1) / df_resid
     s2_post, d0, _ = squeeze_var(s2, df_resid)
     df_total = df_resid + (d0 if np.isfinite(d0) else 1e6)
-    fit = ModelFit(variable, var_type, levels, coef, s2_post, df_total, xtx_inv, resid, n, df_resid, unit)
+    fit = ModelFit(variable, var_type, levels, coef, s2_post, df_total, xtx_inv, n, df_resid, unit)
     if var_type == "continuous":
         fit.contrasts["slope"] = np.array([0.0, 1.0])
-    else:
+    else:  # every pair of levels; effect = mean(first) - mean(second)
         k = len(levels)
-        for j, lv in enumerate(levels):
-            c = np.full(k, -1.0 / (k - 1))
-            c[j] = 1.0
-            fit.contrasts[lv] = c
+        for i in range(k):
+            for j in range(i + 1, k):
+                c = np.zeros(k)
+                c[i], c[j] = 1.0, -1.0
+                fit.contrasts[pair_label(levels[i], levels[j])] = c
     return fit
+
+
+PAIR_SEP = " vs "
+
+
+def pair_label(a: str, b: str) -> str:
+    return f"{a}{PAIR_SEP}{b}"
 
 
 def moderated_t(fit: ModelFit, contrast: np.ndarray):
@@ -190,18 +198,17 @@ def associate_matrix(
     var_types: Dict[str, str],
     nesting: Dict[str, Optional[str]],
     entity_type: str,
-    keep_fits: bool = False,
 ):
     """Moderated association tests of every row of ``data`` (rows x samples) with each variable.
 
-    Returns ``(table, fits)``; ``table`` has columns
+    Returns a table with columns
     ``entity_type, entity_id, variable, contrast, test, statistic, effect, p, padj, n, unit``.
     BH is applied within each (variable, contrast). Rows with missing values in the
     samples used for a variable are skipped for that variable.
     """
     data = data.loc[:, [c for c in data.columns if c in metadata.index]]
     meta = metadata.loc[data.columns]
-    frames, fits = [], {}
+    frames = []
     for var in variables:
         if var not in meta.columns:
             continue
@@ -221,20 +228,14 @@ def associate_matrix(
         fit = fit_variable(Y, values, var, var_types.get(var, "categorical"), unit=unit)
         if fit is None:
             continue
-        if keep_fits:
-            fits[var] = (fit, ids)
         if fit.var_type == "categorical" and len(fit.levels) > 2:
             F, p = moderated_f(fit)
             frames.append(_frame(entity_type, ids, var, "omnibus", "moderated_F", F, np.full(len(ids), np.nan), p,
                                  fit.n_obs, unit))
         for name, c in fit.contrasts.items():
             eff, t, p = moderated_t(fit, c)
-            label = name if fit.var_type == "continuous" else f"{name} vs rest"
-            frames.append(_frame(entity_type, ids, var, label, "moderated_t", t, eff, p, fit.n_obs, unit))
-            if fit.var_type == "categorical" and len(fit.levels) == 2:
-                break  # the two level-vs-rest contrasts of a binary variable are mirror images
-    table = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=TABLE_COLUMNS)
-    return table, fits
+            frames.append(_frame(entity_type, ids, var, name, "moderated_t", t, eff, p, fit.n_obs, unit))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=TABLE_COLUMNS)
 
 
 TABLE_COLUMNS = ["entity_type", "entity_id", "variable", "contrast", "test", "statistic", "effect", "p", "padj",
@@ -255,71 +256,6 @@ def _frame(entity_type, ids, var, contrast, test, statistic, effect, p, n, unit)
         "n": int(n),
         "unit": unit or "",
     })
-
-
-# ---- CAMERA --------------------------------------------------------------------------
-
-def t_to_z(t: np.ndarray, df: float) -> np.ndarray:
-    """Convert t statistics to z-scores with the same tail probability."""
-    t = np.asarray(t, dtype=float)
-    lower = stats.t.logcdf(-np.abs(t), df)
-    z = -stats.norm.ppf(np.exp(lower))
-    z = np.where(np.isfinite(z), z, np.sign(t) * 37.0)
-    return np.sign(t) * np.abs(z)
-
-
-def camera(
-    z: np.ndarray,
-    residuals: Optional[np.ndarray],
-    sets: Dict[str, np.ndarray],
-    blocks: Optional[np.ndarray] = None,
-    min_size: int = 3,
-) -> pd.DataFrame:
-    """CAMERA competitive test of each set against all other features.
-
-    ``z``: per-feature statistic (z-scored moderated t) for one contrast.
-    ``residuals``: features x samples residual matrix used to estimate the mean
-    inter-feature correlation within each set (variance inflation factor); when
-    ``blocks`` is given (feature -> block id, e.g. data type measured on different
-    samples), correlation is only estimated within blocks.
-    ``sets``: name -> integer indices into ``z``.
-    Returns ``set, n, mean_z, correlation, statistic, p, direction``.
-    """
-    z = np.asarray(z, dtype=float)
-    G = len(z)
-    if residuals is not None:
-        norms = np.sqrt((residuals ** 2).sum(axis=1, keepdims=True))
-        U = np.divide(residuals, norms, out=np.zeros_like(residuals), where=norms > 0)
-    rows = []
-    var_all = z.var(ddof=1)
-    for name, idx in sets.items():
-        idx = np.unique(np.asarray(idx, dtype=int))
-        m = len(idx)
-        if m < min_size or G - m < 3:
-            continue
-        if residuals is None:
-            rho = 0.0
-        elif blocks is None:
-            vif_raw = m * float((U[idx].mean(axis=0) ** 2).sum())
-            rho = (vif_raw - 1) / (m - 1)
-        else:
-            within = 0.0
-            for b in np.unique(blocks[idx]):
-                bi = idx[blocks[idx] == b]
-                mb = len(bi)
-                if mb > 1:
-                    s = U[bi].sum(axis=0)
-                    within += float(s @ s) - mb   # sum of pairwise cosines within the block
-            rho = within / (m * (m - 1))
-        rho = max(rho, 0.0)                       # negative estimates would be anti-conservative
-        vif = 1 + (m - 1) * rho
-        mean_set = z[idx].mean()
-        delta = G / (G - m) * (mean_set - z.mean())
-        var_pooled = ((G - 1) * var_all - delta ** 2 * m * (G - m) / G) / (G - 2)
-        stat = delta / np.sqrt(var_pooled * (vif / m + 1 / (G - m)))
-        p = 2 * stats.t.sf(abs(stat), G - 2)
-        rows.append((name, m, mean_set, rho, stat, p, "up" if stat > 0 else "down"))
-    return pd.DataFrame(rows, columns=["set", "n", "mean_z", "correlation", "statistic", "p", "direction"])
 
 
 # ---- set scores ----------------------------------------------------------------------

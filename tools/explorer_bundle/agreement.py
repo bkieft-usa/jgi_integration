@@ -5,9 +5,10 @@
   at least one annotation of that type; noise/grey features stay in the background but
   their pseudo-group is not tested. Same semantics as ``helpers.compute_enrichment_matrix``
   with ``background='annotated'``.
-* ``agreement`` - how well groups recover annotation terms overall (AMI/ARI, term
-  co-membership against a size-preserving label-permutation null), per term
-  (concentration with permutation p) and per group (purity, entropy).
+* ``agreement`` - how well groups recover the terms of one annotation type overall: the
+  share of co-annotated feature pairs that fall in the same group, compared with the same
+  share after randomly shuffling group labels (sizes kept). Per term, descriptive only:
+  the largest share of the term in one group, and how many groups it spans.
 """
 from __future__ import annotations
 
@@ -18,7 +19,6 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from scipy.stats import hypergeom
-from sklearn.metrics import adjusted_mutual_info_score, adjusted_rand_score
 
 from tools.explorer_bundle.stats import bh_adjust
 from tools.metadata import is_noise_label
@@ -67,35 +67,18 @@ def enrichment_table(long_ann: pd.DataFrame, groups: pd.Series, ann_types: List[
     return pd.concat(frames, ignore_index=True)[cols] if frames else pd.DataFrame(columns=cols)
 
 
-def _gini_sparse(nonzero: np.ndarray, n_total: int) -> float:
-    """Gini coefficient of a count vector given its nonzero entries and full length."""
-    x = np.sort(np.asarray(nonzero, dtype=float))
-    if n_total < 2 or x.sum() == 0:
-        return 0.0
-    ranks = np.arange(n_total - len(x) + 1, n_total + 1)  # zeros occupy the lowest ranks
-    return float((2 * ranks - n_total - 1) @ x / (n_total * x.sum()))
-
-
-def _gini(x: np.ndarray) -> float:
-    x = np.sort(np.asarray(x, dtype=float))
-    if x.sum() == 0 or len(x) < 2:
-        return 0.0
-    n = len(x)
-    return float((2 * np.arange(1, n + 1) - n - 1) @ x / (n * x.sum()))
-
-
-def agreement(long_ann: pd.DataFrame, groups: pd.Series, ann_types: List[str], enrichment: pd.DataFrame,
-              n_permutations: int = 1000, min_term_size: int = 2, alpha: float = 0.05,
+def agreement(long_ann: pd.DataFrame, groups: pd.Series, ann_types: List[str],
+              n_permutations: int = 1000, min_term_size: int = 2,
               exclude_global_maps: bool = True, seed: int = 0) -> Dict[str, pd.DataFrame]:
     """Agreement between data-driven groups and each annotation type.
 
-    Only non-noise grouped features with at least one (size-filtered) term are used.
-    The null distribution permutes group labels among those features, preserving group
-    sizes and each feature's annotations.
+    Only non-noise grouped features with at least one (size-filtered) term are used. The
+    null distribution permutes group labels among those features, preserving group sizes
+    and each feature's annotations. Returns ``{"types": ..., "terms": ...}``.
     """
     rng = np.random.default_rng(seed)
     real = groups[~groups.map(is_noise_label)]
-    type_rows, term_frames, group_frames, null_rows = [], [], [], []
+    type_rows, term_frames = [], []
     for at in ann_types:
         pairs = _filtered_pairs(long_ann, at, real, min_term_size, exclude_global_maps)
         if pairs.empty:
@@ -111,7 +94,6 @@ def agreement(long_ann: pd.DataFrame, groups: pd.Series, ann_types: List[str], e
         A = sp.csr_matrix((np.ones(len(pairs)), (ti, fi)), shape=(len(terms), len(feats)))
         A.data[:] = 1.0
         m = np.asarray(A.sum(axis=1)).ravel()
-
         ok = m >= 2
         pair_total = m * (m - 1) / 2
 
@@ -119,70 +101,31 @@ def agreement(long_ann: pd.DataFrame, groups: pd.Series, ann_types: List[str], e
             G = sp.csr_matrix((np.ones(len(codes)), (np.arange(len(codes)), codes)), shape=(len(codes), len(gnames)))
             return (A @ G).tocsr()
 
-        def summarize(Cs: sp.csr_matrix):
-            """(term co-membership score, per-term concentration) from sparse term x group counts."""
+        def same_group_share(Cs: sp.csr_matrix) -> float:
+            """Mean over terms of the share of the term's feature pairs that share a group."""
             same = Cs.copy()
             same.data = same.data * (same.data - 1) / 2
             same_t = np.asarray(same.sum(axis=1)).ravel()
-            score = float(np.mean(same_t[ok] / pair_total[ok])) if ok.any() else np.nan
-            conc = Cs.max(axis=1).toarray().ravel() / m
-            return score, conc
+            return float(np.mean(same_t[ok] / pair_total[ok])) if ok.any() else np.nan
 
         Cs = counts(gcodes)
-        obs, conc_obs = summarize(Cs)
-        null = np.empty(n_permutations)
-        exceed = np.zeros(len(terms))
-        for i in range(n_permutations):
-            null[i], conc_p = summarize(counts(rng.permutation(gcodes)))
-            exceed += conc_p >= conc_obs - 1e-12
-        sd = null.std(ddof=1) if n_permutations > 1 else np.nan
-        # primary (most specific) term per feature for partition comparison
-        prim = pairs.assign(size=pairs["term_id"].map(pd.Series(m, index=terms))) \
-            .sort_values(["size", "term_id"]).drop_duplicates("feature_id").set_index("feature_id")["term_id"]
-        prim = prim.reindex(feats)
+        obs = same_group_share(Cs)
+        null = np.array([same_group_share(counts(rng.permutation(gcodes))) for _ in range(n_permutations)])
+        null_mean = float(null.mean()) if n_permutations else np.nan
         type_rows.append({
             "ann_type": at, "n_features": len(feats), "n_terms": len(terms), "n_groups": len(gnames),
-            "ami": adjusted_mutual_info_score(prim, glabels), "ari": adjusted_rand_score(prim, glabels),
-            "comembership": obs, "null_mean": float(null.mean()), "null_sd": float(sd),
-            "z": float((obs - null.mean()) / sd) if sd and sd > 0 else np.nan,
-            "p": float((1 + (null >= obs).sum()) / (1 + n_permutations)),
+            "observed": obs, "expected": null_mean,
+            "null_sd": float(null.std(ddof=1)) if n_permutations > 1 else np.nan,
+            "ratio": obs / null_mean if null_mean and null_mean > 0 else np.nan,
+            "p": float((1 + (null >= obs).sum()) / (1 + n_permutations)),  # Phipson & Smyth 2010
         })
-        null_rows.append(pd.DataFrame({"ann_type": at, "null_comembership": null.astype("float32")}))
-
-        perm_p = (1 + exceed) / (1 + n_permutations)
-        multi = m >= 2
-        n_g = len(gnames)
-        tf = pd.DataFrame({
+        term_frames.append(pd.DataFrame({
             "ann_type": at, "term_id": terms, "m": m.astype(int),
-            "concentration": conc_obs, "top_group": gnames[np.asarray(Cs.argmax(axis=1)).ravel()],
+            "concentration": Cs.max(axis=1).toarray().ravel() / m,
+            "top_group": gnames[np.asarray(Cs.argmax(axis=1)).ravel()],
             "n_groups": Cs.getnnz(axis=1),
-            "gini": [_gini_sparse(Cs.data[Cs.indptr[i]:Cs.indptr[i + 1]], n_g) for i in range(len(terms))],
-            "perm_p": np.where(multi, perm_p, np.nan),
-        })
-        tf["perm_padj"] = bh_adjust(tf["perm_p"].to_numpy())
-        term_frames.append(tf)
-
-        Cc = Cs.tocsc()
-        n_annot = np.asarray(Cc.sum(axis=0)).ravel()  # term-memberships per group (multi-label)
-        members = pd.Series(glabels).value_counts().reindex(gnames).to_numpy()
-        ent = np.zeros(n_g)
-        for j in range(n_g):
-            x = Cc.data[Cc.indptr[j]:Cc.indptr[j + 1]]
-            if x.sum() > 0:
-                q = x / x.sum()
-                ent[j] = float(-(q * np.log2(q)).sum())
-        purity = Cc.max(axis=0).toarray().ravel() / members
-        top_term_idx = np.asarray(Cc.argmax(axis=0)).ravel()
-        sig = enrichment[(enrichment["ann_type"] == at) & (enrichment["padj"] < alpha)].groupby("group").size()
-        group_frames.append(pd.DataFrame({
-            "group": gnames, "ann_type": at, "n_annotated": members,
-            "purity": purity, "top_term": terms[top_term_idx], "entropy_bits": ent,
-            "n_significant_terms": sig.reindex(gnames).fillna(0).astype(int).to_numpy(),
         }))
-    empty = pd.DataFrame()
     return {
         "types": pd.DataFrame(type_rows),
-        "terms": pd.concat(term_frames, ignore_index=True) if term_frames else empty,
-        "groups": pd.concat(group_frames, ignore_index=True) if group_frames else empty,
-        "null": pd.concat(null_rows, ignore_index=True) if null_rows else empty,
+        "terms": pd.concat(term_frames, ignore_index=True) if term_frames else pd.DataFrame(),
     }

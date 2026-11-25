@@ -77,6 +77,33 @@ def infer_variable_types(
     return types
 
 
+def identical_variables(metadata: pd.DataFrame, variables: Iterable[str]) -> Dict[str, str]:
+    """Variables that split the samples into exactly the same groups as an earlier variable
+    (e.g. ``group`` = ``organism`` + ``lineage`` label when lineage is nested in organism).
+
+    Testing both would duplicate every result, so each duplicate maps to the first variable
+    with that partition: ``{duplicate: kept}``.
+    """
+    aliases: Dict[str, str] = {}
+    kept: list = []
+    for v in variables:
+        s = metadata[v]
+        codes = pd.factorize(s.astype(str).where(s.notna(), None))[0]
+        match = None
+        for k in kept:
+            t = metadata[k]
+            kcodes = pd.factorize(t.astype(str).where(t.notna(), None))[0]
+            both = pd.DataFrame({"a": codes, "b": kcodes})
+            if (both.groupby("a")["b"].nunique() == 1).all() and (both.groupby("b")["a"].nunique() == 1).all():
+                match = k
+                break
+        if match:
+            aliases[v] = match
+        else:
+            kept.append(v)
+    return aliases
+
+
 def detect_nesting(metadata: pd.DataFrame, variables: Iterable[str]) -> Dict[str, Optional[str]]:
     """For each variable, the experimental unit it should be tested at.
 

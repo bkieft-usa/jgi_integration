@@ -47,19 +47,15 @@ def layout(b, params):
             dbc.Col(ui.card("Sample-to-sample correlation", ui.graph("ov-sim", 488),
                             "Pearson correlation on integrated features, clustered (average linkage)."), lg=6),
         ]),
-        dbc.Row([
-            dbc.Col(ui.card("Do data-driven groups recover knowledge-driven terms?", [
-                ui.graph("ov-agree", 520),
-                html.Div("Each row is an annotation type. For every term, the share of its co-annotated feature "
-                         "pairs that fall in the same group is averaged over terms (dot). Gray: the same statistic "
-                         "when group labels are shuffled (sizes kept). Blue = better than random (permutation "
-                         "p < 0.05). AMI compares the partitions directly (0 = random, 1 = identical).",
-                         className="small text-secondary mt-2"),
-            ]), lg=7),
-            dbc.Col([
-                ui.card("Agreement by annotation type", html.Div(id="ov-agree-table")),
-                ui.card("Group sizes", ui.graph("ov-sizes", 260)),
-            ], lg=5),
+        ui.card("Do data-driven groups recover knowledge-driven terms?", [
+            html.Div("For each annotation type: of all pairs of features that share a term, what share fall in the "
+                     "same data-driven group? The dot is the observed share (averaged over terms); the gray bar is the "
+                     "share expected if group labels were random (1,000 shuffles keeping group sizes). A dot to the "
+                     "right of the bar (blue: permutation p < 0.05) means the groups recover that kind of biology "
+                     "better than chance. The table below lists the same numbers.",
+                     className="small text-secondary mb-2"),
+            ui.graph("ov-agree", 520),
+            html.Div(id="ov-agree-table", className="mt-3"),
         ]),
     ])
 
@@ -82,16 +78,17 @@ def register(app, b):
     def sim_fig(theme):
         return fg.similarity_heatmap(b.similarity, theme, 488)
 
-    @app.callback(Output("ov-agree", "figure"), Output("ov-agree-table", "children"), Output("ov-sizes", "figure"),
-                  Input("theme", "data"))
+    @app.callback(Output("ov-agree", "figure"), Output("ov-agree-table", "children"), Input("theme", "data"))
     def agree(theme):
-        t = b.agree_types
+        t = b.agree
         if t.empty:
-            empty = th.empty_figure(theme, "No annotation types with enough grouped features")
-            return empty, html.Div(), fg.size_histogram(b.groups, theme)
-        tab = t.assign(annotation=t["ann_type"].map(b.ann_label)).sort_values("z", ascending=False)
-        grid = ui.grid("ov-agree-grid", tab, [("annotation", "Annotation type", None, 190), ("ami", "AMI", "num"),
-                                             ("z", "z vs null", "num"), ("p", "perm p", "p"),
-                                             ("n_features", "features", "int"), ("n_terms", "terms", "int")],
-                       height=330, export_name="agreement")
-        return fg.agreement_dots(t, b.ann_label, theme, 520), grid, fg.size_histogram(b.groups, theme)
+            return th.empty_figure(theme, "No annotation types with enough grouped features"), html.Div()
+        tab = t.assign(annotation=t["ann_type"].map(b.ann_label)).sort_values("ratio", ascending=False)
+        grid = ui.grid("ov-agree-grid", tab, [("annotation", "Annotation type", None, 220),
+                                             ("observed", "observed share", "num"),
+                                             ("expected", "expected (random groups)", "num"),
+                                             ("ratio", "observed / expected", "num"), ("p", "permutation p", "p"),
+                                             ("n_features", "features", "int"), ("n_terms", "terms", "int"),
+                                             ("n_groups", "groups", "int")],
+                       height=360, export_name="agreement")
+        return fg.agreement_dots(t, b.ann_label, theme, 520), grid

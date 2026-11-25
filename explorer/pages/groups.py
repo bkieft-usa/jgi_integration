@@ -1,4 +1,4 @@
-"""Data-driven groups: map of groups, zoom into one group's biology."""
+"""Data-driven groupings: the full feature network, then zoom into one group's biology."""
 from __future__ import annotations
 
 from urllib.parse import parse_qs
@@ -12,186 +12,152 @@ from dash import Input, Output, State, dcc, html, no_update
 from explorer import components as ui
 from explorer import figures as fg
 from explorer import theme as th
+from explorer.data import contrast_label
 
 MAX_WITHIN = 300
+N_COLORED_GROUPS = 8
 
 
 def _selected(search) -> str | None:
     return parse_qs((search or "").lstrip("?")).get("group", [None])[0]
 
 
+def _network_caption(b) -> str:
+    n = b.manifest.get("network", {})
+    if b.network_kind == "real":
+        return (f"The run's own correlation network ({n.get('n_nodes', 0):,} features, {n.get('n_edges', 0):,} edges): "
+                "these edges are what defined the groups. Each point is a feature; nearby features are connected.")
+    return (f"Derived network for display ({n.get('n_nodes', 0):,} features, {n.get('n_edges', 0):,} edges): the "
+            f"{b.manifest.get('grouping_method')} method does not produce edges, so each feature is linked to its "
+            f"{n.get('k', 5)} most correlated grouped features. Groups were formed by the clustering itself (see "
+            "'Clustering tree'), not by these edges.")
+
+
 def layout(b, params):
     native = b.native or {}
-    views = [{"label": "Group network (eigengene correlation)", "value": "network"},
-             {"label": "Feature map (UMAP)", "value": "features"}]
+    views = [{"label": "Feature network", "value": "network"}]
     if native.get("kind") == "dendrogram":
-        views.append({"label": "Clustering dendrogram" + (" (approximate)" if native.get("approximate") else ""),
+        views.append({"label": "Clustering tree (dendrogram)" + (" — approximate" if native.get("approximate") else ""),
                       "value": "native"})
     elif native.get("kind") == "hdbscan_tree":
-        views.append({"label": "HDBSCAN cluster tree", "value": "native"})
+        views.append({"label": "Clustering tree (HDBSCAN condensed tree)", "value": "native"})
     group = params.get("group")
+    hl_values = [v for v in (params.get("highlight") or "").split("|") if v]
     return html.Div([
-        ui.page_header("Data-driven groups",
-                       "Explore how groups of co-varying features relate, then click a group to zoom into its "
-                       "annotations, abundance profile, and members (including unannotated ones)."),
+        ui.page_header("Data-Driven Groupings",
+                       "Every grouped feature and how it relates to the others. Highlight knowledge-driven terms or "
+                       "features to see where they fall, then click a feature to open its group: abundance profile, "
+                       "annotations, and members (including unannotated ones)."),
         html.Div([
-            ui.labeled("View", ui.dropdown("gr-view", views, "network", style={"minWidth": "300px"})),
-            ui.labeled("Color", ui.dropdown("gr-color", [{"label": "Selected group", "value": "group"},
-                                                        {"label": "Data type", "value": "dtype"}], "group")),
-            ui.labeled("Groups in network", ui.dropdown("gr-maxn", [{"label": f"largest {n}", "value": n}
-                                                                   for n in (100, 300, 600)] + [{"label": "all", "value": 0}],
-                                                        300, style={"minWidth": "150px"})),
-            dbc.Switch(id="gr-neg", label="Show anti-correlated edges", value=False, className="mb-1 small"),
-            ui.labeled("Highlight a feature or term", ui.dropdown("gr-highlight", [], None, clearable=True,
-                                                                  placeholder="type a KO, pathway, compound, feature ID…",
-                                                                  style={"minWidth": "360px"}, searchable=True)),
+            ui.labeled("View", ui.dropdown("gr-view", views, "network", style={"minWidth": "280px"})),
+            ui.labeled("Color", ui.dropdown("gr-color", [
+                {"label": f"Group (largest {N_COLORED_GROUPS} in color)", "value": "group"},
+                {"label": "Data type", "value": "dtype"},
+                {"label": "Annotated vs not", "value": "annotation"}], "group", style={"minWidth": "220px"})),
+            ui.labeled("Highlight terms or features (several allowed)",
+                       ui.dropdown("gr-highlight", [{"label": v.split(":", 1)[1], "value": v} for v in hl_values],
+                                   hl_values, multi=True, clearable=True, searchable=True,
+                                   placeholder="type a pathway, KO, EC, compound class, feature ID…",
+                                   style={"minWidth": "480px"})),
         ], className="controls"),
+        ui.card("Feature network", [html.Div(ui.graph("gr-net", 640), id="gr-net-wrap"),
+                                    html.Div(ui.graph("gr-native", 640), id="gr-native-wrap", style={"display": "none"}),
+                                    html.Div(id="gr-map-note", className="small text-secondary mt-1")]),
+        html.Div(id="gr-highlight-summary"),
         dbc.Row([
-            dbc.Col(ui.card("Map", [html.Div(id="gr-map-wrap"), html.Div(id="gr-map-note", className="small text-secondary mt-1")]),
-                    lg=7),
-            dbc.Col(html.Div(id="gr-summary"), lg=5),
+            dbc.Col(html.Div(id="gr-summary"), lg=7),
+            dbc.Col(ui.card("Group sizes", ui.graph("gr-sizes", 260),
+                            "Number of features in each data-driven group."), lg=5),
         ]),
         html.Div(id="gr-detail"),
         dcc.Store(id="gr-init", data=group),
     ])
 
 
-def _network_elements(b, filters, max_groups=300, negative=False):
-    g = b.groups
-    min_size = (filters or {}).get("min_group_size", 2)
-    g = g[(g["size"] >= min_size) & ~g["is_noise"]].dropna(subset=["x"])
-    if max_groups:
-        g = g.nlargest(int(max_groups), "size")
-    # normalize positions to a fixed canvas so node spacing does not depend on embedding scale
-    span = max(float(g["x"].max() - g["x"].min()), float(g["y"].max() - g["y"].min()), 1e-9) if len(g) else 1.0
-    scale = 1800.0 / span
-    x0, y0 = (g["x"].min(), g["y"].min()) if len(g) else (0, 0)
-    nodes = []
-    dtype_cols = [c for c in g.columns if c.startswith("n_") and c[2:] in b.dtypes]
-    for gid, r in g.iterrows():
-        counts = {c[2:]: r[c] for c in dtype_cols}
-        total = max(sum(counts.values()), 1)
-        dom = max(counts, key=counts.get) if counts else None
-        kind = dom if dom and counts[dom] / total >= 0.8 else "mixed"
-        nodes.append({"data": {"id": gid, "label": "", "size": float(min(44, 6 + 2.2 * np.sqrt(r["size"]))),
-                               "kind": kind, "n": int(r["size"])},
-                      "position": {"x": float(r["x"] - x0) * scale, "y": float(y0 - r["y"]) * scale}})
-    keep = set(g.index)
-    e = b.group_net
-    e = e[e["source"].isin(keep) & e["target"].isin(keep)] if len(e) else e
-    if len(e) and not negative:
-        e = e[e["r"] > 0]
-    edges = [{"data": {"source": s, "target": t, "r": float(r), "width": 0.6 + 3 * max(abs(r) - 0.7, 0) / 0.3,
-                       "sign": "pos" if r > 0 else "neg"}} for s, t, r in e[["source", "target", "r"]].itertuples(index=False)]
-    return nodes + edges
+def _highlight_sets(b, values):
+    """``[(label, feature_ids)]`` for the highlight dropdown values."""
+    out = []
+    for v in values or []:
+        kind, key = v.split(":", 1)
+        if kind == "term":
+            ids = set(b.term_members(key).index)
+            out.append((b.term_label(key, 40), ids))
+        elif kind == "feature":
+            out.append((key, {key}))
+    return out
 
 
-def _network_stylesheet(theme, selected, highlight_groups):
-    c = th.chrome(theme)
-    ss = th.cytoscape_stylesheet(theme)
-    ss += [
-        {"selector": '[kind = "tx"]', "style": {"background-color": th.dtype_color(theme, "tx")}},
-        {"selector": '[kind = "mx"]', "style": {"background-color": th.dtype_color(theme, "mx")}},
-        {"selector": '[kind = "px"]', "style": {"background-color": th.dtype_color(theme, "px")}},
-        {"selector": '[kind = "mixed"]', "style": {"background-color": th.cat(theme, 2)}},
-        {"selector": '[sign = "pos"]', "style": {"line-color": c["muted"]}},
-        {"selector": '[sign = "neg"]', "style": {"line-color": c["red"]}},
-    ]
-    for gid in list(highlight_groups)[:400]:
-        ss.append({"selector": f'node[id = "{gid}"]', "style": {"border-width": 3, "border-color": th.cat(theme, 3)}})
-    if selected:
-        ss.append({"selector": f'node[id = "{selected}"]',
-                   "style": {"border-width": 4, "border-color": c["ink"], "label": "data(id)", "font-size": 24,
-                             "min-zoomed-font-size": 0, "color": c["ink"], "z-index": 99,
-                             "text-background-color": c["surface"], "text-background-opacity": 0.8}})
-    return ss
-
-
-def _highlight_ids(b, value):
-    if not value:
-        return set()
-    kind, key = value.split(":", 1)
-    if kind == "feature":
-        return {key}
-    if kind == "term":
-        return set(b.term_members(key).index)
-    return set()
+def _colored_groups(b):
+    g = b.groups[~b.groups["is_noise"]]
+    return g.nlargest(N_COLORED_GROUPS, "size").index.tolist()
 
 
 def register(app, b):
     @app.callback(Output("gr-highlight", "options"), Input("gr-highlight", "search_value"),
-                  State("gr-highlight", "value"))
-    def hl_options(query, current):
-        opts = b.search(query or "", kinds=["term", "feature"])
-        if current and not any(o["value"] == current for o in opts):
-            opts = [{"label": current.split(":", 1)[1], "value": current}] + opts
-        return opts
+                  State("gr-highlight", "value"), State("gr-highlight", "options"))
+    def hl_options(query, current, existing):
+        keep = [o for o in (existing or []) if o["value"] in (current or [])]
+        opts = b.search(query or "", kinds=["term", "feature"]) if query else []
+        seen = {o["value"] for o in keep}
+        return keep + [o for o in opts if o["value"] not in seen]
 
-    @app.callback(Output("gr-map-wrap", "children"), Output("gr-map-note", "children"),
-                  Input("gr-view", "value"), Input("filters", "data"), Input("gr-maxn", "value"), Input("gr-neg", "value"))
-    def map_container(view, filters, max_groups, negative):
-        if view == "network":
-            els = _network_elements(b, filters, max_groups, negative)
-            n_nodes = sum(1 for e in els if "position" in e)
-            legend = html.Div([
-                html.Span("Node color: ", className="me-1"),
-                *[html.Span([html.Span(className="legend-dot", style={"background": th.dtype_color("light", d)}),
-                             f"mostly {d}"], className="me-3") for d in b.dtypes],
-                html.Span([html.Span(className="legend-dot", style={"background": th.cat("light", 2)}), "mixed"],
-                          className="me-3"),
-                html.Span("· size = features · edges = eigengene correlation |r| ≥ "
-                          f"{b.manifest.get('config', {}).get('eigengene_network', {}).get('min_abs_r', 0.7)} "
-                          "(gray positive, red negative) · nearby groups have similar abundance profiles (UMAP of eigengenes)"),
-            ])
-            return (cyto.Cytoscape(id="gr-cyto", elements=els, layout={"name": "preset", "fit": True},
-                                   style={"width": "100%", "height": "560px"}, minZoom=0.05, maxZoom=4,
-                                   boxSelectionEnabled=False, wheelSensitivity=0.2),
-                    [legend, html.Div(f"{n_nodes:,} groups shown (largest first; minimum size in the sidebar). "
-                                      "Scroll to zoom, drag to pan, click a group to open it.")])
-        if view == "features":
-            return ui.graph("gr-fmap", 560), "Each point is a feature (UMAP of its profile, correlation metric). " \
-                                             "Scroll to zoom, drag to pan, click a point to open its group."
-        note = (b.native or {}).get("note", "")
-        return ui.graph("gr-native", 560), note
+    @app.callback(Output("gr-net-wrap", "style"), Output("gr-native-wrap", "style"), Output("gr-map-note", "children"),
+                  Input("gr-view", "value"))
+    def map_container(view):
+        hide = {"display": "none"}
+        if view == "native":
+            return hide, {}, (b.native or {}).get("note", "")
+        return {}, hide, [
+            _network_caption(b), " Scroll to zoom, drag to pan, click a feature to open its group. ",
+            "Use the sidebar to include noise / unassigned features."]
 
-    @app.callback(Output("gr-cyto", "stylesheet"), Input("url", "search"), Input("gr-highlight", "value"),
-                  Input("theme", "data"))
-    def cyto_style(search, hl, theme):
-        ids = _highlight_ids(b, hl)
-        hgroups = set(b.features.loc[b.features.index.isin(ids), "group"].dropna())
-        return _network_stylesheet(theme, _selected(search), hgroups)
-
-    @app.callback(Output("gr-fmap", "figure"), Input("url", "search"), Input("gr-highlight", "value"),
-                  Input("gr-color", "value"), Input("filters", "data"), Input("theme", "data"))
-    def fmap(search, hl, color, filters, theme):
-        f = b.features
+    @app.callback(Output("gr-net", "figure"), Output("gr-highlight-summary", "children"),
+                  Input("url", "search"), Input("gr-highlight", "value"), Input("gr-color", "value"),
+                  Input("filters", "data"), Input("theme", "data"))
+    def network(search, hl, color, filters, theme):
+        f = b.features.loc[b.network_nodes]
         if not (filters or {}).get("include_noise"):
             f = f[~f["is_noise"].fillna(False).astype(bool)]
-        fig = fg.feature_map(f, theme, _selected(search), _highlight_ids(b, hl), color or "group")
-        fig.update_layout(uirevision="fmap")
-        return fig
+        min_size = (filters or {}).get("min_group_size", 1)
+        f = f[f["group"].map(b.groups["size"]).fillna(0) >= min_size]
+        sets = _highlight_sets(b, hl)
+        fig = fg.network_figure(f, b.feature_edges, theme, color or "group", _colored_groups(b), _selected(search),
+                                sets)
+        fig.update_layout(uirevision="network")
+        summary = None
+        if sets:
+            rows = []
+            for label, ids in sets:
+                in_net = f.index.intersection(list(ids))
+                groups = b.features.loc[in_net, "group"].value_counts()
+                rows.append(html.Li([html.B(label), f": {len(ids):,} features, {len(in_net):,} in the network",
+                                     (", mostly in " + ", ".join(f"{g} ({n})" for g, n in groups.head(3).items()))
+                                     if len(groups) else ""]))
+            summary = ui.note(html.Ul(rows, className="mb-0 ps-3"))
+        return fig, summary
+
+    @app.callback(Output("gr-sizes", "figure"), Input("theme", "data"))
+    def sizes(theme):
+        return fg.size_histogram(b.groups, theme)
 
     @app.callback(Output("gr-native", "figure"), Input("url", "search"), Input("theme", "data"))
     def native_fig(search, theme):
         n = b.native or {}
         if n.get("kind") == "dendrogram":
-            return fg.dendrogram(n, theme, _selected(search))
+            return fg.dendrogram(n, theme, _selected(search), height=640)
         if n.get("kind") == "hdbscan_tree":
-            return fg.hdbscan_icicle(n, theme, _selected(search))
-        return th.empty_figure(theme, "No native structure view for this grouping method")
+            return fg.hdbscan_icicle(n, theme, _selected(search), height=640)
+        return th.empty_figure(theme, "No clustering tree for this grouping method")
 
-    @app.callback(Output("url", "href", allow_duplicate=True), Input("gr-cyto", "tapNodeData"),
-                  prevent_initial_call=True)
-    def tap_node(data):
-        return ui.href("/groups", group=data["id"]) if data else no_update
-
-    @app.callback(Output("url", "href", allow_duplicate=True), Input("gr-fmap", "clickData"),
-                  prevent_initial_call=True)
-    def click_feature(click):
-        if not click:
+    @app.callback(Output("url", "href", allow_duplicate=True), Input("gr-net", "clickData"), State("url", "search"),
+                  State("gr-highlight", "value"), prevent_initial_call=True)
+    def click_feature(click, search, hl):
+        if not click or "customdata" not in click["points"][0]:
             return no_update
         g = click["points"][0]["customdata"][1]
-        return ui.href("/groups", group=g) if g else no_update
+        if not g or g == "–" or g == _selected(search):
+            return no_update
+        return ui.href("/groups", group=g, highlight="|".join(hl or []))
 
     @app.callback(Output("url", "href", allow_duplicate=True), Input("gr-native", "clickData"),
                   prevent_initial_call=True)
@@ -209,12 +175,12 @@ def register(app, b):
         g = _selected(search)
         if not g or g not in b.groups.index:
             hint = ui.card("No group selected", html.Div([
-                html.P("Click a node in the group network, a point on the feature map, or a leaf of the tree. "
-                       "You can also search for a group in the top bar."),
-                html.P("Largest groups:", className="mb-1 small text-secondary"),
-                ui.grid("gr-top", b.groups.reset_index().head(200),
-                        [("group", None, None, 120), ("size", "features", "int", 90), ("top_term", "top enriched term")],
-                        height=420, export_name="groups"),
+                html.P("Click a feature in the network, a leaf of the clustering tree, or a row below. You can also "
+                       "search for a group in the top bar.", className="small"),
+                ui.grid("gr-top", b.groups.reset_index().head(500),
+                        [("group", None, None, 130), ("size", "features", "int", 90),
+                         ("frac_annotated", "annotated", "num", 100), ("top_term", "top enriched term")],
+                        height=300, export_name="groups"),
             ]))
             return hint, None
         r = b.groups.loc[g]
@@ -231,7 +197,7 @@ def register(app, b):
                       html.Span(r["top_term"] if isinstance(r.get("top_term"), str) else "none at this FDR")],
                      className="small mb-1"),
             html.Div([html.Span("Strongest metadata association: ", className="text-secondary"),
-                      html.Span(f"{r['best_variable']} · {r['best_contrast']} (padj {ui.fmt_p(r['best_padj'])})"
+                      html.Span(f"{r['best_variable']} · {contrast_label(r['best_contrast'])} (padj {ui.fmt_p(r['best_padj'])})"
                                 if isinstance(r.get("best_variable"), str) else "–")], className="small"),
         ])
         at_counts = b.enrichment_for_group(g)
@@ -239,7 +205,7 @@ def register(app, b):
                       at_counts["ann_type"].value_counts().index.tolist() or [b.ann_types[0]["key"] if b.ann_types else None])[0]
         tabs = dbc.Tabs([
             dbc.Tab(label="Abundance profile", tab_id="profile", children=html.Div([
-                html.Div([ui.labeled("Metadata variable", ui.dropdown("gr-var", b.variables,
+                html.Div([ui.labeled("Metadata variable", ui.dropdown("gr-var", b.variable_options(),
                                                                       b.variables[0] if b.variables else None))],
                          className="controls mt-2"),
                 dbc.Row([dbc.Col(ui.graph("gr-profile", 360), lg=7), dbc.Col(html.Div(id="gr-assoc"), lg=5)]),
@@ -263,8 +229,8 @@ def register(app, b):
             return th.empty_figure(theme, "No eigengene for this group"), None
         fig = fg.profile_strip(b.eig.loc[g], b.samples, var, b.levels(var), theme, "Group eigengene (SD)")
         a = b.associations_for("group", g)
-        a = a[a["variable"] == var].sort_values("p")
-        tbl = ui.grid("gr-assoc-grid", a, [("contrast", None, None, 200), ("effect", "Δ eigengene", "num"),
+        a = a[a["variable"] == b.canonical(var)].sort_values("p")
+        tbl = ui.grid("gr-assoc-grid", a, [("contrast", "comparison", None, 220), ("effect", "Δ eigengene", "num"),
                                            ("padj", "padj", "p")], height=320, export_name=f"{g}_associations")
         return fig, tbl
 
@@ -308,10 +274,12 @@ def register(app, b):
         n_un = int((~m["is_annotated"]).sum())
         return html.Div([
             html.Div(f"{len(m):,} members; {n_un:,} have no annotation of any type. kME = correlation with the "
-                     "group eigengene (how typical the feature is of the group).", className="small text-secondary mb-1"),
+                     "group eigengene (how typical the feature is of the group). Degree = network neighbours.",
+                     className="small text-secondary mb-1"),
             ui.grid("gr-mem-grid", m, [("feature_id", None, None, 220), ("dtype", None, None, 70), ("display_name", "name"),
-                                       ("kME", "kME", "num", 90), ("is_annotated", "annotated", None, 100),
-                                       ("n_terms", "terms", "int", 80)], height=480, export_name=f"{g}_members"),
+                                       ("kME", "kME", "num", 90), ("degree", "degree", "int", 90),
+                                       ("is_annotated", "annotated", None, 100), ("n_terms", "terms", "int", 80)],
+                    height=480, export_name=f"{g}_members"),
         ])
 
     @app.callback(Output("gr-within", "children"), Input("url", "search"), Input("theme", "data"))
@@ -319,50 +287,32 @@ def register(app, b):
         g = _selected(search)
         if not g:
             return None
-        m = b.group_members(g).sort_values("kME", ascending=False)
+        m = b.group_members(g)
         e = b.feature_edges
-        real = len(e) > 0
-        if real:  # show the best-connected members of the real network
-            inside = e[e["source"].isin(m.index) & e["target"].isin(m.index)]
-            degree = pd.concat([inside["source"], inside["target"]]).value_counts()
-            m = m.assign(degree=degree.reindex(m.index).fillna(0)).sort_values(["degree", "kME"], ascending=False)
+        inside = e[e["source"].isin(m.index) & e["target"].isin(m.index)]
+        degree = pd.concat([inside["source"], inside["target"]]).value_counts()
+        m = m.assign(deg_in=degree.reindex(m.index).fillna(0)).sort_values(["deg_in", "kME"], ascending=False)
         ids = list(m.index[:MAX_WITHIN])
         idset = set(ids)
-        if real:
-            sub = e[e["source"].isin(idset) & e["target"].isin(idset)]
-            edges = [(s, t, w) for s, t, w in sub[["source", "target", "weight"]].itertuples(index=False)]
-            caption = "Real correlation-network edges used to define the modules."
-        else:
-            Z = b.z.reindex(ids).to_numpy(dtype=float)
-            Zc = np.nan_to_num(Z - Z.mean(axis=1, keepdims=True))
-            Zc /= np.maximum(np.linalg.norm(Zc, axis=1, keepdims=True), 1e-12)
-            R = Zc @ Zc.T
-            np.fill_diagonal(R, -np.inf)
-            edges = set()
-            for i in range(len(ids)):
-                for j in np.argsort(-R[i])[:3]:
-                    if R[i, j] >= 0.7:
-                        edges.add((min(i, j), max(i, j)))
-            edges = [(ids[i], ids[j], float(R[i, j])) for i, j in edges]
-            caption = ("Correlation view (not the clustering itself): each member linked to its 3 most correlated "
-                       "members (r ≥ 0.7).")
+        sub = inside[inside["source"].isin(idset) & inside["target"].isin(idset)]
+        caption = ("Edges of the run's correlation network between members of this group." if b.network_kind == "real"
+                   else "Edges of the derived nearest-neighbour network between members of this group "
+                        "(a display aid; the clustering did not use edges).")
         if len(m) > MAX_WITHIN:
-            caption += (f" Showing the {MAX_WITHIN} best-connected members of {len(m):,}." if real else
-                        f" Showing the {MAX_WITHIN} most typical members (highest kME) of {len(m):,}.")
-        connected = {s for s, t, _ in edges} | {t for s, t, _ in edges}
+            caption += f" Showing the {MAX_WITHIN} best-connected members of {len(m):,}."
+        connected = set(sub["source"]) | set(sub["target"])
         if len(ids) - len(connected) > 0:
-            caption += f" {len(ids) - len(connected):,} shown members have no edge to another shown member."
+            caption += f" {len(ids) - len(connected):,} shown members have no edge to another member."
         nodes = [{"data": {"id": f, "label": (m.at[f, "display_name"] or "")[:24] if isinstance(m.at[f, "display_name"], str) else "",
                            "size": 10 + 14 * max(float(m.at[f, "kME"]) if pd.notna(m.at[f, "kME"]) else 0, 0),
                            "dtype": m.at[f, "dtype"], "ann": "yes" if m.at[f, "is_annotated"] else "no"}}
                  for f in ids]
         els = nodes + [{"data": {"source": s, "target": t, "width": 1.0, "color": th.chrome(theme)["muted"]}}
-                       for s, t, _ in edges]
+                       for s, t in sub[["source", "target"]].itertuples(index=False)]
         ss = th.cytoscape_stylesheet(theme) + [
             {"selector": f'[dtype = "{d}"]', "style": {"background-color": th.dtype_color(theme, d)}} for d in b.dtypes
         ] + [{"selector": '[ann = "no"]', "style": {"background-opacity": 0.25, "border-width": 2,
                                                     "border-color": th.chrome(theme)["ink2"]}},
-             # names appear only once zoomed in far enough to read them
              {"selector": "node", "style": {"min-zoomed-font-size": 14, "font-size": 10}}]
         legend = html.Div([
             *[html.Span([html.Span(className="legend-dot", style={"background": th.dtype_color(theme, d)}), d],
