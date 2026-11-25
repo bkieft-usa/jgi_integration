@@ -23,6 +23,11 @@ cd "$(dirname "$SELF")"     # input_data/ (Finder starts .command files in your 
 
 die() { echo; echo "ERROR: $*" >&2; echo; read -r -p "Press Return to close." _ || true; exit 1; }
 
+if [ -f Dockerfile ] && [ -f docker-compose.example.yml ]; then
+    die "this is the repository's copy of start.command (${SELF}), reached directly or through a symlink.
+Copy the file itself into your input_data folder (cp, not ln -s) and run that copy."
+fi
+
 dev=0
 for arg in "$@"; do
     case "$arg" in
@@ -74,7 +79,9 @@ done
 compose() { docker compose -p "$PROJECT" -f "$compose_file" "$@"; }
 
 echo "Starting ${CONTAINER} with image ghcr.io/bkieft-usa/jgi-integration:${tag}"
-compose up -d --force-recreate --pull "$pull" || die "the container did not start (see the messages above)."
+compose up -d --force-recreate --pull "$pull" || die "the container did not start (see the messages above).
+If they say 'denied' or 'unauthorized', Docker is sending an old saved login for ghcr.io (the image itself
+is public). Remove it with:  docker logout ghcr.io   and run this again."
 
 stop_container() {
     trap - INT TERM HUP
